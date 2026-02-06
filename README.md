@@ -178,25 +178,7 @@ Example: For a query on 100K partitions with `tenant_id = 'acme'`:
 | Storage overhead        | <5%                    |
 | Recovery time           | <10s                   |
 
-## Project Structure
-
-```
-arkilian/
-├── cmd/
-│   ├── arkilian-ingest/     # Ingestion service
-│   ├── arkilian-query/      # Query service
-│   └── arkilian-compact/    # Compaction daemon
-├── internal/
-│   ├── bloom/               # Bloom filter implementation
-│   ├── compaction/          # Compaction logic
-│   ├── manifest/            # Manifest catalog
-│   ├── partition/           # Partition builder
-│   ├── query/               # Query parser, planner, executor
-│   ├── storage/             # Object storage abstraction
-│   └── api/                 # HTTP/gRPC handlers
-├── pkg/types/               # Shared types (Row, Schema, ULID)
-└── test/                    # Integration tests
-```
+ 
 
 ## Testing
 
@@ -226,15 +208,8 @@ go test ./test/integration/...
 
 - No distributed ACID transactions across partitions
 - Eventual consistency (not strong consistency)
-- Schema must be declared per partition key
-- Not suitable for real-time OLTP (<10ms latency requirements)
-
-## When NOT to Use Arkilian
-
-- You need distributed transactions → Use PostgreSQL or Spanner
-- You need strong consistency → Use rqlite
-- You have <100GB data in single region → Use LiteFS
-- You need full ANSI SQL compliance → Use TimescaleDB
+- Schema must be declared per partition key 
+ 
 
 ## License
 
