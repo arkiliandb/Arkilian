@@ -1,0 +1,67 @@
+// Copyright 2026 Project Arkilian Authors
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package arkilian.v1;
+
+option go_package = "github.com/arkilian/arkilian/api/proto;proto";
+
+// IngestService provides batch ingestion capabilities for Project Arkilian.
+service IngestService {
+  // BatchIngest ingests a batch of rows into a partition.
+  // This is the high-throughput gRPC endpoint for data ingestion.
+  rpc BatchIngest(IngestRequest) returns (IngestResponse);
+}
+
+// IngestRequest represents a batch ingest request.
+message IngestRequest {
+  // partition_key is the key used to route data to the appropriate partition.
+  // Format depends on strategy: YYYYMMDD for time-based, tenant ID for tenant-based.
+  string partition_key = 1;
+
+  // rows contains the batch of event rows to ingest.
+  repeated Row rows = 2;
+
+  // idempotency_key is an optional key for idempotent ingestion.
+  // If provided, duplicate requests with the same key will return the original result.
+  string idempotency_key = 3;
+}
+
+// IngestResponse represents the response from a batch ingest operation.
+message IngestResponse {
+  // partition_id is the unique identifier of the created partition.
+  string partition_id = 1;
+
+  // row_count is the number of rows successfully ingested.
+  int64 row_count = 2;
+
+  // size_bytes is the size of the created partition in bytes.
+  int64 size_bytes = 3;
+
+  // request_id is the unique identifier for this request (for tracing).
+  string request_id = 4;
+}
+
+// Row represents a single event row to be ingested.
+message Row {
+  // event_id is the optional ULID for the event.
+  // If not provided, a new ULID will be generated.
+  bytes event_id = 1;
+
+  // tenant_id identifies the tenant this event belongs to (required).
+  string tenant_id = 2;
+
+  // user_id identifies the user who triggered the event (required).
+  int64 user_id = 3;
+
+  // event_time is the Unix timestamp in nanoseconds when the event occurred (required).
+  int64 event_time = 4;
+
+  // event_type categorizes the event, e.g., "page_view", "purchase" (required).
+  string event_type = 5;
+
+  // payload contains the event-specific data as JSON bytes.
+  // The payload will be compressed with Snappy before storage.
+  bytes payload = 6;
+}
