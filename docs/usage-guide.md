@@ -29,38 +29,129 @@ cd arkilian
 go build ./...
 
 # Verify installation
-./arkilian-ingest --version
-./arkilian-query --version
-./arkilian-compact --version
+./arkilian --version
 ```
 
 ### Minimal Setup (Local Development)
 
+The simplest way to run Arkilian is with the unified binary:
+
+```bash
+# Run all services with a single command
+./arkilian --data-dir /tmp/arkilian
+
+# This starts:
+# - Ingest service on :8080
+# - Query service on :8081
+# - Compaction service on :8082
+# - gRPC service on :9090
+```
+
+### Running Specific Services
+
+You can run individual services using the `--mode` flag:
+
+```bash
+# Run only the ingest service
+./arkilian --mode ingest --data-dir /tmp/arkilian
+
+# Run only the query service
+./arkilian --mode query --data-dir /tmp/arkilian
+
+# Run only the compaction service
+./arkilian --mode compact --data-dir /tmp/arkilian
+```
+
+### Using a Configuration File
+
+Create a `config.yaml` file:
+
+```yaml
+mode: all
+data_dir: /data/arkilian
+
+http:
+  ingest_addr: ":8080"
+  query_addr: ":8081"
+  compact_addr: ":8082"
+
+grpc:
+  addr: ":9090"
+  enabled: true
+
+query:
+  concurrency: 10
+  pool_size: 100
+
+compaction:
+  check_interval: 5m
+  ttl_days: 7
+
+storage:
+  type: local
+```
+
+Then run:
+
+```bash
+./arkilian --config config.yaml
+```
+
+### Legacy Setup (Separate Binaries)
+
+You can also run each service as a separate binary:
+
 ```bash
 # Create data directories
 mkdir -p /tmp/arkilian/storage /tmp/arkilian/manifests
-```
 
 # Start services (in separate terminals)
-
-./arkilian-ingest --storage-path /tmp/arkilian/storage --manifest-path /tmp/arkilian/manifests/manifest.db
-./arkilian-query --storage-path /tmp/arkilian/storage --manifest-path /tmp/arkilian/manifests/manifest.db
-./arkilian-compact --storage-path /tmp/arkilian/storage --manifest-path /tmp/arkilian/manifests/manifest.db
+./arkilian-ingest --storage /tmp/arkilian/storage --manifest /tmp/arkilian/manifests/manifest.db
+./arkilian-query --storage /tmp/arkilian/storage --manifest /tmp/arkilian/manifests/manifest.db
+./arkilian-compact --storage /tmp/arkilian/storage --manifest /tmp/arkilian/manifests/manifest.db
+```
 
 ````
 
 ### Production Setup (AWS S3)
 
+Using the unified binary with S3:
+
 ```bash
 # Set environment variables
+export ARKILIAN_STORAGE_TYPE=s3
 export ARKILIAN_S3_BUCKET=my-arkilian-bucket
 export ARKILIAN_S3_REGION=us-east-1
 export AWS_ACCESS_KEY_ID=your-access-key
 export AWS_SECRET_ACCESS_KEY=your-secret-key
 
 # Start with S3 backend
+./arkilian --data-dir /data/arkilian
+```
+
+Or using a config file:
+
+```yaml
+# config-prod.yaml
+mode: all
+data_dir: /data/arkilian
+
+storage:
+  type: s3
+  s3:
+    bucket: my-arkilian-bucket
+    region: us-east-1
+```
+
+```bash
+./arkilian --config config-prod.yaml
+```
+
+Legacy approach with separate binaries:
+
+```bash
 ./arkilian-ingest --storage-type s3 --s3-bucket $ARKILIAN_S3_BUCKET
-````
+```
 
 ---
 

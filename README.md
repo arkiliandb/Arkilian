@@ -1,6 +1,6 @@
 # Arkilian
 
-A distributed analytical database that treats SQLite files as immutable 8-16MB micro-partitions stored in object storage (S3/GCS), with a stateless query federation layer providing Snowflake-like compute/storage separation.
+A the immutable database engine for real applications that treats SQLite files as immutable 8-16MB micro-partitions stored in object storage (S3/GCS), with a stateless query federation layer providing Snowflake-like compute/storage separation.
 
 ## Why Arkilian?
 
@@ -75,17 +75,33 @@ Unlike monolithic SQLite distribution attempts (rqlite, LiteFS), Arkilian embrac
 go build ./...
 ```
 
-### Run Services
+### Run with Unified Binary (Recommended)
+
+The simplest way to run Arkilian is with the unified binary that runs all services:
+
+```bash
+# Run all services with a single command
+./arkilian --data-dir /data/arkilian
+
+# Or run specific services
+./arkilian --mode ingest --data-dir /data/arkilian
+./arkilian --mode query --data-dir /data/arkilian
+./arkilian --mode compact --data-dir /data/arkilian
+```
+
+### Run Individual Services (Legacy)
+
+You can also run each service separately:
 
 ```bash
 # Start the ingestion service
-./arkilian-ingest --storage-path /data/arkilian --manifest-path /data/manifest.db
+./arkilian-ingest --storage /data/arkilian/storage --manifest /data/arkilian/manifest.db
 
 # Start the query service
-./arkilian-query --storage-path /data/arkilian --manifest-path /data/manifest.db
+./arkilian-query --storage /data/arkilian/storage --manifest /data/arkilian/manifest.db
 
 # Start the compaction daemon
-./arkilian-compact --storage-path /data/arkilian --manifest-path /data/manifest.db
+./arkilian-compact --storage /data/arkilian/storage --manifest /data/arkilian/manifest.db
 ```
 
 ## API
@@ -178,8 +194,6 @@ Example: For a query on 100K partitions with `tenant_id = 'acme'`:
 | Storage overhead        | <5%                    |
 | Recovery time           | <10s                   |
 
- 
-
 ## Testing
 
 ```bash
@@ -195,6 +209,68 @@ go test ./test/integration/...
 
 ## Configuration
 
+### Unified Binary Configuration
+
+The unified `arkilian` binary supports configuration via command-line flags, environment variables, and config files.
+
+**Command-line flags:**
+
+| Flag             | Default           | Description                               |
+| ---------------- | ----------------- | ----------------------------------------- |
+| `--config`       | -                 | Path to YAML/JSON config file             |
+| `--data-dir`     | `./data/arkilian` | Base directory for all data files         |
+| `--mode`         | `all`             | Service mode: all, ingest, query, compact |
+| `--http-ingest`  | `:8080`           | HTTP address for ingest service           |
+| `--http-query`   | `:8081`           | HTTP address for query service            |
+| `--http-compact` | `:8082`           | HTTP address for compaction service       |
+| `--grpc-addr`    | `:9090`           | gRPC server address                       |
+
+**Environment variables:**
+
+| Environment Variable         | Default              | Description              |
+| ---------------------------- | -------------------- | ------------------------ |
+| `ARKILIAN_MODE`              | `all`                | Service mode             |
+| `ARKILIAN_DATA_DIR`          | `./data/arkilian`    | Base data directory      |
+| `ARKILIAN_HTTP_INGEST_ADDR`  | `:8080`              | Ingest HTTP address      |
+| `ARKILIAN_HTTP_QUERY_ADDR`   | `:8081`              | Query HTTP address       |
+| `ARKILIAN_HTTP_COMPACT_ADDR` | `:8082`              | Compact HTTP address     |
+| `ARKILIAN_GRPC_ADDR`         | `:9090`              | gRPC server address      |
+| `ARKILIAN_STORAGE_TYPE`      | `local`              | Storage type (local, s3) |
+| `ARKILIAN_STORAGE_PATH`      | `{data-dir}/storage` | Local storage path       |
+| `ARKILIAN_S3_BUCKET`         | -                    | S3 bucket for partitions |
+| `ARKILIAN_S3_REGION`         | `us-east-1`          | AWS region               |
+
+**Example config file (config.yaml):**
+
+```yaml
+mode: all
+data_dir: /data/arkilian
+
+http:
+  ingest_addr: ":8080"
+  query_addr: ":8081"
+  compact_addr: ":8082"
+
+grpc:
+  addr: ":9090"
+  enabled: true
+
+query:
+  concurrency: 10
+  pool_size: 100
+
+compaction:
+  check_interval: 5m
+  min_partition_size: 8388608 # 8MB
+  ttl_days: 7
+
+storage:
+  type: local
+  path: /data/arkilian/storage
+```
+
+### Legacy Service Configuration
+
 | Environment Variable     | Default             | Description              |
 | ------------------------ | ------------------- | ------------------------ |
 | `ARKILIAN_STORAGE_PATH`  | `/data/arkilian`    | Local storage path       |
@@ -208,8 +284,7 @@ go test ./test/integration/...
 
 - No distributed ACID transactions across partitions
 - Eventual consistency (not strong consistency)
-- Schema must be declared per partition key 
- 
+- Schema must be declared per partition key
 
 ## Documentation
 
