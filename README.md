@@ -211,6 +211,11 @@ go test ./test/integration/...
 - Schema must be declared per partition key 
  
 
+## Documentation
+
+- [Usage Guide](docs/usage-guide.md) - Complete usage documentation with real-world scenarios
+- [Blueprint](blue-print.md) - Original RFC and architecture design
+
 ## License
 
 MIT
