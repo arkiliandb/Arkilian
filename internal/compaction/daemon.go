@@ -44,13 +44,14 @@ func DefaultConfig() CompactionConfig {
 
 // Daemon manages background compaction operations.
 type Daemon struct {
-	config    CompactionConfig
-	catalog   manifest.Catalog
-	storage   storage.ObjectStorage
-	finder    *CandidateFinder
-	merger    *Merger
-	validator *Validator
-	gc        *GarbageCollector
+	config       CompactionConfig
+	catalog      manifest.Catalog
+	storage      storage.ObjectStorage
+	finder       *CandidateFinder
+	merger       *Merger
+	validator    *Validator
+	gc           *GarbageCollector
+	backpressure *BackpressureController
 
 	mu      sync.Mutex
 	running bool
@@ -63,13 +64,30 @@ func NewDaemon(config CompactionConfig, catalog manifest.Catalog, store storage.
 	workDir := filepath.Join(config.WorkDir, "arkilian_compaction")
 
 	return &Daemon{
-		config:    config,
-		catalog:   catalog,
-		storage:   store,
-		finder:    NewCandidateFinder(catalog, config.MinPartitionSize, config.MaxPartitionsPerKey, sizer),
-		merger:    NewMerger(store, workDir),
-		validator: NewValidator(),
-		gc:        NewGarbageCollector(catalog, store, time.Duration(config.TTLDays)*24*time.Hour),
+		config:       config,
+		catalog:      catalog,
+		storage:      store,
+		finder:       NewCandidateFinder(catalog, config.MinPartitionSize, config.MaxPartitionsPerKey, sizer),
+		merger:       NewMerger(store, workDir),
+		validator:    NewValidator(),
+		gc:           NewGarbageCollector(catalog, store, time.Duration(config.TTLDays)*24*time.Hour),
+		backpressure: NewBackpressureController(DefaultBackpressureConfig()),
+	}
+}
+
+// NewDaemonWithBackpressure creates a compaction daemon with custom backpressure config.
+func NewDaemonWithBackpressure(config CompactionConfig, catalog manifest.Catalog, store storage.ObjectStorage, sizer AdaptiveSizer, bpConfig BackpressureConfig) *Daemon {
+	workDir := filepath.Join(config.WorkDir, "arkilian_compaction")
+
+	return &Daemon{
+		config:       config,
+		catalog:      catalog,
+		storage:      store,
+		finder:       NewCandidateFinder(catalog, config.MinPartitionSize, config.MaxPartitionsPerKey, sizer),
+		merger:       NewMerger(store, workDir),
+		validator:    NewValidator(),
+		gc:           NewGarbageCollector(catalog, store, time.Duration(config.TTLDays)*24*time.Hour),
+		backpressure: NewBackpressureController(bpConfig),
 	}
 }
 
@@ -132,10 +150,15 @@ func (d *Daemon) run(ctx context.Context) {
 }
 
 // runOnce performs a single compaction cycle: find candidates, merge, validate, and GC.
+// Backpressure-aware: adjusts concurrency based on recent failure rate and pauses
+// if the system is degraded with a non-zero backlog.
 func (d *Daemon) runOnce(ctx context.Context) {
 	if ctx.Err() != nil {
 		return
 	}
+
+	// Adjust concurrency based on recent failure/success history
+	d.backpressure.AdjustConcurrency()
 
 	// Find compaction candidates
 	groups, err := d.finder.FindCandidates(ctx)
@@ -144,17 +167,44 @@ func (d *Daemon) runOnce(ctx context.Context) {
 		return
 	}
 
-	// Process each candidate group
+	// Check backpressure: pause if failure rate is high and there's a backlog
+	if d.backpressure.ShouldPause(len(groups)) {
+		stats := d.backpressure.Stats()
+		log.Printf("compaction: pausing — failure_rate=%.2f%%, backlog=%d, concurrency=%d",
+			stats.FailureRate*100, len(groups), stats.CurrentConcurrency)
+		return
+	}
+
+	// Process candidate groups with bounded concurrency
+	concurrency := d.backpressure.Concurrency()
+	sem := make(chan struct{}, concurrency)
+
+	var wg sync.WaitGroup
 	for _, group := range groups {
 		if ctx.Err() != nil {
-			return
+			break
 		}
 
-		if err := d.compactGroup(ctx, group); err != nil {
-			log.Printf("compaction: failed to compact group %s: %v", group.PartitionKey, err)
-			// Continue with other groups — don't halt on individual failures
-		}
+		wg.Add(1)
+		go func(g *CandidateGroup) {
+			defer wg.Done()
+
+			select {
+			case sem <- struct{}{}:
+				defer func() { <-sem }()
+			case <-ctx.Done():
+				return
+			}
+
+			if err := d.compactGroup(ctx, g); err != nil {
+				log.Printf("compaction: failed to compact group %s: %v", g.PartitionKey, err)
+				d.backpressure.RecordFailure()
+			} else {
+				d.backpressure.RecordSuccess()
+			}
+		}(group)
 	}
+	wg.Wait()
 
 	// Run garbage collection
 	if ctx.Err() != nil {
@@ -413,4 +463,9 @@ func (d *Daemon) TriggerCompaction(ctx context.Context, partitionKey string) err
 // RunOnce performs a single compaction cycle (useful for testing).
 func (d *Daemon) RunOnce(ctx context.Context) {
 	d.runOnce(ctx)
+}
+
+// BackpressureStats returns the current backpressure controller statistics.
+func (d *Daemon) BackpressureStats() BackpressureStats {
+	return d.backpressure.Stats()
 }

@@ -144,6 +144,9 @@ type QueryConfig struct {
 
 	// MaxPreloadPartitions is the max partitions to preload bloom filters for
 	MaxPreloadPartitions int `json:"max_preload_partitions" yaml:"max_preload_partitions"`
+
+	// BloomCacheSizeMB is the maximum memory for the bloom filter LRU cache in MB (default: 1024).
+	BloomCacheSizeMB int `json:"bloom_cache_size_mb" yaml:"bloom_cache_size_mb"`
 }
 
 // CompactionConfig holds compaction service configuration.
@@ -162,6 +165,21 @@ type CompactionConfig struct {
 
 	// TTLDays is the days before compacted partitions are garbage collected
 	TTLDays int `json:"ttl_days" yaml:"ttl_days"`
+
+	// Backpressure controls dynamic concurrency adjustment based on failure rate.
+	Backpressure BackpressureConfig `json:"backpressure" yaml:"backpressure"`
+}
+
+// BackpressureConfig holds backpressure configuration for the compaction daemon.
+type BackpressureConfig struct {
+	// MaxConcurrency is the upper bound for concurrent compaction goroutines (default: 4).
+	MaxConcurrency int `json:"max_concurrency" yaml:"max_concurrency"`
+
+	// MinConcurrency is the lower bound (default: 1).
+	MinConcurrency int `json:"min_concurrency" yaml:"min_concurrency"`
+
+	// FailureThreshold is the failure rate (0.0–1.0) above which backoff triggers (default: 0.10).
+	FailureThreshold float64 `json:"failure_threshold" yaml:"failure_threshold"`
 }
 
 // StorageConfig holds storage configuration.
@@ -225,6 +243,7 @@ func DefaultConfig() *Config {
 			Concurrency:          16,
 			PoolSize:             200,
 			MaxPreloadPartitions: 2000,
+			BloomCacheSizeMB:     1024,
 		},
 		Compaction: CompactionConfig{
 			WorkDir:             "",
@@ -232,6 +251,11 @@ func DefaultConfig() *Config {
 			MinPartitionSize:    32 * 1024 * 1024,
 			MaxPartitionsPerKey: 50,
 			TTLDays:             7,
+			Backpressure: BackpressureConfig{
+				MaxConcurrency:   4,
+				MinConcurrency:   1,
+				FailureThreshold: 0.10,
+			},
 		},
 		Storage: StorageConfig{
 			Type: "local",
@@ -480,6 +504,22 @@ func LoadFromEnv(cfg *Config) {
 	}
 	if v := os.Getenv("ARKILIAN_INGEST_ADAPTIVE_MAX_SIZE_MB"); v != "" {
 		fmt.Sscanf(v, "%d", &cfg.Ingest.AdaptiveSizing.MaxSizeMB)
+	}
+
+	// Backpressure configuration
+	if v := os.Getenv("ARKILIAN_COMPACTION_BP_MAX_CONCURRENCY"); v != "" {
+		fmt.Sscanf(v, "%d", &cfg.Compaction.Backpressure.MaxConcurrency)
+	}
+	if v := os.Getenv("ARKILIAN_COMPACTION_BP_MIN_CONCURRENCY"); v != "" {
+		fmt.Sscanf(v, "%d", &cfg.Compaction.Backpressure.MinConcurrency)
+	}
+	if v := os.Getenv("ARKILIAN_COMPACTION_BP_FAILURE_THRESHOLD"); v != "" {
+		fmt.Sscanf(v, "%f", &cfg.Compaction.Backpressure.FailureThreshold)
+	}
+
+	// Bloom cache configuration
+	if v := os.Getenv("ARKILIAN_QUERY_BLOOM_CACHE_SIZE_MB"); v != "" {
+		fmt.Sscanf(v, "%d", &cfg.Query.BloomCacheSizeMB)
 	}
 }
 

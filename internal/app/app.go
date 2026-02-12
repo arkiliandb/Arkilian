@@ -261,7 +261,11 @@ func (a *App) startIngestService(ctx context.Context) error {
 // startQueryService starts the query HTTP server.
 func (a *App) startQueryService(ctx context.Context) error {
 	// Initialize pruner with storage for bloom filter loading
-	pruner := planner.NewPruner(a.catalogReader, a.storage)
+	bloomCacheBytes := int64(a.cfg.Query.BloomCacheSizeMB) * 1024 * 1024
+	if bloomCacheBytes <= 0 {
+		bloomCacheBytes = 1 << 30 // 1GB default
+	}
+	pruner := planner.NewPrunerWithCacheSize(a.catalogReader, a.storage, bloomCacheBytes)
 
 	// Initialize query planner
 	queryPlanner := planner.NewPlannerWithPruner(a.catalogReader, pruner)
@@ -364,11 +368,18 @@ func (a *App) startCompactService(ctx context.Context) error {
 		CheckInterval:       a.cfg.Compaction.CheckInterval,
 		WorkDir:             a.cfg.Compaction.WorkDir,
 	}
-	a.compactDaemon = compaction.NewDaemon(compactConfig, a.catalog, a.storage, compactAdaptiveSizer)
-	log.Printf("Compaction daemon initialized: min_size=%dMB, max_partitions=%d, ttl=%d days",
+	a.compactDaemon = compaction.NewDaemonWithBackpressure(compactConfig, a.catalog, a.storage, compactAdaptiveSizer,
+		compaction.BackpressureConfig{
+			MaxConcurrency:   a.cfg.Compaction.Backpressure.MaxConcurrency,
+			MinConcurrency:   a.cfg.Compaction.Backpressure.MinConcurrency,
+			FailureThreshold: a.cfg.Compaction.Backpressure.FailureThreshold,
+			WindowDuration:   5 * time.Minute,
+		})
+	log.Printf("Compaction daemon initialized: min_size=%dMB, max_partitions=%d, ttl=%d days, max_concurrency=%d",
 		minPartitionSize/(1024*1024),
 		a.cfg.Compaction.MaxPartitionsPerKey,
-		a.cfg.Compaction.TTLDays)
+		a.cfg.Compaction.TTLDays,
+		a.cfg.Compaction.Backpressure.MaxConcurrency)
 
 	// Setup HTTP server for health checks and manual triggers
 	mux := http.NewServeMux()
