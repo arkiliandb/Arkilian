@@ -56,7 +56,7 @@ func main() {
 	log.Printf("Manifest catalog initialized at: %s", cfg.ManifestPath)
 
 	// Initialize partition builder
-	builder := partition.NewBuilder(cfg.PartitionDir)
+	builder := partition.NewBuilder(cfg.PartitionDir, 0)
 	metaGen := partition.NewMetadataGenerator()
 	log.Printf("Partition builder initialized with output dir: %s", cfg.PartitionDir)
 

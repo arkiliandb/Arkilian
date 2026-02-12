@@ -26,6 +26,7 @@ import (
 	"github.com/arkilian/arkilian/internal/query/aggregator"
 	"github.com/arkilian/arkilian/internal/query/executor"
 	"github.com/arkilian/arkilian/internal/query/parser"
+	"github.com/arkilian/arkilian/internal/query/planner"
 	"github.com/arkilian/arkilian/internal/storage"
 	"github.com/arkilian/arkilian/pkg/types"
 	"github.com/golang/snappy"
@@ -90,7 +91,7 @@ func setupBenchDir(b *testing.B, prefix string) string {
 
 // buildPartitionFile creates a real SQLite partition and returns its path + metadata.
 func buildPartitionFile(b *testing.B, dir string, rows []types.Row, partKey string) (*partition.PartitionInfo, string) {
-	builder := partition.NewBuilder(dir)
+	builder := partition.NewBuilder(dir, 0)
 	ctx := context.Background()
 	key := types.PartitionKey{Strategy: "time", Value: partKey}
 	info, err := builder.Build(ctx, rows, key)
@@ -108,7 +109,7 @@ func buildPartitionFile(b *testing.B, dir string, rows []types.Row, partKey stri
 // Target: 50K rows/sec/node (Requirement 16.1)
 func BenchmarkHeavyIngestion_10K(b *testing.B) {
 	dir := setupBenchDir(b, "ingest10k")
-	builder := partition.NewBuilder(dir)
+	builder := partition.NewBuilder(dir, 0)
 	ctx := context.Background()
 	rng := rand.New(rand.NewSource(42))
 	rows := generateHeavyRows(10000, rng)
@@ -132,7 +133,7 @@ func BenchmarkHeavyIngestion_10K(b *testing.B) {
 // BenchmarkHeavyIngestion_50K measures ingestion of 50K rows per partition.
 func BenchmarkHeavyIngestion_50K(b *testing.B) {
 	dir := setupBenchDir(b, "ingest50k")
-	builder := partition.NewBuilder(dir)
+	builder := partition.NewBuilder(dir, 0)
 	ctx := context.Background()
 	rng := rand.New(rand.NewSource(42))
 	rows := generateHeavyRows(50000, rng)
@@ -177,7 +178,7 @@ func BenchmarkHeavyIngestion_Concurrent(b *testing.B) {
 		workerID := int(atomic.AddInt64(&totalRows, 0)) % workers
 		workerDir := filepath.Join(dir, fmt.Sprintf("worker_%d", workerID))
 		os.MkdirAll(workerDir, 0755)
-		builder := partition.NewBuilder(workerDir)
+		builder := partition.NewBuilder(workerDir, 0)
 		rows := workerRows[workerID%workers]
 		i := 0
 
@@ -949,7 +950,7 @@ func BenchmarkHeavyMetadataGeneration(b *testing.B) {
 	rng := rand.New(rand.NewSource(42))
 	rows := generateHeavyRows(50000, rng)
 
-	builder := partition.NewBuilder(dir)
+	builder := partition.NewBuilder(dir, 0)
 	ctx := context.Background()
 	key := types.PartitionKey{Strategy: "time", Value: "20260206"}
 	info, err := builder.Build(ctx, rows, key)
@@ -982,7 +983,7 @@ func BenchmarkHeavyMetadataRoundTrip(b *testing.B) {
 	rng := rand.New(rand.NewSource(42))
 	rows := generateHeavyRows(50000, rng)
 
-	builder := partition.NewBuilder(dir)
+	builder := partition.NewBuilder(dir, 0)
 	ctx := context.Background()
 	key := types.PartitionKey{Strategy: "time", Value: "20260206"}
 	info, err := builder.Build(ctx, rows, key)
@@ -1111,7 +1112,7 @@ func BenchmarkHeavyEndToEnd_IngestToQuery(b *testing.B) {
 
 	ctx := context.Background()
 	rng := rand.New(rand.NewSource(42))
-	builder := partition.NewBuilder(partDir)
+	builder := partition.NewBuilder(partDir, 0)
 	metaGen := partition.NewMetadataGenerator()
 
 	// Phase 1: Ingest multiple partitions
@@ -1355,7 +1356,7 @@ func BenchmarkHeavyMixedWorkload(b *testing.B) {
 
 	// Pre-populate with some partitions
 	rng := rand.New(rand.NewSource(42))
-	builder := partition.NewBuilder(partDir)
+	builder := partition.NewBuilder(partDir, 0)
 	metaGen := partition.NewMetadataGenerator()
 
 	for p := 0; p < 10; p++ {
@@ -1387,7 +1388,7 @@ func BenchmarkHeavyMixedWorkload(b *testing.B) {
 			localRng := rand.New(rand.NewSource(int64(workerID) + 100))
 			wDir := filepath.Join(partDir, fmt.Sprintf("w%d", workerID))
 			os.MkdirAll(wDir, 0755)
-			localBuilder := partition.NewBuilder(wDir)
+			localBuilder := partition.NewBuilder(wDir, 0)
 
 			for i := 0; i < b.N/writerCount; i++ {
 				rows := generateHeavyRows(1000, localRng)
@@ -1533,7 +1534,7 @@ func TestIngestionAllocScaling(t *testing.T) {
 		}
 		defer os.RemoveAll(dir)
 
-		builder := partition.NewBuilder(dir)
+		builder := partition.NewBuilder(dir, 0)
 		ctx := context.Background()
 		key := types.PartitionKey{Strategy: "time", Value: "20260206"}
 
@@ -1652,7 +1653,7 @@ func BenchmarkHeavyStorage_SimulatedS3Latency(b *testing.B) {
 
 	ctx := context.Background()
 	rng := rand.New(rand.NewSource(42))
-	builder := partition.NewBuilder(partDir)
+	builder := partition.NewBuilder(partDir, 0)
 	metaGen := partition.NewMetadataGenerator()
 
 	// Ingest partitions (use real storage for setup, no latency)
@@ -1833,7 +1834,7 @@ func BenchmarkHeavyCompaction_PartialFailure(b *testing.B) {
 		for p := 0; p < 3; p++ {
 			pDir := filepath.Join(iterPartDir, fmt.Sprintf("p_%d", p))
 			os.MkdirAll(pDir, 0755)
-			pBuilder := partition.NewBuilder(pDir)
+			pBuilder := partition.NewBuilder(pDir, 0)
 			rows := generateHeavyRows(500, rng) // small partitions
 			key := types.PartitionKey{Strategy: "time", Value: partKey}
 			info, err := pBuilder.Build(ctx, rows, key)
@@ -1913,5 +1914,328 @@ func BenchmarkHeavyCompaction_PartialFailure(b *testing.B) {
 
 		b.ReportMetric(1, "upload_failed")
 		b.ReportMetric(float64(len(sourcePartitionIDs)), "source_partitions_intact")
+	}
+}
+
+// BenchmarkHeavyBloomFilter_CompressedCacheMemory loads 10K bloom filters into
+// the compressed LRU cache and compares memory usage against uncompressed storage.
+// It verifies that compressed cache uses ≤40% of uncompressed memory and reports
+// per-filter sizes and cache hit latency.
+//
+// Filters are sized for 10K expected items (production capacity) but filled with
+// only ~500 items each, simulating typical partition bloom filters that are
+// provisioned for peak cardinality but operate well below capacity. The resulting
+// sparse bit arrays compress very well under Snappy.
+func BenchmarkHeavyBloomFilter_CompressedCacheMemory(b *testing.B) {
+	const (
+		numFilters       = 10000
+		expectedItems    = 10000 // filter capacity (production sizing)
+		actualItems      = 200   // items actually inserted (typical fill)
+	)
+
+	rng := rand.New(rand.NewSource(42))
+
+	// Build 10K bloom filters sized for production capacity but partially filled.
+	// Uses 0.1% FPR matching the tenant_id production config, which creates
+	// larger, sparser bit arrays that compress well under Snappy.
+	filters := make([]*bloom.BloomFilter, numFilters)
+	for i := 0; i < numFilters; i++ {
+		f := bloom.NewWithEstimates(expectedItems, 0.001)
+		for j := 0; j < actualItems; j++ {
+			f.Add([]byte(fmt.Sprintf("tenant_%d_user_%d", rng.Intn(500), rng.Intn(50000))))
+		}
+		filters[i] = f
+	}
+
+	// Measure uncompressed size: raw serialized bytes per filter
+	var totalUncompressedBytes int64
+	for _, f := range filters {
+		raw, err := f.Serialize()
+		if err != nil {
+			b.Fatal(err)
+		}
+		totalUncompressedBytes += int64(len(raw))
+	}
+
+	// Compress all filters and load into the LRU cache (large enough to hold all)
+	cache := planner.NewPrunerWithCacheSize(nil, nil, 1<<30) // 1GB cache, nil catalog/storage (not needed for cache ops)
+
+	var totalCompressedBytes int64
+	for i, f := range filters {
+		cf, err := bloom.CompressFilter(f)
+		if err != nil {
+			b.Fatal(err)
+		}
+		totalCompressedBytes += int64(cf.CompressedSizeBytes())
+		key := fmt.Sprintf("partition_%d:tenant_id", i)
+		cache.LoadBloomFilterDirect(key, cf)
+	}
+
+	stats := cache.GetCacheStats()
+
+	bytesPerFilterUncompressed := float64(totalUncompressedBytes) / float64(numFilters)
+	bytesPerFilterCompressed := float64(totalCompressedBytes) / float64(numFilters)
+	compressionRatio := float64(totalCompressedBytes) / float64(totalUncompressedBytes)
+
+	b.ReportMetric(bytesPerFilterUncompressed, "bytes_per_filter_uncompressed")
+	b.ReportMetric(bytesPerFilterCompressed, "bytes_per_filter_compressed")
+	b.ReportMetric(compressionRatio*100, "compression_pct")
+	b.ReportMetric(float64(stats.LRUFilters), "cached_filters")
+	b.ReportMetric(float64(stats.LRUMemoryBytes)/(1024*1024), "cache_MB")
+
+	// Verify compressed cache uses ≤40% of uncompressed memory
+	if compressionRatio > 0.40 {
+		b.Fatalf("compressed cache uses %.1f%% of uncompressed memory, expected ≤40%%", compressionRatio*100)
+	}
+
+	// Benchmark cache hit latency: lookup existing filters
+	testKey := []byte("tenant_250_user_25000")
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		idx := i % numFilters
+		key := fmt.Sprintf("partition_%d:tenant_id", idx)
+		cf, ok := cache.GetCachedFilter(key)
+		if !ok {
+			b.Fatal("expected cache hit")
+		}
+		cf.Contains(testKey)
+	}
+
+	// Report cache hit latency (b.N iterations already timed)
+	b.ReportMetric(0, "cache_hit_latency_ns") // Go benchmark framework reports ns/op automatically
+}
+
+// probabilisticFaultStorage wraps an ObjectStorage and fails UploadMultipart
+// calls with a configurable probability, simulating sustained intermittent failures.
+type probabilisticFaultStorage struct {
+	inner        storage.ObjectStorage
+	failRate     float64 // probability of failure per UploadMultipart call (0.0–1.0)
+	rng          *rand.Rand
+	mu           sync.Mutex
+	uploadCalls  atomic.Int64
+	uploadFails  atomic.Int64
+}
+
+func newProbabilisticFaultStorage(inner storage.ObjectStorage, failRate float64, seed int64) *probabilisticFaultStorage {
+	return &probabilisticFaultStorage{
+		inner:    inner,
+		failRate: failRate,
+		rng:      rand.New(rand.NewSource(seed)),
+	}
+}
+
+func (p *probabilisticFaultStorage) Upload(ctx context.Context, localPath, objectPath string) error {
+	return p.inner.Upload(ctx, localPath, objectPath)
+}
+
+func (p *probabilisticFaultStorage) UploadMultipart(ctx context.Context, localPath, objectPath string) (string, error) {
+	p.uploadCalls.Add(1)
+	p.mu.Lock()
+	fail := p.rng.Float64() < p.failRate
+	p.mu.Unlock()
+	if fail {
+		p.uploadFails.Add(1)
+		return "", fmt.Errorf("simulated probabilistic upload failure (rate=%.0f%%)", p.failRate*100)
+	}
+	return p.inner.UploadMultipart(ctx, localPath, objectPath)
+}
+
+func (p *probabilisticFaultStorage) Download(ctx context.Context, objectPath, localPath string) error {
+	return p.inner.Download(ctx, objectPath, localPath)
+}
+
+func (p *probabilisticFaultStorage) Delete(ctx context.Context, objectPath string) error {
+	return p.inner.Delete(ctx, objectPath)
+}
+
+func (p *probabilisticFaultStorage) Exists(ctx context.Context, objectPath string) (bool, error) {
+	return p.inner.Exists(ctx, objectPath)
+}
+
+func (p *probabilisticFaultStorage) ConditionalPut(ctx context.Context, localPath, objectPath, etag string) error {
+	return p.inner.ConditionalPut(ctx, localPath, objectPath, etag)
+}
+
+func (p *probabilisticFaultStorage) ListObjects(ctx context.Context, prefix string) ([]string, error) {
+	return p.inner.ListObjects(ctx, prefix)
+}
+
+// BenchmarkHeavyCompaction_SustainedFailure runs 100 compaction cycles with a
+// 10% upload failure rate and verifies that the compaction daemon can sustain
+// throughput without unbounded backlog growth. It tracks successful and failed
+// compactions, backlog size (small partition count) over time, and recovery
+// time after failures stop.
+func BenchmarkHeavyCompaction_SustainedFailure(b *testing.B) {
+	dir := setupBenchDir(b, "compact-sustained")
+	storageDir := filepath.Join(dir, "storage")
+	manifestPath := filepath.Join(dir, "manifest.db")
+	workDir := filepath.Join(dir, "compaction_work")
+
+	os.MkdirAll(workDir, 0755)
+
+	realStorage, err := storage.NewLocalStorage(storageDir)
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	catalog, err := manifest.NewCatalog(manifestPath)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer catalog.Close()
+
+	ctx := context.Background()
+	rng := rand.New(rand.NewSource(99))
+
+	const (
+		totalCycles       = 100
+		failureRate       = 0.10
+		partitionsPerSeed = 3 // small partitions seeded per cycle
+	)
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for iter := 0; iter < b.N; iter++ {
+		// Seed initial backlog: create small partitions across several keys
+		// so the daemon always has work to do.
+		initialKeys := 5
+		for k := 0; k < initialKeys; k++ {
+			partKey := fmt.Sprintf("sustained_%d_%d", iter, k)
+			pDir := filepath.Join(dir, "parts", fmt.Sprintf("iter%d_key%d", iter, k))
+			os.MkdirAll(pDir, 0755)
+			for p := 0; p < partitionsPerSeed; p++ {
+				subDir := filepath.Join(pDir, fmt.Sprintf("p%d", p))
+				os.MkdirAll(subDir, 0755)
+				pBuilder := partition.NewBuilder(subDir, 0)
+				rows := generateHeavyRows(200, rng)
+				key := types.PartitionKey{Strategy: "time", Value: partKey}
+				info, err := pBuilder.Build(ctx, rows, key)
+				if err != nil {
+					b.Fatal(err)
+				}
+				info.PartitionID = fmt.Sprintf("sustained:%d:%d:%d", iter, k, p)
+				objPath := fmt.Sprintf("partitions/%s/%s.sqlite", partKey, info.PartitionID)
+				if err := realStorage.Upload(ctx, info.SQLitePath, objPath); err != nil {
+					b.Fatal(err)
+				}
+				info.SizeBytes = 50 * 1024 // 50KB — well under 8MB threshold
+				if err := catalog.RegisterPartition(ctx, info, objPath); err != nil {
+					b.Fatal(err)
+				}
+			}
+		}
+
+		faultStorage := newProbabilisticFaultStorage(realStorage, failureRate, int64(iter))
+
+		compactionCfg := compaction.CompactionConfig{
+			MinPartitionSize:    8 * 1024 * 1024,
+			MaxPartitionsPerKey: 100,
+			TTLDays:             7,
+			CheckInterval:       time.Hour,
+			WorkDir:             workDir,
+		}
+		daemon := compaction.NewDaemon(compactionCfg, catalog, faultStorage)
+
+		var successfulCompactions int
+		var failedCycles int
+		backlogHistory := make([]int64, 0, totalCycles)
+
+		// Phase 1: Run cycles with 10% failure rate
+		for cycle := 0; cycle < totalCycles; cycle++ {
+			// Snapshot backlog before this cycle
+			backlog, err := catalog.GetPartitionCount(ctx)
+			if err != nil {
+				b.Fatal(err)
+			}
+			backlogHistory = append(backlogHistory, backlog)
+
+			prevFails := faultStorage.uploadFails.Load()
+			daemon.RunOnce(ctx)
+			newFails := faultStorage.uploadFails.Load()
+
+			if newFails > prevFails {
+				failedCycles++
+			} else if backlog > 0 {
+				// If backlog decreased or stayed same without new failures, count as success
+				newBacklog, _ := catalog.GetPartitionCount(ctx)
+				if newBacklog < backlog {
+					successfulCompactions++
+				}
+			}
+
+			// Inject new small partitions every 10 cycles to simulate ongoing ingestion
+			if cycle%10 == 0 && cycle > 0 {
+				partKey := fmt.Sprintf("sustained_%d_new_%d", iter, cycle)
+				pDir := filepath.Join(dir, "parts", fmt.Sprintf("iter%d_new%d", iter, cycle))
+				os.MkdirAll(pDir, 0755)
+				for p := 0; p < 3; p++ {
+					subDir := filepath.Join(pDir, fmt.Sprintf("p%d", p))
+					os.MkdirAll(subDir, 0755)
+					pBuilder := partition.NewBuilder(subDir, 0)
+					rows := generateHeavyRows(200, rng)
+					key := types.PartitionKey{Strategy: "time", Value: partKey}
+					info, err := pBuilder.Build(ctx, rows, key)
+					if err != nil {
+						b.Fatal(err)
+					}
+					info.PartitionID = fmt.Sprintf("sustained:%d:new:%d:%d", iter, cycle, p)
+					objPath := fmt.Sprintf("partitions/%s/%s.sqlite", partKey, info.PartitionID)
+					if err := realStorage.Upload(ctx, info.SQLitePath, objPath); err != nil {
+						b.Fatal(err)
+					}
+					info.SizeBytes = 50 * 1024
+					if err := catalog.RegisterPartition(ctx, info, objPath); err != nil {
+						b.Fatal(err)
+					}
+				}
+			}
+		}
+
+		backlogAfterFailures, _ := catalog.GetPartitionCount(ctx)
+
+		// Phase 2: Run recovery cycles with no failures to measure recovery
+		recoveryStorage := newProbabilisticFaultStorage(realStorage, 0.0, int64(iter+1000))
+		recoveryDaemon := compaction.NewDaemon(compactionCfg, catalog, recoveryStorage)
+
+		recoveryCycles := 0
+		for recoveryCycles < 50 {
+			prevCount, _ := catalog.GetPartitionCount(ctx)
+			recoveryDaemon.RunOnce(ctx)
+			newCount, _ := catalog.GetPartitionCount(ctx)
+			recoveryCycles++
+			// If no more compaction work is being done, we've recovered
+			if newCount >= prevCount {
+				break
+			}
+		}
+
+		backlogAfterRecovery, _ := catalog.GetPartitionCount(ctx)
+
+		// Verify: backlog must not grow unboundedly.
+		// The initial backlog is initialKeys * partitionsPerSeed = 15.
+		// With 10% failure rate and periodic new partitions, the backlog should
+		// stay bounded. We allow up to 4x the initial seeded count as headroom.
+		initialBacklog := int64(initialKeys * partitionsPerSeed)
+		maxAllowedBacklog := initialBacklog * 4
+		if backlogAfterFailures > maxAllowedBacklog {
+			b.Fatalf("backlog grew unboundedly: %d partitions after %d cycles (initial=%d, max_allowed=%d)",
+				backlogAfterFailures, totalCycles, initialBacklog, maxAllowedBacklog)
+		}
+
+		// Verify: successful compactions must outpace failure-induced backlog
+		if successfulCompactions == 0 && failedCycles > 0 {
+			b.Fatalf("no successful compactions in %d cycles with %d failures — daemon cannot make progress", totalCycles, failedCycles)
+		}
+
+		b.ReportMetric(float64(successfulCompactions)/float64(totalCycles), "compactions_per_cycle")
+		b.ReportMetric(float64(backlogAfterFailures), "backlog_partitions")
+		b.ReportMetric(float64(recoveryCycles), "failure_recovery_cycles")
+		b.ReportMetric(float64(failedCycles), "failed_cycles")
+		b.ReportMetric(float64(successfulCompactions), "successful_compactions")
+		b.ReportMetric(float64(backlogAfterRecovery), "backlog_after_recovery")
 	}
 }

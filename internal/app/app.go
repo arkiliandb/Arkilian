@@ -157,7 +157,7 @@ func (a *App) initSharedResources() error {
 // startIngestService starts the ingest HTTP and gRPC servers.
 func (a *App) startIngestService(ctx context.Context) error {
 	// Initialize partition builder
-	builder := partition.NewBuilder(a.cfg.Ingest.PartitionDir)
+	builder := partition.NewBuilder(a.cfg.Ingest.PartitionDir, a.cfg.Ingest.TargetPartitionSizeMB)
 	metaGen := partition.NewMetadataGenerator()
 	log.Printf("Partition builder initialized: %s", a.cfg.Ingest.PartitionDir)
 
@@ -256,8 +256,8 @@ func (a *App) startQueryService(ctx context.Context) error {
 		log.Printf("Warning: Failed to preload bloom filters: %v", err)
 	} else {
 		stats := pruner.GetCacheStats()
-		log.Printf("Bloom filter cache: %d partitions, %d filters loaded",
-			stats.PartitionsWithFilters, stats.TotalFilters)
+		log.Printf("Bloom filter cache: %d filters loaded, %d bytes",
+			stats.LRUFilters, stats.LRUMemoryBytes)
 	}
 
 	// Create HTTP handler
@@ -298,9 +298,17 @@ func (a *App) startQueryService(ctx context.Context) error {
 
 // startCompactService starts the compaction daemon and HTTP server.
 func (a *App) startCompactService(ctx context.Context) error {
+	// Derive compaction min partition size from the ingest target partition size.
+	// Partitions below the target size are candidates for compaction.
+	minPartitionSize := a.cfg.Compaction.MinPartitionSize
+	targetBytes := int64(a.cfg.Ingest.TargetPartitionSizeMB) * 1024 * 1024
+	if targetBytes > minPartitionSize {
+		minPartitionSize = targetBytes
+	}
+
 	// Initialize compaction daemon
 	compactConfig := compaction.CompactionConfig{
-		MinPartitionSize:    a.cfg.Compaction.MinPartitionSize,
+		MinPartitionSize:    minPartitionSize,
 		MaxPartitionsPerKey: a.cfg.Compaction.MaxPartitionsPerKey,
 		TTLDays:             a.cfg.Compaction.TTLDays,
 		CheckInterval:       a.cfg.Compaction.CheckInterval,
@@ -308,7 +316,7 @@ func (a *App) startCompactService(ctx context.Context) error {
 	}
 	a.compactDaemon = compaction.NewDaemon(compactConfig, a.catalog, a.storage)
 	log.Printf("Compaction daemon initialized: min_size=%dMB, max_partitions=%d, ttl=%d days",
-		a.cfg.Compaction.MinPartitionSize/(1024*1024),
+		minPartitionSize/(1024*1024),
 		a.cfg.Compaction.MaxPartitionsPerKey,
 		a.cfg.Compaction.TTLDays)
 

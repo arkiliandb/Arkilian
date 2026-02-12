@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -53,7 +54,7 @@ func setupQueryTestEnv(t *testing.T) (
 	}
 
 	// Create test data
-	builder := partition.NewBuilder(partitionDir)
+	builder := partition.NewBuilder(partitionDir, 0)
 	metaGen := partition.NewMetadataGenerator()
 	ctx := context.Background()
 
@@ -411,3 +412,119 @@ func TestQueryEmptyResult(t *testing.T) {
 		t.Errorf("expected 0 rows, got %d", len(resp.Rows))
 	}
 }
+
+// TestQueryMemoryExhaustion verifies that when query results exceed the
+// StreamingCollector's maxMemoryBytes, rows are spilled to disk instead of
+// being silently dropped. The result set must be complete.
+func TestQueryMemoryExhaustion(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "arkilian-memexhaust-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	partitionDir := filepath.Join(tempDir, "partitions")
+	storageDir := filepath.Join(tempDir, "storage")
+	manifestPath := filepath.Join(tempDir, "manifest.db")
+	downloadDir := filepath.Join(tempDir, "downloads")
+
+	store, err := storage.NewLocalStorage(storageDir)
+	if err != nil {
+		t.Fatalf("failed to create storage: %v", err)
+	}
+
+	catalog, err := manifest.NewCatalog(manifestPath)
+	if err != nil {
+		t.Fatalf("failed to create catalog: %v", err)
+	}
+	defer catalog.Close()
+
+	ctx := context.Background()
+	builder := partition.NewBuilder(partitionDir, 0)
+	metaGen := partition.NewMetadataGenerator()
+
+	// Ingest a decent number of rows across multiple partitions so the total
+	// result set will exceed a tiny maxMemoryBytes limit.
+	const rowsPerPartition = 50
+	const numPartitions = 4
+	totalExpected := rowsPerPartition * numPartitions
+
+	for p := 0; p < numPartitions; p++ {
+		rows := make([]types.Row, rowsPerPartition)
+		for i := 0; i < rowsPerPartition; i++ {
+			rows[i] = types.Row{
+				TenantID:  "test-tenant",
+				UserID:    int64(p*1000 + i),
+				EventTime: time.Now().Add(time.Duration(-i) * time.Second).UnixNano(),
+				EventType: "test_event",
+				Payload:   map[string]interface{}{"idx": i, "partition": p, "padding": "some extra data to increase row size"},
+			}
+		}
+
+		key := types.PartitionKey{Strategy: types.StrategyTime, Value: "20260210"}
+		info, err := builder.Build(ctx, rows, key)
+		if err != nil {
+			t.Fatalf("partition %d: build failed: %v", p, err)
+		}
+
+		metaPath, err := metaGen.GenerateAndWrite(info, rows)
+		if err != nil {
+			t.Fatalf("partition %d: metadata failed: %v", p, err)
+		}
+		info.MetadataPath = metaPath
+
+		objectPath := fmt.Sprintf("partitions/20260210/%s.sqlite", info.PartitionID)
+		metaObjectPath := fmt.Sprintf("partitions/20260210/%s.meta.json", info.PartitionID)
+
+		if _, err := store.UploadMultipart(ctx, info.SQLitePath, objectPath); err != nil {
+			t.Fatalf("partition %d: upload failed: %v", p, err)
+		}
+		if err := store.Upload(ctx, info.MetadataPath, metaObjectPath); err != nil {
+			t.Fatalf("partition %d: meta upload failed: %v", p, err)
+		}
+		if err := catalog.RegisterPartition(ctx, info, objectPath); err != nil {
+			t.Fatalf("partition %d: register failed: %v", p, err)
+		}
+	}
+
+	// Create executor with a very small MaxMemoryBytes to force spill-to-disk.
+	queryPlanner := planner.NewPlanner(catalog)
+	exec, err := executor.NewParallelExecutor(queryPlanner, store, executor.ExecutorConfig{
+		Concurrency:    4,
+		DownloadDir:    downloadDir,
+		MaxMemoryBytes: 512, // 512 bytes — will force spill almost immediately
+	})
+	if err != nil {
+		t.Fatalf("failed to create executor: %v", err)
+	}
+	defer exec.Close()
+
+	handler := apihttp.NewQueryHandler(exec)
+	wrappedHandler := apihttp.DefaultMiddleware()(handler)
+
+	reqBody := apihttp.QueryRequest{
+		SQL: "SELECT tenant_id, user_id, event_type FROM events",
+	}
+	body, _ := json.Marshal(reqBody)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/query", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+
+	rec := httptest.NewRecorder()
+	wrappedHandler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("query failed: %d - %s", rec.Code, rec.Body.String())
+	}
+
+	var resp apihttp.QueryResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to unmarshal response: %v", err)
+	}
+
+	// The critical assertion: ALL rows must be returned, none silently dropped.
+	if len(resp.Rows) != totalExpected {
+		t.Errorf("expected %d rows (spill-to-disk should preserve all), got %d", totalExpected, len(resp.Rows))
+	}
+}
+

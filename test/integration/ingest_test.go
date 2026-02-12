@@ -47,7 +47,7 @@ func TestIngestFlow(t *testing.T) {
 	}
 	defer catalog.Close()
 
-	builder := partition.NewBuilder(partitionDir)
+	builder := partition.NewBuilder(partitionDir, 0)
 	metaGen := partition.NewMetadataGenerator()
 
 	handler := apihttp.NewIngestHandler(builder, metaGen, catalog, store)
@@ -151,7 +151,7 @@ func TestIngestIdempotencyKey(t *testing.T) {
 	}
 	defer catalog.Close()
 
-	builder := partition.NewBuilder(partitionDir)
+	builder := partition.NewBuilder(partitionDir, 0)
 
 	// Build a partition
 	rows := []types.Row{
@@ -213,7 +213,7 @@ func TestIngestValidation(t *testing.T) {
 	catalog, _ := manifest.NewCatalog(manifestPath)
 	defer catalog.Close()
 
-	builder := partition.NewBuilder(partitionDir)
+	builder := partition.NewBuilder(partitionDir, 0)
 	metaGen := partition.NewMetadataGenerator()
 
 	handler := apihttp.NewIngestHandler(builder, metaGen, catalog, store)
@@ -293,7 +293,7 @@ func TestIngestRequestID(t *testing.T) {
 	catalog, _ := manifest.NewCatalog(manifestPath)
 	defer catalog.Close()
 
-	builder := partition.NewBuilder(partitionDir)
+	builder := partition.NewBuilder(partitionDir, 0)
 	metaGen := partition.NewMetadataGenerator()
 
 	handler := apihttp.NewIngestHandler(builder, metaGen, catalog, store)
@@ -354,7 +354,7 @@ func TestIngestMultipleBatches(t *testing.T) {
 	catalog, _ := manifest.NewCatalog(manifestPath)
 	defer catalog.Close()
 
-	builder := partition.NewBuilder(partitionDir)
+	builder := partition.NewBuilder(partitionDir, 0)
 	metaGen := partition.NewMetadataGenerator()
 
 	handler := apihttp.NewIngestHandler(builder, metaGen, catalog, store)

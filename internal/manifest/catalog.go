@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"log"
 	"sync"
 	"time"
 
@@ -157,7 +158,14 @@ func (c *SQLiteCatalog) RegisterPartition(ctx context.Context, info *partition.P
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	return c.insertPartition(ctx, info, objectPath)
+	if err := c.insertPartition(ctx, info, objectPath); err != nil {
+		return err
+	}
+
+	// Check partition count thresholds and warn operators
+	c.logPartitionCountThreshold(ctx)
+
+	return nil
 }
 
 // insertPartition inserts a partition record (must be called with lock held).
@@ -955,3 +963,116 @@ func (c *SQLiteCatalog) DeleteCompactionIntent(ctx context.Context, targetPartit
 	}
 	return nil
 }
+
+// FindPartitionsByKeyPrefix returns active partitions whose partition_key starts with the given prefix.
+// This enables scoping catalog queries to a shard boundary for future sharding support.
+func (c *SQLiteCatalog) FindPartitionsByKeyPrefix(ctx context.Context, prefix string) ([]*PartitionRecord, error) {
+	query := `
+		SELECT partition_id, partition_key, object_path,
+			min_user_id, max_user_id,
+			min_event_time, max_event_time,
+			min_tenant_id, max_tenant_id,
+			row_count, size_bytes, schema_version, created_at, compacted_into
+		FROM partitions
+		WHERE compacted_into IS NULL
+			AND partition_key >= ?
+			AND partition_key < ?
+		ORDER BY partition_key, created_at ASC`
+
+	// Compute the exclusive upper bound by incrementing the last byte of the prefix.
+	upperBound := prefix + "\xff"
+
+	rows, err := c.readDB.QueryContext(ctx, query, prefix, upperBound)
+	if err != nil {
+		return nil, fmt.Errorf("manifest: failed to query partitions by key prefix: %w", err)
+	}
+	defer rows.Close()
+
+	var records []*PartitionRecord
+	for rows.Next() {
+		record, err := c.scanPartitionRows(rows)
+		if err != nil {
+			return nil, err
+		}
+		records = append(records, record)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("manifest: error iterating partitions by key prefix: %w", err)
+	}
+	return records, nil
+}
+
+// GetDistinctPartitionKeys returns all distinct partition key values for active (non-compacted) partitions.
+// This is useful for shard discovery and enumerating partition key prefixes.
+func (c *SQLiteCatalog) GetDistinctPartitionKeys(ctx context.Context) ([]string, error) {
+	rows, err := c.readDB.QueryContext(ctx,
+		"SELECT DISTINCT partition_key FROM partitions WHERE compacted_into IS NULL ORDER BY partition_key")
+	if err != nil {
+		return nil, fmt.Errorf("manifest: failed to query distinct partition keys: %w", err)
+	}
+	defer rows.Close()
+
+	var keys []string
+	for rows.Next() {
+		var key string
+		if err := rows.Scan(&key); err != nil {
+			return nil, fmt.Errorf("manifest: failed to scan partition key: %w", err)
+		}
+		keys = append(keys, key)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("manifest: error iterating partition keys: %w", err)
+	}
+	return keys, nil
+}
+
+
+// GetPartitionCountByKeyPrefix returns the count of active partitions whose key starts with the given prefix.
+func (c *SQLiteCatalog) GetPartitionCountByKeyPrefix(ctx context.Context, prefix string) (int64, error) {
+	upperBound := prefix + "\xff"
+	var count int64
+	err := c.readDB.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM partitions WHERE compacted_into IS NULL AND partition_key >= ? AND partition_key < ?",
+		prefix, upperBound,
+	).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("manifest: failed to count partitions by key prefix: %w", err)
+	}
+	return count, nil
+}
+
+// GetTotalPartitionCount returns the total number of active partitions and logs a warning
+// when the count exceeds 500K, indicating the manifest may need sharding.
+func (c *SQLiteCatalog) GetTotalPartitionCount(ctx context.Context) (int64, error) {
+	count, err := c.GetPartitionCount(ctx)
+	if err != nil {
+		return 0, err
+	}
+	if count > 500000 {
+		log.Printf("[WARN] manifest: total active partition count (%d) exceeds 500K — consider sharding the manifest catalog", count)
+	}
+	return count, nil
+}
+
+
+// partitionCountThresholds defines the partition count levels at which warnings are emitted.
+var partitionCountThresholds = []int64{1000000, 500000, 100000}
+
+// logPartitionCountThreshold checks the total active partition count and logs a warning
+// when it crosses 100K, 500K, or 1M thresholds. Called after each RegisterPartition.
+func (c *SQLiteCatalog) logPartitionCountThreshold(ctx context.Context) {
+	var count int64
+	err := c.db.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM partitions WHERE compacted_into IS NULL",
+	).Scan(&count)
+	if err != nil {
+		return // best-effort; don't fail the write path
+	}
+	for _, threshold := range partitionCountThresholds {
+		if count >= threshold {
+			log.Printf("[WARN] manifest: active partition count (%d) has crossed %dK threshold — plan for manifest sharding", count, threshold/1000)
+			return
+		}
+	}
+}
+

@@ -1,11 +1,15 @@
 package executor
 
 import (
+	"database/sql"
+	"encoding/json"
 	"fmt"
+	"os"
 	"sort"
 	"strings"
 
 	"github.com/arkilian/arkilian/internal/query/parser"
+	_ "github.com/mattn/go-sqlite3"
 )
 
 // ResultMerger merges partial results from multiple partitions.
@@ -632,9 +636,9 @@ func (m *UnionAllMerger) Merge(partialResults []*PartialResult) (*QueryResult, e
 }
 
 // StreamingCollector consumes rows from a channel with memory-bounded collection.
-// When memory usage exceeds maxMemoryBytes, it spills rows to a temporary SQLite
-// file on disk. For queries without ORDER BY, LIMIT is applied during collection
-// to avoid accumulating all rows.
+// When memory usage exceeds maxMemoryBytes, it spills accumulated rows to a
+// temporary SQLite file on disk and continues collecting there. On finalization,
+// rows are read back from the spill file for ORDER BY / LIMIT application.
 type StreamingCollector struct {
 	columns        []string
 	orderBy        []parser.OrderByClause
@@ -688,9 +692,109 @@ func estimateRowSize(row []interface{}) int64 {
 	return size
 }
 
+// spillFile manages a temporary SQLite file for spilling rows to disk.
+type spillFile struct {
+	db       *sql.DB
+	path     string
+	insertFn *sql.Stmt
+	numCols  int
+	count    int64
+}
+
+// newSpillFile creates a temporary SQLite database for spilling rows.
+func newSpillFile(numCols int) (*spillFile, error) {
+	f, err := os.CreateTemp("", "arkilian-spill-*.db")
+	if err != nil {
+		return nil, fmt.Errorf("spill: create temp file: %w", err)
+	}
+	path := f.Name()
+	f.Close()
+
+	db, err := sql.Open("sqlite3", path+"?_journal_mode=OFF&_synchronous=OFF")
+	if err != nil {
+		os.Remove(path)
+		return nil, fmt.Errorf("spill: open db: %w", err)
+	}
+
+	// Build CREATE TABLE with rowid + one JSON column per value.
+	// We store each cell as JSON to preserve type information.
+	createSQL := "CREATE TABLE spill (rowid INTEGER PRIMARY KEY AUTOINCREMENT, data TEXT NOT NULL)"
+	if _, err := db.Exec(createSQL); err != nil {
+		db.Close()
+		os.Remove(path)
+		return nil, fmt.Errorf("spill: create table: %w", err)
+	}
+
+	stmt, err := db.Prepare("INSERT INTO spill (data) VALUES (?)")
+	if err != nil {
+		db.Close()
+		os.Remove(path)
+		return nil, fmt.Errorf("spill: prepare insert: %w", err)
+	}
+
+	return &spillFile{db: db, path: path, insertFn: stmt, numCols: numCols}, nil
+}
+
+// insertRow serializes a row as JSON and inserts it into the spill table.
+func (sf *spillFile) insertRow(row []interface{}) error {
+	data, err := json.Marshal(row)
+	if err != nil {
+		return fmt.Errorf("spill: marshal row: %w", err)
+	}
+	if _, err := sf.insertFn.Exec(string(data)); err != nil {
+		return fmt.Errorf("spill: insert row: %w", err)
+	}
+	sf.count++
+	return nil
+}
+
+// readAll reads all spilled rows back in insertion order.
+func (sf *spillFile) readAll() ([][]interface{}, error) {
+	rows, err := sf.db.Query("SELECT data FROM spill ORDER BY rowid")
+	if err != nil {
+		return nil, fmt.Errorf("spill: query rows: %w", err)
+	}
+	defer rows.Close()
+
+	var result [][]interface{}
+	for rows.Next() {
+		var data string
+		if err := rows.Scan(&data); err != nil {
+			return nil, fmt.Errorf("spill: scan row: %w", err)
+		}
+		var row []interface{}
+		if err := json.Unmarshal([]byte(data), &row); err != nil {
+			return nil, fmt.Errorf("spill: unmarshal row: %w", err)
+		}
+		// json.Unmarshal turns numbers into float64; convert back to int64
+		// where the value is a whole number for consistency.
+		for i, v := range row {
+			if f, ok := v.(float64); ok {
+				if f == float64(int64(f)) {
+					row[i] = int64(f)
+				}
+			}
+		}
+		result = append(result, row)
+	}
+	return result, rows.Err()
+}
+
+// close cleans up the spill file.
+func (sf *spillFile) close() {
+	if sf.insertFn != nil {
+		sf.insertFn.Close()
+	}
+	if sf.db != nil {
+		sf.db.Close()
+	}
+	os.Remove(sf.path)
+}
+
 // CollectFromChannel reads rows from the channel and collects them into a QueryResult.
 // It applies early LIMIT termination for queries without ORDER BY, and tracks
-// approximate memory usage to prevent OOM.
+// approximate memory usage. When memory is exhausted, rows are spilled to a
+// temporary SQLite file on disk to avoid silent data loss.
 func (sc *StreamingCollector) CollectFromChannel(
 	rowChan <-chan streamedRow,
 	done chan struct{},
@@ -698,6 +802,14 @@ func (sc *StreamingCollector) CollectFromChannel(
 	var allRows [][]interface{}
 	var columns []string
 	var memUsed int64
+	var spill *spillFile
+
+	// Ensure spill file cleanup on exit.
+	defer func() {
+		if spill != nil {
+			spill.close()
+		}
+	}()
 
 	// Compute target row count for early termination.
 	targetRows := int64(-1)
@@ -720,16 +832,39 @@ func (sc *StreamingCollector) CollectFromChannel(
 
 		rowSize := estimateRowSize(sr.Row)
 
-		// Check memory bound — if exceeded, stop collecting to prevent OOM.
-		// In a production system this would spill to a temp SQLite file;
-		// for now we cap collection and return what we have.
+		// Check memory bound — if exceeded, spill to disk.
 		if memUsed+rowSize > sc.maxMemoryBytes {
-			// Signal producers to stop.
-			if !doneClosed {
-				close(done)
-				doneClosed = true
+			if spill == nil {
+				// First time exceeding memory: create spill file and flush
+				// in-memory rows to it.
+				numCols := len(sr.Row)
+				var err error
+				spill, err = newSpillFile(numCols)
+				if err != nil {
+					return nil, fmt.Errorf("streaming collector: %w", err)
+				}
+				for _, memRow := range allRows {
+					if err := spill.insertRow(memRow); err != nil {
+						return nil, fmt.Errorf("streaming collector: flush to spill: %w", err)
+					}
+				}
+				// Release in-memory rows — they're on disk now.
+				allRows = nil
+				memUsed = 0
 			}
-			// Drain remaining rows from channel without storing.
+			// Write the current row directly to the spill file.
+			if err := spill.insertRow(sr.Row); err != nil {
+				return nil, fmt.Errorf("streaming collector: spill row: %w", err)
+			}
+			continue
+		}
+
+		// If we're already spilling, keep writing to disk even if this row
+		// would fit in memory (simpler logic, avoids fragmented state).
+		if spill != nil {
+			if err := spill.insertRow(sr.Row); err != nil {
+				return nil, fmt.Errorf("streaming collector: spill row: %w", err)
+			}
 			continue
 		}
 
@@ -743,7 +878,18 @@ func (sc *StreamingCollector) CollectFromChannel(
 				doneClosed = true
 			}
 			// Drain remaining rows.
-			continue
+			for range rowChan {
+			}
+			break
+		}
+	}
+
+	// If we spilled to disk, read everything back.
+	if spill != nil {
+		var err error
+		allRows, err = spill.readAll()
+		if err != nil {
+			return nil, fmt.Errorf("streaming collector: read spill: %w", err)
 		}
 	}
 

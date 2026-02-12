@@ -283,3 +283,185 @@ func TestCatalog_GetCompactionCandidates(t *testing.T) {
 		t.Errorf("expected 2 compaction candidates, got %d", len(candidates))
 	}
 }
+
+func TestCatalog_FindPartitionsByKeyPrefix(t *testing.T) {
+	tmpFile, err := os.CreateTemp("", "manifest_test_*.db")
+	if err != nil {
+		t.Fatalf("failed to create temp file: %v", err)
+	}
+	tmpFile.Close()
+	defer os.Remove(tmpFile.Name())
+
+	catalog, err := NewCatalog(tmpFile.Name())
+	if err != nil {
+		t.Fatalf("failed to create catalog: %v", err)
+	}
+	defer catalog.Close()
+
+	ctx := context.Background()
+
+	// Register partitions across different keys
+	infos := []*partition.PartitionInfo{
+		{PartitionID: "a1", PartitionKey: "20260201", RowCount: 10, SizeBytes: 100, SchemaVersion: 1, CreatedAt: time.Now()},
+		{PartitionID: "a2", PartitionKey: "20260205", RowCount: 20, SizeBytes: 200, SchemaVersion: 1, CreatedAt: time.Now()},
+		{PartitionID: "a3", PartitionKey: "20260210", RowCount: 30, SizeBytes: 300, SchemaVersion: 1, CreatedAt: time.Now()},
+		{PartitionID: "a4", PartitionKey: "20260301", RowCount: 40, SizeBytes: 400, SchemaVersion: 1, CreatedAt: time.Now()},
+	}
+	for _, info := range infos {
+		if err := catalog.RegisterPartition(ctx, info, "s3://bucket/"+info.PartitionID+".sqlite"); err != nil {
+			t.Fatalf("failed to register: %v", err)
+		}
+	}
+
+	// Prefix "202602" should match the first 3 partitions
+	records, err := catalog.FindPartitionsByKeyPrefix(ctx, "202602")
+	if err != nil {
+		t.Fatalf("FindPartitionsByKeyPrefix failed: %v", err)
+	}
+	if len(records) != 3 {
+		t.Errorf("expected 3 partitions for prefix 202602, got %d", len(records))
+	}
+
+	// Prefix "202603" should match only the last one
+	records, err = catalog.FindPartitionsByKeyPrefix(ctx, "202603")
+	if err != nil {
+		t.Fatalf("FindPartitionsByKeyPrefix failed: %v", err)
+	}
+	if len(records) != 1 {
+		t.Errorf("expected 1 partition for prefix 202603, got %d", len(records))
+	}
+
+	// Non-matching prefix
+	records, err = catalog.FindPartitionsByKeyPrefix(ctx, "202604")
+	if err != nil {
+		t.Fatalf("FindPartitionsByKeyPrefix failed: %v", err)
+	}
+	if len(records) != 0 {
+		t.Errorf("expected 0 partitions for prefix 202604, got %d", len(records))
+	}
+}
+
+func TestCatalog_GetDistinctPartitionKeys(t *testing.T) {
+	tmpFile, err := os.CreateTemp("", "manifest_test_*.db")
+	if err != nil {
+		t.Fatalf("failed to create temp file: %v", err)
+	}
+	tmpFile.Close()
+	defer os.Remove(tmpFile.Name())
+
+	catalog, err := NewCatalog(tmpFile.Name())
+	if err != nil {
+		t.Fatalf("failed to create catalog: %v", err)
+	}
+	defer catalog.Close()
+
+	ctx := context.Background()
+
+	infos := []*partition.PartitionInfo{
+		{PartitionID: "b1", PartitionKey: "20260205", RowCount: 10, SizeBytes: 100, SchemaVersion: 1, CreatedAt: time.Now()},
+		{PartitionID: "b2", PartitionKey: "20260205", RowCount: 20, SizeBytes: 200, SchemaVersion: 1, CreatedAt: time.Now()},
+		{PartitionID: "b3", PartitionKey: "20260206", RowCount: 30, SizeBytes: 300, SchemaVersion: 1, CreatedAt: time.Now()},
+	}
+	for _, info := range infos {
+		if err := catalog.RegisterPartition(ctx, info, "s3://bucket/"+info.PartitionID+".sqlite"); err != nil {
+			t.Fatalf("failed to register: %v", err)
+		}
+	}
+
+	keys, err := catalog.GetDistinctPartitionKeys(ctx)
+	if err != nil {
+		t.Fatalf("GetDistinctPartitionKeys failed: %v", err)
+	}
+	if len(keys) != 2 {
+		t.Fatalf("expected 2 distinct keys, got %d", len(keys))
+	}
+	if keys[0] != "20260205" || keys[1] != "20260206" {
+		t.Errorf("unexpected keys: %v", keys)
+	}
+}
+
+func TestCatalog_GetPartitionCountByKeyPrefix(t *testing.T) {
+	tmpFile, err := os.CreateTemp("", "manifest_test_*.db")
+	if err != nil {
+		t.Fatalf("failed to create temp file: %v", err)
+	}
+	tmpFile.Close()
+	defer os.Remove(tmpFile.Name())
+
+	catalog, err := NewCatalog(tmpFile.Name())
+	if err != nil {
+		t.Fatalf("failed to create catalog: %v", err)
+	}
+	defer catalog.Close()
+
+	ctx := context.Background()
+
+	infos := []*partition.PartitionInfo{
+		{PartitionID: "c1", PartitionKey: "20260201", RowCount: 10, SizeBytes: 100, SchemaVersion: 1, CreatedAt: time.Now()},
+		{PartitionID: "c2", PartitionKey: "20260205", RowCount: 20, SizeBytes: 200, SchemaVersion: 1, CreatedAt: time.Now()},
+		{PartitionID: "c3", PartitionKey: "20260301", RowCount: 30, SizeBytes: 300, SchemaVersion: 1, CreatedAt: time.Now()},
+	}
+	for _, info := range infos {
+		if err := catalog.RegisterPartition(ctx, info, "s3://bucket/"+info.PartitionID+".sqlite"); err != nil {
+			t.Fatalf("failed to register: %v", err)
+		}
+	}
+
+	count, err := catalog.GetPartitionCountByKeyPrefix(ctx, "202602")
+	if err != nil {
+		t.Fatalf("GetPartitionCountByKeyPrefix failed: %v", err)
+	}
+	if count != 2 {
+		t.Errorf("expected 2 for prefix 202602, got %d", count)
+	}
+
+	count, err = catalog.GetPartitionCountByKeyPrefix(ctx, "202603")
+	if err != nil {
+		t.Fatalf("GetPartitionCountByKeyPrefix failed: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("expected 1 for prefix 202603, got %d", count)
+	}
+}
+
+func TestCatalog_GetTotalPartitionCount(t *testing.T) {
+	tmpFile, err := os.CreateTemp("", "manifest_test_*.db")
+	if err != nil {
+		t.Fatalf("failed to create temp file: %v", err)
+	}
+	tmpFile.Close()
+	defer os.Remove(tmpFile.Name())
+
+	catalog, err := NewCatalog(tmpFile.Name())
+	if err != nil {
+		t.Fatalf("failed to create catalog: %v", err)
+	}
+	defer catalog.Close()
+
+	ctx := context.Background()
+
+	// Empty catalog
+	count, err := catalog.GetTotalPartitionCount(ctx)
+	if err != nil {
+		t.Fatalf("GetTotalPartitionCount failed: %v", err)
+	}
+	if count != 0 {
+		t.Errorf("expected 0, got %d", count)
+	}
+
+	// Add a partition
+	info := &partition.PartitionInfo{
+		PartitionID: "d1", PartitionKey: "20260205", RowCount: 10, SizeBytes: 100, SchemaVersion: 1, CreatedAt: time.Now(),
+	}
+	if err := catalog.RegisterPartition(ctx, info, "s3://bucket/d1.sqlite"); err != nil {
+		t.Fatalf("failed to register: %v", err)
+	}
+
+	count, err = catalog.GetTotalPartitionCount(ctx)
+	if err != nil {
+		t.Fatalf("GetTotalPartitionCount failed: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("expected 1, got %d", count)
+	}
+}

@@ -22,7 +22,7 @@ func TestBuilder_Build(t *testing.T) {
 	}
 	defer os.RemoveAll(tmpDir)
 
-	builder := NewBuilder(tmpDir)
+	builder := NewBuilder(tmpDir, 0)
 
 	// Create test rows
 	rows := []types.Row{
@@ -137,7 +137,7 @@ func TestBuilder_EmptyRows(t *testing.T) {
 	}
 	defer os.RemoveAll(tmpDir)
 
-	builder := NewBuilder(tmpDir)
+	builder := NewBuilder(tmpDir, 0)
 	key := types.PartitionKey{Strategy: types.StrategyTime, Value: "20260205"}
 
 	_, err = builder.Build(context.Background(), []types.Row{}, key)
@@ -153,7 +153,7 @@ func TestBuilder_ValidationError(t *testing.T) {
 	}
 	defer os.RemoveAll(tmpDir)
 
-	builder := NewBuilder(tmpDir)
+	builder := NewBuilder(tmpDir, 0)
 	key := types.PartitionKey{Strategy: types.StrategyTime, Value: "20260205"}
 
 	// Row with missing required fields
@@ -180,7 +180,7 @@ func TestMetadataGenerator_Generate(t *testing.T) {
 	}
 	defer os.RemoveAll(tmpDir)
 
-	builder := NewBuilder(tmpDir)
+	builder := NewBuilder(tmpDir, 0)
 	metaGen := NewMetadataGenerator()
 
 	rows := []types.Row{

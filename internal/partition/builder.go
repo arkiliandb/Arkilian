@@ -41,6 +41,13 @@ type PartitionBuilder interface {
 	BuildWithSchema(ctx context.Context, rows []types.Row, key types.PartitionKey, schema types.Schema) (*PartitionInfo, error)
 }
 
+// Builder implements PartitionBuilder.
+type Builder struct {
+	outputDir        string
+	ulidGenerator    *types.ULIDGenerator
+	targetSizeBytes  int64
+}
+
 // PartitionInfo contains metadata about a created partition.
 type PartitionInfo struct {
 	PartitionID   string
@@ -60,18 +67,21 @@ type MinMax struct {
 	Max interface{}
 }
 
-// Builder implements PartitionBuilder.
-type Builder struct {
-	outputDir     string
-	ulidGenerator *types.ULIDGenerator
-}
-
 // NewBuilder creates a new partition builder.
-func NewBuilder(outputDir string) *Builder {
-	return &Builder{
-		outputDir:     outputDir,
-		ulidGenerator: types.NewULIDGenerator(),
+// targetSizeMB sets the target partition size in megabytes (0 uses default of 16MB).
+func NewBuilder(outputDir string, targetSizeMB int) *Builder {
+	if targetSizeMB <= 0 {
+		targetSizeMB = 16
 	}
+	return &Builder{
+		outputDir:       outputDir,
+		ulidGenerator:   types.NewULIDGenerator(),
+		targetSizeBytes: int64(targetSizeMB) * 1024 * 1024,
+	}
+}
+// TargetSizeBytes returns the configured target partition size in bytes.
+func (b *Builder) TargetSizeBytes() int64 {
+	return b.targetSizeBytes
 }
 
 // Build creates a partition from rows using the default schema.

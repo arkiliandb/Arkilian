@@ -47,7 +47,7 @@ func setupCompactionTestEnv(t *testing.T, numPartitions int) (
 	}
 
 	// Create small partitions
-	builder := partition.NewBuilder(partitionDir)
+	builder := partition.NewBuilder(partitionDir, 0)
 	metaGen := partition.NewMetadataGenerator()
 	ctx := context.Background()
 
@@ -322,7 +322,7 @@ func TestTTLEnforcement(t *testing.T) {
 	catalog, _ := manifest.NewCatalog(manifestPath)
 	defer catalog.Close()
 
-	builder := partition.NewBuilder(partitionDir)
+	builder := partition.NewBuilder(partitionDir, 0)
 	metaGen := partition.NewMetadataGenerator()
 
 	// Create a partition
@@ -377,7 +377,7 @@ func TestCompactionWithDifferentPartitionKeys(t *testing.T) {
 	catalog, _ := manifest.NewCatalog(manifestPath)
 	defer catalog.Close()
 
-	builder := partition.NewBuilder(partitionDir)
+	builder := partition.NewBuilder(partitionDir, 0)
 	metaGen := partition.NewMetadataGenerator()
 
 	// Create partitions for two different keys

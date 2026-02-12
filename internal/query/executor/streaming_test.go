@@ -76,11 +76,11 @@ func TestStreamingCollector_LimitEarlyTermination(t *testing.T) {
 }
 
 func TestStreamingCollector_MemoryBound(t *testing.T) {
-	// Set a very small memory limit to trigger the bound
+	// Set a very small memory limit to trigger spill-to-disk
 	collector := NewStreamingCollector(
 		[]string{"data"},
 		nil, nil, nil,
-		200, // 200 bytes — very small
+		200, // 200 bytes — very small, will trigger spill
 	)
 
 	rowChan := make(chan streamedRow, 100)
@@ -106,9 +106,9 @@ func TestStreamingCollector_MemoryBound(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	// Should have collected fewer than 50 rows due to memory bound
-	if len(result.Rows) >= 50 {
-		t.Fatalf("expected fewer than 50 rows due to memory bound, got %d", len(result.Rows))
+	// With spill-to-disk, ALL 50 rows should be collected (no silent dropping)
+	if len(result.Rows) != 50 {
+		t.Fatalf("expected 50 rows (spill-to-disk should preserve all), got %d", len(result.Rows))
 	}
 }
 

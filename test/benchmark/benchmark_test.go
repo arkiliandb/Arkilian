@@ -27,7 +27,7 @@ func BenchmarkRowIngestion(b *testing.B) {
 	}
 	defer os.RemoveAll(tmpDir)
 
-	builder := partition.NewBuilder(tmpDir)
+	builder := partition.NewBuilder(tmpDir, 0)
 	ctx := context.Background()
 
 	// Generate test rows

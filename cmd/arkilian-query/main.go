@@ -81,7 +81,7 @@ func main() {
 		log.Printf("Warning: Failed to preload bloom filters: %v", err)
 	} else {
 		stats := pruner.GetCacheStats()
-		log.Printf("Bloom filter cache: %d partitions, %d filters loaded", stats.PartitionsWithFilters, stats.TotalFilters)
+		log.Printf("Bloom filter cache: %d filters loaded, %d bytes", stats.LRUFilters, stats.LRUMemoryBytes)
 	}
 
 	// Initialize shutdown manager

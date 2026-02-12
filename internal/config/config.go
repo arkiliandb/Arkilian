@@ -83,6 +83,9 @@ type GRPCConfig struct {
 type IngestConfig struct {
 	// PartitionDir is the directory for partition output
 	PartitionDir string `json:"partition_dir" yaml:"partition_dir"`
+
+	// TargetPartitionSizeMB is the target partition size in megabytes (8–256, default 16)
+	TargetPartitionSizeMB int `json:"target_partition_size_mb" yaml:"target_partition_size_mb"`
 }
 
 // QueryConfig holds query service configuration.
@@ -160,7 +163,8 @@ func DefaultConfig() *Config {
 			Enabled: true,
 		},
 		Ingest: IngestConfig{
-			PartitionDir: "",
+			PartitionDir:          "",
+			TargetPartitionSizeMB: 16,
 		},
 		Query: QueryConfig{
 			DownloadDir:          "",
@@ -233,6 +237,10 @@ func (c *Config) Validate() error {
 
 	if c.Storage.Type == "s3" && c.Storage.S3.Bucket == "" {
 		return fmt.Errorf("s3.bucket is required when storage type is s3")
+	}
+
+	if c.Ingest.TargetPartitionSizeMB < 8 || c.Ingest.TargetPartitionSizeMB > 256 {
+		return fmt.Errorf("ingest.target_partition_size_mb must be between 8 and 256, got %d", c.Ingest.TargetPartitionSizeMB)
 	}
 
 	return nil
@@ -329,6 +337,11 @@ func LoadFromEnv(cfg *Config) {
 	// Storage configuration
 	if v := os.Getenv("ARKILIAN_STORAGE_TYPE"); v != "" {
 		cfg.Storage.Type = v
+	}
+
+	// Ingest configuration
+	if v := os.Getenv("ARKILIAN_INGEST_TARGET_PARTITION_SIZE_MB"); v != "" {
+		fmt.Sscanf(v, "%d", &cfg.Ingest.TargetPartitionSizeMB)
 	}
 	if v := os.Getenv("ARKILIAN_STORAGE_PATH"); v != "" {
 		cfg.Storage.Path = v
