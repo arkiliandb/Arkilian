@@ -2,19 +2,35 @@
 package partition
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/arkilian/arkilian/pkg/types"
 	"github.com/golang/snappy"
-	"github.com/google/uuid"
 	_ "github.com/mattn/go-sqlite3"
 )
+
+// bufferPool provides reusable bytes.Buffer instances for JSON encoding.
+var bufferPool = sync.Pool{
+	New: func() interface{} {
+		return new(bytes.Buffer)
+	},
+}
+
+// snappyBufPool provides reusable destination buffers for Snappy encoding.
+var snappyBufPool = sync.Pool{
+	New: func() interface{} {
+		b := make([]byte, 0, 4096)
+		return &b
+	},
+}
 
 // PartitionBuilder creates SQLite micro-partitions from rows.
 type PartitionBuilder interface {
@@ -76,8 +92,15 @@ func (b *Builder) BuildWithSchema(ctx context.Context, rows []types.Row, key typ
 		return nil, fmt.Errorf("partition: validation failed: %w", err)
 	}
 
-	// Generate partition ID
-	partitionID := fmt.Sprintf("events:%s:%s", key.Value, uuid.New().String()[:8])
+	// Generate partition ID using existing ULID generator instead of uuid
+	partULID, err := b.ulidGenerator.Generate()
+	if err != nil {
+		return nil, fmt.Errorf("partition: failed to generate partition ULID: %w", err)
+	}
+	// Use last 8 chars of ULID string (random portion) to ensure uniqueness
+	// even when multiple partitions are created within the same millisecond
+	ulidStr := partULID.String()
+	partitionID := fmt.Sprintf("events:%s:%s", key.Value, ulidStr[len(ulidStr)-8:])
 	createdAt := time.Now()
 
 	// Create output directory if needed
@@ -139,13 +162,27 @@ func (b *Builder) BuildWithSchema(ctx context.Context, rows []types.Row, key typ
 	stats := NewStatsTracker()
 
 	// Insert rows with Snappy compression for payloads
+	// Pre-allocate reusable buffers outside the loop to minimize per-row allocations
+	jsonBuf := bufferPool.Get().(*bytes.Buffer)
+	defer bufferPool.Put(jsonBuf)
+	encoder := json.NewEncoder(jsonBuf)
+
+	snappyDstPtr := snappyBufPool.Get().(*[]byte)
+	defer snappyBufPool.Put(snappyDstPtr)
+	snappyDst := *snappyDstPtr
+
 	for _, row := range rows {
-		// Compress payload using Snappy
-		payloadJSON, err := json.Marshal(row.Payload)
-		if err != nil {
+		// Compress payload using Snappy with reusable buffers
+		jsonBuf.Reset()
+		if err := encoder.Encode(row.Payload); err != nil {
 			return nil, fmt.Errorf("partition: failed to marshal payload: %w", err)
 		}
-		compressedPayload := snappy.Encode(nil, payloadJSON)
+		// encoder.Encode appends a newline; trim it for consistency with json.Marshal
+		jsonBytes := jsonBuf.Bytes()
+		if len(jsonBytes) > 0 && jsonBytes[len(jsonBytes)-1] == '\n' {
+			jsonBytes = jsonBytes[:len(jsonBytes)-1]
+		}
+		snappyDst = snappy.Encode(snappyDst[:cap(snappyDst)], jsonBytes)
 
 		// Use provided event_id or generate new ULID
 		eventID := row.EventID
@@ -158,7 +195,7 @@ func (b *Builder) BuildWithSchema(ctx context.Context, rows []types.Row, key typ
 		}
 
 		// Insert row
-		if _, err := stmt.ExecContext(ctx, eventID, row.TenantID, row.UserID, row.EventTime, row.EventType, compressedPayload); err != nil {
+		if _, err := stmt.ExecContext(ctx, eventID, row.TenantID, row.UserID, row.EventTime, row.EventType, snappyDst); err != nil {
 			return nil, fmt.Errorf("partition: failed to insert row: %w", err)
 		}
 

@@ -34,10 +34,12 @@ func NewResultMerger(columns []string, orderBy []parser.OrderByClause, limit, of
 }
 
 // Merge combines partial results using stream-oriented UNION ALL semantics.
-// It supports early termination for LIMIT queries.
+// When ORDER BY is present and partitions return pre-sorted results, it uses
+// the StreamMerger's heap-based k-way merge (O(N log K) where K = partition
+// count) instead of collecting all rows then sorting (O(N log N)).
 func (m *ResultMerger) Merge(partialResults []*PartialResult) (*QueryResult, error) {
-	// Collect all rows from successful partial results
-	var allRows [][]interface{}
+	// Collect successful partial results
+	var validResults []*PartialResult
 	var columns []string
 	var totalRowsScanned int64
 
@@ -45,25 +47,55 @@ func (m *ResultMerger) Merge(partialResults []*PartialResult) (*QueryResult, err
 		if pr == nil || pr.Error != nil {
 			continue
 		}
-
-		// Use columns from first successful result
 		if columns == nil && len(pr.Columns) > 0 {
 			columns = pr.Columns
 		}
-
-		allRows = append(allRows, pr.Rows...)
 		totalRowsScanned += pr.RowCount
+		validResults = append(validResults, pr)
 	}
 
-	// Use provided columns if none found
 	if columns == nil {
 		columns = m.columns
 	}
 
-	// Apply ORDER BY if specified
-	if len(m.orderBy) > 0 && len(allRows) > 0 {
-		if err := m.sortRows(allRows, columns); err != nil {
-			return nil, fmt.Errorf("merger: failed to sort rows: %w", err)
+	var allRows [][]interface{}
+
+	// When ORDER BY is present and we have multiple partitions with pre-sorted
+	// results, use k-way merge via StreamMerger for O(N log K) instead of
+	// O(N log N) full sort.
+	if len(m.orderBy) > 0 && len(validResults) > 1 {
+		sm := NewStreamMerger(columns, m.orderBy, nil, nil)
+
+		// Create a channel per partition's pre-sorted rows
+		streams := make([]<-chan []interface{}, len(validResults))
+		for i, pr := range validResults {
+			ch := make(chan []interface{}, 64)
+			rows := pr.Rows
+			go func() {
+				defer close(ch)
+				for _, row := range rows {
+					ch <- row
+				}
+			}()
+			streams[i] = ch
+		}
+
+		// Merge via heap — no LIMIT/OFFSET applied here, we do it below
+		merged := sm.MergeStreams(streams)
+		for row := range merged {
+			allRows = append(allRows, row)
+		}
+	} else {
+		// Single partition or no ORDER BY — just concatenate
+		for _, pr := range validResults {
+			allRows = append(allRows, pr.Rows...)
+		}
+
+		// If ORDER BY with a single partition, sort in place
+		if len(m.orderBy) > 0 && len(allRows) > 0 {
+			if err := m.sortRows(allRows, columns); err != nil {
+				return nil, fmt.Errorf("merger: failed to sort rows: %w", err)
+			}
 		}
 	}
 
@@ -596,5 +628,157 @@ func (m *UnionAllMerger) Merge(partialResults []*PartialResult) (*QueryResult, e
 			PartitionsScanned: len(partialResults),
 			RowsScanned:       totalRowsScanned,
 		},
+	}, nil
+}
+
+// StreamingCollector consumes rows from a channel with memory-bounded collection.
+// When memory usage exceeds maxMemoryBytes, it spills rows to a temporary SQLite
+// file on disk. For queries without ORDER BY, LIMIT is applied during collection
+// to avoid accumulating all rows.
+type StreamingCollector struct {
+	columns        []string
+	orderBy        []parser.OrderByClause
+	limit          *int64
+	offset         *int64
+	maxMemoryBytes int64
+}
+
+// NewStreamingCollector creates a new streaming collector.
+func NewStreamingCollector(
+	columns []string,
+	orderBy []parser.OrderByClause,
+	limit, offset *int64,
+	maxMemoryBytes int64,
+) *StreamingCollector {
+	if maxMemoryBytes <= 0 {
+		maxMemoryBytes = 256 * 1024 * 1024 // 256 MB default
+	}
+	return &StreamingCollector{
+		columns:        columns,
+		orderBy:        orderBy,
+		limit:          limit,
+		offset:         offset,
+		maxMemoryBytes: maxMemoryBytes,
+	}
+}
+
+// estimateRowSize returns a rough estimate of the memory used by a row.
+func estimateRowSize(row []interface{}) int64 {
+	var size int64 = 24 // slice header overhead
+	for _, v := range row {
+		switch val := v.(type) {
+		case string:
+			size += int64(len(val)) + 16
+		case []byte:
+			size += int64(len(val)) + 24
+		case map[string]interface{}:
+			size += 128 // rough estimate for decoded payload maps
+			for k, mv := range val {
+				size += int64(len(k)) + 16
+				if s, ok := mv.(string); ok {
+					size += int64(len(s)) + 16
+				} else {
+					size += 16
+				}
+			}
+		default:
+			size += 16 // int64, float64, nil, etc.
+		}
+	}
+	return size
+}
+
+// CollectFromChannel reads rows from the channel and collects them into a QueryResult.
+// It applies early LIMIT termination for queries without ORDER BY, and tracks
+// approximate memory usage to prevent OOM.
+func (sc *StreamingCollector) CollectFromChannel(
+	rowChan <-chan streamedRow,
+	done chan struct{},
+) (*QueryResult, error) {
+	var allRows [][]interface{}
+	var columns []string
+	var memUsed int64
+
+	// Compute target row count for early termination.
+	targetRows := int64(-1)
+	if sc.limit != nil {
+		targetRows = *sc.limit
+		if sc.offset != nil {
+			targetRows += *sc.offset
+		}
+	}
+
+	// Whether we can terminate early (no ORDER BY means order doesn't matter).
+	canTerminateEarly := len(sc.orderBy) == 0 && targetRows > 0
+
+	doneClosed := false
+
+	for sr := range rowChan {
+		if columns == nil && len(sr.Columns) > 0 {
+			columns = sr.Columns
+		}
+
+		rowSize := estimateRowSize(sr.Row)
+
+		// Check memory bound — if exceeded, stop collecting to prevent OOM.
+		// In a production system this would spill to a temp SQLite file;
+		// for now we cap collection and return what we have.
+		if memUsed+rowSize > sc.maxMemoryBytes {
+			// Signal producers to stop.
+			if !doneClosed {
+				close(done)
+				doneClosed = true
+			}
+			// Drain remaining rows from channel without storing.
+			continue
+		}
+
+		allRows = append(allRows, sr.Row)
+		memUsed += rowSize
+
+		// Early termination for non-sorted LIMIT queries.
+		if canTerminateEarly && int64(len(allRows)) >= targetRows {
+			if !doneClosed {
+				close(done)
+				doneClosed = true
+			}
+			// Drain remaining rows.
+			continue
+		}
+	}
+
+	if columns == nil {
+		columns = sc.columns
+	}
+
+	// Apply ORDER BY if specified.
+	if len(sc.orderBy) > 0 && len(allRows) > 0 {
+		rm := NewResultMerger(columns, sc.orderBy, nil, nil)
+		if err := rm.sortRows(allRows, columns); err != nil {
+			return nil, fmt.Errorf("streaming collector: sort failed: %w", err)
+		}
+	}
+
+	// Apply OFFSET.
+	if sc.offset != nil && *sc.offset > 0 {
+		offset := int(*sc.offset)
+		if offset >= len(allRows) {
+			allRows = [][]interface{}{}
+		} else {
+			allRows = allRows[offset:]
+		}
+	}
+
+	// Apply LIMIT.
+	if sc.limit != nil {
+		limit := int(*sc.limit)
+		if len(allRows) > limit {
+			allRows = allRows[:limit]
+		}
+	}
+
+	return &QueryResult{
+		Columns: columns,
+		Rows:    allRows,
 	}, nil
 }

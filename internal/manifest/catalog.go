@@ -3,6 +3,7 @@ package manifest
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"sync"
 	"time"
@@ -67,32 +68,73 @@ type Predicate struct {
 
 // SQLiteCatalog implements Catalog using SQLite.
 type SQLiteCatalog struct {
-	db     *sql.DB
+	db     *sql.DB // Write connection (single writer)
+	readDB *sql.DB // Read connection pool (concurrent readers)
 	dbPath string
-	mu     sync.Mutex // Single-writer lock
+	mu     sync.Mutex // Write-only lock (reads don't need this)
+
+	// Prepared statement cache (for read connection)
+	insertPartitionStmt *sql.Stmt
+	findStmtCache       map[string]*sql.Stmt
+	findStmtMu          sync.RWMutex
 }
 
 // NewCatalog creates a new SQLite-based catalog.
 func NewCatalog(dbPath string) (*SQLiteCatalog, error) {
+	// Write connection: single writer with WAL mode
 	db, err := sql.Open("sqlite3", dbPath+"?_journal_mode=WAL&_busy_timeout=5000")
 	if err != nil {
 		return nil, fmt.Errorf("manifest: failed to open database: %w", err)
 	}
-
-	// Set connection pool settings
 	db.SetMaxOpenConns(1) // Single writer
 	db.SetMaxIdleConns(1)
 
-	catalog := &SQLiteCatalog{
-		db:     db,
-		dbPath: dbPath,
+	// Read connection pool: concurrent readers via read-only mode
+	readDB, err := sql.Open("sqlite3", dbPath+"?_journal_mode=WAL&_busy_timeout=5000&mode=ro")
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("manifest: failed to open read database: %w", err)
+	}
+	readDB.SetMaxOpenConns(4)
+	readDB.SetMaxIdleConns(4)
+	readDB.SetConnMaxLifetime(5 * time.Minute)
+
+	// Enable read_uncommitted on read connections for snapshot isolation without blocking
+	if _, err := readDB.Exec("PRAGMA read_uncommitted = true"); err != nil {
+		readDB.Close()
+		db.Close()
+		return nil, fmt.Errorf("manifest: failed to set read_uncommitted pragma: %w", err)
 	}
 
-	// Initialize schema
+	catalog := &SQLiteCatalog{
+		db:            db,
+		readDB:        readDB,
+		dbPath:        dbPath,
+		findStmtCache: make(map[string]*sql.Stmt),
+	}
+
+	// Initialize schema (uses write connection)
 	if err := catalog.initSchema(); err != nil {
+		readDB.Close()
 		db.Close()
 		return nil, fmt.Errorf("manifest: failed to initialize schema: %w", err)
 	}
+
+	// Prepare cached insert statement on write connection
+	insertStmt, err := db.Prepare(`
+		INSERT INTO partitions (
+			partition_id, partition_key, object_path,
+			min_user_id, max_user_id,
+			min_event_time, max_event_time,
+			min_tenant_id, max_tenant_id,
+			row_count, size_bytes, schema_version, created_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+	if err != nil {
+		readDB.Close()
+		db.Close()
+		return nil, fmt.Errorf("manifest: failed to prepare insert statement: %w", err)
+	}
+	catalog.insertPartitionStmt = insertStmt
 
 	return catalog, nil
 }
@@ -151,16 +193,7 @@ func (c *SQLiteCatalog) insertPartition(ctx context.Context, info *partition.Par
 		}
 	}
 
-	query := `
-		INSERT INTO partitions (
-			partition_id, partition_key, object_path,
-			min_user_id, max_user_id,
-			min_event_time, max_event_time,
-			min_tenant_id, max_tenant_id,
-			row_count, size_bytes, schema_version, created_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-
-	_, err := c.db.ExecContext(ctx, query,
+	_, err := c.insertPartitionStmt.ExecContext(ctx,
 		info.PartitionID, info.PartitionKey, objectPath,
 		minUserID, maxUserID,
 		minEventTime, maxEventTime,
@@ -289,7 +322,7 @@ func (c *SQLiteCatalog) GetPartition(ctx context.Context, partitionID string) (*
 		FROM partitions
 		WHERE partition_id = ?`
 
-	row := c.db.QueryRowContext(ctx, query, partitionID)
+	row := c.readDB.QueryRowContext(ctx, query, partitionID)
 	return c.scanPartitionRecord(row)
 }
 
@@ -320,7 +353,13 @@ func (c *SQLiteCatalog) scanPartitionRecord(row *sql.Row) (*PartitionRecord, err
 func (c *SQLiteCatalog) FindPartitions(ctx context.Context, predicates []Predicate) ([]*PartitionRecord, error) {
 	query, args := c.buildFindQuery(predicates)
 
-	rows, err := c.db.QueryContext(ctx, query, args...)
+	// Use cached prepared statement for this query pattern
+	stmt, err := c.getOrPrepareStmt(query)
+	if err != nil {
+		return nil, fmt.Errorf("manifest: failed to prepare find query: %w", err)
+	}
+
+	rows, err := stmt.QueryContext(ctx, args...)
 	if err != nil {
 		return nil, fmt.Errorf("manifest: failed to query partitions: %w", err)
 	}
@@ -340,6 +379,31 @@ func (c *SQLiteCatalog) FindPartitions(ctx context.Context, predicates []Predica
 	}
 
 	return records, nil
+}
+
+// getOrPrepareStmt returns a cached prepared statement or creates one.
+func (c *SQLiteCatalog) getOrPrepareStmt(query string) (*sql.Stmt, error) {
+	c.findStmtMu.RLock()
+	if stmt, ok := c.findStmtCache[query]; ok {
+		c.findStmtMu.RUnlock()
+		return stmt, nil
+	}
+	c.findStmtMu.RUnlock()
+
+	c.findStmtMu.Lock()
+	defer c.findStmtMu.Unlock()
+
+	// Double-check after acquiring write lock
+	if stmt, ok := c.findStmtCache[query]; ok {
+		return stmt, nil
+	}
+
+	stmt, err := c.readDB.Prepare(query)
+	if err != nil {
+		return nil, err
+	}
+	c.findStmtCache[query] = stmt
+	return stmt, nil
 }
 
 // scanPartitionRows scans rows into a PartitionRecord.
@@ -375,6 +439,13 @@ func (c *SQLiteCatalog) buildFindQuery(predicates []Predicate) (string, []interf
 
 	var args []interface{}
 
+	// Derive partition key prefix bounds from event_time predicates
+	keyClause, keyArgs := c.derivePartitionKeyBounds(predicates)
+	if keyClause != "" {
+		baseQuery += " AND " + keyClause
+		args = append(args, keyArgs...)
+	}
+
 	for _, pred := range predicates {
 		clause, predArgs := c.buildPredicateClause(pred)
 		if clause != "" {
@@ -384,6 +455,66 @@ func (c *SQLiteCatalog) buildFindQuery(predicates []Predicate) (string, []interf
 	}
 
 	return baseQuery, args
+}
+
+// derivePartitionKeyBounds extracts time bounds from event_time predicates
+// and converts them to YYYYMMDD partition key bounds for prefix pruning.
+func (c *SQLiteCatalog) derivePartitionKeyBounds(predicates []Predicate) (string, []interface{}) {
+	var minTime, maxTime *int64
+
+	for _, pred := range predicates {
+		if pred.Column != "event_time" {
+			continue
+		}
+		switch pred.Operator {
+		case "=":
+			if v, ok := pred.Value.(int64); ok {
+				minTime = &v
+				maxTime = &v
+			}
+		case ">=", ">":
+			if v, ok := pred.Value.(int64); ok {
+				if minTime == nil || v < *minTime {
+					minTime = &v
+				}
+			}
+		case "<=", "<":
+			if v, ok := pred.Value.(int64); ok {
+				if maxTime == nil || v > *maxTime {
+					maxTime = &v
+				}
+			}
+		case "BETWEEN":
+			if len(pred.Values) >= 2 {
+				if v, ok := pred.Values[0].(int64); ok {
+					if minTime == nil || v < *minTime {
+						minTime = &v
+					}
+				}
+				if v, ok := pred.Values[1].(int64); ok {
+					if maxTime == nil || v > *maxTime {
+						maxTime = &v
+					}
+				}
+			}
+		}
+	}
+
+	if minTime == nil && maxTime == nil {
+		return "", nil
+	}
+
+	// Use wide bounds for open-ended ranges
+	if minTime == nil {
+		minTime = maxTime
+	}
+	if maxTime == nil {
+		maxTime = minTime
+	}
+
+	minKey := time.Unix(*minTime, 0).UTC().Format("20060102")
+	maxKey := time.Unix(*maxTime, 0).UTC().Format("20060102")
+	return "partition_key BETWEEN ? AND ?", []interface{}{minKey, maxKey}
 }
 
 // buildPredicateClause builds a SQL clause from a predicate.
@@ -535,7 +666,7 @@ func (c *SQLiteCatalog) GetCompactionCandidates(ctx context.Context, key string,
 			AND size_bytes < ?
 		ORDER BY created_at ASC`
 
-	rows, err := c.db.QueryContext(ctx, query, key, maxSize)
+	rows, err := c.readDB.QueryContext(ctx, query, key, maxSize)
 	if err != nil {
 		return nil, fmt.Errorf("manifest: failed to query compaction candidates: %w", err)
 	}
@@ -604,15 +735,32 @@ func (c *SQLiteCatalog) DeleteExpired(ctx context.Context, ttl time.Duration) ([
 	return expiredIDs, nil
 }
 
-// Close closes the catalog database connection.
+// Close closes the catalog database connections.
 func (c *SQLiteCatalog) Close() error {
+	// Close cached prepared statements (on write connection)
+	if c.insertPartitionStmt != nil {
+		c.insertPartitionStmt.Close()
+	}
+	// Close cached find statements (on read connection)
+	c.findStmtMu.Lock()
+	for _, stmt := range c.findStmtCache {
+		stmt.Close()
+	}
+	c.findStmtCache = nil
+	c.findStmtMu.Unlock()
+
+	// Close read connection first, then write connection
+	if err := c.readDB.Close(); err != nil {
+		c.db.Close()
+		return err
+	}
 	return c.db.Close()
 }
 
 // GetPartitionCount returns the total number of active (non-compacted) partitions.
 func (c *SQLiteCatalog) GetPartitionCount(ctx context.Context) (int64, error) {
 	var count int64
-	err := c.db.QueryRowContext(ctx,
+	err := c.readDB.QueryRowContext(ctx,
 		"SELECT COUNT(*) FROM partitions WHERE compacted_into IS NULL",
 	).Scan(&count)
 	if err != nil {
@@ -624,7 +772,7 @@ func (c *SQLiteCatalog) GetPartitionCount(ctx context.Context) (int64, error) {
 // GetPartitionCountByKey returns the number of active partitions for a given partition key.
 func (c *SQLiteCatalog) GetPartitionCountByKey(ctx context.Context, key string) (int64, error) {
 	var count int64
-	err := c.db.QueryRowContext(ctx,
+	err := c.readDB.QueryRowContext(ctx,
 		"SELECT COUNT(*) FROM partitions WHERE compacted_into IS NULL AND partition_key = ?",
 		key,
 	).Scan(&count)
@@ -632,4 +780,178 @@ func (c *SQLiteCatalog) GetPartitionCountByKey(ctx context.Context, key string) 
 		return 0, fmt.Errorf("manifest: failed to count partitions by key: %w", err)
 	}
 	return count, nil
+}
+
+// RunAnalyze runs ANALYZE to update SQLite query planner statistics.
+// Should be called after bulk inserts to keep index statistics current.
+func (c *SQLiteCatalog) RunAnalyze(ctx context.Context) error {
+	_, err := c.db.ExecContext(ctx, AnalyzeSQL)
+	if err != nil {
+		return fmt.Errorf("manifest: failed to run ANALYZE: %w", err)
+	}
+	return nil
+}
+
+// FindCompactedPartitions returns all partitions that have a non-NULL compacted_into value.
+// This is used by crash recovery to detect incomplete compactions.
+func (c *SQLiteCatalog) FindCompactedPartitions(ctx context.Context) ([]*PartitionRecord, error) {
+	query := `
+		SELECT partition_id, partition_key, object_path,
+			min_user_id, max_user_id,
+			min_event_time, max_event_time,
+			min_tenant_id, max_tenant_id,
+			row_count, size_bytes, schema_version, created_at, compacted_into
+		FROM partitions
+		WHERE compacted_into IS NOT NULL`
+
+	rows, err := c.readDB.QueryContext(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("manifest: failed to query compacted partitions: %w", err)
+	}
+	defer rows.Close()
+
+	var records []*PartitionRecord
+	for rows.Next() {
+		record, err := c.scanPartitionRows(rows)
+		if err != nil {
+			return nil, err
+		}
+		records = append(records, record)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("manifest: error iterating compacted partitions: %w", err)
+	}
+	return records, nil
+}
+
+// ResetCompactedInto sets compacted_into to NULL for the given partition IDs.
+// This is used by crash recovery to rollback incomplete compactions.
+func (c *SQLiteCatalog) ResetCompactedInto(ctx context.Context, partitionIDs []string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	tx, err := c.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("manifest: failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	for _, id := range partitionIDs {
+		if _, err := tx.ExecContext(ctx,
+			"UPDATE partitions SET compacted_into = NULL WHERE partition_id = ?", id); err != nil {
+			return fmt.Errorf("manifest: failed to reset compacted_into for %s: %w", id, err)
+		}
+	}
+
+	return tx.Commit()
+}
+
+
+// CompactionIntent represents an in-progress compaction operation.
+type CompactionIntent struct {
+	TargetPartitionID string
+	SourcePartitionIDs []string
+	TargetObjectPath  string
+	TargetMetaPath    string
+	CreatedAt         time.Time
+}
+
+// WriteCompactionIntent records a compaction intent (Phase 1 of two-phase commit).
+func (c *SQLiteCatalog) WriteCompactionIntent(ctx context.Context, intent *CompactionIntent) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	sourceIDsJSON, err := json.Marshal(intent.SourcePartitionIDs)
+	if err != nil {
+		return fmt.Errorf("manifest: failed to marshal source IDs: %w", err)
+	}
+
+	_, err = c.db.ExecContext(ctx,
+		`INSERT OR REPLACE INTO compaction_intents (target_partition_id, source_partition_ids, target_object_path, target_meta_path, created_at)
+		 VALUES (?, ?, ?, ?, ?)`,
+		intent.TargetPartitionID, string(sourceIDsJSON), intent.TargetObjectPath, intent.TargetMetaPath, intent.CreatedAt.Unix())
+	if err != nil {
+		return fmt.Errorf("manifest: failed to write compaction intent: %w", err)
+	}
+	return nil
+}
+
+// CompleteCompaction executes Phase 2 of two-phase commit:
+// registers the target partition, marks sources as compacted, and deletes the intent
+// all within a single transaction.
+func (c *SQLiteCatalog) CompleteCompaction(ctx context.Context, info *partition.PartitionInfo, objectPath string, sourceIDs []string, intentTargetID string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	tx, err := c.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("manifest: failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	// Register the target partition
+	if err := c.insertPartitionTx(ctx, tx, info, objectPath); err != nil {
+		return fmt.Errorf("manifest: failed to register compacted partition: %w", err)
+	}
+
+	// Mark source partitions as compacted
+	for _, sourceID := range sourceIDs {
+		result, err := tx.ExecContext(ctx,
+			"UPDATE partitions SET compacted_into = ? WHERE partition_id = ? AND compacted_into IS NULL",
+			info.PartitionID, sourceID)
+		if err != nil {
+			return fmt.Errorf("manifest: failed to mark partition %s as compacted: %w", sourceID, err)
+		}
+		rowsAffected, _ := result.RowsAffected()
+		if rowsAffected == 0 {
+			return fmt.Errorf("manifest: partition %s not found or already compacted", sourceID)
+		}
+	}
+
+	// Delete the compaction intent
+	if _, err := tx.ExecContext(ctx,
+		"DELETE FROM compaction_intents WHERE target_partition_id = ?", intentTargetID); err != nil {
+		return fmt.Errorf("manifest: failed to delete compaction intent: %w", err)
+	}
+
+	return tx.Commit()
+}
+
+// FindCompactionIntents returns all pending compaction intents.
+func (c *SQLiteCatalog) FindCompactionIntents(ctx context.Context) ([]*CompactionIntent, error) {
+	rows, err := c.readDB.QueryContext(ctx,
+		"SELECT target_partition_id, source_partition_ids, target_object_path, target_meta_path, created_at FROM compaction_intents")
+	if err != nil {
+		return nil, fmt.Errorf("manifest: failed to query compaction intents: %w", err)
+	}
+	defer rows.Close()
+
+	var intents []*CompactionIntent
+	for rows.Next() {
+		var intent CompactionIntent
+		var sourceIDsJSON string
+		var createdAtUnix int64
+		if err := rows.Scan(&intent.TargetPartitionID, &sourceIDsJSON, &intent.TargetObjectPath, &intent.TargetMetaPath, &createdAtUnix); err != nil {
+			return nil, fmt.Errorf("manifest: failed to scan compaction intent: %w", err)
+		}
+		if err := json.Unmarshal([]byte(sourceIDsJSON), &intent.SourcePartitionIDs); err != nil {
+			return nil, fmt.Errorf("manifest: failed to unmarshal source IDs: %w", err)
+		}
+		intent.CreatedAt = time.Unix(createdAtUnix, 0)
+		intents = append(intents, &intent)
+	}
+	return intents, rows.Err()
+}
+
+// DeleteCompactionIntent removes a compaction intent record.
+func (c *SQLiteCatalog) DeleteCompactionIntent(ctx context.Context, targetPartitionID string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	_, err := c.db.ExecContext(ctx,
+		"DELETE FROM compaction_intents WHERE target_partition_id = ?", targetPartitionID)
+	if err != nil {
+		return fmt.Errorf("manifest: failed to delete compaction intent: %w", err)
+	}
+	return nil
 }

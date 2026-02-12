@@ -63,7 +63,7 @@ func (s *StatsTracker) Update(row types.Row) {
 
 // GetMinMaxStats returns the computed min/max statistics.
 func (s *StatsTracker) GetMinMaxStats() map[string]MinMax {
-	stats := make(map[string]MinMax)
+	stats := make(map[string]MinMax, 3)
 
 	if s.minUserID != nil && s.maxUserID != nil {
 		stats["user_id"] = MinMax{Min: *s.minUserID, Max: *s.maxUserID}
@@ -78,6 +78,17 @@ func (s *StatsTracker) GetMinMaxStats() map[string]MinMax {
 	}
 
 	return stats
+}
+
+// Reset resets the tracker for reuse, avoiding a new allocation.
+func (s *StatsTracker) Reset() {
+	s.rowCount = 0
+	s.minUserID = nil
+	s.maxUserID = nil
+	s.minEventTime = nil
+	s.maxEventTime = nil
+	s.minTenantID = nil
+	s.maxTenantID = nil
 }
 
 // RowCount returns the number of rows tracked.

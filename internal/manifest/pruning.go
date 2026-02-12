@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 )
 
 // Pruner provides partition pruning functionality using min/max statistics.
@@ -183,6 +184,12 @@ func (p *Pruner) PruneComplex(ctx context.Context, cond PruneCondition) ([]*Part
 
 	// Add time range condition
 	if cond.TimeRange != nil {
+		// Add partition key prefix pruning for time-based partition keys
+		minKey, maxKey := timeRangeToPartitionKeys(cond.TimeRange.Min, cond.TimeRange.Max)
+		if cond.PartitionKey == nil {
+			conditions = append(conditions, "partition_key BETWEEN ? AND ?")
+			args = append(args, minKey, maxKey)
+		}
 		conditions = append(conditions, "(min_event_time IS NULL OR min_event_time <= ?)")
 		args = append(args, cond.TimeRange.Max)
 		conditions = append(conditions, "(max_event_time IS NULL OR max_event_time >= ?)")
@@ -287,4 +294,11 @@ func (OverlapCheck) PointInRange(point, min, max int64) bool {
 // StringPointInRange checks if a string point is within a range.
 func (OverlapCheck) StringPointInRange(point, min, max string) bool {
 	return point >= min && point <= max
+}
+
+// timeRangeToPartitionKeys derives YYYYMMDD partition key bounds from unix epoch timestamps.
+func timeRangeToPartitionKeys(minTime, maxTime int64) (string, string) {
+	minDate := time.Unix(minTime, 0).UTC().Format("20060102")
+	maxDate := time.Unix(maxTime, 0).UTC().Format("20060102")
+	return minDate, maxDate
 }

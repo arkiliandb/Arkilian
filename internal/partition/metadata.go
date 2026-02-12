@@ -42,14 +42,46 @@ type BloomFilterMeta struct {
 
 // MetadataGenerator generates metadata sidecars for partitions.
 type MetadataGenerator struct {
-	targetFPR float64 // Target false positive rate for bloom filters
+	// columnFPR holds per-column false positive rate targets.
+	// Columns not in this map use defaultFPR.
+	columnFPR  map[string]float64
+	defaultFPR float64
 }
 
-// NewMetadataGenerator creates a new metadata generator.
+// NewMetadataGenerator creates a new metadata generator with optimized FPR defaults:
+// - tenant_id: 0.1% (low cardinality per partition, high pruning value)
+// - user_id: 1% (high cardinality)
 func NewMetadataGenerator() *MetadataGenerator {
 	return &MetadataGenerator{
-		targetFPR: 0.01, // 1% false positive rate as per requirements
+		defaultFPR: 0.01,
+		columnFPR: map[string]float64{
+			"tenant_id": 0.001, // 0.1% — 10× fewer false positives for tenant pruning
+			"user_id":   0.01,  // 1%
+		},
 	}
+}
+
+// NewMetadataGeneratorWithFPR creates a metadata generator with custom per-column FPR targets.
+func NewMetadataGeneratorWithFPR(defaultFPR float64, columnFPR map[string]float64) *MetadataGenerator {
+	if defaultFPR <= 0 || defaultFPR >= 1 {
+		defaultFPR = 0.01
+	}
+	m := &MetadataGenerator{
+		defaultFPR: defaultFPR,
+		columnFPR:  make(map[string]float64, len(columnFPR)),
+	}
+	for k, v := range columnFPR {
+		m.columnFPR[k] = v
+	}
+	return m
+}
+
+// fprForColumn returns the target FPR for a given column.
+func (g *MetadataGenerator) fprForColumn(column string) float64 {
+	if fpr, ok := g.columnFPR[column]; ok {
+		return fpr
+	}
+	return g.defaultFPR
 }
 
 // Generate creates a metadata sidecar for the given partition info and rows.
@@ -113,31 +145,44 @@ func (g *MetadataGenerator) Generate(info *PartitionInfo, rows []types.Row) (*Me
 
 
 // buildBloomFilters creates bloom filters for tenant_id and user_id columns.
+// Uses a single pass over rows and reuses a byte buffer for int64 conversion.
+// Each column uses its own FPR target from the generator configuration.
 func (g *MetadataGenerator) buildBloomFilters(rows []types.Row) (map[string]*BloomFilterMeta, error) {
 	if len(rows) == 0 {
 		return nil, nil
 	}
 
-	filters := make(map[string]*BloomFilterMeta)
+	filters := make(map[string]*BloomFilterMeta, 2)
 
-	// Build bloom filter for tenant_id
-	tenantFilter := bloom.NewWithEstimates(len(rows), g.targetFPR)
-	for _, row := range rows {
-		tenantFilter.Add([]byte(row.TenantID))
+	// Build both bloom filters in a single pass over rows, each with its own FPR
+	tenantFilter := bloom.NewWithEstimates(len(rows), g.fprForColumn("tenant_id"))
+	userFilter := bloom.NewWithEstimates(len(rows), g.fprForColumn("user_id"))
+
+	// Reuse a single byte buffer for int64→bytes conversion
+	var userIDBuf [8]byte
+
+	for i := range rows {
+		tenantFilter.Add([]byte(rows[i].TenantID))
+
+		// Convert user_id to bytes using stack-allocated buffer
+		v := rows[i].UserID
+		userIDBuf[0] = byte(v >> 56)
+		userIDBuf[1] = byte(v >> 48)
+		userIDBuf[2] = byte(v >> 40)
+		userIDBuf[3] = byte(v >> 32)
+		userIDBuf[4] = byte(v >> 24)
+		userIDBuf[5] = byte(v >> 16)
+		userIDBuf[6] = byte(v >> 8)
+		userIDBuf[7] = byte(v)
+		userFilter.Add(userIDBuf[:])
 	}
+
 	tenantMeta, err := g.serializeBloomFilter(tenantFilter)
 	if err != nil {
 		return nil, fmt.Errorf("failed to serialize tenant_id bloom filter: %w", err)
 	}
 	filters["tenant_id"] = tenantMeta
 
-	// Build bloom filter for user_id
-	userFilter := bloom.NewWithEstimates(len(rows), g.targetFPR)
-	for _, row := range rows {
-		// Convert user_id to bytes for bloom filter
-		userIDBytes := int64ToBytes(row.UserID)
-		userFilter.Add(userIDBytes)
-	}
 	userMeta, err := g.serializeBloomFilter(userFilter)
 	if err != nil {
 		return nil, fmt.Errorf("failed to serialize user_id bloom filter: %w", err)
@@ -160,20 +205,6 @@ func (g *MetadataGenerator) serializeBloomFilter(filter *bloom.BloomFilter) (*Bl
 		NumHashes:  filter.NumHashes(),
 		Base64Data: base64Data,
 	}, nil
-}
-
-// int64ToBytes converts an int64 to a byte slice (big-endian).
-func int64ToBytes(v int64) []byte {
-	b := make([]byte, 8)
-	b[0] = byte(v >> 56)
-	b[1] = byte(v >> 48)
-	b[2] = byte(v >> 40)
-	b[3] = byte(v >> 32)
-	b[4] = byte(v >> 24)
-	b[5] = byte(v >> 16)
-	b[6] = byte(v >> 8)
-	b[7] = byte(v)
-	return b
 }
 
 // WriteToFile writes the metadata sidecar to a JSON file.

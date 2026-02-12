@@ -53,6 +53,12 @@ var CreatePartitionsIndexesSQL = []string{
 
 	// Index for TTL-based garbage collection
 	`CREATE INDEX IF NOT EXISTS idx_partitions_created ON partitions(created_at)`,
+
+	// Composite covering index for the most common prune query pattern (time + user range)
+	`CREATE INDEX IF NOT EXISTS idx_partitions_prune ON partitions(compacted_into, min_event_time, max_event_time, min_user_id, max_user_id)`,
+
+	// Composite covering index for tenant-based pruning
+	`CREATE INDEX IF NOT EXISTS idx_partitions_tenant_prune ON partitions(compacted_into, min_tenant_id, max_tenant_id)`,
 }
 
 // CreateSchemaVersionsTableSQL creates the schema versions table.
@@ -74,9 +80,24 @@ CREATE TABLE IF NOT EXISTS idempotency_keys (
     FOREIGN KEY (partition_id) REFERENCES partitions(partition_id)
 )`
 
+// CreateCompactionIntentsTableSQL creates the compaction intents table.
+// This table tracks in-progress compaction operations for crash recovery.
+// Phase 1 writes an intent; Phase 2 completes the compaction and deletes the intent.
+const CreateCompactionIntentsTableSQL = `
+CREATE TABLE IF NOT EXISTS compaction_intents (
+    target_partition_id TEXT PRIMARY KEY,
+    source_partition_ids TEXT NOT NULL,
+    target_object_path TEXT NOT NULL,
+    target_meta_path TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+)`
+
 // CreateIdempotencyKeysIndexSQL creates an index for TTL-based cleanup of idempotency keys.
 const CreateIdempotencyKeysIndexSQL = `
 CREATE INDEX IF NOT EXISTS idx_idempotency_created ON idempotency_keys(created_at)`
+
+// AnalyzeSQL runs ANALYZE to keep the SQLite query planner informed about index statistics.
+const AnalyzeSQL = `ANALYZE`
 
 // AllSchemaSQL returns all SQL statements needed to initialize the manifest catalog.
 func AllSchemaSQL() []string {
@@ -85,6 +106,7 @@ func AllSchemaSQL() []string {
 		CreateSchemaVersionsTableSQL,
 		CreateIdempotencyKeysTableSQL,
 		CreateIdempotencyKeysIndexSQL,
+		CreateCompactionIntentsTableSQL,
 	}
 	statements = append(statements, CreatePartitionsIndexesSQL...)
 	return statements

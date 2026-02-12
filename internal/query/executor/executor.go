@@ -10,11 +10,20 @@ import (
 	"time"
 
 	"github.com/arkilian/arkilian/internal/manifest"
+	"github.com/arkilian/arkilian/internal/query/aggregator"
 	"github.com/arkilian/arkilian/internal/query/parser"
 	"github.com/arkilian/arkilian/internal/query/planner"
 	"github.com/arkilian/arkilian/internal/storage"
 	"github.com/golang/snappy"
 )
+
+// snappyDecodeBufPool provides reusable destination buffers for Snappy decoding.
+var snappyDecodeBufPool = sync.Pool{
+	New: func() interface{} {
+		b := make([]byte, 0, 4096)
+		return &b
+	},
+}
 
 // QueryExecutor executes queries across partitions in parallel.
 type QueryExecutor interface {
@@ -58,12 +67,14 @@ type PartialResult struct {
 
 // ParallelExecutor implements QueryExecutor with parallel partition execution.
 type ParallelExecutor struct {
-	planner     *planner.Planner
-	storage     storage.ObjectStorage
-	pool        *ConnectionPool
-	downloadDir string
-	concurrency int
-	mu          sync.Mutex
+	planner        *planner.Planner
+	storage        storage.ObjectStorage
+	pool           *ConnectionPool
+	downloadDir    string
+	concurrency    int
+	downloadCache  *DownloadCache
+	maxMemoryBytes int64
+	mu             sync.Mutex
 }
 
 // ExecutorConfig holds configuration for the executor.
@@ -76,17 +87,28 @@ type ExecutorConfig struct {
 
 	// PoolConfig is the connection pool configuration
 	PoolConfig PoolConfig
+
+	// MaxCacheBytes is the maximum total size of cached partition files (default: 10GB).
+	// Set to 0 to disable caching.
+	MaxCacheBytes int64
+
+	// MaxMemoryBytes is the maximum memory for result collection before spilling to disk (default: 256MB).
+	MaxMemoryBytes int64
 }
 
 // DefaultExecutorConfig returns the default executor configuration.
+// DefaultExecutorConfig returns the default executor configuration.
 func DefaultExecutorConfig() ExecutorConfig {
 	return ExecutorConfig{
-		Concurrency: 10,
-		DownloadDir: filepath.Join(os.TempDir(), "arkilian-partitions"),
-		PoolConfig:  DefaultPoolConfig(),
+		Concurrency:    10,
+		DownloadDir:    filepath.Join(os.TempDir(), "arkilian-partitions"),
+		PoolConfig:     DefaultPoolConfig(),
+		MaxCacheBytes:  10 * 1024 * 1024 * 1024, // 10 GB
+		MaxMemoryBytes: 256 * 1024 * 1024,        // 256 MB
 	}
 }
 
+// NewParallelExecutor creates a new parallel query executor.
 // NewParallelExecutor creates a new parallel query executor.
 func NewParallelExecutor(
 	planner *planner.Planner,
@@ -96,18 +118,28 @@ func NewParallelExecutor(
 	if config.Concurrency <= 0 {
 		config.Concurrency = 10
 	}
+	if config.MaxMemoryBytes <= 0 {
+		config.MaxMemoryBytes = 256 * 1024 * 1024
+	}
 
 	// Create download directory
 	if err := os.MkdirAll(config.DownloadDir, 0755); err != nil {
 		return nil, fmt.Errorf("executor: failed to create download directory: %w", err)
 	}
 
+	var cache *DownloadCache
+	if config.MaxCacheBytes > 0 {
+		cache = NewDownloadCache(config.MaxCacheBytes)
+	}
+
 	return &ParallelExecutor{
-		planner:     planner,
-		storage:     storage,
-		pool:        NewConnectionPool(config.PoolConfig),
-		downloadDir: config.DownloadDir,
-		concurrency: config.Concurrency,
+		planner:        planner,
+		storage:        storage,
+		pool:           NewConnectionPool(config.PoolConfig),
+		downloadDir:    config.DownloadDir,
+		concurrency:    config.Concurrency,
+		downloadCache:  cache,
+		maxMemoryBytes: config.MaxMemoryBytes,
 	}, nil
 }
 
@@ -130,12 +162,19 @@ func (e *ParallelExecutor) Execute(ctx context.Context, stmt *parser.SelectState
 	return result, nil
 }
 
-// ExecutePlan executes a pre-planned query.
+// streamedRow carries a single row plus its column names from a partition goroutine.
+type streamedRow struct {
+	Columns []string
+	Row     []interface{}
+}
+
+// ExecutePlan executes a pre-planned query using streaming row iteration.
+// Partition goroutines send rows to a shared channel instead of collecting into slices,
+// and the merger consumes from the channel with early LIMIT termination.
 func (e *ParallelExecutor) ExecutePlan(ctx context.Context, plan *planner.QueryPlan) (*QueryResult, error) {
 	startTime := time.Now()
 
 	if len(plan.Partitions) == 0 {
-		// No partitions to scan, return empty result
 		columns := e.extractColumnNames(plan.Statement)
 		return &QueryResult{
 			Columns: columns,
@@ -147,155 +186,201 @@ func (e *ParallelExecutor) ExecutePlan(ctx context.Context, plan *planner.QueryP
 		}, nil
 	}
 
-	// Execute queries in parallel across partitions
-	partialResults := e.executeParallel(ctx, plan)
+	// Create a channel for streaming rows from partition goroutines.
+	rowChan := make(chan streamedRow, e.concurrency*64)
+	// done channel signals early termination (e.g. LIMIT reached).
+	done := make(chan struct{})
 
-	// Collect results
-	var allRows [][]interface{}
-	var columns []string
-	var totalRowsScanned int64
-	var downloadTimeMs, queryTimeMs int64
-
-	for _, pr := range partialResults {
-		if pr.Error != nil {
-			// Log error but continue with other partitions
-			continue
-		}
-		if columns == nil && len(pr.Columns) > 0 {
-			columns = pr.Columns
-		}
-		allRows = append(allRows, pr.Rows...)
-		totalRowsScanned += pr.RowCount
-	}
-
-	// If no columns were found, extract from statement
-	if columns == nil {
-		columns = e.extractColumnNames(plan.Statement)
-	}
-
-	// Apply LIMIT if specified
-	if plan.Statement.Limit != nil {
-		limit := int(*plan.Statement.Limit)
-		if len(allRows) > limit {
-			allRows = allRows[:limit]
-		}
-	}
-
-	return &QueryResult{
-		Columns: columns,
-		Rows:    allRows,
-		Stats: ExecutionStats{
-			PartitionsScanned: len(plan.Partitions),
-			PartitionsPruned:  plan.PruningStats.PrunedCount,
-			RowsScanned:       totalRowsScanned,
-			ExecutionTimeMs:   time.Since(startTime).Milliseconds(),
-			DownloadTimeMs:    downloadTimeMs,
-			QueryTimeMs:       queryTimeMs,
-		},
-	}, nil
-}
-
-// executeParallel executes queries across partitions in parallel.
-func (e *ParallelExecutor) executeParallel(ctx context.Context, plan *planner.QueryPlan) []*PartialResult {
-	results := make([]*PartialResult, len(plan.Partitions))
-
-	// Create a semaphore to limit concurrency
-	sem := make(chan struct{}, e.concurrency)
+	// Launch partition goroutines that stream rows into the channel.
 	var wg sync.WaitGroup
+	sem := make(chan struct{}, e.concurrency)
+	var totalRowsScanned int64
+	var rowCountMu sync.Mutex
 
-	for i, partition := range plan.Partitions {
+	for _, partition := range plan.Partitions {
 		wg.Add(1)
-		go func(idx int, part *manifest.PartitionRecord) {
+		go func(part *manifest.PartitionRecord) {
 			defer wg.Done()
 
-			// Acquire semaphore
 			select {
 			case sem <- struct{}{}:
 				defer func() { <-sem }()
 			case <-ctx.Done():
-				results[idx] = &PartialResult{
-					PartitionID: part.PartitionID,
-					Error:       ctx.Err(),
-				}
+				return
+			case <-done:
 				return
 			}
 
-			// Execute query on this partition
-			result := e.executeOnPartition(ctx, plan, part)
-			results[idx] = result
-		}(i, partition)
+			count := e.streamPartitionRows(ctx, plan, part, rowChan, done)
+			rowCountMu.Lock()
+			totalRowsScanned += count
+			rowCountMu.Unlock()
+		}(partition)
 	}
 
-	wg.Wait()
-	return results
+	// Close rowChan once all goroutines finish.
+	go func() {
+		wg.Wait()
+		close(rowChan)
+	}()
+
+	// Consume rows from the channel with memory-bounded collection.
+	collector := NewStreamingCollector(
+		e.extractColumnNames(plan.Statement),
+		plan.Statement.OrderBy,
+		plan.Statement.Limit,
+		plan.Statement.Offset,
+		e.maxMemoryBytes,
+	)
+
+	result, err := collector.CollectFromChannel(rowChan, done)
+	if err != nil {
+		return nil, fmt.Errorf("executor: merge failed: %w", err)
+	}
+
+	rowCountMu.Lock()
+	scanned := totalRowsScanned
+	rowCountMu.Unlock()
+
+	result.Stats = ExecutionStats{
+		PartitionsScanned: len(plan.Partitions),
+		PartitionsPruned:  plan.PruningStats.PrunedCount,
+		RowsScanned:       scanned,
+		ExecutionTimeMs:   time.Since(startTime).Milliseconds(),
+	}
+
+	return result, nil
 }
 
-// executeOnPartition executes a query on a single partition.
-func (e *ParallelExecutor) executeOnPartition(
+// streamPartitionRows downloads a partition, executes the query, and streams
+// each row into rowChan. For aggregate queries without GROUP BY, partial
+// aggregates are computed inline during the scan without materializing rows,
+// and only the final aggregate row is sent. Returns the number of rows scanned.
+func (e *ParallelExecutor) streamPartitionRows(
 	ctx context.Context,
 	plan *planner.QueryPlan,
 	partition *manifest.PartitionRecord,
-) *PartialResult {
-	result := &PartialResult{
-		PartitionID: partition.PartitionID,
-	}
-
-	// Download partition if needed
+	rowChan chan<- streamedRow,
+	done <-chan struct{},
+) int64 {
 	localPath, err := e.ensurePartitionDownloaded(ctx, partition)
 	if err != nil {
-		result.Error = fmt.Errorf("failed to download partition: %w", err)
-		return result
+		return 0
 	}
 
-	// Get connection from pool
 	db, err := e.pool.Get(ctx, localPath)
 	if err != nil {
-		result.Error = fmt.Errorf("failed to get connection: %w", err)
-		return result
+		return 0
 	}
 	defer e.pool.Release(localPath)
 
-	// Build and execute SQL query
 	sqlQuery := e.buildPartitionQuery(plan.Statement)
 	rows, err := db.QueryContext(ctx, sqlQuery)
 	if err != nil {
-		result.Error = fmt.Errorf("failed to execute query: %w", err)
-		return result
+		return 0
 	}
 	defer rows.Close()
 
-	// Get column names
 	columns, err := rows.Columns()
 	if err != nil {
-		result.Error = fmt.Errorf("failed to get columns: %w", err)
-		return result
+		return 0
 	}
-	result.Columns = columns
 
-	// Scan rows
+	// Detect if this is a simple aggregate query (aggregates without GROUP BY).
+	// If so, compute partial aggregates inline without materializing rows.
+	aggExprs := aggregator.ExtractAggregateExprs(plan.Statement)
+	isInlineAggregate := len(aggExprs) > 0 && len(plan.Statement.GroupBy) == 0
+
+	var aggSet *aggregator.PartialAggregateSet
+	var aggColIndices []int
+	if isInlineAggregate {
+		aggColIndices = aggregator.ResolveAggregateColumnIndices(aggExprs, columns)
+		aggSet = aggregator.NewPartialAggregateSet(aggExprs)
+	}
+
+	values := make([]interface{}, len(columns))
+	valuePtrs := make([]interface{}, len(columns))
+	for i := range values {
+		valuePtrs[i] = &values[i]
+	}
+
+	decodeBufPtr := snappyDecodeBufPool.Get().(*[]byte)
+	defer snappyDecodeBufPool.Put(decodeBufPtr)
+	decodeBuf := *decodeBufPtr
+
+	var count int64
 	for rows.Next() {
-		values := make([]interface{}, len(columns))
-		valuePtrs := make([]interface{}, len(columns))
-		for i := range values {
-			valuePtrs[i] = &values[i]
-		}
-
 		if err := rows.Scan(valuePtrs...); err != nil {
-			result.Error = fmt.Errorf("failed to scan row: %w", err)
-			return result
+			return count
 		}
 
-		// Process values (decompress payload if needed)
-		processedValues := e.processRowValues(columns, values)
-		result.Rows = append(result.Rows, processedValues)
-		result.RowCount++
+		processed := make([]interface{}, len(values))
+		for i, col := range columns {
+			val := values[i]
+			if col == "payload" {
+				if compressed, ok := val.([]byte); ok && len(compressed) > 0 {
+					var decErr error
+					decodeBuf, decErr = snappy.Decode(decodeBuf[:cap(decodeBuf)], compressed)
+					if decErr == nil {
+						var payload map[string]interface{}
+						if json.Unmarshal(decodeBuf, &payload) == nil {
+							val = payload
+						}
+					}
+				}
+			}
+			processed[i] = val
+		}
+
+		count++
+
+		if isInlineAggregate {
+			// Accumulate into partial aggregates without materializing the row.
+			for i, agg := range aggSet.Aggregates {
+				idx := aggColIndices[i]
+				if idx < 0 {
+					agg.Accumulate(int64(1)) // COUNT(*)
+				} else if idx < len(processed) {
+					agg.Accumulate(processed[idx])
+				}
+			}
+		} else {
+			// Stream the row to the collector.
+			select {
+			case rowChan <- streamedRow{Columns: columns, Row: processed}:
+			case <-done:
+				return count
+			case <-ctx.Done():
+				return count
+			}
+		}
+
+		for i := range values {
+			values[i] = nil
+		}
 	}
 
-	if err := rows.Err(); err != nil {
-		result.Error = fmt.Errorf("error iterating rows: %w", err)
+	// For inline aggregates, send the single result row.
+	if isInlineAggregate && aggSet != nil {
+		resultRow := aggSet.Results()
+		// Build column names from aggregate expressions.
+		aggColumns := make([]string, len(aggExprs))
+		for i, expr := range aggExprs {
+			col := plan.Statement.Columns[i]
+			if col.Alias != "" {
+				aggColumns[i] = col.Alias
+			} else {
+				aggColumns[i] = expr.String()
+			}
+		}
+		select {
+		case rowChan <- streamedRow{Columns: aggColumns, Row: resultRow}:
+		case <-done:
+		case <-ctx.Done():
+		}
 	}
 
-	return result
+	return count
 }
 
 // ensurePartitionDownloaded downloads a partition if not already present locally.
@@ -303,16 +388,31 @@ func (e *ParallelExecutor) ensurePartitionDownloaded(
 	ctx context.Context,
 	partition *manifest.PartitionRecord,
 ) (string, error) {
+	// Check LRU cache first
+	if e.downloadCache != nil {
+		if cached := e.downloadCache.Get(partition.ObjectPath); cached != "" {
+			return cached, nil
+		}
+	}
+
 	localPath := filepath.Join(e.downloadDir, filepath.Base(partition.ObjectPath))
 
-	// Check if already downloaded
-	if _, err := os.Stat(localPath); err == nil {
+	// Check if already on disk (e.g. from a previous run without cache)
+	if info, err := os.Stat(localPath); err == nil && info.Size() > 0 {
+		if e.downloadCache != nil {
+			e.downloadCache.Put(partition.ObjectPath, localPath)
+		}
 		return localPath, nil
 	}
 
 	// Download from storage
 	if err := e.storage.Download(ctx, partition.ObjectPath, localPath); err != nil {
 		return "", err
+	}
+
+	// Record in cache
+	if e.downloadCache != nil {
+		e.downloadCache.Put(partition.ObjectPath, localPath)
 	}
 
 	return localPath, nil
@@ -365,6 +465,9 @@ func (e *ParallelExecutor) extractColumnNames(stmt *parser.SelectStatement) []st
 
 // Close releases all resources.
 func (e *ParallelExecutor) Close() error {
+	if e.downloadCache != nil {
+		e.downloadCache.Clear()
+	}
 	return e.pool.Close()
 }
 
@@ -513,20 +616,29 @@ func (e *SimpleExecutor) executeOnPath(
 	}
 	result.Columns = columns
 
-	for rows.Next() {
-		values := make([]interface{}, len(columns))
-		valuePtrs := make([]interface{}, len(columns))
-		for i := range values {
-			valuePtrs[i] = &values[i]
-		}
+	// Pre-allocate scan buffers once outside the loop
+	values := make([]interface{}, len(columns))
+	valuePtrs := make([]interface{}, len(columns))
+	for i := range values {
+		valuePtrs[i] = &values[i]
+	}
 
+	for rows.Next() {
 		if err := rows.Scan(valuePtrs...); err != nil {
 			result.Error = err
 			return result
 		}
 
-		result.Rows = append(result.Rows, values)
+		// Copy values for this row (values slice is reused)
+		rowCopy := make([]interface{}, len(values))
+		copy(rowCopy, values)
+		result.Rows = append(result.Rows, rowCopy)
 		result.RowCount++
+
+		// Reset scan targets for next iteration
+		for i := range values {
+			values[i] = nil
+		}
 	}
 
 	if err := rows.Err(); err != nil {

@@ -290,3 +290,58 @@ func TestOverlapCheck(t *testing.T) {
 		t.Error("expected no overlap for [aaa,bbb] and [ccc,ddd]")
 	}
 }
+
+func TestFindPartitions_PartitionKeyPrefixPruning(t *testing.T) {
+	tmpFile, err := os.CreateTemp("", "manifest_test_*.db")
+	if err != nil {
+		t.Fatalf("failed to create temp file: %v", err)
+	}
+	tmpFile.Close()
+	defer os.Remove(tmpFile.Name())
+
+	catalog, err := NewCatalog(tmpFile.Name())
+	if err != nil {
+		t.Fatalf("failed to create catalog: %v", err)
+	}
+	defer catalog.Close()
+
+	ctx := context.Background()
+
+	// Feb 5, 2026 and Feb 6, 2026 timestamps
+	feb5Start := time.Date(2026, 2, 5, 0, 0, 0, 0, time.UTC).Unix()
+	feb5End := time.Date(2026, 2, 5, 23, 59, 59, 0, time.UTC).Unix()
+	feb6Start := time.Date(2026, 2, 6, 0, 0, 0, 0, time.UTC).Unix()
+	feb6End := time.Date(2026, 2, 6, 23, 59, 59, 0, time.UTC).Unix()
+
+	partitions := []*partition.PartitionInfo{
+		{
+			PartitionID: "p-feb5", PartitionKey: "20260205", RowCount: 100, SizeBytes: 1000, SchemaVersion: 1, CreatedAt: time.Now(),
+			MinMaxStats: map[string]partition.MinMax{"event_time": {Min: feb5Start, Max: feb5End}},
+		},
+		{
+			PartitionID: "p-feb6", PartitionKey: "20260206", RowCount: 100, SizeBytes: 1000, SchemaVersion: 1, CreatedAt: time.Now(),
+			MinMaxStats: map[string]partition.MinMax{"event_time": {Min: feb6Start, Max: feb6End}},
+		},
+	}
+
+	for _, p := range partitions {
+		if err := catalog.RegisterPartition(ctx, p, "s3://bucket/"+p.PartitionID+".sqlite"); err != nil {
+			t.Fatalf("failed to register partition %s: %v", p.PartitionID, err)
+		}
+	}
+
+	// Query with event_time BETWEEN that covers only Feb 5 — should only return p-feb5
+	records, err := catalog.FindPartitions(ctx, []Predicate{
+		{Column: "event_time", Operator: "BETWEEN", Values: []interface{}{feb5Start, feb5End}},
+	})
+	if err != nil {
+		t.Fatalf("failed to find partitions: %v", err)
+	}
+
+	if len(records) != 1 {
+		t.Errorf("expected 1 partition, got %d", len(records))
+	}
+	if len(records) > 0 && records[0].PartitionID != "p-feb5" {
+		t.Errorf("expected p-feb5, got %s", records[0].PartitionID)
+	}
+}

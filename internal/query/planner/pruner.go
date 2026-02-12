@@ -1,6 +1,7 @@
 package planner
 
 import (
+	"container/list"
 	"context"
 	"encoding/binary"
 	"fmt"
@@ -40,22 +41,127 @@ type Pruner struct {
 	catalog *manifest.SQLiteCatalog
 	storage storage.ObjectStorage
 
-	// bloomCache caches loaded bloom filters by partition ID and column.
-	bloomCache   map[string]map[string]*bloom.BloomFilter
+	// bloomCache is an LRU cache for deserialized bloom filters keyed by "partitionID:column".
+	bloomLRU     *bloomLRUCache
 	bloomCacheMu sync.RWMutex
+
+	// Legacy map-based bloom cache (kept for backward compat with LoadBloomFiltersFromMetadata)
+	bloomCache map[string]map[string]*bloom.BloomFilter
 
 	// metadataCache caches loaded metadata sidecars by partition ID.
 	metadataCache   map[string]*partition.MetadataSidecar
 	metadataCacheMu sync.RWMutex
+
+	// PrefetchConcurrency controls how many metadata sidecars are downloaded
+	// in parallel during phase 2 pruning. Default: 8.
+	PrefetchConcurrency int
 }
 
-// NewPruner creates a new 2-phase pruner.
+// bloomLRUCache is a memory-aware LRU cache for bloom filters.
+// It tracks per-filter memory size (numBits/8 bytes) and evicts LRU entries
+// when the total cached memory exceeds the configured limit.
+type bloomLRUCache struct {
+	maxMemoryBytes int64 // max total memory for cached filters (default: 1GB)
+	currentBytes   int64 // current total memory usage
+	items          map[string]*list.Element
+	order          *list.List
+}
+
+type bloomLRUEntry struct {
+	key       string // "partitionID:column"
+	filter    *bloom.BloomFilter
+	sizeBytes int64 // memory footprint of this filter: numBits / 8
+}
+
+// filterMemorySize returns the approximate in-memory size of a bloom filter in bytes.
+func filterMemorySize(f *bloom.BloomFilter) int64 {
+	return int64(f.NumBits()) / 8
+}
+
+func newBloomLRUCache(maxMemoryBytes int64) *bloomLRUCache {
+	if maxMemoryBytes <= 0 {
+		maxMemoryBytes = 1 << 30 // default: 1GB
+	}
+	return &bloomLRUCache{
+		maxMemoryBytes: maxMemoryBytes,
+		items:          make(map[string]*list.Element),
+		order:          list.New(),
+	}
+}
+
+func (c *bloomLRUCache) get(key string) (*bloom.BloomFilter, bool) {
+	elem, ok := c.items[key]
+	if !ok {
+		return nil, false
+	}
+	c.order.MoveToFront(elem)
+	return elem.Value.(*bloomLRUEntry).filter, true
+}
+
+func (c *bloomLRUCache) put(key string, filter *bloom.BloomFilter) {
+	size := filterMemorySize(filter)
+
+	if elem, ok := c.items[key]; ok {
+		old := elem.Value.(*bloomLRUEntry)
+		c.currentBytes -= old.sizeBytes
+		old.filter = filter
+		old.sizeBytes = size
+		c.currentBytes += size
+		c.order.MoveToFront(elem)
+		c.evict()
+		return
+	}
+
+	entry := &bloomLRUEntry{key: key, filter: filter, sizeBytes: size}
+	elem := c.order.PushFront(entry)
+	c.items[key] = elem
+	c.currentBytes += size
+
+	c.evict()
+}
+
+// evict removes LRU entries until currentBytes <= maxMemoryBytes.
+func (c *bloomLRUCache) evict() {
+	for c.currentBytes > c.maxMemoryBytes && c.order.Len() > 0 {
+		back := c.order.Back()
+		if back == nil {
+			break
+		}
+		evicted := back.Value.(*bloomLRUEntry)
+		c.currentBytes -= evicted.sizeBytes
+		delete(c.items, evicted.key)
+		c.order.Remove(back)
+	}
+}
+
+func (c *bloomLRUCache) len() int {
+	return len(c.items)
+}
+
+func (c *bloomLRUCache) memoryBytes() int64 {
+	return c.currentBytes
+}
+
+func (c *bloomLRUCache) clear() {
+	c.items = make(map[string]*list.Element)
+	c.order.Init()
+	c.currentBytes = 0
+}
+
+// NewPruner creates a new 2-phase pruner with a 1GB bloom filter cache.
 func NewPruner(catalog *manifest.SQLiteCatalog, storage storage.ObjectStorage) *Pruner {
+	return NewPrunerWithCacheSize(catalog, storage, 1<<30) // 1GB default
+}
+
+// NewPrunerWithCacheSize creates a new 2-phase pruner with a configurable bloom filter cache size.
+func NewPrunerWithCacheSize(catalog *manifest.SQLiteCatalog, storage storage.ObjectStorage, maxCacheBytes int64) *Pruner {
 	return &Pruner{
-		catalog:       catalog,
-		storage:       storage,
-		bloomCache:    make(map[string]map[string]*bloom.BloomFilter),
-		metadataCache: make(map[string]*partition.MetadataSidecar),
+		catalog:             catalog,
+		storage:             storage,
+		bloomLRU:            newBloomLRUCache(maxCacheBytes),
+		bloomCache:          make(map[string]map[string]*bloom.BloomFilter),
+		metadataCache:       make(map[string]*partition.MetadataSidecar),
+		PrefetchConcurrency: 8,
 	}
 }
 
@@ -116,6 +222,9 @@ func (p *Pruner) phase2Prune(ctx context.Context, candidates []*manifest.Partiti
 		return candidates, nil
 	}
 
+	// Prefetch metadata sidecars in parallel to avoid serial S3 round-trips
+	p.prefetchMetadata(ctx, candidates)
+
 	var result []*manifest.PartitionRecord
 
 	for _, candidate := range candidates {
@@ -133,6 +242,48 @@ func (p *Pruner) phase2Prune(ctx context.Context, candidates []*manifest.Partiti
 	}
 
 	return result, nil
+}
+
+// prefetchMetadata downloads metadata sidecars for candidates in parallel.
+func (p *Pruner) prefetchMetadata(ctx context.Context, candidates []*manifest.PartitionRecord) {
+	// Filter to only candidates not already cached
+	var uncached []*manifest.PartitionRecord
+	p.metadataCacheMu.RLock()
+	for _, c := range candidates {
+		if _, ok := p.metadataCache[c.PartitionID]; !ok {
+			uncached = append(uncached, c)
+		}
+	}
+	p.metadataCacheMu.RUnlock()
+
+	if len(uncached) == 0 {
+		return
+	}
+
+	concurrency := p.PrefetchConcurrency
+	if concurrency <= 0 {
+		concurrency = 8
+	}
+
+	sem := make(chan struct{}, concurrency)
+	var wg sync.WaitGroup
+
+	for _, candidate := range uncached {
+		wg.Add(1)
+		go func(c *manifest.PartitionRecord) {
+			defer wg.Done()
+			select {
+			case sem <- struct{}{}:
+				defer func() { <-sem }()
+			case <-ctx.Done():
+				return
+			}
+			// loadMetadata handles caching internally
+			p.loadMetadata(ctx, c)
+		}(candidate)
+	}
+
+	wg.Wait()
 }
 
 // getBloomFilterPredicates extracts predicates that can use bloom filter pruning.
@@ -233,8 +384,15 @@ func int64ToBytes(v int64) []byte {
 
 // getBloomFilter retrieves a bloom filter for a partition and column.
 func (p *Pruner) getBloomFilter(ctx context.Context, partitionRec *manifest.PartitionRecord, column string) (*bloom.BloomFilter, error) {
-	// Check cache first
+	lruKey := partitionRec.PartitionID + ":" + column
+
+	// Check LRU cache first
 	p.bloomCacheMu.RLock()
+	if filter, ok := p.bloomLRU.get(lruKey); ok {
+		p.bloomCacheMu.RUnlock()
+		return filter, nil
+	}
+	// Also check legacy map cache
 	if filters, ok := p.bloomCache[partitionRec.PartitionID]; ok {
 		if filter, ok := filters[column]; ok {
 			p.bloomCacheMu.RUnlock()
@@ -264,8 +422,9 @@ func (p *Pruner) getBloomFilter(ctx context.Context, partitionRec *manifest.Part
 		return nil, fmt.Errorf("pruner: failed to deserialize bloom filter: %w", err)
 	}
 
-	// Cache the filter
+	// Cache the filter in both LRU and legacy map
 	p.bloomCacheMu.Lock()
+	p.bloomLRU.put(lruKey, filter)
 	if _, ok := p.bloomCache[partitionRec.PartitionID]; !ok {
 		p.bloomCache[partitionRec.PartitionID] = make(map[string]*bloom.BloomFilter)
 	}
@@ -347,6 +506,7 @@ func (p *Pruner) PreloadBloomFilters(ctx context.Context, partitions []*manifest
 func (p *Pruner) ClearCache() {
 	p.bloomCacheMu.Lock()
 	p.bloomCache = make(map[string]map[string]*bloom.BloomFilter)
+	p.bloomLRU.clear()
 	p.bloomCacheMu.Unlock()
 
 	p.metadataCacheMu.Lock()
@@ -358,6 +518,8 @@ func (p *Pruner) ClearCache() {
 type CacheStats struct {
 	PartitionsWithFilters int
 	TotalFilters          int
+	LRUFilters            int
+	LRUMemoryBytes        int64
 	MetadataCached        int
 }
 
@@ -377,6 +539,8 @@ func (p *Pruner) GetCacheStats() CacheStats {
 	return CacheStats{
 		PartitionsWithFilters: len(p.bloomCache),
 		TotalFilters:          totalFilters,
+		LRUFilters:            p.bloomLRU.len(),
+		LRUMemoryBytes:        p.bloomLRU.memoryBytes(),
 		MetadataCached:        len(p.metadataCache),
 	}
 }
