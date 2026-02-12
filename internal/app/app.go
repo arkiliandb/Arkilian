@@ -29,9 +29,10 @@ type App struct {
 	cfg *config.Config
 
 	// Shared resources
-	storage  storage.ObjectStorage
-	catalog  *manifest.SQLiteCatalog
-	shutdown *server.ShutdownManager
+	storage       storage.ObjectStorage
+	catalog       manifest.Catalog        // Used by ingest, compaction, GC (full read/write)
+	catalogReader manifest.CatalogReader   // Used by planner/pruner (read-only)
+	shutdown      *server.ShutdownManager
 
 	// Service components
 	ingestServer  *http.Server
@@ -141,11 +142,23 @@ func (a *App) initSharedResources() error {
 	log.Printf("Storage initialized: type=%s", a.cfg.Storage.Type)
 
 	// Initialize manifest catalog
-	a.catalog, err = manifest.NewCatalog(a.cfg.ManifestPath())
-	if err != nil {
-		return fmt.Errorf("failed to initialize manifest catalog: %w", err)
+	if a.cfg.Manifest.Sharded {
+		sharded, err := manifest.NewShardedCatalog(a.cfg.ManifestDir(), a.cfg.Manifest.ShardCount)
+		if err != nil {
+			return fmt.Errorf("failed to initialize sharded manifest catalog: %w", err)
+		}
+		a.catalog = sharded
+		a.catalogReader = sharded
+		log.Printf("Sharded manifest catalog initialized: %d shards in %s", a.cfg.Manifest.ShardCount, a.cfg.ManifestDir())
+	} else {
+		single, err := manifest.NewCatalog(a.cfg.ManifestPath())
+		if err != nil {
+			return fmt.Errorf("failed to initialize manifest catalog: %w", err)
+		}
+		a.catalog = single
+		a.catalogReader = single
+		log.Printf("Manifest catalog initialized: %s", a.cfg.ManifestPath())
 	}
-	log.Printf("Manifest catalog initialized: %s", a.cfg.ManifestPath())
 
 	// Initialize shutdown manager
 	shutdownConfig := server.DefaultShutdownConfig()
@@ -156,13 +169,34 @@ func (a *App) initSharedResources() error {
 
 // startIngestService starts the ingest HTTP and gRPC servers.
 func (a *App) startIngestService(ctx context.Context) error {
-	// Initialize partition builder
+	// Initialize partition builder with static target size as baseline
 	builder := partition.NewBuilder(a.cfg.Ingest.PartitionDir, a.cfg.Ingest.TargetPartitionSizeMB)
 	metaGen := partition.NewMetadataGenerator()
+
+	// Initialize adaptive sizer for dynamic partition sizing at scale
+	var sizerOpts []partition.AdaptiveSizerOption
+	asCfg := a.cfg.Ingest.AdaptiveSizing
+	if asCfg.Enabled {
+		sizerOpts = append(sizerOpts, partition.WithBoundsMB(asCfg.MinSizeMB, asCfg.MaxSizeMB))
+		for _, tier := range asCfg.Tiers {
+			sizerOpts = append(sizerOpts, partition.WithTierMB(tier.ThresholdGB, tier.TargetSizeMB))
+		}
+	}
+	adaptiveSizer := partition.NewAdaptiveSizer(
+		asCfg.Enabled,
+		a.cfg.Ingest.TargetPartitionSizeMB,
+		&catalogVolumeQuerier{reader: a.catalogReader},
+		sizerOpts...,
+	)
+
+	if asCfg.Enabled {
+		log.Printf("Adaptive partition sizing enabled: min=%dMB, max=%dMB, %d tiers",
+			asCfg.MinSizeMB, asCfg.MaxSizeMB, len(asCfg.Tiers))
+	}
 	log.Printf("Partition builder initialized: %s", a.cfg.Ingest.PartitionDir)
 
 	// Create HTTP handler
-	ingestHandler := httpapi.NewIngestHandler(builder, metaGen, a.catalog, a.storage)
+	ingestHandler := httpapi.NewIngestHandler(builder, metaGen, a.catalog, a.storage, adaptiveSizer)
 
 	// Setup HTTP server with middleware
 	mux := http.NewServeMux()
@@ -227,10 +261,10 @@ func (a *App) startIngestService(ctx context.Context) error {
 // startQueryService starts the query HTTP server.
 func (a *App) startQueryService(ctx context.Context) error {
 	// Initialize pruner with storage for bloom filter loading
-	pruner := planner.NewPruner(a.catalog, a.storage)
+	pruner := planner.NewPruner(a.catalogReader, a.storage)
 
 	// Initialize query planner
-	queryPlanner := planner.NewPlannerWithPruner(a.catalog, pruner)
+	queryPlanner := planner.NewPlannerWithPruner(a.catalogReader, pruner)
 
 	// Initialize query executor
 	execConfig := executor.ExecutorConfig{
@@ -299,12 +333,28 @@ func (a *App) startQueryService(ctx context.Context) error {
 // startCompactService starts the compaction daemon and HTTP server.
 func (a *App) startCompactService(ctx context.Context) error {
 	// Derive compaction min partition size from the ingest target partition size.
-	// Partitions below the target size are candidates for compaction.
+	// When adaptive sizing is enabled, the compaction daemon uses the sizer
+	// to determine per-key thresholds instead of a single global value.
 	minPartitionSize := a.cfg.Compaction.MinPartitionSize
 	targetBytes := int64(a.cfg.Ingest.TargetPartitionSizeMB) * 1024 * 1024
 	if targetBytes > minPartitionSize {
 		minPartitionSize = targetBytes
 	}
+
+	// Build adaptive sizer for compaction (same config as ingest)
+	var compactSizerOpts []partition.AdaptiveSizerOption
+	if asCfg := a.cfg.Ingest.AdaptiveSizing; asCfg.Enabled {
+		compactSizerOpts = append(compactSizerOpts, partition.WithBoundsMB(asCfg.MinSizeMB, asCfg.MaxSizeMB))
+		for _, tier := range asCfg.Tiers {
+			compactSizerOpts = append(compactSizerOpts, partition.WithTierMB(tier.ThresholdGB, tier.TargetSizeMB))
+		}
+	}
+	compactAdaptiveSizer := partition.NewAdaptiveSizer(
+		a.cfg.Ingest.AdaptiveSizing.Enabled,
+		a.cfg.Ingest.TargetPartitionSizeMB,
+		&catalogVolumeQuerier{reader: a.catalogReader},
+		compactSizerOpts...,
+	)
 
 	// Initialize compaction daemon
 	compactConfig := compaction.CompactionConfig{
@@ -314,7 +364,7 @@ func (a *App) startCompactService(ctx context.Context) error {
 		CheckInterval:       a.cfg.Compaction.CheckInterval,
 		WorkDir:             a.cfg.Compaction.WorkDir,
 	}
-	a.compactDaemon = compaction.NewDaemon(compactConfig, a.catalog, a.storage)
+	a.compactDaemon = compaction.NewDaemon(compactConfig, a.catalog, a.storage, compactAdaptiveSizer)
 	log.Printf("Compaction daemon initialized: min_size=%dMB, max_partitions=%d, ttl=%d days",
 		minPartitionSize/(1024*1024),
 		a.cfg.Compaction.MaxPartitionsPerKey,
@@ -499,4 +549,23 @@ func (a *App) triggerHandler() http.HandlerFunc {
 // WaitForShutdown blocks until a shutdown signal is received.
 func (a *App) WaitForShutdown(ctx context.Context) error {
 	return a.shutdown.ListenForSignals(ctx)
+}
+
+// catalogVolumeQuerier adapts manifest.CatalogReader to partition.VolumeQuerier.
+type catalogVolumeQuerier struct {
+	reader manifest.CatalogReader
+}
+
+func (q *catalogVolumeQuerier) TotalVolumeBytes(ctx context.Context, partitionKey string) (int64, error) {
+	partitions, err := q.reader.FindPartitions(ctx, []manifest.Predicate{
+		{Column: "partition_key", Operator: "=", Value: partitionKey},
+	})
+	if err != nil {
+		return 0, err
+	}
+	var total int64
+	for _, p := range partitions {
+		total += p.SizeBytes
+	}
+	return total, nil
 }

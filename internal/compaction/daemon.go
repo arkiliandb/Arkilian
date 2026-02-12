@@ -59,14 +59,14 @@ type Daemon struct {
 }
 
 // NewDaemon creates a new compaction daemon.
-func NewDaemon(config CompactionConfig, catalog manifest.Catalog, store storage.ObjectStorage) *Daemon {
+func NewDaemon(config CompactionConfig, catalog manifest.Catalog, store storage.ObjectStorage, sizer AdaptiveSizer) *Daemon {
 	workDir := filepath.Join(config.WorkDir, "arkilian_compaction")
 
 	return &Daemon{
 		config:    config,
 		catalog:   catalog,
 		storage:   store,
-		finder:    NewCandidateFinder(catalog, config.MinPartitionSize, config.MaxPartitionsPerKey),
+		finder:    NewCandidateFinder(catalog, config.MinPartitionSize, config.MaxPartitionsPerKey, sizer),
 		merger:    NewMerger(store, workDir),
 		validator: NewValidator(),
 		gc:        NewGarbageCollector(catalog, store, time.Duration(config.TTLDays)*24*time.Hour),
@@ -369,7 +369,28 @@ func (d *Daemon) compactGroup(ctx context.Context, group *CandidateGroup) error 
 	log.Printf("compaction: completed for key=%s, merged %d partitions into %s (%d rows)",
 		group.PartitionKey, len(group.Partitions), result.PartitionInfo.PartitionID, result.TotalRows)
 
+	// Rebuild zone maps for the affected partition key (best-effort).
+	// Compaction changes which partitions exist for this key, so the aggregate
+	// bloom filter is stale. Delete it so it gets rebuilt during future ingests.
+	d.rebuildZoneMap(ctx, group.PartitionKey)
+
 	return nil
+}
+
+// rebuildZoneMap invalidates zone maps for a partition key after compaction.
+func (d *Daemon) rebuildZoneMap(ctx context.Context, partitionKey string) {
+	type zoneMapRebuilder interface {
+		RebuildZoneMap(ctx context.Context, partitionKey string) error
+	}
+
+	rebuilder, ok := d.catalog.(zoneMapRebuilder)
+	if !ok {
+		return
+	}
+
+	if err := rebuilder.RebuildZoneMap(ctx, partitionKey); err != nil {
+		log.Printf("compaction: failed to rebuild zone map for key %s: %v", partitionKey, err)
+	}
 }
 
 // TriggerCompaction manually triggers compaction for a specific partition key.

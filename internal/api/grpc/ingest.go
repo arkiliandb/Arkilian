@@ -5,8 +5,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 
 	"github.com/arkilian/arkilian/api/proto"
+	"github.com/arkilian/arkilian/internal/bloom"
 	"github.com/arkilian/arkilian/internal/manifest"
 	"github.com/arkilian/arkilian/internal/partition"
 	"github.com/arkilian/arkilian/internal/storage"
@@ -74,9 +76,13 @@ func (s *IngestServer) BatchIngest(ctx context.Context, req *proto.IngestRequest
 	}
 
 	// Generate metadata sidecar
-	metaPath, err := s.metaGen.GenerateAndWrite(info, rows)
+	sidecar, err := s.metaGen.Generate(info, rows)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to generate metadata: %v", err)
+	}
+	metaPath := partition.GenerateMetadataPath(info.SQLitePath)
+	if err := sidecar.WriteToFile(metaPath); err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to write metadata: %v", err)
 	}
 	info.MetadataPath = metaPath
 
@@ -92,6 +98,9 @@ func (s *IngestServer) BatchIngest(ctx context.Context, req *proto.IngestRequest
 	if err := s.registerPartition(ctx, info, objectPath, req.IdempotencyKey); err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to register partition: %v", err)
 	}
+
+	// Update zone maps with bloom filters from this partition (best-effort)
+	s.updateZoneMaps(ctx, req.PartitionKey, sidecar)
 
 	return &proto.IngestResponse{
 		PartitionId: info.PartitionID,
@@ -121,6 +130,39 @@ func (s *IngestServer) registerPartition(ctx context.Context, info *partition.Pa
 		return err
 	}
 	return s.catalog.RegisterPartition(ctx, info, objectPath)
+}
+
+// updateZoneMaps merges bloom filters from the metadata sidecar into zone maps.
+// This is best-effort — zone map update failures don't fail the ingest request.
+func (s *IngestServer) updateZoneMaps(ctx context.Context, partitionKey string, sidecar *partition.MetadataSidecar) {
+	if sidecar == nil || len(sidecar.BloomFilters) == 0 {
+		return
+	}
+
+	type zoneMapUpdater interface {
+		UpdateZoneMapsFromMetadata(ctx context.Context, partitionKey string, bloomFilters map[string]*bloom.BloomFilter, distinctCounts map[string]int) error
+	}
+
+	updater, ok := s.catalog.(zoneMapUpdater)
+	if !ok {
+		return
+	}
+
+	filters := make(map[string]*bloom.BloomFilter, len(sidecar.BloomFilters))
+	distinctCounts := make(map[string]int, len(sidecar.BloomFilters))
+	for col, meta := range sidecar.BloomFilters {
+		bf, err := bloom.DeserializeFromBase64(meta.Base64Data)
+		if err != nil {
+			log.Printf("grpc ingest: failed to deserialize bloom filter for zone map update (%s): %v", col, err)
+			continue
+		}
+		filters[col] = bf
+		distinctCounts[col] = meta.DistinctCount
+	}
+
+	if err := updater.UpdateZoneMapsFromMetadata(ctx, partitionKey, filters, distinctCounts); err != nil {
+		log.Printf("grpc ingest: failed to update zone maps for key %s: %v", partitionKey, err)
+	}
 }
 
 // convertProtoRows converts proto Row messages to typed Row structs.

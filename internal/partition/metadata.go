@@ -34,10 +34,11 @@ type PartitionStats struct {
 
 // BloomFilterMeta holds bloom filter metadata and data.
 type BloomFilterMeta struct {
-	Algorithm  string `json:"algorithm"`
-	NumBits    int    `json:"num_bits"`
-	NumHashes  int    `json:"num_hashes"`
-	Base64Data string `json:"base64_data"`
+	Algorithm     string `json:"algorithm"`
+	NumBits       int    `json:"num_bits"`
+	NumHashes     int    `json:"num_hashes"`
+	DistinctCount int    `json:"distinct_count,omitempty"` // Number of distinct values in the filter
+	Base64Data    string `json:"base64_data"`
 }
 
 // MetadataGenerator generates metadata sidecars for partitions.
@@ -49,14 +50,16 @@ type MetadataGenerator struct {
 }
 
 // NewMetadataGenerator creates a new metadata generator with optimized FPR defaults:
-// - tenant_id: 0.1% (low cardinality per partition, high pruning value)
-// - user_id: 1% (high cardinality)
+// - tenant_id: 0.001% (low cardinality per partition, highest pruning value)
+// - user_id: 0.01% (high cardinality, point lookups common)
+// - event_type: 0.01% (low cardinality, very common filter predicate)
 func NewMetadataGenerator() *MetadataGenerator {
 	return &MetadataGenerator{
-		defaultFPR: 0.01,
+		defaultFPR: 0.001,
 		columnFPR: map[string]float64{
-			"tenant_id": 0.001, // 0.1% — 10× fewer false positives for tenant pruning
-			"user_id":   0.01,  // 1%
+			"tenant_id":  0.00001, // 0.001% — near-zero false positives for tenant isolation
+			"user_id":    0.0001,  // 0.01% — 100× fewer false positives than before
+			"event_type": 0.0001,  // 0.01% — new: enables pruning on event_type predicates
 		},
 	}
 }
@@ -144,27 +147,41 @@ func (g *MetadataGenerator) Generate(info *PartitionInfo, rows []types.Row) (*Me
 }
 
 
-// buildBloomFilters creates bloom filters for tenant_id and user_id columns.
+// buildBloomFilters creates bloom filters for tenant_id, user_id, and event_type columns.
 // Uses a single pass over rows and reuses a byte buffer for int64 conversion.
 // Each column uses its own FPR target from the generator configuration.
+// Also tracks distinct value counts per column for smarter pruning decisions.
 func (g *MetadataGenerator) buildBloomFilters(rows []types.Row) (map[string]*BloomFilterMeta, error) {
 	if len(rows) == 0 {
 		return nil, nil
 	}
 
-	filters := make(map[string]*BloomFilterMeta, 2)
+	filters := make(map[string]*BloomFilterMeta, 3)
 
-	// Build both bloom filters in a single pass over rows, each with its own FPR
-	tenantFilter := bloom.NewWithEstimates(len(rows), g.fprForColumn("tenant_id"))
-	userFilter := bloom.NewWithEstimates(len(rows), g.fprForColumn("user_id"))
+	// Track distinct values for cardinality estimation
+	distinctTenants := make(map[string]struct{})
+	distinctUsers := make(map[int64]struct{})
+	distinctEventTypes := make(map[string]struct{})
+
+	// First pass: count distinct values for optimal bloom filter sizing
+	for i := range rows {
+		distinctTenants[rows[i].TenantID] = struct{}{}
+		distinctUsers[rows[i].UserID] = struct{}{}
+		distinctEventTypes[rows[i].EventType] = struct{}{}
+	}
+
+	// Size bloom filters based on distinct count (not row count) for tighter filters
+	tenantFilter := bloom.NewWithEstimates(len(distinctTenants), g.fprForColumn("tenant_id"))
+	userFilter := bloom.NewWithEstimates(len(distinctUsers), g.fprForColumn("user_id"))
+	eventTypeFilter := bloom.NewWithEstimates(len(distinctEventTypes), g.fprForColumn("event_type"))
 
 	// Reuse a single byte buffer for int64→bytes conversion
 	var userIDBuf [8]byte
 
+	// Second pass: populate filters
 	for i := range rows {
 		tenantFilter.Add([]byte(rows[i].TenantID))
 
-		// Convert user_id to bytes using stack-allocated buffer
 		v := rows[i].UserID
 		userIDBuf[0] = byte(v >> 56)
 		userIDBuf[1] = byte(v >> 48)
@@ -175,19 +192,30 @@ func (g *MetadataGenerator) buildBloomFilters(rows []types.Row) (map[string]*Blo
 		userIDBuf[6] = byte(v >> 8)
 		userIDBuf[7] = byte(v)
 		userFilter.Add(userIDBuf[:])
+
+		eventTypeFilter.Add([]byte(rows[i].EventType))
 	}
 
 	tenantMeta, err := g.serializeBloomFilter(tenantFilter)
 	if err != nil {
 		return nil, fmt.Errorf("failed to serialize tenant_id bloom filter: %w", err)
 	}
+	tenantMeta.DistinctCount = len(distinctTenants)
 	filters["tenant_id"] = tenantMeta
 
 	userMeta, err := g.serializeBloomFilter(userFilter)
 	if err != nil {
 		return nil, fmt.Errorf("failed to serialize user_id bloom filter: %w", err)
 	}
+	userMeta.DistinctCount = len(distinctUsers)
 	filters["user_id"] = userMeta
+
+	eventTypeMeta, err := g.serializeBloomFilter(eventTypeFilter)
+	if err != nil {
+		return nil, fmt.Errorf("failed to serialize event_type bloom filter: %w", err)
+	}
+	eventTypeMeta.DistinctCount = len(distinctEventTypes)
+	filters["event_type"] = eventTypeMeta
 
 	return filters, nil
 }

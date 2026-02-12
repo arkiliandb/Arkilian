@@ -47,6 +47,19 @@ type Config struct {
 
 	// Storage configuration
 	Storage StorageConfig `json:"storage" yaml:"storage"`
+
+	// Manifest configuration
+	Manifest ManifestConfig `json:"manifest" yaml:"manifest"`
+}
+
+// ManifestConfig holds manifest catalog configuration.
+type ManifestConfig struct {
+	// Sharded enables sharded manifest mode (multiple SQLite files instead of one).
+	// When false (default), a single manifest.db is used for backward compatibility.
+	Sharded bool `json:"sharded" yaml:"sharded"`
+
+	// ShardCount is the number of manifest shards (default: 16). Only used when Sharded=true.
+	ShardCount int `json:"shard_count" yaml:"shard_count"`
 }
 
 // HTTPConfig holds HTTP server configuration.
@@ -84,8 +97,38 @@ type IngestConfig struct {
 	// PartitionDir is the directory for partition output
 	PartitionDir string `json:"partition_dir" yaml:"partition_dir"`
 
-	// TargetPartitionSizeMB is the target partition size in megabytes (8–256, default 16)
+	// TargetPartitionSizeMB is the target partition size in megabytes (8–256, default 16).
+	// When AdaptiveSizing is enabled, this serves as the fallback for new partition keys.
 	TargetPartitionSizeMB int `json:"target_partition_size_mb" yaml:"target_partition_size_mb"`
+
+	// AdaptiveSizing configures automatic partition size scaling based on data volume.
+	// When enabled, partition target sizes grow with the total data stored per key,
+	// reducing S3 object count and LIST costs at scale.
+	AdaptiveSizing AdaptiveSizingConfig `json:"adaptive_sizing" yaml:"adaptive_sizing"`
+}
+
+// AdaptiveSizingConfig controls how partition target sizes scale with data volume.
+type AdaptiveSizingConfig struct {
+	// Enabled turns adaptive sizing on/off. When false, TargetPartitionSizeMB is used.
+	Enabled bool `json:"enabled" yaml:"enabled"`
+
+	// MinSizeMB is the floor for partition size (default: 8).
+	MinSizeMB int `json:"min_size_mb" yaml:"min_size_mb"`
+
+	// MaxSizeMB is the ceiling for partition size (default: 128).
+	MaxSizeMB int `json:"max_size_mb" yaml:"max_size_mb"`
+
+	// Tiers maps cumulative data volume thresholds (in GB) to target partition sizes (in MB).
+	Tiers []SizingTier `json:"tiers" yaml:"tiers"`
+}
+
+// SizingTier maps a cumulative volume threshold to a target partition size.
+type SizingTier struct {
+	// ThresholdGB is the minimum total data volume (in GB) for this tier to apply.
+	ThresholdGB float64 `json:"threshold_gb" yaml:"threshold_gb"`
+
+	// TargetSizeMB is the partition target size when this tier is active.
+	TargetSizeMB int `json:"target_size_mb" yaml:"target_size_mb"`
 }
 
 // QueryConfig holds query service configuration.
@@ -164,24 +207,39 @@ func DefaultConfig() *Config {
 		},
 		Ingest: IngestConfig{
 			PartitionDir:          "",
-			TargetPartitionSizeMB: 16,
+			TargetPartitionSizeMB: 32,
+			AdaptiveSizing: AdaptiveSizingConfig{
+				Enabled:   true,
+				MinSizeMB: 16,
+				MaxSizeMB: 256,
+				Tiers: []SizingTier{
+					{ThresholdGB: 0, TargetSizeMB: 32},
+					{ThresholdGB: 1, TargetSizeMB: 64},
+					{ThresholdGB: 10, TargetSizeMB: 128},
+					{ThresholdGB: 100, TargetSizeMB: 256},
+				},
+			},
 		},
 		Query: QueryConfig{
 			DownloadDir:          "",
-			Concurrency:          10,
-			PoolSize:             100,
-			MaxPreloadPartitions: 1000,
+			Concurrency:          16,
+			PoolSize:             200,
+			MaxPreloadPartitions: 2000,
 		},
 		Compaction: CompactionConfig{
 			WorkDir:             "",
 			CheckInterval:       5 * time.Minute,
-			MinPartitionSize:    8 * 1024 * 1024,
-			MaxPartitionsPerKey: 100,
+			MinPartitionSize:    32 * 1024 * 1024,
+			MaxPartitionsPerKey: 50,
 			TTLDays:             7,
 		},
 		Storage: StorageConfig{
 			Type: "local",
 			Path: "",
+		},
+		Manifest: ManifestConfig{
+			Sharded:    true,
+			ShardCount: 32,
 		},
 	}
 }
@@ -213,9 +271,14 @@ func (c *Config) Resolve() {
 	}
 }
 
-// ManifestPath returns the path to the manifest database.
+// ManifestPath returns the path to the single manifest database (non-sharded mode).
 func (c *Config) ManifestPath() string {
 	return filepath.Join(c.DataDir, "manifest.db")
+}
+
+// ManifestDir returns the directory where manifest shard files are stored.
+func (c *Config) ManifestDir() string {
+	return c.DataDir
 }
 
 // Validate validates the configuration.
@@ -241,6 +304,50 @@ func (c *Config) Validate() error {
 
 	if c.Ingest.TargetPartitionSizeMB < 8 || c.Ingest.TargetPartitionSizeMB > 256 {
 		return fmt.Errorf("ingest.target_partition_size_mb must be between 8 and 256, got %d", c.Ingest.TargetPartitionSizeMB)
+	}
+
+	// Validate adaptive sizing config
+	if err := c.validateAdaptiveSizing(); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// validateAdaptiveSizing checks the adaptive sizing configuration.
+func (c *Config) validateAdaptiveSizing() error {
+	as := c.Ingest.AdaptiveSizing
+	if !as.Enabled {
+		return nil
+	}
+
+	if as.MinSizeMB < 8 {
+		return fmt.Errorf("ingest.adaptive_sizing.min_size_mb must be >= 8, got %d", as.MinSizeMB)
+	}
+	if as.MaxSizeMB > 256 {
+		return fmt.Errorf("ingest.adaptive_sizing.max_size_mb must be <= 256, got %d", as.MaxSizeMB)
+	}
+	if as.MinSizeMB > as.MaxSizeMB {
+		return fmt.Errorf("ingest.adaptive_sizing.min_size_mb (%d) must be <= max_size_mb (%d)", as.MinSizeMB, as.MaxSizeMB)
+	}
+
+	if len(as.Tiers) == 0 {
+		return fmt.Errorf("ingest.adaptive_sizing.tiers must have at least one entry")
+	}
+
+	prevThreshold := -1.0
+	for i, tier := range as.Tiers {
+		if tier.ThresholdGB < 0 {
+			return fmt.Errorf("ingest.adaptive_sizing.tiers[%d].threshold_gb must be >= 0", i)
+		}
+		if tier.ThresholdGB <= prevThreshold && i > 0 {
+			return fmt.Errorf("ingest.adaptive_sizing.tiers must be sorted ascending by threshold_gb")
+		}
+		if tier.TargetSizeMB < as.MinSizeMB || tier.TargetSizeMB > as.MaxSizeMB {
+			return fmt.Errorf("ingest.adaptive_sizing.tiers[%d].target_size_mb (%d) must be between %d and %d",
+				i, tier.TargetSizeMB, as.MinSizeMB, as.MaxSizeMB)
+		}
+		prevThreshold = tier.ThresholdGB
 	}
 
 	return nil
@@ -354,6 +461,25 @@ func LoadFromEnv(cfg *Config) {
 	}
 	if v := os.Getenv("ARKILIAN_S3_ENDPOINT"); v != "" {
 		cfg.Storage.S3.Endpoint = v
+	}
+
+	// Manifest configuration
+	if v := os.Getenv("ARKILIAN_MANIFEST_SHARDED"); v != "" {
+		cfg.Manifest.Sharded = v == "true" || v == "1"
+	}
+	if v := os.Getenv("ARKILIAN_MANIFEST_SHARD_COUNT"); v != "" {
+		fmt.Sscanf(v, "%d", &cfg.Manifest.ShardCount)
+	}
+
+	// Adaptive sizing configuration
+	if v := os.Getenv("ARKILIAN_INGEST_ADAPTIVE_SIZING"); v != "" {
+		cfg.Ingest.AdaptiveSizing.Enabled = v == "true" || v == "1"
+	}
+	if v := os.Getenv("ARKILIAN_INGEST_ADAPTIVE_MIN_SIZE_MB"); v != "" {
+		fmt.Sscanf(v, "%d", &cfg.Ingest.AdaptiveSizing.MinSizeMB)
+	}
+	if v := os.Getenv("ARKILIAN_INGEST_ADAPTIVE_MAX_SIZE_MB"); v != "" {
+		fmt.Sscanf(v, "%d", &cfg.Ingest.AdaptiveSizing.MaxSizeMB)
 	}
 }
 

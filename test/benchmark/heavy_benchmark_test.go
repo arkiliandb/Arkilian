@@ -1869,7 +1869,7 @@ func BenchmarkHeavyCompaction_PartialFailure(b *testing.B) {
 			CheckInterval:       time.Hour, // won't tick during test
 			WorkDir:             iterWorkDir,
 		}
-		daemon := compaction.NewDaemon(compactionCfg, catalog, faultStorage)
+		daemon := compaction.NewDaemon(compactionCfg, catalog, faultStorage, nil)
 
 		// Run one compaction cycle — should fail during upload
 		daemon.RunOnce(ctx)
@@ -2138,7 +2138,7 @@ func BenchmarkHeavyCompaction_SustainedFailure(b *testing.B) {
 			CheckInterval:       time.Hour,
 			WorkDir:             workDir,
 		}
-		daemon := compaction.NewDaemon(compactionCfg, catalog, faultStorage)
+		daemon := compaction.NewDaemon(compactionCfg, catalog, faultStorage, nil)
 
 		var successfulCompactions int
 		var failedCycles int
@@ -2199,7 +2199,7 @@ func BenchmarkHeavyCompaction_SustainedFailure(b *testing.B) {
 
 		// Phase 2: Run recovery cycles with no failures to measure recovery
 		recoveryStorage := newProbabilisticFaultStorage(realStorage, 0.0, int64(iter+1000))
-		recoveryDaemon := compaction.NewDaemon(compactionCfg, catalog, recoveryStorage)
+		recoveryDaemon := compaction.NewDaemon(compactionCfg, catalog, recoveryStorage, nil)
 
 		recoveryCycles := 0
 		for recoveryCycles < 50 {

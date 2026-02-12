@@ -61,7 +61,7 @@ func main() {
 		CheckInterval:       cfg.CheckInterval,
 		WorkDir:             cfg.WorkDir,
 	}
-	daemon := compaction.NewDaemon(compactConfig, catalog, store)
+	daemon := compaction.NewDaemon(compactConfig, catalog, store, nil)
 	log.Printf("Compaction daemon initialized with min_size=%dMB, max_partitions=%d, ttl=%d days",
 		cfg.MinPartitionSize/(1024*1024), cfg.MaxPartitionsPerKey, cfg.TTLDays)
 

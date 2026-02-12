@@ -92,6 +92,23 @@ CREATE TABLE IF NOT EXISTS compaction_intents (
     created_at INTEGER NOT NULL
 )`
 
+// CreateZoneMapsTableSQL creates the zone maps table.
+// Zone maps store per-partition-key aggregate bloom filters in the manifest itself,
+// enabling bloom filter pruning without S3 GETs for metadata sidecars.
+// Each row holds a merged bloom filter for all active partitions sharing a partition_key.
+const CreateZoneMapsTableSQL = `
+CREATE TABLE IF NOT EXISTS zone_maps (
+    partition_key TEXT NOT NULL,
+    column_name TEXT NOT NULL,
+    bloom_data BLOB NOT NULL,
+    num_bits INTEGER NOT NULL,
+    num_hashes INTEGER NOT NULL,
+    item_count INTEGER NOT NULL,
+    distinct_count INTEGER NOT NULL DEFAULT 0,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (partition_key, column_name)
+)`
+
 // CreateIdempotencyKeysIndexSQL creates an index for TTL-based cleanup of idempotency keys.
 const CreateIdempotencyKeysIndexSQL = `
 CREATE INDEX IF NOT EXISTS idx_idempotency_created ON idempotency_keys(created_at)`
@@ -107,6 +124,7 @@ func AllSchemaSQL() []string {
 		CreateIdempotencyKeysTableSQL,
 		CreateIdempotencyKeysIndexSQL,
 		CreateCompactionIntentsTableSQL,
+		CreateZoneMapsTableSQL,
 	}
 	statements = append(statements, CreatePartitionsIndexesSQL...)
 	return statements

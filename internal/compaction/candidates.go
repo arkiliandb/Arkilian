@@ -11,22 +11,29 @@ import (
 )
 
 const (
-	// DefaultMaxPartitionSize is the threshold below which partitions are candidates for compaction (8MB).
-	DefaultMaxPartitionSize int64 = 8 * 1024 * 1024
+	// DefaultMaxPartitionSize is the threshold below which partitions are candidates for compaction (32MB).
+	DefaultMaxPartitionSize int64 = 32 * 1024 * 1024
 
 	// DefaultMaxPartitionsPerKey is the threshold above which compaction is triggered for a partition key.
-	DefaultMaxPartitionsPerKey int64 = 100
+	DefaultMaxPartitionsPerKey int64 = 50
 )
 
 // CandidateFinder identifies partitions eligible for compaction.
 type CandidateFinder struct {
-	catalog            manifest.Catalog
-	maxPartitionSize   int64
+	catalog             manifest.Catalog
+	maxPartitionSize    int64
 	maxPartitionsPerKey int64
+	adaptiveSizer       AdaptiveSizer
+}
+
+// AdaptiveSizer provides per-key partition size targets. When nil or when
+// TargetSizeBytes returns 0, the static maxPartitionSize is used.
+type AdaptiveSizer interface {
+	TargetSizeBytes(ctx context.Context, partitionKey string) int64
 }
 
 // NewCandidateFinder creates a new compaction candidate finder.
-func NewCandidateFinder(catalog manifest.Catalog, maxPartitionSize int64, maxPartitionsPerKey int64) *CandidateFinder {
+func NewCandidateFinder(catalog manifest.Catalog, maxPartitionSize int64, maxPartitionsPerKey int64, sizer AdaptiveSizer) *CandidateFinder {
 	if maxPartitionSize <= 0 {
 		maxPartitionSize = DefaultMaxPartitionSize
 	}
@@ -34,10 +41,23 @@ func NewCandidateFinder(catalog manifest.Catalog, maxPartitionSize int64, maxPar
 		maxPartitionsPerKey = DefaultMaxPartitionsPerKey
 	}
 	return &CandidateFinder{
-		catalog:            catalog,
-		maxPartitionSize:   maxPartitionSize,
+		catalog:             catalog,
+		maxPartitionSize:    maxPartitionSize,
 		maxPartitionsPerKey: maxPartitionsPerKey,
+		adaptiveSizer:       sizer,
 	}
+}
+
+// thresholdForKey returns the compaction size threshold for a partition key.
+// If adaptive sizing is enabled, it uses the per-key target; otherwise falls
+// back to the static maxPartitionSize.
+func (f *CandidateFinder) thresholdForKey(ctx context.Context, partitionKey string) int64 {
+	if f.adaptiveSizer != nil {
+		if target := f.adaptiveSizer.TargetSizeBytes(ctx, partitionKey); target > 0 {
+			return target
+		}
+	}
+	return f.maxPartitionSize
 }
 
 // CandidateGroup represents a group of partitions that should be compacted together.
@@ -96,6 +116,8 @@ func (f *CandidateFinder) FindSmallPartitions(ctx context.Context) ([]*Candidate
 }
 
 // findSmallPartitions finds partitions below the size threshold grouped by key.
+// When adaptive sizing is enabled, each key gets its own threshold based on
+// total data volume, so high-volume keys use larger target sizes.
 func (f *CandidateFinder) findSmallPartitions(ctx context.Context) ([]*CandidateGroup, error) {
 	// Query all active partition keys to check each for small partitions
 	allPartitions, err := f.catalog.FindPartitions(ctx, nil)
@@ -103,20 +125,26 @@ func (f *CandidateFinder) findSmallPartitions(ctx context.Context) ([]*Candidate
 		return nil, fmt.Errorf("failed to query partitions: %w", err)
 	}
 
-	// Group small partitions by key
-	keyGroups := make(map[string][]*manifest.PartitionRecord)
+	// Group all partitions by key first
+	byKey := make(map[string][]*manifest.PartitionRecord)
 	for _, p := range allPartitions {
-		if p.SizeBytes < f.maxPartitionSize {
-			keyGroups[p.PartitionKey] = append(keyGroups[p.PartitionKey], p)
-		}
+		byKey[p.PartitionKey] = append(byKey[p.PartitionKey], p)
 	}
 
+	// For each key, determine the threshold and find small partitions
 	var groups []*CandidateGroup
-	for key, partitions := range keyGroups {
-		if len(partitions) >= 2 {
+	for key, partitions := range byKey {
+		threshold := f.thresholdForKey(ctx, key)
+		var small []*manifest.PartitionRecord
+		for _, p := range partitions {
+			if p.SizeBytes < threshold {
+				small = append(small, p)
+			}
+		}
+		if len(small) >= 2 {
 			groups = append(groups, &CandidateGroup{
 				PartitionKey: key,
-				Partitions:   partitions,
+				Partitions:   small,
 				Reason:       ReasonSmallPartitions,
 			})
 		}
@@ -171,7 +199,8 @@ func (f *CandidateFinder) findOverflowPartitions(ctx context.Context) ([]*Candid
 }
 
 // IsCompactionCandidate checks if a single partition is a candidate for compaction
-// based on its size.
+// based on its size. Uses the static threshold; for per-key adaptive thresholds,
+// use FindCandidates instead.
 func (f *CandidateFinder) IsCompactionCandidate(p *manifest.PartitionRecord) bool {
 	return p.SizeBytes < f.maxPartitionSize && p.CompactedInto == nil
 }

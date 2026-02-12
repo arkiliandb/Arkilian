@@ -16,7 +16,7 @@ import (
 	"github.com/arkilian/arkilian/internal/storage"
 )
 
-// PruneResult contains the result of a 2-phase pruning operation.
+// PruneResult contains the result of a 3-phase pruning operation.
 type PruneResult struct {
 	// Partitions is the final list of partitions after all pruning phases.
 	Partitions []*manifest.PartitionRecord
@@ -27,18 +27,24 @@ type PruneResult struct {
 	// Phase1Candidates is the number of partitions after min/max pruning.
 	Phase1Candidates int
 
-	// Phase2Candidates is the number of partitions after bloom filter pruning.
+	// Phase1_5Candidates is the number of partitions after zone map pruning.
+	// Zone maps eliminate entire partition-key groups using aggregate bloom filters
+	// stored in the manifest, avoiding S3 GETs for metadata sidecars.
+	Phase1_5Candidates int
+
+	// Phase2Candidates is the number of partitions after per-partition bloom filter pruning.
 	Phase2Candidates int
 
 	// PruningRatio is the ratio of pruned partitions (0.0 to 1.0).
 	PruningRatio float64
 }
 
-// Pruner implements 2-phase partition pruning.
+// Pruner implements 3-phase partition pruning.
 // Phase 1: Query manifest with min/max predicates
-// Phase 2: Apply bloom filters to candidate partitions
+// Phase 1.5: Zone map pruning — eliminate entire partition-key groups via aggregate bloom filters
+// Phase 2: Apply per-partition bloom filters to remaining candidates
 type Pruner struct {
-	catalog *manifest.SQLiteCatalog
+	catalog manifest.CatalogReader
 	storage storage.ObjectStorage
 
 	// bloomLRU is an LRU cache for compressed bloom filters keyed by "partitionID:column".
@@ -146,12 +152,12 @@ func (c *bloomLRUCache) clear() {
 }
 
 // NewPruner creates a new 2-phase pruner with a 1GB bloom filter cache.
-func NewPruner(catalog *manifest.SQLiteCatalog, storage storage.ObjectStorage) *Pruner {
+func NewPruner(catalog manifest.CatalogReader, storage storage.ObjectStorage) *Pruner {
 	return NewPrunerWithCacheSize(catalog, storage, 1<<30) // 1GB default
 }
 
 // NewPrunerWithCacheSize creates a new 2-phase pruner with a configurable bloom filter cache size.
-func NewPrunerWithCacheSize(catalog *manifest.SQLiteCatalog, storage storage.ObjectStorage, maxCacheBytes int64) *Pruner {
+func NewPrunerWithCacheSize(catalog manifest.CatalogReader, storage storage.ObjectStorage, maxCacheBytes int64) *Pruner {
 	return &Pruner{
 		catalog:             catalog,
 		storage:             storage,
@@ -161,9 +167,10 @@ func NewPrunerWithCacheSize(catalog *manifest.SQLiteCatalog, storage storage.Obj
 	}
 }
 
-// Prune performs 2-phase partition pruning.
+// Prune performs 3-phase partition pruning.
 // Phase 1: Query manifest with min/max predicates to get candidate partitions.
-// Phase 2: Apply bloom filters to eliminate false positives from phase 1.
+// Phase 1.5: Zone map pruning — check aggregate bloom filters per partition_key to eliminate entire key groups.
+// Phase 2: Apply per-partition bloom filters to eliminate remaining false positives.
 func (p *Pruner) Prune(ctx context.Context, manifestPredicates []manifest.Predicate, parserPredicates []parser.Predicate) (*PruneResult, error) {
 	// Get total partition count
 	totalCount, err := p.catalog.GetPartitionCount(ctx)
@@ -177,8 +184,15 @@ func (p *Pruner) Prune(ctx context.Context, manifestPredicates []manifest.Predic
 		return nil, fmt.Errorf("pruner: phase 1 failed: %w", err)
 	}
 
-	// Phase 2: Bloom filter pruning
-	phase2Candidates, err := p.phase2Prune(ctx, phase1Candidates, parserPredicates)
+	// Phase 1.5: Zone map pruning — eliminate partition-key groups via aggregate bloom filters
+	phase1_5Candidates, err := p.phase1_5ZoneMapPrune(ctx, phase1Candidates, parserPredicates)
+	if err != nil {
+		// Zone map pruning is best-effort; fall through to phase 2 on error
+		phase1_5Candidates = phase1Candidates
+	}
+
+	// Phase 2: Per-partition bloom filter pruning
+	phase2Candidates, err := p.phase2Prune(ctx, phase1_5Candidates, parserPredicates)
 	if err != nil {
 		return nil, fmt.Errorf("pruner: phase 2 failed: %w", err)
 	}
@@ -190,11 +204,12 @@ func (p *Pruner) Prune(ctx context.Context, manifestPredicates []manifest.Predic
 	}
 
 	return &PruneResult{
-		Partitions:       phase2Candidates,
-		TotalPartitions:  int(totalCount),
-		Phase1Candidates: len(phase1Candidates),
-		Phase2Candidates: len(phase2Candidates),
-		PruningRatio:     pruningRatio,
+		Partitions:         phase2Candidates,
+		TotalPartitions:    int(totalCount),
+		Phase1Candidates:   len(phase1Candidates),
+		Phase1_5Candidates: len(phase1_5Candidates),
+		Phase2Candidates:   len(phase2Candidates),
+		PruningRatio:       pruningRatio,
 	}, nil
 }
 
@@ -206,6 +221,110 @@ func (p *Pruner) phase1Prune(ctx context.Context, predicates []manifest.Predicat
 	}
 
 	return p.catalog.FindPartitions(ctx, predicates)
+}
+
+// phase1_5ZoneMapPrune eliminates entire partition-key groups using aggregate bloom filters
+// stored in the manifest catalog (zone maps). This avoids S3 GETs for metadata sidecars
+// by checking a merged bloom filter that covers all partitions sharing a partition_key.
+//
+// For each bloom-filterable predicate column, it:
+// 1. Groups phase1 candidates by partition_key
+// 2. Batch-queries zone maps from the catalog for those keys
+// 3. Checks each zone map's bloom filter for the predicate value
+// 4. Eliminates all partitions in a key group if the zone map says "definitely not present"
+func (p *Pruner) phase1_5ZoneMapPrune(ctx context.Context, candidates []*manifest.PartitionRecord, predicates []parser.Predicate) ([]*manifest.PartitionRecord, error) {
+	bloomPreds := getBloomFilterPredicates(predicates)
+	if len(bloomPreds) == 0 {
+		return candidates, nil
+	}
+
+	// Group candidates by partition_key
+	keyPartitions := make(map[string][]*manifest.PartitionRecord)
+	for _, c := range candidates {
+		keyPartitions[c.PartitionKey] = append(keyPartitions[c.PartitionKey], c)
+	}
+
+	keys := make([]string, 0, len(keyPartitions))
+	for k := range keyPartitions {
+		keys = append(keys, k)
+	}
+
+	// For each bloom predicate column, query zone maps and prune keys
+	eliminatedKeys := make(map[string]bool)
+
+	for _, pred := range bloomPreds {
+		zoneMaps, err := p.catalog.GetZoneMapsForKeys(ctx, keys, pred.Column)
+		if err != nil {
+			// Best-effort: skip zone map pruning on error
+			continue
+		}
+
+		for _, key := range keys {
+			if eliminatedKeys[key] {
+				continue // already eliminated by a previous predicate
+			}
+
+			zm, ok := zoneMaps[key]
+			if !ok {
+				continue // no zone map for this key — can't prune, keep it
+			}
+
+			canEliminate := false
+			switch pred.Type {
+			case parser.PredicateEquality:
+				if pred.Operator == "=" {
+					canEliminate = !p.checkZoneMapValue(zm, pred.Column, pred.Value)
+				}
+			case parser.PredicateIn:
+				if !pred.Not {
+					// For IN: if none of the values are in the zone map, eliminate
+					anyPresent := false
+					for _, val := range pred.Values {
+						if p.checkZoneMapValue(zm, pred.Column, val) {
+							anyPresent = true
+							break
+						}
+					}
+					canEliminate = !anyPresent
+				}
+			}
+
+			if canEliminate {
+				eliminatedKeys[key] = true
+			}
+		}
+	}
+
+	if len(eliminatedKeys) == 0 {
+		return candidates, nil
+	}
+
+	// Rebuild candidate list excluding eliminated keys
+	result := make([]*manifest.PartitionRecord, 0, len(candidates))
+	for _, c := range candidates {
+		if !eliminatedKeys[c.PartitionKey] {
+			result = append(result, c)
+		}
+	}
+	return result, nil
+}
+
+// checkZoneMapValue checks if a value might exist in a zone map's bloom filter.
+func (p *Pruner) checkZoneMapValue(zm *manifest.ZoneMapEntry, column string, value interface{}) bool {
+	var bytes []byte
+	switch v := value.(type) {
+	case string:
+		bytes = []byte(v)
+	case int64:
+		bytes = int64ToBytes(v)
+	case int:
+		bytes = int64ToBytes(int64(v))
+	case float64:
+		bytes = int64ToBytes(int64(v))
+	default:
+		return true // unknown type, assume present
+	}
+	return zm.BloomFilter.Contains(bytes)
 }
 
 // phase2Prune applies bloom filters to eliminate false positives.
@@ -300,8 +419,8 @@ func getBloomFilterPredicates(predicates []parser.Predicate) []parser.Predicate 
 
 // isBloomFilterColumn returns true if the column has a bloom filter.
 func isBloomFilterColumn(column string) bool {
-	// Bloom filters are built for tenant_id and user_id columns
-	return column == "tenant_id" || column == "user_id"
+	// Bloom filters are built for tenant_id, user_id, and event_type columns
+	return column == "tenant_id" || column == "user_id" || column == "event_type"
 }
 
 // checkBloomFilters checks if a partition passes all bloom filter predicates.
@@ -587,7 +706,7 @@ func GetPrunableColumns() []string {
 
 // GetBloomFilterColumns returns the list of columns that have bloom filters.
 func GetBloomFilterColumns() []string {
-	return []string{"tenant_id", "user_id"}
+	return []string{"tenant_id", "user_id", "event_type"}
 }
 
 // ExtractPrunablePredicates extracts predicates that can be used for pruning.

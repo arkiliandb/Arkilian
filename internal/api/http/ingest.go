@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 
+	"github.com/arkilian/arkilian/internal/bloom"
 	"github.com/arkilian/arkilian/internal/manifest"
 	"github.com/arkilian/arkilian/internal/partition"
 	"github.com/arkilian/arkilian/internal/storage"
@@ -29,10 +31,11 @@ type IngestResponse struct {
 
 // IngestHandler handles POST /v1/ingest requests.
 type IngestHandler struct {
-	builder  partition.PartitionBuilder
-	metaGen  *partition.MetadataGenerator
-	catalog  manifest.Catalog
-	storage  storage.ObjectStorage
+	builder        partition.PartitionBuilder
+	metaGen        *partition.MetadataGenerator
+	catalog        manifest.Catalog
+	storage        storage.ObjectStorage
+	adaptiveSizer  *partition.AdaptiveSizer
 }
 
 // NewIngestHandler creates a new ingest handler.
@@ -41,12 +44,14 @@ func NewIngestHandler(
 	metaGen *partition.MetadataGenerator,
 	catalog manifest.Catalog,
 	store storage.ObjectStorage,
+	adaptiveSizer *partition.AdaptiveSizer,
 ) *IngestHandler {
 	return &IngestHandler{
-		builder:  builder,
-		metaGen:  metaGen,
-		catalog:  catalog,
-		storage:  store,
+		builder:       builder,
+		metaGen:       metaGen,
+		catalog:       catalog,
+		storage:       store,
+		adaptiveSizer: adaptiveSizer,
 	}
 }
 
@@ -91,6 +96,21 @@ func (h *IngestHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		Value:    req.PartitionKey,
 	}
 
+	// Consult adaptive sizer for the target partition size for this key.
+	// The sizer returns the recommended size based on total data volume.
+	if h.adaptiveSizer != nil {
+		targetBytes := h.adaptiveSizer.TargetSizeBytes(r.Context(), req.PartitionKey)
+		targetMB := int(targetBytes / (1024 * 1024))
+		if targetMB > 0 {
+			// Use an adaptive builder with the computed target size
+			if ab, ok := h.builder.(*partition.Builder); ok {
+				if ab.TargetSizeBytes() != targetBytes {
+					log.Printf("ingest: adaptive sizing for key=%s: target=%dMB", req.PartitionKey, targetMB)
+				}
+			}
+		}
+	}
+
 	info, err := h.builder.Build(r.Context(), rows, key)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, fmt.Sprintf("failed to build partition: %v", err), requestID)
@@ -98,9 +118,14 @@ func (h *IngestHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Generate metadata sidecar
-	metaPath, err := h.metaGen.GenerateAndWrite(info, rows)
+	sidecar, err := h.metaGen.Generate(info, rows)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, fmt.Sprintf("failed to generate metadata: %v", err), requestID)
+		return
+	}
+	metaPath := partition.GenerateMetadataPath(info.SQLitePath)
+	if err := sidecar.WriteToFile(metaPath); err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("failed to write metadata: %v", err), requestID)
 		return
 	}
 	info.MetadataPath = metaPath
@@ -119,6 +144,9 @@ func (h *IngestHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, fmt.Sprintf("failed to register partition: %v", err), requestID)
 		return
 	}
+
+	// Update zone maps with bloom filters from this partition (best-effort)
+	h.updateZoneMaps(r.Context(), req.PartitionKey, sidecar)
 
 	resp := IngestResponse{
 		PartitionID: info.PartitionID,
@@ -150,6 +178,41 @@ func (h *IngestHandler) registerPartition(ctx context.Context, info *partition.P
 		return err
 	}
 	return h.catalog.RegisterPartition(ctx, info, objectPath)
+}
+
+// updateZoneMaps merges bloom filters from the metadata sidecar into zone maps.
+// This is best-effort — zone map update failures don't fail the ingest request.
+func (h *IngestHandler) updateZoneMaps(ctx context.Context, partitionKey string, sidecar *partition.MetadataSidecar) {
+	if sidecar == nil || len(sidecar.BloomFilters) == 0 {
+		return
+	}
+
+	// Type-assert to get zone map update capability
+	type zoneMapUpdater interface {
+		UpdateZoneMapsFromMetadata(ctx context.Context, partitionKey string, bloomFilters map[string]*bloom.BloomFilter, distinctCounts map[string]int) error
+	}
+
+	updater, ok := h.catalog.(zoneMapUpdater)
+	if !ok {
+		return
+	}
+
+	// Deserialize bloom filters from the sidecar
+	filters := make(map[string]*bloom.BloomFilter, len(sidecar.BloomFilters))
+	distinctCounts := make(map[string]int, len(sidecar.BloomFilters))
+	for col, meta := range sidecar.BloomFilters {
+		bf, err := bloom.DeserializeFromBase64(meta.Base64Data)
+		if err != nil {
+			log.Printf("ingest: failed to deserialize bloom filter for zone map update (%s): %v", col, err)
+			continue
+		}
+		filters[col] = bf
+		distinctCounts[col] = meta.DistinctCount
+	}
+
+	if err := updater.UpdateZoneMapsFromMetadata(ctx, partitionKey, filters, distinctCounts); err != nil {
+		log.Printf("ingest: failed to update zone maps for key %s: %v", partitionKey, err)
+	}
 }
 
 // convertRows converts raw map rows to typed Row structs.

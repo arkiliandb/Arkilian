@@ -108,7 +108,7 @@ func setupCompactionTestEnv(t *testing.T, numPartitions int) (
 		WorkDir:             workDir,
 	}
 
-	daemon := compaction.NewDaemon(config, catalog, store)
+	daemon := compaction.NewDaemon(config, catalog, store, nil)
 
 	cleanup := func() {
 		daemon.Stop()
@@ -190,7 +190,7 @@ func TestCompactionCandidateSelection(t *testing.T) {
 	defer cleanup()
 
 	// Create candidate finder with low threshold
-	finder := compaction.NewCandidateFinder(catalog, 100*1024*1024, 2)
+	finder := compaction.NewCandidateFinder(catalog, 100*1024*1024, 2, nil)
 
 	// Find candidates
 	groups, err := finder.FindCandidates(ctx)
@@ -412,7 +412,7 @@ func TestCompactionWithDifferentPartitionKeys(t *testing.T) {
 		CheckInterval:       time.Hour,
 		WorkDir:             workDir,
 	}
-	daemon := compaction.NewDaemon(config, catalog, store)
+	daemon := compaction.NewDaemon(config, catalog, store, nil)
 	defer daemon.Stop()
 
 	daemon.RunOnce(ctx)

@@ -163,7 +163,7 @@ func parseFlags() Config {
 }
 
 // preloadBloomFilters loads bloom filters for recent partitions into memory.
-func preloadBloomFilters(ctx context.Context, catalog *manifest.SQLiteCatalog, pruner *planner.Pruner) error {
+func preloadBloomFilters(ctx context.Context, catalog manifest.CatalogReader, pruner *planner.Pruner) error {
 	// Get all active partitions
 	partitions, err := catalog.FindPartitions(ctx, nil)
 	if err != nil {

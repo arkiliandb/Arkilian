@@ -44,12 +44,12 @@ type PruningStats struct {
 
 // Planner generates query plans from parsed SQL statements.
 type Planner struct {
-	catalog *manifest.SQLiteCatalog
+	catalog manifest.CatalogReader
 	pruner  *Pruner
 }
 
 // NewPlanner creates a new query planner.
-func NewPlanner(catalog *manifest.SQLiteCatalog) *Planner {
+func NewPlanner(catalog manifest.CatalogReader) *Planner {
 	return &Planner{
 		catalog: catalog,
 		pruner:  NewPruner(catalog, nil), // No storage for basic planner
@@ -57,7 +57,7 @@ func NewPlanner(catalog *manifest.SQLiteCatalog) *Planner {
 }
 
 // NewPlannerWithPruner creates a new query planner with a custom pruner.
-func NewPlannerWithPruner(catalog *manifest.SQLiteCatalog, pruner *Pruner) *Planner {
+func NewPlannerWithPruner(catalog manifest.CatalogReader, pruner *Pruner) *Planner {
 	return &Planner{
 		catalog: catalog,
 		pruner:  pruner,

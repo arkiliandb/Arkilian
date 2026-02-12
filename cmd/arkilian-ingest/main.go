@@ -65,7 +65,7 @@ func main() {
 	shutdownMgr := server.NewShutdownManager(shutdownConfig)
 
 	// Create HTTP handler
-	ingestHandler := httpapi.NewIngestHandler(builder, metaGen, catalog, store)
+	ingestHandler := httpapi.NewIngestHandler(builder, metaGen, catalog, store, nil)
 
 	// Setup HTTP server with middleware
 	mux := http.NewServeMux()
