@@ -1,10 +1,17 @@
+<br/>
+<h1 align="center">Arkilian</h1>  
+<p align="center">
+  <a href="https://github.com/codedynasty-dev/cradova">
+    <img src="https://avatars.githubusercontent.com/u/261335565?s=88&v=4" alt="Logo" width="80" height="80"
+    >
+  </a>
+</p>
 
-<center>
-<h1> 
-Arkilian
-</h1> 
-<img src="https://avatars.githubusercontent.com/u/261335565?s=88&v=4" style="border-radius: 12px; margin: 24px" />
-</center>
+ 
+![License](https://img.shields.io/github/license/codedynasty-dev/cradova)
+[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/cradova/cradova.js/blob/next/contributing.md) 
+![Stargazers](https://img.shields.io/github/stars/codedynasty-dev/cradova?style=social)
+
 
 ### An immutable database that follows Snowflake architecture, designed for scalable, replayable systems beyond analytics.
 
