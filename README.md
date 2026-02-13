@@ -1,15 +1,17 @@
 <br/>
 <h1 align="center">Arkilian</h1>  
 <p align="center">
-  <a href="https://github.com/codedynasty-dev/Arkilian">
+  <a href="https://github.com/CodeDynasty-dev/Arkilian">
     <img src="https://avatars.githubusercontent.com/u/261335565?s=88&v=4" alt="Arkilian Database"   
     >
   </a>
 </p>
 
-![License](https://img.shields.io/github/license/codedynasty-dev/birth-of-Arkilian)
-[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/Arkilian/Arkilian.js/blob/next/contributing.md)
-![Stargazers](https://img.shields.io/github/stars/codedynasty-dev/birth-of-Arkilian?style=social)
+<!-- [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/CodeDynasty-dev/birth-of-Arkilian/blob/next/contributing.md) -->
+![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
+![Arkilian](https://img.shields.io/github/v/release/CodeDynasty-dev/birth-of-Arkilian)
+[![Stargazers](https://img.shields.io/github/stars/CodeDynasty-dev/birth-of-Arkilian?style=social)](https://github.com/CodeDynasty-dev/birth-of-Arkilian)
+
 
 ### An immutable database that follows Snowflake architecture, designed for scalable, replayable systems beyond analytics.
 
@@ -78,7 +80,9 @@ Unlike monolithic SQLite distribution attempts (rqlite, LiteFS), Arkilian embrac
 ### Building
 
 - Prerequisites
-- Go 1.21+ in
+- Go 1.21+ in  
+
+![Go](https://img.shields.io/badge/Go-00ADD8?style=flat&logo=go&logoColor=white)
 
 ```bash
 go build ./...
