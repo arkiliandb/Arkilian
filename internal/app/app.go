@@ -373,7 +373,7 @@ func (a *App) startCompactService(ctx context.Context) error {
 			MaxConcurrency:   a.cfg.Compaction.Backpressure.MaxConcurrency,
 			MinConcurrency:   a.cfg.Compaction.Backpressure.MinConcurrency,
 			FailureThreshold: a.cfg.Compaction.Backpressure.FailureThreshold,
-			WindowDuration:   5 * time.Minute,
+			WindowDuration:   10 * time.Minute,
 		})
 	log.Printf("Compaction daemon initialized: min_size=%dMB, max_partitions=%d, ttl=%d days, max_concurrency=%d",
 		minPartitionSize/(1024*1024),

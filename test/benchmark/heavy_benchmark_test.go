@@ -2159,8 +2159,12 @@ func BenchmarkHeavyCompaction_SustainedFailure(b *testing.B) {
 
 			if newFails > prevFails {
 				failedCycles++
-			} else if backlog > 0 {
-				// If backlog decreased or stayed same without new failures, count as success
+			}
+
+			// Check if the backlog decreased — this means at least some
+			// compactions succeeded, even if failures also occurred in the
+			// same cycle (mixed outcome).
+			if backlog > 0 {
 				newBacklog, _ := catalog.GetPartitionCount(ctx)
 				if newBacklog < backlog {
 					successfulCompactions++

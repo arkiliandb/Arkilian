@@ -151,9 +151,9 @@ func (c *bloomLRUCache) clear() {
 	c.currentBytes = 0
 }
 
-// NewPruner creates a new 2-phase pruner with a 1GB bloom filter cache.
+// NewPruner creates a new 2-phase pruner with a 4GB bloom filter cache.
 func NewPruner(catalog manifest.CatalogReader, storage storage.ObjectStorage) *Pruner {
-	return NewPrunerWithCacheSize(catalog, storage, 1<<30) // 1GB default
+	return NewPrunerWithCacheSize(catalog, storage, 4<<30) // 4GB default
 }
 
 // NewPrunerWithCacheSize creates a new 2-phase pruner with a configurable bloom filter cache size.
@@ -163,7 +163,7 @@ func NewPrunerWithCacheSize(catalog manifest.CatalogReader, storage storage.Obje
 		storage:             storage,
 		bloomLRU:            newBloomLRUCache(maxCacheBytes),
 		metadataCache:       make(map[string]*partition.MetadataSidecar),
-		PrefetchConcurrency: 8,
+		PrefetchConcurrency: 16,
 	}
 }
 

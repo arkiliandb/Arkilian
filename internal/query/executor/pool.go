@@ -60,8 +60,8 @@ type PoolConfig struct {
 func DefaultPoolConfig() PoolConfig {
 	return PoolConfig{
 		MaxConnections:      10,
-		MaxTotalConnections: 100,
-		IdleTimeout:         5 * time.Minute,
+		MaxTotalConnections: 512,
+		IdleTimeout:         10 * time.Minute,
 	}
 }
 

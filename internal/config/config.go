@@ -216,7 +216,7 @@ func DefaultConfig() *Config {
 			QueryAddr:    ":8081",
 			CompactAddr:  ":8082",
 			ReadTimeout:  30 * time.Second,
-			WriteTimeout: 60 * time.Second,
+			WriteTimeout: 120 * time.Second,
 			IdleTimeout:  120 * time.Second,
 		},
 		GRPC: GRPCConfig{
@@ -225,36 +225,36 @@ func DefaultConfig() *Config {
 		},
 		Ingest: IngestConfig{
 			PartitionDir:          "",
-			TargetPartitionSizeMB: 32,
+			TargetPartitionSizeMB: 64,
 			AdaptiveSizing: AdaptiveSizingConfig{
 				Enabled:   true,
 				MinSizeMB: 16,
 				MaxSizeMB: 256,
 				Tiers: []SizingTier{
-					{ThresholdGB: 0, TargetSizeMB: 32},
-					{ThresholdGB: 1, TargetSizeMB: 64},
-					{ThresholdGB: 10, TargetSizeMB: 128},
+					{ThresholdGB: 0, TargetSizeMB: 64},
+					{ThresholdGB: 1, TargetSizeMB: 128},
+					{ThresholdGB: 10, TargetSizeMB: 192},
 					{ThresholdGB: 100, TargetSizeMB: 256},
 				},
 			},
 		},
 		Query: QueryConfig{
 			DownloadDir:          "",
-			Concurrency:          16,
-			PoolSize:             200,
-			MaxPreloadPartitions: 2000,
-			BloomCacheSizeMB:     1024,
+			Concurrency:          32,
+			PoolSize:             512,
+			MaxPreloadPartitions: 10000,
+			BloomCacheSizeMB:     4096,
 		},
 		Compaction: CompactionConfig{
 			WorkDir:             "",
-			CheckInterval:       5 * time.Minute,
-			MinPartitionSize:    32 * 1024 * 1024,
-			MaxPartitionsPerKey: 50,
+			CheckInterval:       2 * time.Minute,
+			MinPartitionSize:    64 * 1024 * 1024,
+			MaxPartitionsPerKey: 100,
 			TTLDays:             7,
 			Backpressure: BackpressureConfig{
-				MaxConcurrency:   4,
+				MaxConcurrency:   8,
 				MinConcurrency:   1,
-				FailureThreshold: 0.10,
+				FailureThreshold: 0.05,
 			},
 		},
 		Storage: StorageConfig{
@@ -263,7 +263,7 @@ func DefaultConfig() *Config {
 		},
 		Manifest: ManifestConfig{
 			Sharded:    true,
-			ShardCount: 32,
+			ShardCount: 64,
 		},
 	}
 }

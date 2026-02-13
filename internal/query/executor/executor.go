@@ -100,11 +100,11 @@ type ExecutorConfig struct {
 // DefaultExecutorConfig returns the default executor configuration.
 func DefaultExecutorConfig() ExecutorConfig {
 	return ExecutorConfig{
-		Concurrency:    10,
+		Concurrency:    32,
 		DownloadDir:    filepath.Join(os.TempDir(), "arkilian-partitions"),
 		PoolConfig:     DefaultPoolConfig(),
-		MaxCacheBytes:  10 * 1024 * 1024 * 1024, // 10 GB
-		MaxMemoryBytes: 256 * 1024 * 1024,        // 256 MB
+		MaxCacheBytes:  20 * 1024 * 1024 * 1024, // 20 GB
+		MaxMemoryBytes: 512 * 1024 * 1024,        // 512 MB
 	}
 }
 

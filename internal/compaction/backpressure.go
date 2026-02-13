@@ -48,26 +48,26 @@ type BackpressureConfig struct {
 // DefaultBackpressureConfig returns sensible defaults.
 func DefaultBackpressureConfig() BackpressureConfig {
 	return BackpressureConfig{
-		MaxConcurrency:   4,
+		MaxConcurrency:   8,
 		MinConcurrency:   1,
-		FailureThreshold: 0.10,
-		WindowDuration:   5 * time.Minute,
+		FailureThreshold: 0.05,
+		WindowDuration:   10 * time.Minute,
 	}
 }
 
 // NewBackpressureController creates a new controller with the given config.
 func NewBackpressureController(cfg BackpressureConfig) *BackpressureController {
 	if cfg.MaxConcurrency <= 0 {
-		cfg.MaxConcurrency = 4
+		cfg.MaxConcurrency = 8
 	}
 	if cfg.MinConcurrency <= 0 {
 		cfg.MinConcurrency = 1
 	}
 	if cfg.FailureThreshold <= 0 {
-		cfg.FailureThreshold = 0.10
+		cfg.FailureThreshold = 0.05
 	}
 	if cfg.WindowDuration <= 0 {
-		cfg.WindowDuration = 5 * time.Minute
+		cfg.WindowDuration = 10 * time.Minute
 	}
 
 	bp := &BackpressureController{

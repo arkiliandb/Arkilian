@@ -8,8 +8,8 @@ import (
 func TestBackpressureController_InitialState(t *testing.T) {
 	bp := NewBackpressureController(DefaultBackpressureConfig())
 
-	if bp.Concurrency() != 4 {
-		t.Fatalf("expected initial concurrency 4, got %d", bp.Concurrency())
+	if bp.Concurrency() != 8 {
+		t.Fatalf("expected initial concurrency 8, got %d", bp.Concurrency())
 	}
 	if bp.FailureRate() != 0 {
 		t.Fatalf("expected initial failure rate 0, got %f", bp.FailureRate())

@@ -71,8 +71,8 @@ func NewAdaptiveSizer(enabled bool, fallbackMB int, querier VolumeQuerier, opts 
 	if len(s.tiers) == 0 {
 		s.tiers = []sizingTier{
 			{thresholdBytes: 0, targetBytes: int64(fallbackMB) * 1024 * 1024},
-			{thresholdBytes: 1 * 1024 * 1024 * 1024, targetBytes: 64 * 1024 * 1024},
-			{thresholdBytes: 10 * 1024 * 1024 * 1024, targetBytes: 128 * 1024 * 1024},
+			{thresholdBytes: 1 * 1024 * 1024 * 1024, targetBytes: 128 * 1024 * 1024},
+			{thresholdBytes: 10 * 1024 * 1024 * 1024, targetBytes: 192 * 1024 * 1024},
 			{thresholdBytes: 100 * 1024 * 1024 * 1024, targetBytes: 256 * 1024 * 1024},
 		}
 	}
