@@ -60,6 +60,12 @@ type ManifestConfig struct {
 
 	// ShardCount is the number of manifest shards (default: 16). Only used when Sharded=true.
 	ShardCount int `json:"shard_count" yaml:"shard_count"`
+
+	// AutoShardThreshold is the partition count at which a single-file catalog
+	// automatically migrates to sharded mode. Set to 0 to disable auto-migration.
+	// Default: 50000. When the threshold is crossed during startup, the app logs
+	// a warning and performs an online migration to sharded mode.
+	AutoShardThreshold int64 `json:"auto_shard_threshold" yaml:"auto_shard_threshold"`
 }
 
 // HTTPConfig holds HTTP server configuration.
@@ -262,8 +268,9 @@ func DefaultConfig() *Config {
 			Path: "",
 		},
 		Manifest: ManifestConfig{
-			Sharded:    true,
-			ShardCount: 64,
+			Sharded:            true,
+			ShardCount:         64,
+			AutoShardThreshold: 50000,
 		},
 	}
 }
@@ -493,6 +500,9 @@ func LoadFromEnv(cfg *Config) {
 	}
 	if v := os.Getenv("ARKILIAN_MANIFEST_SHARD_COUNT"); v != "" {
 		fmt.Sscanf(v, "%d", &cfg.Manifest.ShardCount)
+	}
+	if v := os.Getenv("ARKILIAN_MANIFEST_AUTO_SHARD_THRESHOLD"); v != "" {
+		fmt.Sscanf(v, "%d", &cfg.Manifest.AutoShardThreshold)
 	}
 
 	// Adaptive sizing configuration

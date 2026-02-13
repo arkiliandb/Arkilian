@@ -132,6 +132,17 @@ func (bp *BackpressureController) pruneWindowLocked() {
 
 // AdjustConcurrency recalculates the concurrency level based on recent failure rate.
 // Call this at the start of each compaction cycle.
+// AdjustConcurrency recalculates the concurrency level based on recent failure rate.
+// Call this at the start of each compaction cycle.
+//
+// Recovery strategy:
+//   - When failure rate > threshold: halve concurrency (aggressive backoff)
+//   - When failure rate < threshold/2: exponential ramp-up (double, capped at max)
+//   - When failure rate between threshold/2 and threshold: linear ramp-up (+1)
+//   - Otherwise: hold steady
+//
+// The exponential ramp-up ensures recovery from min→max takes O(log N) cycles
+// instead of O(N) cycles with the previous 25% linear approach.
 func (bp *BackpressureController) AdjustConcurrency() {
 	bp.mu.Lock()
 	rate := bp.failureRateLocked()
@@ -146,9 +157,16 @@ func (bp *BackpressureController) AdjustConcurrency() {
 			next = bp.minConcurrency
 		}
 		bp.currentConcurrency.Store(next)
+	} else if rate == 0 && len(bp.attempts) > 0 {
+		// Zero failures with recent history: aggressive ramp-up (double)
+		next := current * 2
+		if next > bp.maxConcurrency {
+			next = bp.maxConcurrency
+		}
+		bp.currentConcurrency.Store(next)
 	} else if rate < bp.threshold/2 {
-		// Ramp up: increase by 25% (at least +1)
-		delta := current / 4
+		// Low failure rate: moderate ramp-up (50%, at least +1)
+		delta := current / 2
 		if delta < 1 {
 			delta = 1
 		}
@@ -157,14 +175,31 @@ func (bp *BackpressureController) AdjustConcurrency() {
 			next = bp.maxConcurrency
 		}
 		bp.currentConcurrency.Store(next)
+	} else if rate <= bp.threshold {
+		// Between threshold/2 and threshold: cautious linear ramp-up (+1)
+		next := current + 1
+		if next > bp.maxConcurrency {
+			next = bp.maxConcurrency
+		}
+		bp.currentConcurrency.Store(next)
 	}
-	// Otherwise: hold steady
+	// rate exactly at threshold: hold steady (handled by no else clause)
 }
 
 // ShouldPause returns true if compaction should pause due to high failure rate
 // combined with a non-zero backlog. This prevents cascading failures.
+// ShouldPause returns true if compaction should pause due to high failure rate
+// combined with a large backlog. Small backlogs (≤ maxConcurrency) are always
+// processed to prevent starvation — the system needs to attempt compactions
+// to generate the success records that drive recovery.
 func (bp *BackpressureController) ShouldPause(backlogSize int) bool {
 	if backlogSize == 0 {
+		return false
+	}
+	// Never pause when backlog is small enough to process in one cycle —
+	// this ensures the system always makes progress and generates success
+	// records that lower the failure rate.
+	if int32(backlogSize) <= bp.maxConcurrency {
 		return false
 	}
 	return bp.FailureRate() > bp.threshold

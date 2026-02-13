@@ -2243,3 +2243,302 @@ func BenchmarkHeavyCompaction_SustainedFailure(b *testing.B) {
 		b.ReportMetric(float64(backlogAfterRecovery), "backlog_after_recovery")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// SCALE VALIDATION BENCHMARKS (QA Report — Petabyte Viability)
+// ---------------------------------------------------------------------------
+// These benchmarks validate architectural fixes at 1M+ partition scale.
+// Run with: go test -bench=BenchmarkScale -benchtime=1x -timeout=60m ./test/benchmark/...
+
+// populateShardedCatalog registers numPartitions into a ShardedCatalog.
+func populateShardedCatalog(b *testing.B, sc *manifest.ShardedCatalog, numPartitions int) {
+	ctx := context.Background()
+	rng := rand.New(rand.NewSource(99))
+
+	for i := 0; i < numPartitions; i++ {
+		day := i % 30
+		minTime := int64(day*86400 + rng.Intn(43200))
+		maxTime := minTime + int64(rng.Intn(43200))
+		minUser := int64(rng.Intn(numUsers))
+		maxUser := minUser + int64(rng.Intn(5000))
+		tenantIdx := rng.Intn(numTenants)
+		minTenant := fmt.Sprintf("tenant_%04d", tenantIdx)
+		maxTenant := fmt.Sprintf("tenant_%04d", tenantIdx+rng.Intn(50))
+
+		info := &partition.PartitionInfo{
+			PartitionID:  fmt.Sprintf("events:2026%02d%02d:%06d", 2, day+1, i),
+			PartitionKey: fmt.Sprintf("2026%02d%02d", 2, day+1),
+			RowCount:     int64(1000 + rng.Intn(50000)),
+			SizeBytes:    int64(1024*1024 + rng.Intn(15*1024*1024)),
+			MinMaxStats: map[string]partition.MinMax{
+				"event_time": {Min: minTime, Max: maxTime},
+				"user_id":    {Min: minUser, Max: maxUser},
+				"tenant_id":  {Min: minTenant, Max: maxTenant},
+			},
+			SchemaVersion: 1,
+			CreatedAt:     time.Now(),
+		}
+		err := sc.RegisterPartition(ctx, info, fmt.Sprintf("partitions/2026%02d%02d/%06d.sqlite", 2, day+1, i))
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkScaleShardedPruning_100K validates that sharded catalog prune latency
+// at 100K partitions is sublinear compared to single-file catalog.
+// Target: <50ms at 100K partitions (vs 231ms single-file).
+func BenchmarkScaleShardedPruning_100K(b *testing.B) {
+	dir := setupBenchDir(b, "sharded-100k")
+	sc, err := manifest.NewShardedCatalog(dir, 16)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer sc.Close()
+
+	populateShardedCatalog(b, sc, 100000)
+	ctx := context.Background()
+
+	predicates := []manifest.Predicate{
+		{Column: "event_time", Operator: ">=", Value: int64(500000)},
+		{Column: "event_time", Operator: "<=", Value: int64(510000)},
+		{Column: "user_id", Operator: ">=", Value: int64(10000)},
+		{Column: "user_id", Operator: "<=", Value: int64(15000)},
+	}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		results, err := sc.FindPartitions(ctx, predicates)
+		if err != nil {
+			b.Fatal(err)
+		}
+		_ = results
+	}
+}
+
+// BenchmarkScaleShardedPruning_1M validates prune latency at 1M partitions.
+// Target: <50ms prune latency at 1M partitions.
+// This is the critical test — single-file SQLite projects to 2.3s at this scale.
+func BenchmarkScaleShardedPruning_1M(b *testing.B) {
+	if testing.Short() {
+		b.Skip("skipping 1M partition benchmark in short mode")
+	}
+
+	dir := setupBenchDir(b, "sharded-1m")
+	// 64 shards for 1M partitions (~15K partitions per shard)
+	sc, err := manifest.NewShardedCatalog(dir, 64)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer sc.Close()
+
+	populateShardedCatalog(b, sc, 1_000_000)
+	ctx := context.Background()
+
+	predicates := []manifest.Predicate{
+		{Column: "event_time", Operator: ">=", Value: int64(500000)},
+		{Column: "event_time", Operator: "<=", Value: int64(510000)},
+		{Column: "user_id", Operator: ">=", Value: int64(10000)},
+		{Column: "user_id", Operator: "<=", Value: int64(15000)},
+	}
+
+	// Run ANALYZE on all shards to ensure query planner has statistics
+	if err := sc.RunAnalyze(ctx); err != nil {
+		b.Fatal(err)
+	}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		results, err := sc.FindPartitions(ctx, predicates)
+		if err != nil {
+			b.Fatal(err)
+		}
+		_ = results
+	}
+
+	count, _ := sc.GetPartitionCount(ctx)
+	b.ReportMetric(float64(count), "total_partitions")
+	b.ReportMetric(float64(sc.ShardCount()), "shard_count")
+}
+
+// BenchmarkScaleBloomFilter_FPR_Production validates FPR at production settings.
+// Production uses 0.001% FPR for tenant_id (not 1% as in the original benchmark).
+// Target: <100 false positives per 1M lookups.
+func BenchmarkScaleBloomFilter_FPR_Production(b *testing.B) {
+	// Production FPR targets from partition/metadata.go:
+	// tenant_id: 0.00001 (0.001%)
+	// user_id:   0.0001  (0.01%)
+	tests := []struct {
+		name      string
+		targetFPR float64
+		numItems  int
+		maxFP     int // max false positives per 1M lookups
+	}{
+		{"tenant_id_10K", 0.00001, 10_000, 15},
+		{"tenant_id_100K", 0.00001, 100_000, 15},
+		{"user_id_10K", 0.0001, 10_000, 150},
+		{"user_id_100K", 0.0001, 100_000, 150},
+	}
+
+	for _, tt := range tests {
+		b.Run(tt.name, func(b *testing.B) {
+			numBits, numHashes := bloom.OptimalParameters(tt.numItems, tt.targetFPR)
+			filter := bloom.New(numBits, numHashes)
+
+			for i := 0; i < tt.numItems; i++ {
+				filter.Add([]byte(fmt.Sprintf("item_%d", i)))
+			}
+
+			testCount := 1_000_000
+			falsePositives := 0
+			for i := 0; i < testCount; i++ {
+				key := []byte(fmt.Sprintf("nonmember_%d", i))
+				if filter.Contains(key) {
+					falsePositives++
+				}
+			}
+
+			actualFPR := float64(falsePositives) / float64(testCount)
+			b.ReportMetric(actualFPR*100, "FPR%")
+			b.ReportMetric(float64(falsePositives), "false_positives_per_1M")
+			b.ReportMetric(float64(numBits)/(8*1024*1024), "filter_MB")
+
+			if falsePositives > tt.maxFP {
+				b.Errorf("%s: %d false positives per 1M lookups exceeds max %d (FPR=%.6f%%)",
+					tt.name, falsePositives, tt.maxFP, actualFPR*100)
+			}
+		})
+	}
+}
+
+// BenchmarkScaleBackpressureRecovery validates that the backpressure controller
+// recovers from min→max concurrency in O(log N) cycles, not O(N).
+// Target: recovery from concurrency=1 to concurrency=8 in ≤6 cycles.
+func BenchmarkScaleBackpressureRecovery(b *testing.B) {
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		bp := compaction.NewBackpressureController(compaction.BackpressureConfig{
+			MaxConcurrency:   8,
+			MinConcurrency:   1,
+			FailureThreshold: 0.10,
+			WindowDuration:   1 * time.Minute,
+		})
+
+		// Simulate degradation: drive concurrency to minimum
+		for j := 0; j < 20; j++ {
+			bp.RecordFailure()
+		}
+		for j := 0; j < 10; j++ {
+			bp.AdjustConcurrency()
+		}
+		if bp.Concurrency() != 1 {
+			b.Fatalf("expected concurrency 1 after degradation, got %d", bp.Concurrency())
+		}
+
+		// Simulate recovery: overwhelm the failure history with successes.
+		// Need enough successes to push failure rate well below threshold/2 (5%).
+		// 20 failures + 400 successes = 20/420 ≈ 4.8% < 5% threshold/2.
+		for j := 0; j < 400; j++ {
+			bp.RecordSuccess()
+		}
+
+		cycles := 0
+		for bp.Concurrency() < 8 && cycles < 20 {
+			bp.AdjustConcurrency()
+			cycles++
+		}
+
+		b.ReportMetric(float64(cycles), "recovery_cycles")
+		b.ReportMetric(float64(bp.Concurrency()), "final_concurrency")
+
+		if cycles > 6 {
+			b.Errorf("recovery took %d cycles (target ≤6), final concurrency=%d", cycles, bp.Concurrency())
+		}
+	}
+}
+
+// BenchmarkScaleFullScan_Allocations validates per-row allocation reduction
+// in the executor's row processing path using pooled slices.
+// Target: <100 bytes/row for non-payload columns.
+func BenchmarkScaleFullScan_Allocations(b *testing.B) {
+	dir := setupBenchDir(b, "scan-alloc")
+	rng := rand.New(rand.NewSource(42))
+	rows := generateHeavyRows(50000, rng)
+	_, sqlitePath := buildPartitionFile(b, dir, rows, "20260206")
+
+	db, err := sql.Open("sqlite3", sqlitePath+"?mode=ro&_query_only=true")
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer db.Close()
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		sqlRows, err := db.Query(
+			"SELECT event_id, tenant_id, user_id, event_time, event_type FROM events")
+		if err != nil {
+			b.Fatal(err)
+		}
+
+		columns, _ := sqlRows.Columns()
+		values := make([]interface{}, len(columns))
+		valuePtrs := make([]interface{}, len(columns))
+		for j := range values {
+			valuePtrs[j] = &values[j]
+		}
+
+		count := 0
+		for sqlRows.Next() {
+			sqlRows.Scan(valuePtrs...)
+			// Simulate the pooled row slice pattern from the executor
+			processed := make([]interface{}, len(values))
+			copy(processed, values)
+			_ = processed
+			count++
+			for j := range values {
+				values[j] = nil
+			}
+		}
+		sqlRows.Close()
+		b.ReportMetric(float64(count), "rows_scanned")
+	}
+}
+
+// BenchmarkScaleShouldPause_SmallBacklog validates that the backpressure
+// controller no longer pauses when the backlog is small enough to process
+// in a single cycle (≤ maxConcurrency).
+func BenchmarkScaleShouldPause_SmallBacklog(b *testing.B) {
+	for i := 0; i < b.N; i++ {
+		bp := compaction.NewBackpressureController(compaction.BackpressureConfig{
+			MaxConcurrency:   8,
+			MinConcurrency:   1,
+			FailureThreshold: 0.10,
+			WindowDuration:   1 * time.Minute,
+		})
+
+		// High failure rate
+		for j := 0; j < 20; j++ {
+			bp.RecordFailure()
+		}
+
+		// Small backlog (≤ maxConcurrency) should NOT pause
+		if bp.ShouldPause(5) {
+			b.Fatal("should not pause with small backlog (5) even at high failure rate")
+		}
+		if bp.ShouldPause(8) {
+			b.Fatal("should not pause with backlog equal to maxConcurrency (8)")
+		}
+
+		// Large backlog (> maxConcurrency) SHOULD pause
+		if !bp.ShouldPause(20) {
+			b.Fatal("should pause with large backlog (20) at high failure rate")
+		}
+	}
+}

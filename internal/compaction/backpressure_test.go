@@ -79,16 +79,22 @@ func TestBackpressureController_RampUpOnLowFailureRate(t *testing.T) {
 	// Force concurrency down first
 	bp.currentConcurrency.Store(2)
 
-	// Record all successes (0% failure rate, well below threshold/2 = 10%)
+	// Record all successes (0% failure rate → aggressive ramp-up: double)
 	for i := 0; i < 10; i++ {
 		bp.RecordSuccess()
 	}
 
 	bp.AdjustConcurrency()
 
-	// Should ramp up: 2 + max(2/4, 1) = 2 + 1 = 3
-	if bp.Concurrency() != 3 {
-		t.Fatalf("expected concurrency 3 after ramp-up, got %d", bp.Concurrency())
+	// Zero failure rate with history → double: 2 * 2 = 4
+	if bp.Concurrency() != 4 {
+		t.Fatalf("expected concurrency 4 after aggressive ramp-up, got %d", bp.Concurrency())
+	}
+
+	// Another cycle should double again: 4 * 2 = 8
+	bp.AdjustConcurrency()
+	if bp.Concurrency() != 8 {
+		t.Fatalf("expected concurrency 8 after second ramp-up, got %d", bp.Concurrency())
 	}
 }
 
@@ -152,12 +158,21 @@ func TestBackpressureController_ShouldPause(t *testing.T) {
 		t.Fatal("should not pause with zero backlog")
 	}
 
-	// High failure rate + backlog → pause
+	// High failure rate + small backlog (≤ maxConcurrency) → don't pause
+	// This ensures the system always makes progress on small backlogs.
 	for i := 0; i < 10; i++ {
 		bp.RecordFailure()
 	}
-	if !bp.ShouldPause(5) {
-		t.Fatal("should pause with high failure rate and backlog")
+	if bp.ShouldPause(3) {
+		t.Fatal("should not pause with small backlog (3) ≤ maxConcurrency (4)")
+	}
+	if bp.ShouldPause(4) {
+		t.Fatal("should not pause with backlog equal to maxConcurrency (4)")
+	}
+
+	// High failure rate + large backlog (> maxConcurrency) → pause
+	if !bp.ShouldPause(10) {
+		t.Fatal("should pause with high failure rate and large backlog (10)")
 	}
 
 	// Low failure rate + backlog → don't pause

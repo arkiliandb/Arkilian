@@ -155,9 +155,35 @@ func (a *App) initSharedResources() error {
 		if err != nil {
 			return fmt.Errorf("failed to initialize manifest catalog: %w", err)
 		}
-		a.catalog = single
-		a.catalogReader = single
-		log.Printf("Manifest catalog initialized: %s", a.cfg.ManifestPath())
+
+		// Auto-migrate to sharded mode if partition count exceeds threshold.
+		// This prevents the operational footgun where queries silently degrade
+		// from 4ms to 245ms+ at 100K partitions without operator intervention.
+		if a.cfg.Manifest.AutoShardThreshold > 0 {
+			sharded, err := manifest.MigrateToSharded(
+				single,
+				a.cfg.ManifestDir(),
+				a.cfg.Manifest.ShardCount,
+				a.cfg.Manifest.AutoShardThreshold,
+			)
+			if err != nil {
+				single.Close()
+				return fmt.Errorf("failed to auto-migrate manifest to sharded mode: %w", err)
+			}
+			if sharded != nil {
+				a.catalog = sharded
+				a.catalogReader = sharded
+				log.Printf("Auto-migrated manifest catalog to sharded mode: %d shards", a.cfg.Manifest.ShardCount)
+			} else {
+				a.catalog = single
+				a.catalogReader = single
+				log.Printf("Manifest catalog initialized: %s", a.cfg.ManifestPath())
+			}
+		} else {
+			a.catalog = single
+			a.catalogReader = single
+			log.Printf("Manifest catalog initialized: %s", a.cfg.ManifestPath())
+		}
 	}
 
 	// Initialize shutdown manager

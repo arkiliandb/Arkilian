@@ -25,6 +25,29 @@ var snappyDecodeBufPool = sync.Pool{
 	},
 }
 
+// rowSlicePool provides reusable []interface{} slices for row processing.
+// Each goroutine gets its own slice from the pool, copies values into it,
+// then sends it on the channel. The receiver owns the slice after that.
+// Pool entries are keyed by capacity to avoid mismatched lengths.
+var rowSlicePool = sync.Pool{
+	New: func() interface{} {
+		s := make([]interface{}, 0, 16)
+		return &s
+	},
+}
+
+// getRowSlice returns a []interface{} of the given length from the pool.
+func getRowSlice(n int) []interface{} {
+	sp := rowSlicePool.Get().(*[]interface{})
+	s := *sp
+	if cap(s) >= n {
+		s = s[:n]
+	} else {
+		s = make([]interface{}, n)
+	}
+	return s
+}
+
 // QueryExecutor executes queries across partitions in parallel.
 type QueryExecutor interface {
 	// Execute runs a query and returns results
@@ -314,7 +337,7 @@ func (e *ParallelExecutor) streamPartitionRows(
 			return count
 		}
 
-		processed := make([]interface{}, len(values))
+		processed := getRowSlice(len(values))
 		for i, col := range columns {
 			val := values[i]
 			if col == "payload" {

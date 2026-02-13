@@ -1,15 +1,25 @@
-# Arkilian
 
-A the immutable database engine for real applications that treats SQLite files as immutable 8-16MB micro-partitions stored in object storage (S3/GCS), with a stateless query federation layer providing Snowflake-like compute/storage separation.
+<center>
+<h1> 
+Arkilian
+</h1> 
+<img src="https://avatars.githubusercontent.com/u/261335565?s=88&v=4" style="border-radius: 12px; margin: 24px" />
+</center>
+
+### An immutable database that follows Snowflake architecture, designed for scalable, replayable systems beyond analytics.
+
+
+
+Arkilian treats SQLite files as immutable 8-128MB micro-partitions stored in object storage (S3/GCS), with a stateless query federation layer providing Snowflake-like compute/storage separation.
 
 ## Why Arkilian?
 
-Unlike monolithic SQLite distribution attempts (rqlite, LiteFS), Arkilian embraces SQLite's single-node nature and partitions at the dataset level—no VFS complexity, no WAL coordination hazards, no storage duplication.
+Unlike monolithic SQLite distribution attempts (rqlite, LiteFS), Arkilian embraces SQLite's write single-node nature and partitions at the dataset level—no VFS complexity, no WAL coordination hazards, no storage duplication.
 
 **Target workloads:**
 
-- Time-series analytics
 - Multi-tenant SaaS event stores
+- Time-series analytics
 - Edge-to-cloud sync with strong eventual consistency
 
 **What you get:**
@@ -62,23 +72,20 @@ Unlike monolithic SQLite distribution attempts (rqlite, LiteFS), Arkilian embrac
 3. **Metadata-Driven Pruning**: Bloom filters + min/max stats eliminate >99% of I/O.
 4. **Write Isolation**: Writers operate on disjoint partition keys (no distributed locking).
 
-## Quick Start
-
-### Prerequisites
-
-- Go 1.21+
-- SQLite3
-
-### Build
+### Building
+- Prerequisites
+- Go 1.21+ in
 
 ```bash
 go build ./...
 ```
+- Run benchmark
+```bash
+go test -v -bench=BenchmarkProd -run=TestProd -benchtime=2x -timeout=300s ./test/benchmark/
+```
 
-### Run with Unified Binary (Recommended)
-
-The simplest way to run Arkilian is with the unified binary that runs all services:
-
+### Run Binary
+ 
 ```bash
 # Run all services with a single command
 ./arkilian --data-dir /data/arkilian
@@ -87,21 +94,6 @@ The simplest way to run Arkilian is with the unified binary that runs all servic
 ./arkilian --mode ingest --data-dir /data/arkilian
 ./arkilian --mode query --data-dir /data/arkilian
 ./arkilian --mode compact --data-dir /data/arkilian
-```
-
-### Run Individual Services (Legacy)
-
-You can also run each service separately:
-
-```bash
-# Start the ingestion service
-./arkilian-ingest --storage /data/arkilian/storage --manifest /data/arkilian/manifest.db
-
-# Start the query service
-./arkilian-query --storage /data/arkilian/storage --manifest /data/arkilian/manifest.db
-
-# Start the compaction daemon
-./arkilian-compact --storage /data/arkilian/storage --manifest /data/arkilian/manifest.db
 ```
 
 ## API
@@ -284,7 +276,6 @@ storage:
 
 - No distributed ACID transactions across partitions
 - Eventual consistency (not strong consistency)
-- Schema must be declared per partition key
 
 ## Documentation
 
