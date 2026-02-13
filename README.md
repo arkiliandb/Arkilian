@@ -14,7 +14,7 @@ Arkilian treats SQLite files as immutable 8-128MB micro-partitions stored in obj
 
 ## Why Arkilian?
 
-Unlike monolithic SQLite distribution attempts (rqlite, LiteFS), Arkilian embraces SQLite's write single-node nature and partitions at the dataset level—no VFS complexity, no WAL coordination hazards, no storage duplication.
+Unlike monolithic SQLite distribution attempts (rqlite, LiteFS), Arkilian embraces SQLite's write single-node nature and partitions at the dataset level—no VFS complexity, no WAL coordination issues, no storage duplication.
 
 **Target workloads:**
 
