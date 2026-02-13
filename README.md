@@ -1,15 +1,15 @@
 <br/>
 <h1 align="center">Arkilian</h1>  
 <p align="center">
-  <a href="https://github.com/codedynasty-dev/cradova">
-    <img src="https://avatars.githubusercontent.com/u/261335565?s=88&v=4" alt="Arkilian Database"  
+  <a href="https://github.com/codedynasty-dev/Arkilian">
+    <img src="https://avatars.githubusercontent.com/u/261335565?s=88&v=4" alt="Arkilian Database"   
     >
   </a>
 </p>
 
-![License](https://img.shields.io/github/license/codedynasty-dev/cradova)
-[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/cradova/cradova.js/blob/next/contributing.md)
-![Stargazers](https://img.shields.io/github/stars/codedynasty-dev/cradova?style=social)
+![License](https://img.shields.io/github/license/codedynasty-dev/birth-of-Arkilian)
+[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/Arkilian/Arkilian.js/blob/next/contributing.md)
+![Stargazers](https://img.shields.io/github/stars/codedynasty-dev/birth-of-Arkilian?style=social)
 
 ### An immutable database that follows Snowflake architecture, designed for scalable, replayable systems beyond analytics.
 
