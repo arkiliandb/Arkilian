@@ -1,7 +1,7 @@
 <br/>
 <h1 align="center">Arkilian</h1>  
 <p align="center">
-  <a href="https://github.com/CodeDynasty-dev/Arkilian">
+  <a href="https://github.com/CodeDynasty-dev/birth-of-Arkilian">
     <img src="https://avatars.githubusercontent.com/u/261335565?s=88&v=4" alt="Arkilian Database"   
     >
   </a>

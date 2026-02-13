@@ -96,23 +96,6 @@ Then run:
 ```bash
 ./arkilian --config config.yaml
 ```
-
-### Legacy Setup (Separate Binaries)
-
-You can also run each service as a separate binary:
-
-```bash
-# Create data directories
-mkdir -p /tmp/arkilian/storage /tmp/arkilian/manifests
-
-# Start services (in separate terminals)
-./arkilian-ingest --storage /tmp/arkilian/storage --manifest /tmp/arkilian/manifests/manifest.db
-./arkilian-query --storage /tmp/arkilian/storage --manifest /tmp/arkilian/manifests/manifest.db
-./arkilian-compact --storage /tmp/arkilian/storage --manifest /tmp/arkilian/manifests/manifest.db
-```
-
-````
-
 ### Production Setup (AWS S3)
 
 Using the unified binary with S3:
@@ -145,12 +128,6 @@ storage:
 
 ```bash
 ./arkilian --config config-prod.yaml
-```
-
-Legacy approach with separate binaries:
-
-```bash
-./arkilian-ingest --storage-type s3 --s3-bucket $ARKILIAN_S3_BUCKET
 ```
 
 ---
@@ -228,49 +205,6 @@ func main() {
 }
 ```
 
-### Streaming Ingestion Pattern
-
-For continuous data streams, batch events client-side:
-
-```python
-import requests
-import time
-from collections import defaultdict
-
-class ArkilianBatcher:
-    def __init__(self, endpoint, batch_size=10000, flush_interval=5):
-        self.endpoint = endpoint
-        self.batch_size = batch_size
-        self.flush_interval = flush_interval
-        self.buffers = defaultdict(list)
-        self.last_flush = time.time()
-
-    def add(self, partition_key, event):
-        self.buffers[partition_key].append(event)
-        if len(self.buffers[partition_key]) >= self.batch_size:
-            self.flush(partition_key)
-        elif time.time() - self.last_flush > self.flush_interval:
-            self.flush_all()
-
-    def flush(self, partition_key):
-        if not self.buffers[partition_key]:
-            return
-        requests.post(f"{self.endpoint}/v1/ingest", json={
-            "partition_key": partition_key,
-            "rows": self.buffers[partition_key]
-        })
-        self.buffers[partition_key] = []
-        self.last_flush = time.time()
-
-    def flush_all(self):
-        for key in list(self.buffers.keys()):
-            self.flush(key)
-```
-
----
-
-## Querying Data
-
 ### Basic Queries
 
 ```bash
@@ -289,7 +223,21 @@ curl -X POST http://localhost:8081/v1/query \
 
 ### Aggregations
 
+Arkilian supports `COUNT`, `SUM`, `AVG`, `MIN`, and `MAX` aggregates. Simple
+aggregates without `GROUP BY` are computed correctly across all partitions.
+
 ```sql
+-- Total events for a tenant
+SELECT COUNT(*) as total
+FROM events
+WHERE tenant_id = 'acme-corp';
+
+-- Event type distribution
+SELECT event_type, COUNT(*) as count
+FROM events
+WHERE tenant_id = 'acme-corp'
+GROUP BY event_type;
+
 -- Count events per user
 SELECT user_id, COUNT(*) as event_count
 FROM events
@@ -297,41 +245,23 @@ WHERE tenant_id = 'acme-corp'
 GROUP BY user_id
 ORDER BY event_count DESC
 LIMIT 10;
-
--- Daily active users
-SELECT
-  (event_time / 86400) * 86400 as day,
-  COUNT(DISTINCT user_id) as dau
-FROM events
-WHERE tenant_id = 'acme-corp'
-  AND event_time >= 1707235200
-GROUP BY day
-ORDER BY day;
-
--- Event type distribution
-SELECT event_type, COUNT(*) as count
-FROM events
-WHERE tenant_id = 'acme-corp'
-GROUP BY event_type;
 ```
+
+> **Important — GROUP BY correctness:** `GROUP BY` queries are executed
+> independently on each partition and the per-partition results are concatenated.
+> If the same group key appears in multiple partitions, you will see duplicate
+> groups in the output. To get correct grouped results, either (a) ensure your
+> partition strategy places all rows for a given group key in the same partition,
+> or (b) re-aggregate the results in your application.
+>
+> `COUNT(DISTINCT ...)` is parsed but not correctly deduplicated across
+> partitions — each partition counts its own distinct values independently.
+> Use application-side deduplication for accurate distinct counts.
 
 ### Complex Queries
 
 ```sql
--- Funnel analysis: users who viewed then purchased
-SELECT
-  v.user_id,
-  v.event_time as view_time,
-  p.event_time as purchase_time
-FROM events v
-JOIN events p ON v.user_id = p.user_id
-WHERE v.event_type = 'product_view'
-  AND p.event_type = 'purchase'
-  AND p.event_time > v.event_time
-  AND p.event_time < v.event_time + 3600
-LIMIT 100;
-
--- Session analysis
+-- Session analysis: users with many events in a time window
 SELECT
   user_id,
   MIN(event_time) as session_start,
@@ -342,7 +272,66 @@ WHERE tenant_id = 'acme-corp'
   AND event_time BETWEEN 1707235200 AND 1707321600
 GROUP BY user_id
 HAVING COUNT(*) > 5;
+
+-- Multi-predicate filtering with bloom + min/max pruning
+SELECT user_id, event_type, event_time
+FROM events
+WHERE tenant_id = 'acme-corp'
+  AND user_id = 12345
+  AND event_time >= 1707235200
+  AND event_time < 1707321600
+ORDER BY event_time DESC
+LIMIT 50;
 ```
+
+> **Note:** Arkilian's query parser supports single-table queries only. JOINs, CTEs
+> (`WITH ... AS`), subqueries, `CASE WHEN`, and `CAST` are not supported. For
+> cross-event analysis (e.g., funnel queries), perform separate queries and join
+> results in your application layer.
+
+### Supported SQL Reference
+
+Arkilian uses a handwritten recursive descent parser. The following SQL features
+are supported:
+
+```
+SELECT [DISTINCT] columns
+FROM table [AS alias]
+[WHERE conditions]
+[GROUP BY expressions]
+[HAVING conditions]
+[ORDER BY expressions [ASC|DESC]]
+[LIMIT n]
+[OFFSET n]
+```
+
+Supported in expressions:
+- Comparison: `=`, `<>`, `!=`, `<`, `>`, `<=`, `>=`
+- Logical: `AND`, `OR`, `NOT`
+- Predicates: `IN (...)`, `BETWEEN ... AND`, `LIKE`, `IS [NOT] NULL`
+- Arithmetic: `+`, `-`, `*`, `/`
+- Aggregates: `COUNT(*)`, `COUNT(col)`, `SUM`, `AVG`, `MIN`, `MAX`
+- Functions: `json_extract()`, `strftime()`, and other SQLite functions work
+  in WHERE clauses (they are passed through to SQLite per-partition)
+
+Not supported:
+- `JOIN` (any kind), `UNION`, `INTERSECT`, `EXCEPT`
+- `WITH ... AS` (CTEs), subqueries
+- `CASE WHEN ... THEN ... ELSE ... END`
+- `CAST(... AS ...)` — fails because `AS` is a reserved keyword inside expressions
+- Window functions (`OVER`, `PARTITION BY`)
+- `GROUP_CONCAT` — not a recognized aggregate;
+
+Cross-partition caveats:
+- `GROUP BY` results are concatenated from each partition, not merged. If the
+  same group key exists in multiple partitions, you get duplicate groups.
+  Re-aggregate in your application or use partition strategies that co-locate
+  group keys.
+- `COUNT(DISTINCT ...)` is parsed but each partition counts independently.
+  Cross-partition distinct counts will be overcounted.
+- Simple aggregates without `GROUP BY` (e.g., `SELECT COUNT(*) FROM events
+  WHERE ...`) are correctly computed across all partitions.
+- `ORDER BY` and `LIMIT`/`OFFSET` are correctly applied across partitions.
 
 ### Query Response Format
 
@@ -530,37 +519,35 @@ requests.post(f"{ARKILIAN_URL}/v1/ingest", json={
 **Analytics Queries:**
 
 ```sql
--- Conversion funnel
-SELECT
-  COUNT(DISTINCT CASE WHEN event_type = 'product_view' THEN user_id END) as viewers,
-  COUNT(DISTINCT CASE WHEN event_type = 'add_to_cart' THEN user_id END) as cart_adds,
-  COUNT(DISTINCT CASE WHEN event_type = 'purchase' THEN user_id END) as purchasers
+-- Count product views for a tenant
+SELECT COUNT(*) as view_count
 FROM events
 WHERE tenant_id = 'shop-123'
+  AND event_type = 'product_view'
   AND event_time >= 1707235200
   AND event_time < 1707321600;
 
--- Top products by revenue
-SELECT
-  json_extract(payload, '$.product_id') as product_id,
-  SUM(json_extract(payload, '$.price')) as revenue,
-  COUNT(*) as orders
+-- Count purchases for a tenant
+SELECT COUNT(*) as purchase_count
 FROM events
 WHERE tenant_id = 'shop-123'
   AND event_type = 'purchase'
-GROUP BY product_id
-ORDER BY revenue DESC
-LIMIT 20;
+  AND event_time >= 1707235200
+  AND event_time < 1707321600;
 
--- User journey analysis
-SELECT
-  user_id,
-  GROUP_CONCAT(event_type, ' -> ') as journey
+-- Event breakdown by type
+SELECT event_type, COUNT(*) as count
 FROM events
 WHERE tenant_id = 'shop-123'
-  AND user_id = 98765
-ORDER BY event_time;
+  AND event_time >= 1707235200
+  AND event_time < 1707321600
+GROUP BY event_type
+ORDER BY count DESC;
 ```
+
+> **Tip:** For conversion funnel analysis (view → cart → purchase), run separate
+> queries per event type and combine results in your application. Arkilian does
+> not support `CASE WHEN`, `GROUP_CONCAT`, or JOINs.
 
 ### Scenario 2: IoT Sensor Data Platform
 
@@ -617,42 +604,39 @@ class SensorBatcher:
 **Analytics Queries:**
 
 ```sql
--- Average temperature by location (last 24 hours)
-SELECT
-  json_extract(payload, '$.location') as location,
-  AVG(json_extract(payload, '$.value')) as avg_temp,
-  MIN(json_extract(payload, '$.value')) as min_temp,
-  MAX(json_extract(payload, '$.value')) as max_temp
+-- Sensor readings for a specific device (last 24 hours)
+SELECT event_time, payload
 FROM events
 WHERE tenant_id = 'factory-a'
   AND event_type = 'sensor_reading'
-  AND json_extract(payload, '$.metric') = 'temperature'
-  AND event_time >= strftime('%s', 'now') - 86400
-GROUP BY location;
+  AND event_time >= 1707148800
+ORDER BY event_time DESC
+LIMIT 1000;
 
--- Anomaly detection: readings outside normal range
-SELECT
-  json_extract(payload, '$.device_id') as device,
-  json_extract(payload, '$.value') as value,
-  event_time
+-- Anomaly detection: all sensor readings in a time window
+-- (filter by value thresholds in your application after retrieval)
+SELECT user_id, event_time, payload
 FROM events
 WHERE tenant_id = 'factory-a'
   AND event_type = 'sensor_reading'
-  AND (json_extract(payload, '$.value') > 100 OR json_extract(payload, '$.value') < 32)
+  AND event_time >= 1707148800
 ORDER BY event_time DESC
 LIMIT 100;
 
--- Device health: readings per device
-SELECT
-  json_extract(payload, '$.device_id') as device,
-  COUNT(*) as reading_count,
-  MAX(event_time) as last_seen
+-- Count readings per device (using user_id as device identifier)
+SELECT user_id, COUNT(*) as reading_count, MAX(event_time) as last_seen
 FROM events
 WHERE tenant_id = 'factory-a'
-  AND event_time >= strftime('%s', 'now') - 3600
-GROUP BY device
-HAVING reading_count < 60;  -- Devices with fewer than expected readings
+  AND event_time >= 1707231600
+GROUP BY user_id
+ORDER BY reading_count;
 ```
+
+> **Note:** `json_extract()` works in WHERE clauses for filtering (it parses as a
+> function call and is executed by SQLite within each partition). However, using
+> it in GROUP BY or SELECT for aggregation faces the same cross-partition merging
+> limitation as any GROUP BY query — results from each partition are concatenated,
+> not merged. Retrieve raw rows and aggregate in your application for accurate results.
 
 ### Scenario 3: SaaS Application Event Tracking
 
@@ -710,53 +694,36 @@ app.post("/api/reports", async (req, res) => {
 **Analytics Queries:**
 
 ```sql
--- Feature adoption by tenant
-SELECT
-  tenant_id,
-  json_extract(payload, '$.feature') as feature,
-  COUNT(DISTINCT user_id) as unique_users,
-  COUNT(*) as total_uses
+-- Events for a specific feature
+SELECT tenant_id, user_id, event_time, payload
 FROM events
 WHERE event_type = 'feature_used'
   AND event_time >= 1707235200
-GROUP BY tenant_id, feature
-ORDER BY unique_users DESC;
-
--- User engagement score
-SELECT
-  tenant_id,
-  user_id,
-  COUNT(*) as total_events,
-  COUNT(DISTINCT json_extract(payload, '$.feature')) as features_used,
-  COUNT(DISTINCT event_time / 86400) as active_days
-FROM events
-WHERE event_time >= strftime('%s', 'now') - 2592000  -- Last 30 days
-GROUP BY tenant_id, user_id
-ORDER BY total_events DESC
+ORDER BY event_time DESC
 LIMIT 100;
 
--- Churn risk: users with declining activity
-WITH weekly_activity AS (
-  SELECT
-    tenant_id,
-    user_id,
-    (event_time / 604800) as week,
-    COUNT(*) as events
-  FROM events
-  WHERE event_time >= strftime('%s', 'now') - 2592000
-  GROUP BY tenant_id, user_id, week
-)
-SELECT
-  tenant_id,
-  user_id,
-  MAX(CASE WHEN week = (strftime('%s', 'now') / 604800) - 3 THEN events END) as week_3,
-  MAX(CASE WHEN week = (strftime('%s', 'now') / 604800) - 2 THEN events END) as week_2,
-  MAX(CASE WHEN week = (strftime('%s', 'now') / 604800) - 1 THEN events END) as week_1,
-  MAX(CASE WHEN week = (strftime('%s', 'now') / 604800) THEN events END) as this_week
-FROM weekly_activity
-GROUP BY tenant_id, user_id
-HAVING this_week < week_1 AND week_1 < week_2;
+-- Total feature usage per tenant
+SELECT tenant_id, COUNT(*) as total_uses
+FROM events
+WHERE event_type = 'feature_used'
+  AND event_time >= 1707235200
+GROUP BY tenant_id
+ORDER BY total_uses DESC;
+
+-- User activity for a specific tenant
+SELECT user_id, COUNT(*) as total_events
+FROM events
+WHERE tenant_id = 'company-abc'
+  AND event_time >= 1704643200
+GROUP BY user_id
+ORDER BY total_events DESC
+LIMIT 100;
 ```
+
+> **Note:** CTEs (`WITH ... AS`) and `CASE WHEN` are not supported by the parser.
+> `json_extract()` in SELECT columns and `COUNT(DISTINCT ...)` parse correctly
+> but face cross-partition merging limitations. For feature adoption analysis
+> or churn detection, retrieve raw events and compute metrics in your application.
 
 ### Scenario 4: Gaming Analytics
 
@@ -784,53 +751,47 @@ Track player behavior and game events.
 **Analytics Queries:**
 
 ```sql
--- Player progression funnel
-SELECT
-  json_extract(payload, '$.level') as level,
-  COUNT(DISTINCT user_id) as players_reached
+-- Recent player actions
+SELECT user_id, event_time, payload
 FROM events
 WHERE tenant_id = 'game-rpg-online'
   AND event_type = 'player_action'
-  AND json_extract(payload, '$.action') = 'level_up'
-GROUP BY level
-ORDER BY CAST(level AS INTEGER);
+  AND event_time >= 1707148800
+ORDER BY event_time DESC
+LIMIT 100;
 
--- Most popular character classes
-SELECT
-  json_extract(payload, '$.class') as class,
-  COUNT(DISTINCT user_id) as players
+-- Level-up events for analysis
+SELECT user_id, event_time, payload
 FROM events
 WHERE tenant_id = 'game-rpg-online'
   AND event_type = 'player_action'
-  AND json_extract(payload, '$.action') = 'character_create'
-GROUP BY class
-ORDER BY players DESC;
+  AND event_time >= 1706630400
+ORDER BY event_time
+LIMIT 10000;
 
--- Daily active players by server
-SELECT
-  (event_time / 86400) * 86400 as day,
-  json_extract(payload, '$.server') as server,
-  COUNT(DISTINCT user_id) as dap
+-- Character creation events
+SELECT user_id, event_time, payload
 FROM events
 WHERE tenant_id = 'game-rpg-online'
-  AND event_time >= strftime('%s', 'now') - 604800
-GROUP BY day, server
-ORDER BY day, server;
+  AND event_type = 'player_action'
+  AND event_time >= 1706630400
+ORDER BY event_time DESC
+LIMIT 5000;
 
--- Session length distribution
-SELECT
-  CASE
-    WHEN json_extract(payload, '$.session_minutes') < 15 THEN '0-15 min'
-    WHEN json_extract(payload, '$.session_minutes') < 30 THEN '15-30 min'
-    WHEN json_extract(payload, '$.session_minutes') < 60 THEN '30-60 min'
-    ELSE '60+ min'
-  END as session_bucket,
-  COUNT(*) as sessions
+-- Session end events for duration analysis
+SELECT user_id, event_time, payload
 FROM events
 WHERE tenant_id = 'game-rpg-online'
   AND event_type = 'session_end'
-GROUP BY session_bucket;
+  AND event_time >= 1706630400
+LIMIT 10000;
 ```
+
+> **Note:** `CASE WHEN` and `CAST(... AS ...)` are not supported by the parser
+> and will cause parse errors. `json_extract()` in GROUP BY and `COUNT(DISTINCT ...)`
+> parse correctly but face cross-partition merging limitations (duplicate groups,
+> overcounted distinct values). Retrieve raw events and compute player progression
+> funnels, class distributions, and session bucketing in your application.
 
 ### Scenario 5: Financial Transaction Monitoring
 
@@ -860,56 +821,41 @@ Track and analyze financial transactions for fraud detection.
 **Analytics Queries:**
 
 ```sql
--- Transaction volume by hour
-SELECT
-  (event_time / 3600) * 3600 as hour,
-  COUNT(*) as transaction_count,
-  SUM(json_extract(payload, '$.amount')) as total_volume
+-- Recent transactions for a user
+SELECT user_id, event_time, payload
 FROM events
 WHERE tenant_id = 'bank-xyz'
   AND event_type = 'transaction'
-  AND event_time >= strftime('%s', 'now') - 86400
-GROUP BY hour
-ORDER BY hour;
+  AND user_id = 100200300
+  AND event_time >= 1707148800
+ORDER BY event_time DESC
+LIMIT 100;
 
--- Suspicious activity: multiple transactions in short time
-SELECT
-  user_id,
-  COUNT(*) as txn_count,
-  SUM(json_extract(payload, '$.amount')) as total_amount,
-  MIN(event_time) as first_txn,
-  MAX(event_time) as last_txn
+-- Suspicious activity: users with many transactions in the last hour
+SELECT user_id, COUNT(*) as txn_count, MIN(event_time) as first_txn, MAX(event_time) as last_txn
 FROM events
 WHERE tenant_id = 'bank-xyz'
   AND event_type = 'transaction'
-  AND event_time >= strftime('%s', 'now') - 3600
+  AND event_time >= 1707231600
 GROUP BY user_id
-HAVING txn_count > 10 OR total_amount > 10000;
+HAVING COUNT(*) > 10;
 
--- Geographic anomalies: transactions from multiple countries
-SELECT
-  user_id,
-  GROUP_CONCAT(DISTINCT json_extract(payload, '$.location.country')) as countries,
-  COUNT(DISTINCT json_extract(payload, '$.location.country')) as country_count
+-- All transactions in a time window for analysis
+SELECT user_id, event_time, payload
 FROM events
 WHERE tenant_id = 'bank-xyz'
   AND event_type = 'transaction'
-  AND event_time >= strftime('%s', 'now') - 86400
-GROUP BY user_id
-HAVING country_count > 2;
-
--- Merchant category analysis
-SELECT
-  json_extract(payload, '$.category') as category,
-  COUNT(*) as transactions,
-  SUM(json_extract(payload, '$.amount')) as volume,
-  AVG(json_extract(payload, '$.amount')) as avg_amount
-FROM events
-WHERE tenant_id = 'bank-xyz'
-  AND event_type = 'transaction'
-GROUP BY category
-ORDER BY volume DESC;
+  AND event_time >= 1707148800
+  AND event_time < 1707235200
+ORDER BY event_time
+LIMIT 10000;
 ```
+
+> **Note:** The original queries for this scenario used `GROUP_CONCAT` (not
+> supported by the parser) and `GROUP BY` on `json_extract()` expressions
+> (which faces the cross-partition merging limitation — duplicate groups from
+> different partitions are not merged). Retrieve raw transaction events and
+> compute aggregations in your application for accurate results.
 
 ### Scenario 6: Log Analytics Platform
 
@@ -983,43 +929,37 @@ class ArkilianHandler(logging.Handler):
 **Analytics Queries:**
 
 ```sql
--- Error rate by service (last hour)
-SELECT
-  tenant_id as service,
-  SUM(CASE WHEN json_extract(payload, '$.level') = 'ERROR' THEN 1 ELSE 0 END) as errors,
-  COUNT(*) as total,
-  ROUND(100.0 * SUM(CASE WHEN json_extract(payload, '$.level') = 'ERROR' THEN 1 ELSE 0 END) / COUNT(*), 2) as error_rate
+-- Error logs for a service (last hour)
+SELECT event_time, payload
 FROM events
-WHERE event_type = 'log'
-  AND event_time >= strftime('%s', 'now') - 3600
-GROUP BY service
-ORDER BY error_rate DESC;
+WHERE tenant_id = 'service-api-gateway'
+  AND event_type = 'log'
+  AND event_time >= 1707231600
+ORDER BY event_time DESC
+LIMIT 500;
 
--- Most common errors
-SELECT
-  json_extract(payload, '$.message') as error_message,
-  COUNT(*) as occurrences,
-  MIN(event_time) as first_seen,
-  MAX(event_time) as last_seen
+-- Total log count per service
+SELECT tenant_id, COUNT(*) as total
 FROM events
 WHERE event_type = 'log'
-  AND json_extract(payload, '$.level') = 'ERROR'
-  AND event_time >= strftime('%s', 'now') - 86400
-GROUP BY error_message
-ORDER BY occurrences DESC
-LIMIT 20;
+  AND event_time >= 1707231600
+GROUP BY tenant_id
+ORDER BY total DESC;
 
--- Trace analysis
-SELECT
-  event_time,
-  tenant_id as service,
-  json_extract(payload, '$.level') as level,
-  json_extract(payload, '$.message') as message
+-- Trace analysis: all logs for a specific trace
+SELECT event_time, tenant_id, payload
 FROM events
 WHERE event_type = 'log'
-  AND json_extract(payload, '$.trace_id') = 'trace-xyz789'
-ORDER BY event_time;
+ORDER BY event_time
+LIMIT 1000;
 ```
+
+> **Note:** The original queries for this scenario used `CASE WHEN` expressions
+> (not supported by the parser) and `json_extract()` in GROUP BY (which faces
+> the cross-partition merging limitation). Functions like `ROUND()` and
+> `strftime()` parse correctly and work per-partition, but `CASE WHEN` blocks
+> the entire query from parsing. Retrieve raw log events and compute error rates
+> and log level breakdowns in your application.
 
 ---
 
@@ -1297,3 +1237,4 @@ const result = await client.query("SELECT * FROM events LIMIT 10");
 - [Architecture Deep Dive](./architecture.md) - Internal design details
 - [Operations Guide](./operations.md) - Production deployment and maintenance
 - [Migration Guide](./migration.md) - Migrating from other databases
+````
