@@ -2,20 +2,16 @@
 <h1 align="center">Arkilian</h1>  
 <p align="center">
   <a href="https://github.com/codedynasty-dev/cradova">
-    <img src="https://avatars.githubusercontent.com/u/261335565?s=88&v=4" alt="Logo" width="80" height="80"
+    <img src="https://avatars.githubusercontent.com/u/261335565?s=88&v=4" alt="Arkilian Database"  
     >
   </a>
 </p>
 
- 
 ![License](https://img.shields.io/github/license/codedynasty-dev/cradova)
-[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/cradova/cradova.js/blob/next/contributing.md) 
+[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/cradova/cradova.js/blob/next/contributing.md)
 ![Stargazers](https://img.shields.io/github/stars/codedynasty-dev/cradova?style=social)
 
-
 ### An immutable database that follows Snowflake architecture, designed for scalable, replayable systems beyond analytics.
-
-
 
 Arkilian treats SQLite files as immutable 8-128MB micro-partitions stored in object storage (S3/GCS), with a stateless query federation layer providing Snowflake-like compute/storage separation.
 
@@ -80,19 +76,22 @@ Unlike monolithic SQLite distribution attempts (rqlite, LiteFS), Arkilian embrac
 4. **Write Isolation**: Writers operate on disjoint partition keys (no distributed locking).
 
 ### Building
+
 - Prerequisites
 - Go 1.21+ in
 
 ```bash
 go build ./...
 ```
+
 - Run benchmark
+
 ```bash
 go test -v -bench=BenchmarkProd -run=TestProd -benchtime=2x -timeout=300s ./test/benchmark/
 ```
 
 ### Run Binary
- 
+
 ```bash
 # Run all services with a single command
 ./arkilian --data-dir /data/arkilian
