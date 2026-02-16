@@ -3,3 +3,4 @@ data/*
 report.txt
 QA-report.txt
 video.mp4
+.env

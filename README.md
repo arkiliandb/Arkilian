@@ -271,7 +271,7 @@ storage:
   path: /data/arkilian/storage
 ```
 
-### Legacy Service Configuration
+### Service Configuration
 
 | Environment Variable     | Default             | Description              |
 | ------------------------ | ------------------- | ------------------------ |
@@ -304,3 +304,32 @@ Inspired by:
 - [DuckDB](https://duckdb.org) - Embeddable analytical database
 - [Litestream](https://litestream.io) - WAL replication
 - [Apache Iceberg](https://iceberg.apache.org) - Metadata layer for immutable files
+
+## Deployment
+
+### Docker
+
+Arkilian includes a multi-stage `Dockerfile` that builds minimal, secure images for all services.
+
+\`\`\`bash
+# Build the image
+docker build -t arkilian:latest .
+
+# Run Ingest Service (Default)
+docker run -p 8080:8080 arkilian:latest
+
+# Run Query Service
+docker run -p 8081:8081 --entrypoint /usr/local/bin/arkilian-query arkilian:latest
+
+# Run Compaction Service
+docker run --entrypoint /usr/local/bin/arkilian-compact arkilian:latest
+\`\`\`
+
+### CI/CD
+
+The project uses GitHub Actions for Continuous Integration. The workflow at \`.github/workflows/ci.yaml\` automatically:
+
+1.  Verifies dependencies.
+2.  Runs static analysis (\`go vet\`).
+3.  Executes the full test suite with race detection.
+4.  Verifies the Docker build.

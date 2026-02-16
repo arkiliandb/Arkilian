@@ -124,9 +124,12 @@ func (a *App) initSharedResources() error {
 	case "local":
 		a.storage, err = storage.NewLocalStorage(a.cfg.Storage.Path)
 	case "s3":
-		s3Cfg := storage.S3Config{
-			Region:   a.cfg.Storage.S3.Region,
-			Endpoint: a.cfg.Storage.S3.Endpoint,
+		s3Cfg := storage.DefaultS3Config()
+		if a.cfg.Storage.S3.Region != "" {
+			s3Cfg.Region = a.cfg.Storage.S3.Region
+		}
+		if a.cfg.Storage.S3.Endpoint != "" {
+			s3Cfg.Endpoint = a.cfg.Storage.S3.Endpoint
 		}
 		a.storage, err = storage.NewS3Storage(
 			context.Background(),
@@ -140,6 +143,10 @@ func (a *App) initSharedResources() error {
 		return fmt.Errorf("failed to initialize storage: %w", err)
 	}
 	log.Printf("Storage initialized: type=%s", a.cfg.Storage.Type)
+	if a.cfg.Storage.Type == "s3" {
+		log.Printf("S3 Config: Bucket=%s, Region=%s, Endpoint=%s", 
+			a.cfg.Storage.S3.Bucket, a.cfg.Storage.S3.Region, a.cfg.Storage.S3.Endpoint)
+	}
 
 	// Initialize manifest catalog
 	if a.cfg.Manifest.Sharded {

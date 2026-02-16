@@ -22,8 +22,8 @@ Complete documentation for building real-world applications with Arkilian.
 
 ```bash
 # Clone the repository
-git clone https://github.com/arkilian/arkilian.git
-cd arkilian
+git clone https://github.com/CodeDynasty-dev/birth-of-Arkilian.git
+cd birth-of-Arkilian
 
 # Build all binaries
 go build ./...
@@ -96,21 +96,61 @@ Then run:
 ```bash
 ./arkilian --config config.yaml
 ```
-### Production Setup (AWS S3)
+### Configuration with .env
 
-Using the unified binary with S3:
+Arkilian supports loading configuration from a `.env` file in the current directory. This is used to manage secrets and environment-specific settings.
+
+Create a `.env` file:
 
 ```bash
-# Set environment variables
-export ARKILIAN_STORAGE_TYPE=s3
-export ARKILIAN_S3_BUCKET=my-arkilian-bucket
-export ARKILIAN_S3_REGION=us-east-1
-export AWS_ACCESS_KEY_ID=your-access-key
-export AWS_SECRET_ACCESS_KEY=your-secret-key
+# General
+ARKILIAN_MODE=all
+ARKILIAN_DATA_DIR=./data/arkilian
 
-# Start with S3 backend
-./arkilian --data-dir /data/arkilian
+# Storage (S3 Example)
+ARKILIAN_STORAGE_TYPE=s3
+ARKILIAN_S3_BUCKET=arkilian-bucket
+ARKILIAN_S3_REGION=us-east-1
+ARKILIAN_S3_ENDPOINT= # Optional: Use for MinIO/R2
+
+# AWS SDK automatically picks up standard AWS env vars:
+ARKILIAN_AWS_ACCESS_KEY_ID=...
+ARKILIAN_AWS_SECRET_ACCESS_KEY=...
+
+# Performance Tuning
+ARKILIAN_QUERY_CONCURRENCY=50
+ARKILIAN_INGEST_TARGET_PARTITION_SIZE_MB=64
 ```
+
+Then simply run:
+
+```bash
+./arkilian
+```
+
+### Production Setup (AWS S3)
+
+To run Arkilian with S3 as the storage backend:
+
+1.  **IAM Permissions**: Ensure the AWS credentials have `s3:PutObject`, `s3:GetObject`, `s3:ListBucket`, and `s3:DeleteObject` permissions on the target bucket.
+2.  **Configuration**:
+ 
+
+3.  **Run**:
+    
+    Ensure your `.env` file contains:
+    ```bash
+    ARKILIAN_STORAGE_TYPE=s3
+    ARKILIAN_S3_BUCKET=my-production-bucket
+    ARKILIAN_S3_REGION=us-west-2
+    ARKILIAN_AWS_ACCESS_KEY_ID=AKIA...
+    ARKILIAN_AWS_SECRET_ACCESS_KEY=...
+    ```
+
+    Then run:
+    ```bash
+    ./arkilian
+    ```
 
 Or using a config file:
 
@@ -187,7 +227,7 @@ package main
 
 import (
     "context"
-    pb "github.com/arkilian/arkilian/api/proto"
+    pb "github.com/CodeDynasty-dev/birth-of-Arkilian/api/proto"
     "google.golang.org/grpc"
 )
 
@@ -1202,7 +1242,7 @@ curl -X POST http://localhost:8082/v1/compact/retry?partition_key=20260206
 ### Go
 
 ```go
-import "github.com/arkilian/arkilian-go"
+import "github.com/CodeDynasty-dev/birth-of-Arkilian-go"
 
 client := arkilian.NewClient("http://localhost:8080")
 client.Ingest(ctx, "20260206", rows)

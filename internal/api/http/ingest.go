@@ -134,13 +134,17 @@ func (h *IngestHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	objectPath := fmt.Sprintf("partitions/%s/%s.sqlite", req.PartitionKey, info.PartitionID)
 	metaObjectPath := fmt.Sprintf("partitions/%s/%s.meta.json", req.PartitionKey, info.PartitionID)
 
+
+	log.Printf("Ingest: uploading to %s (meta: %s)", objectPath, metaObjectPath)
 	if err := h.uploadPartition(r.Context(), info, objectPath, metaObjectPath); err != nil {
+		log.Printf("Ingest: upload failed: %v", err)
 		writeError(w, http.StatusInternalServerError, fmt.Sprintf("failed to upload partition: %v", err), requestID)
 		return
 	}
 
 	// Register in manifest catalog
 	if err := h.registerPartition(r.Context(), info, objectPath, req.IdempotencyKey); err != nil {
+		log.Printf("Ingest: registration failed: %v", err)
 		writeError(w, http.StatusInternalServerError, fmt.Sprintf("failed to register partition: %v", err), requestID)
 		return
 	}

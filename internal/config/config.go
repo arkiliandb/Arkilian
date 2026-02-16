@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/joho/godotenv"
 )
 
 // Mode represents the service mode to run.
@@ -428,6 +430,9 @@ func LoadFromFile(path string) (*Config, error) {
 // LoadFromEnv loads configuration from environment variables.
 // Environment variables use the ARKILIAN_ prefix.
 func LoadFromEnv(cfg *Config) {
+	// Try loading .env file (ignore error if not present)
+	_ = godotenv.Load()
+
 	if v := os.Getenv("ARKILIAN_MODE"); v != "" {
 		cfg.Mode = Mode(v)
 	}
@@ -530,6 +535,14 @@ func LoadFromEnv(cfg *Config) {
 	// Bloom cache configuration
 	if v := os.Getenv("ARKILIAN_QUERY_BLOOM_CACHE_SIZE_MB"); v != "" {
 		fmt.Sscanf(v, "%d", &cfg.Query.BloomCacheSizeMB)
+	}
+
+	// Map ARKILIAN_AWS_ credentials to standard AWS_ credentials for the SDK
+	if v := os.Getenv("ARKILIAN_AWS_ACCESS_KEY_ID"); v != "" {
+		os.Setenv("AWS_ACCESS_KEY_ID", v)
+	}
+	if v := os.Getenv("ARKILIAN_AWS_SECRET_ACCESS_KEY"); v != "" {
+		os.Setenv("AWS_SECRET_ACCESS_KEY", v)
 	}
 }
 

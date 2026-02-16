@@ -4,7 +4,9 @@ package http
 import (
 	"context"
 	"encoding/json"
+	"log"
 	"net/http"
+	"runtime/debug"
 
 	"github.com/google/uuid"
 )
@@ -71,6 +73,7 @@ func RecoveryMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer func() {
 			if err := recover(); err != nil {
+				log.Printf("PANIC: %v\n%s", err, debug.Stack())
 				requestID, _ := r.Context().Value(requestIDKey).(string)
 				writeError(w, http.StatusInternalServerError, "internal server error", requestID)
 			}
