@@ -118,6 +118,8 @@ func (w *WAL) Append(entry []byte) (uint64, error) {
 ```
 **Directive:** Ingest API must return 200 OK **only after WAL fsync**. S3 upload happens in a background goroutine.
 
+**Recommendation:** To prevent data loss on ephemeral nodes ensure one writer that uses Persistent Volumes for the WAL.
+
 ### 3.1 Sharded Manifest Catalog (Critical for Scale)
 **Problem:** Single `manifest.db` bottlenecks at >50K partitions (231ms latency).  
 **Solution:** Consistent hashing to shard manifest into N SQLite files.
@@ -172,6 +174,8 @@ func (c *ShardedCatalog) FindPartitions(ctx context.Context, predicates []Predic
     }
     return allRecords, nil
 }
+
+**Recommendation:** To avoid "Hot Shards" for high-volume tenants, use a salted or time-aware hashing key (e.g., `hash(partition_key + year_month)`) for manifest distribution.
 ```
 
 ### 3.1 Temporal Co-Access Graph
@@ -226,6 +230,8 @@ func (g *CoAccessGraph) GetPrefetchCandidates(current string) []string {
 ```
 
 Directive: This graph lives in-memory on Query Nodes. It is not persisted. Reconstruction happens via warm-up queries. Memory cap: 10MB max.
+
+**Recommendation:** Tracking 1.5M partitions per node will exceed 10MB. Track at a higher abstraction (e.g., `partition_key`).
 
 
 
@@ -308,6 +314,8 @@ Instead of rewriting data to match queries, we build **Secondary Index Partition
 4.  **Register:** New index partitions added to Manifest.
 5.  **Prune:** Future queries use index to skip 99% of data partitions.
 6.  **GC:** If predicate frequency drops, index partitions are compacted/deleted.
+
+**Recommendation:** To maintain <100ms visibility, implement a "Hybrid Scan" that combines results from secondary indexes with a direct scan of the latest non-indexed WAL/partitions.
 
 ---
  
@@ -445,13 +453,13 @@ func (p *IndexPolicy) Evaluate(stats *QueryStats) []IndexAction {
 
 ## 3.2.10 Updated Implementation Roadmap
 
-| Week | Task | Owner |
-| :--- | :--- | :--- |
-| **1** | Implement Index Partition Schema & Builder | Storage Team |
-| **2** | Integrate Index Lookup into Query Planner | Query Team |
-| **3** | Build Query Statistics Aggregator | Observability Team |
-| **4** | Implement Automation Policy (Create/Drop) | Backend Team |
-| **5** | Benchmark Dynamic Pattern Shifts | QA Team |
+| steps | Task 
+| :--- | :--- |
+| **1** | Implement Index Partition Schema & Builder 
+| **2** | Integrate Index Lookup into Query Planner 
+| **3** | Build Query Statistics Aggregator 
+| **4** | Implement Automation Policy (Create/Drop) 
+| **5** | Benchmark Dynamic Pattern Shifts 
 
 ---
 
@@ -492,6 +500,8 @@ func (s *S3Storage) CoalescedGet(ctx context.Context, req CoalescedGetRequest) (
     // 3. Parse multipart response and map back to PartitionIDs
     return s.parseMultipartResponse(resp, req.ByteRanges)
 }
+
+**Recommendation:** Implement a "Max Gap Threshold" (e.g., 8MB). If the byte gap between adjacent partitions exceeds this limit, use separate HTTP requests to avoid over-fetching overhead.
 ```
 
 ### 3.4 Backpressure-Aware Compaction
@@ -573,6 +583,8 @@ func (m *Materializer) AnalyzeAndMaterialize(collection string) {
         }
     }
 }
+
+**Recommendation:** To avoid massive I/O storms, only materialize columns for **newly created partitions**. For historical data, continue using the `json_extract` or index path until natural compaction occurs.
 ```
 
 ---
