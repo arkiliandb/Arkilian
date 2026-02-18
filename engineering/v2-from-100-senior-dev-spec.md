@@ -180,6 +180,8 @@ func (c *ShardedCatalog) FindPartitions(ctx context.Context, predicates []Predic
 **Recommendation:** To avoid "Hot Shards" for high-volume tenants, use a salted or time-aware hashing key (e.g., `hash(partition_key + year_month)`) for manifest distribution.
 
 **Recommendation 2:** To avoid "Lost Reads" from S3 consistency jitter, include the LSN in Write Notifications and ensure Query Nodes wait for their local manifest view to reach that LSN before finalizing queries.
+
+**Recommendation 3:** To prevent Manifest Shard lock contention during heavy maintenance, use Transactional Batching for manifest updates (e.g., one atomic commit per compaction cycle).
 ```
 
 ### 3.1 Temporal Co-Access Graph
@@ -508,6 +510,8 @@ func (s *S3Storage) CoalescedGet(ctx context.Context, req CoalescedGetRequest) (
 }
 
 **Recommendation:** Implement a "Max Gap Threshold" (e.g., 8MB). If the byte gap between adjacent partitions exceeds this limit, use separate HTTP requests to avoid over-fetching overhead.
+
+**Recommendation:** To avoid S3 prefix rate-limits (3,500 PUTs/sec), use Entropy Prefixes (e.g., `s3://bucket/h4s7/data/...`) derived from a hash of the partition ID.
 ```
 
 ### 3.4 Backpressure-Aware Compaction
