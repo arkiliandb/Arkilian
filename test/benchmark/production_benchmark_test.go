@@ -599,19 +599,23 @@ func BenchmarkProdFullScan_WithPayloadDecompression(b *testing.B) {
 func BenchmarkProdE2E_ShardedManifest_SimulatedS3(b *testing.B) {
 	dir := setupBenchDir(b, "prod-e2e")
 	partDir := filepath.Join(dir, "partitions")
-	storageDir := filepath.Join(dir, "storage")
 	downloadDir := filepath.Join(dir, "downloads")
 
 	os.MkdirAll(partDir, 0755)
 	os.MkdirAll(downloadDir, 0755)
 
-	realStorage, err := storage.NewLocalStorage(storageDir)
-	if err != nil {
-		b.Fatal(err)
-	}
+	// Use helper to get storage (S3 or Local)
+	realStorage, _, cleanup := getBenchmarkStorage(b, "prod-e2e")
+	defer cleanup()
 
-	// Simulated S3 with 85ms GET latency
-	simStorage := newLatencyStorage(realStorage, 85*time.Millisecond)
+	var benchStorage storage.ObjectStorage
+	if os.Getenv("ARKILIAN_STORAGE_TYPE") == "s3" {
+		// Use real storage directly (S3 has real latency)
+		benchStorage = realStorage
+	} else {
+		// Simulated S3 with 85ms GET latency
+		benchStorage = newLatencyStorage(realStorage, 85*time.Millisecond)
+	}
 
 	// Sharded manifest (production default)
 	sc, err := manifest.NewShardedCatalog(dir, 16)
@@ -640,11 +644,13 @@ func BenchmarkProdE2E_ShardedManifest_SimulatedS3(b *testing.B) {
 			b.Fatal(err)
 		}
 
+		// Use prefix for object paths (important for S3 to avoid collisions)
 		objectPath := fmt.Sprintf("partitions/%s.sqlite", info.PartitionID)
+		metaObjectPath := fmt.Sprintf("partitions/%s.meta.json", info.PartitionID)
+
 		if err := realStorage.Upload(ctx, info.SQLitePath, objectPath); err != nil {
 			b.Fatal(err)
 		}
-		metaObjectPath := fmt.Sprintf("partitions/%s.meta.json", info.PartitionID)
 		if err := realStorage.Upload(ctx, metadataPath, metaObjectPath); err != nil {
 			b.Fatal(err)
 		}
@@ -661,7 +667,10 @@ func BenchmarkProdE2E_ShardedManifest_SimulatedS3(b *testing.B) {
 	b.ReportAllocs()
 
 	for i := 0; i < b.N; i++ {
-		simStorage.getCount.Store(0)
+		// Reset counter if using latency storage
+		if ls, ok := benchStorage.(*latencyStorage); ok {
+			ls.getCount.Store(0)
+		}
 		iterStart := time.Now()
 
 		// Clean downloads to force re-fetch
@@ -676,7 +685,7 @@ func BenchmarkProdE2E_ShardedManifest_SimulatedS3(b *testing.B) {
 			b.Fatal(err)
 		}
 
-		// Phase 2: Download and scan (through S3 latency wrapper)
+		// Phase 2: Download and scan (through storage)
 		totalRows := 0
 		var downloadWg sync.WaitGroup
 		type dlResult struct {
@@ -695,7 +704,7 @@ func BenchmarkProdE2E_ShardedManifest_SimulatedS3(b *testing.B) {
 				defer func() { <-sem }()
 
 				localPath := filepath.Join(downloadDir, fmt.Sprintf("part_%d.sqlite", i))
-				err := simStorage.Download(ctx, p.ObjectPath, localPath)
+				err := benchStorage.Download(ctx, p.ObjectPath, localPath)
 				dlResults[i] = dlResult{localPath: localPath, err: err}
 			}(idx, part)
 		}
@@ -725,11 +734,15 @@ func BenchmarkProdE2E_ShardedManifest_SimulatedS3(b *testing.B) {
 		}
 
 		queryLatencyMs := time.Since(iterStart).Milliseconds()
-		s3Gets := simStorage.getCount.Load()
 		latencies = append(latencies, queryLatencyMs)
 
 		b.ReportMetric(float64(queryLatencyMs), "query_latency_ms")
-		b.ReportMetric(float64(s3Gets), "s3_gets")
+		
+		// Only report s3_gets if we can measure them (i.e. using simulated local storage)
+		if counter, ok := benchStorage.(interface{ getRequestCount() int64 }); ok {
+			b.ReportMetric(float64(counter.getRequestCount()), "s3_gets")
+		}
+		
 		b.ReportMetric(float64(len(partitions)), "partitions_scanned")
 		b.ReportMetric(float64(totalRows), "rows_matched")
 	}

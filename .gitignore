@@ -3,4 +3,8 @@ data/*
 report.txt
 QA-report.txt
 video.mp4
-.env
+.env 
+arkilian_debug
+arkilian.log
+debug.log
+arkilian

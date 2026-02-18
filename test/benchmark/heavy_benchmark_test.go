@@ -1624,26 +1624,33 @@ func (l *latencyStorage) ListObjects(ctx context.Context, prefix string) ([]stri
 	return l.inner.ListObjects(ctx, prefix)
 }
 
+func (l *latencyStorage) getRequestCount() int64 {
+	return l.getCount.Load()
+}
+
 // BenchmarkHeavyStorage_SimulatedS3Latency benchmarks the full query path
 // (prune → download → scan) under simulated S3 latency (80ms per GET).
 // This exposes the real-world cost that local benchmarks mask.
 func BenchmarkHeavyStorage_SimulatedS3Latency(b *testing.B) {
 	dir := setupBenchDir(b, "s3latency")
 	partDir := filepath.Join(dir, "partitions")
-	storageDir := filepath.Join(dir, "storage")
 	manifestPath := filepath.Join(dir, "manifest.db")
 	downloadDir := filepath.Join(dir, "downloads")
 
 	os.MkdirAll(partDir, 0755)
 	os.MkdirAll(downloadDir, 0755)
 
-	realStorage, err := storage.NewLocalStorage(storageDir)
-	if err != nil {
-		b.Fatal(err)
-	}
+	// Use helper to get storage (S3 or Local)
+	realStorage, _, cleanup := getBenchmarkStorage(b, "s3latency")
+	defer cleanup()
 
-	// Wrap with 80ms GET latency to simulate S3
-	simStorage := newLatencyStorage(realStorage, 80*time.Millisecond)
+	// Wrap with 80ms GET latency to simulate S3 (only if not already using S3)
+	var simStorage storage.ObjectStorage
+	if os.Getenv("ARKILIAN_STORAGE_TYPE") == "s3" {
+		simStorage = realStorage // Real S3 has real latency
+	} else {
+		simStorage = newLatencyStorage(realStorage, 80*time.Millisecond)
+	}
 
 	catalog, err := manifest.NewCatalog(manifestPath)
 	if err != nil {
@@ -1671,12 +1678,14 @@ func BenchmarkHeavyStorage_SimulatedS3Latency(b *testing.B) {
 			b.Fatal(err)
 		}
 
+		// Use prefix for object paths (important for S3)
 		objectPath := fmt.Sprintf("partitions/%s.sqlite", info.PartitionID)
+		metaObjectPath := fmt.Sprintf("partitions/%s.meta.json", info.PartitionID)
+
 		if err := realStorage.Upload(ctx, info.SQLitePath, objectPath); err != nil {
 			b.Fatal(err)
 		}
 
-		metaObjectPath := fmt.Sprintf("partitions/%s.meta.json", info.PartitionID)
 		if err := realStorage.Upload(ctx, metadataPath, metaObjectPath); err != nil {
 			b.Fatal(err)
 		}
@@ -1690,7 +1699,10 @@ func BenchmarkHeavyStorage_SimulatedS3Latency(b *testing.B) {
 	b.ReportAllocs()
 
 	for i := 0; i < b.N; i++ {
-		simStorage.getCount.Store(0)
+		// Reset counter if using latency storage
+		if ls, ok := simStorage.(*latencyStorage); ok {
+			ls.getCount.Store(0)
+		}
 		iterStart := time.Now()
 
 		// Clean download dir to force re-downloads each iteration
@@ -1734,10 +1746,11 @@ func BenchmarkHeavyStorage_SimulatedS3Latency(b *testing.B) {
 		}
 
 		queryLatencyMs := time.Since(iterStart).Milliseconds()
-		s3Gets := simStorage.getCount.Load()
-
+		
 		b.ReportMetric(float64(queryLatencyMs), "query_latency_ms")
-		b.ReportMetric(float64(s3Gets), "s3_gets")
+		if counter, ok := simStorage.(interface{ getRequestCount() int64 }); ok {
+			b.ReportMetric(float64(counter.getRequestCount()), "s3_gets")
+		}
 	}
 }
 
@@ -1796,19 +1809,17 @@ func (f *faultInjectingStorage) ListObjects(ctx context.Context, prefix string) 
 // - Manifest is consistent (no dangling compacted_into references)
 // - No orphaned objects exist in storage
 func BenchmarkHeavyCompaction_PartialFailure(b *testing.B) {
-	dir := setupBenchDir(b, "compact-fail")
+	// Use helper to get storage (S3 or Local)
+	realStorage, _, cleanup := getBenchmarkStorage(b, "compact-fail")
+	defer cleanup()
+
+	dir := setupBenchDir(b, "compact-fail-meta")
 	partDir := filepath.Join(dir, "partitions")
-	storageDir := filepath.Join(dir, "storage")
 	manifestPath := filepath.Join(dir, "manifest.db")
 	compactionWorkDir := filepath.Join(dir, "compaction_work")
 
 	os.MkdirAll(partDir, 0755)
 	os.MkdirAll(compactionWorkDir, 0755)
-
-	realStorage, err := storage.NewLocalStorage(storageDir)
-	if err != nil {
-		b.Fatal(err)
-	}
 
 	catalog, err := manifest.NewCatalog(manifestPath)
 	if err != nil {
@@ -1846,6 +1857,7 @@ func BenchmarkHeavyCompaction_PartialFailure(b *testing.B) {
 			info.PartitionID = fmt.Sprintf("events:%s:%d_%d", partKey, i, p)
 
 			objectPath := fmt.Sprintf("partitions/%s/%s.sqlite", partKey, info.PartitionID)
+
 			if err := realStorage.Upload(ctx, info.SQLitePath, objectPath); err != nil {
 				b.Fatal(err)
 			}
@@ -2068,18 +2080,21 @@ func (p *probabilisticFaultStorage) ListObjects(ctx context.Context, prefix stri
 // throughput without unbounded backlog growth. It tracks successful and failed
 // compactions, backlog size (small partition count) over time, and recovery
 // time after failures stop.
+// BenchmarkHeavyCompaction_SustainedFailure runs 100 compaction cycles with a
+// 10% upload failure rate and verifies that the compaction daemon can sustain
+// throughput without unbounded backlog growth. It tracks successful and failed
+// compactions, backlog size (small partition count) over time, and recovery
+// time after failures stop.
 func BenchmarkHeavyCompaction_SustainedFailure(b *testing.B) {
-	dir := setupBenchDir(b, "compact-sustained")
-	storageDir := filepath.Join(dir, "storage")
+	// Use helper to get storage (S3 or Local)
+	realStorage, _, cleanup := getBenchmarkStorage(b, "compact-sustained")
+	defer cleanup()
+
+	dir := setupBenchDir(b, "compact-sustained-meta")
 	manifestPath := filepath.Join(dir, "manifest.db")
 	workDir := filepath.Join(dir, "compaction_work")
 
 	os.MkdirAll(workDir, 0755)
-
-	realStorage, err := storage.NewLocalStorage(storageDir)
-	if err != nil {
-		b.Fatal(err)
-	}
 
 	catalog, err := manifest.NewCatalog(manifestPath)
 	if err != nil {

@@ -14,7 +14,6 @@ import (
 	"github.com/arkilian/arkilian/internal/manifest"
 	"github.com/arkilian/arkilian/internal/partition"
 	"github.com/arkilian/arkilian/internal/query/parser"
-	"github.com/arkilian/arkilian/internal/storage"
 	"github.com/arkilian/arkilian/pkg/types"
 )
 
@@ -250,20 +249,19 @@ func BenchmarkULIDGeneration(b *testing.B) {
 	}
 }
 
-// BenchmarkLocalStorageUploadDownload measures storage operations
-func BenchmarkLocalStorageUploadDownload(b *testing.B) {
-	tmpDir, err := os.MkdirTemp("", "arkilian-bench-storage-*")
+// BenchmarkStorageUploadDownload measures storage operations (Local or S3)
+func BenchmarkStorageUploadDownload(b *testing.B) {
+	// Use helper to get storage (S3 or Local)
+	benchStorage, _, cleanup := getBenchmarkStorage(b, "storage-rw")
+	defer cleanup()
+
+	// Create a test file locally (source for upload)
+	tmpDir, err := os.MkdirTemp("", "arkilian-bench-payload-*")
 	if err != nil {
 		b.Fatal(err)
 	}
 	defer os.RemoveAll(tmpDir)
 
-	localStorage, err := storage.NewLocalStorage(tmpDir)
-	if err != nil {
-		b.Fatal(err)
-	}
-
-	// Create a test file
 	testFile := filepath.Join(tmpDir, "test_source.dat")
 	testData := make([]byte, 1024*1024) // 1MB
 	for i := range testData {
@@ -280,12 +278,13 @@ func BenchmarkLocalStorageUploadDownload(b *testing.B) {
 
 	for i := 0; i < b.N; i++ {
 		objectPath := fmt.Sprintf("test_%d.dat", i)
-		if err := localStorage.Upload(ctx, testFile, objectPath); err != nil {
+
+		if err := benchStorage.Upload(ctx, testFile, objectPath); err != nil {
 			b.Fatal(err)
 		}
 
 		downloadPath := filepath.Join(tmpDir, fmt.Sprintf("download_%d.dat", i))
-		if err := localStorage.Download(ctx, objectPath, downloadPath); err != nil {
+		if err := benchStorage.Download(ctx, objectPath, downloadPath); err != nil {
 			b.Fatal(err)
 		}
 	}
