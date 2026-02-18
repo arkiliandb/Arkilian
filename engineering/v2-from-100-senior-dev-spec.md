@@ -79,6 +79,8 @@ Arkilian 2.0 is a **distributed operational database** designed for high-efficie
 | **Compactor** | `arkilian-compact` (part of `arkilian-ingest`) | Merge small partitions, GC, Tiering. | Backpressure-Aware Compaction. |
 | **Router** | `arkilian-router` (standalone binary) | Load balancing, Write Notifications. | WebSocket Pub/Sub. |
 
+**Recommendation (Advanced):** To prevent a "Notification Storm" at 500K rows/sec, implement Subscription Filtering so Query Nodes only receive updates for their active `partition_keys`.
+
 ---
 
 ## 3. Core Algorithms & Implementation
@@ -176,6 +178,8 @@ func (c *ShardedCatalog) FindPartitions(ctx context.Context, predicates []Predic
 }
 
 **Recommendation:** To avoid "Hot Shards" for high-volume tenants, use a salted or time-aware hashing key (e.g., `hash(partition_key + year_month)`) for manifest distribution.
+
+**Recommendation 2:** To avoid "Lost Reads" from S3 consistency jitter, include the LSN in Write Notifications and ensure Query Nodes wait for their local manifest view to reach that LSN before finalizing queries.
 ```
 
 ### 3.1 Temporal Co-Access Graph
@@ -232,6 +236,8 @@ func (g *CoAccessGraph) GetPrefetchCandidates(current string) []string {
 Directive: This graph lives in-memory on Query Nodes. It is not persisted. Reconstruction happens via warm-up queries. Memory cap: 10MB max.
 
 **Recommendation:** Tracking 1.5M partitions per node will exceed 10MB. Track at a higher abstraction (e.g., `partition_key`).
+
+**Recommendation (Advanced):** To prevent performance "dips" after restarts (Cold-Start), periodically checkpoint the co-access graph state to S3 so nodes can restore predictive intelligence instantly.
 
 
 
@@ -585,6 +591,8 @@ func (m *Materializer) AnalyzeAndMaterialize(collection string) {
 }
 
 **Recommendation:** To avoid massive I/O storms, only materialize columns for **newly created partitions**. For historical data, continue using the `json_extract` or index path until natural compaction occurs.
+
+**Recommendation (Advanced):** To handle mixed-schema performance, the Query Planner must generate two-stage plans that switch between columnar access (new data) and `json_extract` (historical data) based on manifest metadata.
 ```
 
 ---
