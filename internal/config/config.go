@@ -52,6 +52,51 @@ type Config struct {
 
 	// Manifest configuration
 	Manifest ManifestConfig `json:"manifest" yaml:"manifest"`
+
+	// WAL configuration
+	WAL WALConfig `json:"wal" yaml:"wal"`
+
+	// Index configuration
+	Index IndexConfig `json:"index" yaml:"index"`
+
+	// Cache configuration
+	Cache CacheConfig `json:"cache" yaml:"cache"`
+
+	// Router configuration
+	Router RouterConfig `json:"router" yaml:"router"`
+}
+
+// WALConfig holds write-ahead log configuration.
+type WALConfig struct {
+	Dir            string        `json:"dir" yaml:"dir"`
+	MaxSegmentSize int64         `json:"max_segment_size" yaml:"max_segment_size"`
+	FlushInterval  time.Duration `json:"flush_interval" yaml:"flush_interval"`
+	FlushBatchSize int           `json:"flush_batch_size" yaml:"flush_batch_size"`
+	RetentionTime  time.Duration `json:"retention_time" yaml:"retention_time"`
+	Enabled        bool          `json:"enabled" yaml:"enabled"`
+}
+
+// IndexConfig holds secondary index configuration.
+type IndexConfig struct {
+	Enabled         bool          `json:"enabled" yaml:"enabled"`
+	CreateThreshold int64         `json:"create_threshold" yaml:"create_threshold"`
+	DropThreshold   int64         `json:"drop_threshold" yaml:"drop_threshold"`
+	CheckInterval   time.Duration `json:"check_interval" yaml:"check_interval"`
+	MaxIndexes      int           `json:"max_indexes" yaml:"max_indexes"`
+	BucketCount     int           `json:"bucket_count" yaml:"bucket_count"`
+}
+
+// CacheConfig holds tiered cache configuration.
+type CacheConfig struct {
+	NVMeDir         string `json:"nvme_dir" yaml:"nvme_dir"`
+	NVMeMaxBytes    int64  `json:"nvme_max_bytes" yaml:"nvme_max_bytes"`
+	PrefetchEnabled bool   `json:"prefetch_enabled" yaml:"prefetch_enabled"`
+}
+
+// RouterConfig holds write notification router configuration.
+type RouterConfig struct {
+	NotificationsEnabled bool `json:"notifications_enabled" yaml:"notifications_enabled"`
+	BufferSize           int  `json:"buffer_size" yaml:"buffer_size"`
 }
 
 // ManifestConfig holds manifest catalog configuration.
@@ -274,6 +319,31 @@ func DefaultConfig() *Config {
 			ShardCount:         64,
 			AutoShardThreshold: 50000,
 		},
+		WAL: WALConfig{
+			Dir:            "./data/arkilian/wal",
+			MaxSegmentSize: 67108864,
+			FlushInterval:  1 * time.Second,
+			FlushBatchSize: 10000,
+			RetentionTime:  1 * time.Hour,
+			Enabled:        false,
+		},
+		Index: IndexConfig{
+			Enabled:         false,
+			CreateThreshold: 100,
+			DropThreshold:   5,
+			CheckInterval:   5 * time.Minute,
+			MaxIndexes:      10,
+			BucketCount:     64,
+		},
+		Cache: CacheConfig{
+			NVMeDir:         "",
+			NVMeMaxBytes:    536870912000,
+			PrefetchEnabled: false,
+		},
+		Router: RouterConfig{
+			NotificationsEnabled: false,
+			BufferSize:           1000,
+		},
 	}
 }
 
@@ -337,6 +407,30 @@ func (c *Config) Validate() error {
 
 	if c.Ingest.TargetPartitionSizeMB < 8 || c.Ingest.TargetPartitionSizeMB > 256 {
 		return fmt.Errorf("ingest.target_partition_size_mb must be between 8 and 256, got %d", c.Ingest.TargetPartitionSizeMB)
+	}
+
+	// Validate WAL config
+	if c.WAL.Enabled {
+		if c.WAL.Dir == "" {
+			return fmt.Errorf("wal.dir is required when wal.enabled is true")
+		}
+		if c.WAL.FlushInterval < 100*time.Millisecond {
+			return fmt.Errorf("wal.flush_interval must be >= 100ms, got %v", c.WAL.FlushInterval)
+		}
+	}
+	if c.Cache.NVMeDir != "" {
+		// NVMe dir existence check happens at runtime
+	}
+
+	// Validate Index config
+	if c.Index.BucketCount <= 0 || c.Index.BucketCount > 65536 {
+		return fmt.Errorf("index.bucket_count must be > 0 and <= 65536, got %d", c.Index.BucketCount)
+	}
+	if c.Index.MaxIndexes <= 0 {
+		return fmt.Errorf("index.max_indexes must be > 0, got %d", c.Index.MaxIndexes)
+	}
+	if c.Index.CreateThreshold <= c.Index.DropThreshold {
+		return fmt.Errorf("index.create_threshold (%d) must be > drop_threshold (%d)", c.Index.CreateThreshold, c.Index.DropThreshold)
 	}
 
 	// Validate adaptive sizing config
@@ -535,6 +629,71 @@ func LoadFromEnv(cfg *Config) {
 	// Bloom cache configuration
 	if v := os.Getenv("ARKILIAN_QUERY_BLOOM_CACHE_SIZE_MB"); v != "" {
 		fmt.Sscanf(v, "%d", &cfg.Query.BloomCacheSizeMB)
+	}
+
+	// WAL configuration
+	if v := os.Getenv("ARKILIAN_WAL_ENABLED"); v != "" {
+		cfg.WAL.Enabled = v == "true" || v == "1"
+	}
+	if v := os.Getenv("ARKILIAN_WAL_DIR"); v != "" {
+		cfg.WAL.Dir = v
+	}
+	if v := os.Getenv("ARKILIAN_WAL_FLUSH_INTERVAL"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			cfg.WAL.FlushInterval = d
+		}
+	}
+	if v := os.Getenv("ARKILIAN_WAL_FLUSH_BATCH_SIZE"); v != "" {
+		fmt.Sscanf(v, "%d", &cfg.WAL.FlushBatchSize)
+	}
+	if v := os.Getenv("ARKILIAN_WAL_MAX_SEGMENT_SIZE"); v != "" {
+		fmt.Sscanf(v, "%d", &cfg.WAL.MaxSegmentSize)
+	}
+	if v := os.Getenv("ARKILIAN_WAL_RETENTION_TIME"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			cfg.WAL.RetentionTime = d
+		}
+	}
+
+	// Index configuration
+	if v := os.Getenv("ARKILIAN_INDEX_ENABLED"); v != "" {
+		cfg.Index.Enabled = v == "true" || v == "1"
+	}
+	if v := os.Getenv("ARKILIAN_INDEX_CREATE_THRESHOLD"); v != "" {
+		fmt.Sscanf(v, "%d", &cfg.Index.CreateThreshold)
+	}
+	if v := os.Getenv("ARKILIAN_INDEX_DROP_THRESHOLD"); v != "" {
+		fmt.Sscanf(v, "%d", &cfg.Index.DropThreshold)
+	}
+	if v := os.Getenv("ARKILIAN_INDEX_CHECK_INTERVAL"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			cfg.Index.CheckInterval = d
+		}
+	}
+	if v := os.Getenv("ARKILIAN_INDEX_MAX_INDEXES"); v != "" {
+		fmt.Sscanf(v, "%d", &cfg.Index.MaxIndexes)
+	}
+	if v := os.Getenv("ARKILIAN_INDEX_BUCKET_COUNT"); v != "" {
+		fmt.Sscanf(v, "%d", &cfg.Index.BucketCount)
+	}
+
+	// Cache configuration
+	if v := os.Getenv("ARKILIAN_CACHE_NVME_DIR"); v != "" {
+		cfg.Cache.NVMeDir = v
+	}
+	if v := os.Getenv("ARKILIAN_CACHE_NVME_MAX_BYTES"); v != "" {
+		fmt.Sscanf(v, "%d", &cfg.Cache.NVMeMaxBytes)
+	}
+	if v := os.Getenv("ARKILIAN_CACHE_PREFETCH_ENABLED"); v != "" {
+		cfg.Cache.PrefetchEnabled = v == "true" || v == "1"
+	}
+
+	// Router configuration
+	if v := os.Getenv("ARKILIAN_ROUTER_NOTIFICATIONS_ENABLED"); v != "" {
+		cfg.Router.NotificationsEnabled = v == "true" || v == "1"
+	}
+	if v := os.Getenv("ARKILIAN_ROUTER_BUFFER_SIZE"); v != "" {
+		fmt.Sscanf(v, "%d", &cfg.Router.BufferSize)
 	}
 
 	// Map ARKILIAN_AWS_ credentials to standard AWS_ credentials for the SDK
