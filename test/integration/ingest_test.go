@@ -50,7 +50,7 @@ func TestIngestFlow(t *testing.T) {
 	builder := partition.NewBuilder(partitionDir, 0)
 	metaGen := partition.NewMetadataGenerator()
 
-	handler := apihttp.NewIngestHandler(builder, metaGen, catalog, store, nil)
+	handler := apihttp.NewIngestHandler(builder, metaGen, catalog, store, nil, nil)
 
 	// Apply middleware
 	wrappedHandler := apihttp.DefaultMiddleware()(handler)
@@ -216,7 +216,7 @@ func TestIngestValidation(t *testing.T) {
 	builder := partition.NewBuilder(partitionDir, 0)
 	metaGen := partition.NewMetadataGenerator()
 
-	handler := apihttp.NewIngestHandler(builder, metaGen, catalog, store, nil)
+	handler := apihttp.NewIngestHandler(builder, metaGen, catalog, store, nil, nil)
 	wrappedHandler := apihttp.DefaultMiddleware()(handler)
 
 	tests := []struct {
@@ -296,7 +296,7 @@ func TestIngestRequestID(t *testing.T) {
 	builder := partition.NewBuilder(partitionDir, 0)
 	metaGen := partition.NewMetadataGenerator()
 
-	handler := apihttp.NewIngestHandler(builder, metaGen, catalog, store, nil)
+	handler := apihttp.NewIngestHandler(builder, metaGen, catalog, store, nil, nil)
 	wrappedHandler := apihttp.DefaultMiddleware()(handler)
 
 	// Test with custom request ID
@@ -357,7 +357,7 @@ func TestIngestMultipleBatches(t *testing.T) {
 	builder := partition.NewBuilder(partitionDir, 0)
 	metaGen := partition.NewMetadataGenerator()
 
-	handler := apihttp.NewIngestHandler(builder, metaGen, catalog, store, nil)
+	handler := apihttp.NewIngestHandler(builder, metaGen, catalog, store, nil, nil)
 	wrappedHandler := apihttp.DefaultMiddleware()(handler)
 
 	// Ingest 3 batches

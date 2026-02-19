@@ -6,12 +6,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"time"
 
 	"github.com/arkilian/arkilian/api/proto"
 	"github.com/arkilian/arkilian/internal/bloom"
 	"github.com/arkilian/arkilian/internal/manifest"
 	"github.com/arkilian/arkilian/internal/partition"
 	"github.com/arkilian/arkilian/internal/storage"
+	"github.com/arkilian/arkilian/internal/wal"
 	"github.com/arkilian/arkilian/pkg/types"
 	"github.com/google/uuid"
 	"google.golang.org/grpc/codes"
@@ -26,6 +28,8 @@ type IngestServer struct {
 	metaGen *partition.MetadataGenerator
 	catalog manifest.Catalog
 	storage storage.ObjectStorage
+	wal     *wal.WAL
+	walEnabled bool
 }
 
 // NewIngestServer creates a new gRPC ingest server.
@@ -34,12 +38,15 @@ func NewIngestServer(
 	metaGen *partition.MetadataGenerator,
 	catalog manifest.Catalog,
 	store storage.ObjectStorage,
+	walInstance *wal.WAL,
 ) *IngestServer {
 	return &IngestServer{
 		builder: builder,
 		metaGen: metaGen,
 		catalog: catalog,
 		storage: store,
+		wal:     walInstance,
+		walEnabled: walInstance != nil,
 	}
 }
 
@@ -62,6 +69,27 @@ func (s *IngestServer) BatchIngest(ctx context.Context, req *proto.IngestRequest
 	rows, err := convertProtoRows(req.Rows)
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "invalid row data: %v", err)
+	}
+
+	// WAL path: if enabled, append to WAL and return LSN immediately
+	if s.walEnabled && s.wal != nil {
+		entry := &wal.Entry{
+			PartitionKey: req.PartitionKey,
+			Rows:         rows,
+			Schema:       partition.DefaultSchema(),
+			Timestamp:    time.Now().UnixNano(),
+		}
+		lsn, err := s.wal.Append(entry)
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "WAL write failed: %v", err)
+		}
+		return &proto.IngestResponse{
+			PartitionId: "",
+			RowCount:    int64(len(rows)),
+			SizeBytes:   0,
+			RequestId:   requestID,
+			Lsn:         lsn,
+		}, nil
 	}
 
 	// Build partition

@@ -229,7 +229,7 @@ func (a *App) startIngestService(ctx context.Context) error {
 	log.Printf("Partition builder initialized: %s", a.cfg.Ingest.PartitionDir)
 
 	// Create HTTP handler
-	ingestHandler := httpapi.NewIngestHandler(builder, metaGen, a.catalog, a.storage, adaptiveSizer)
+	ingestHandler := httpapi.NewIngestHandler(builder, metaGen, a.catalog, a.storage, adaptiveSizer, nil)
 
 	// Setup HTTP server with middleware
 	mux := http.NewServeMux()
@@ -264,7 +264,7 @@ func (a *App) startIngestService(ctx context.Context) error {
 	// Start gRPC server if enabled
 	if a.cfg.GRPC.Enabled {
 		a.grpcServer = grpc.NewServer()
-		ingestServer := grpcapi.NewIngestServer(builder, metaGen, a.catalog, a.storage)
+		ingestServer := grpcapi.NewIngestServer(builder, metaGen, a.catalog, a.storage, nil)
 		proto.RegisterIngestServiceServer(a.grpcServer, ingestServer)
 
 		var err error

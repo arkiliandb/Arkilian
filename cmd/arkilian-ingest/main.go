@@ -65,7 +65,7 @@ func main() {
 	shutdownMgr := server.NewShutdownManager(shutdownConfig)
 
 	// Create HTTP handler
-	ingestHandler := httpapi.NewIngestHandler(builder, metaGen, catalog, store, nil)
+	ingestHandler := httpapi.NewIngestHandler(builder, metaGen, catalog, store, nil, nil)
 
 	// Setup HTTP server with middleware
 	mux := http.NewServeMux()
@@ -89,7 +89,7 @@ func main() {
 
 	// Create gRPC server
 	grpcServer := grpc.NewServer()
-	ingestServer := grpcapi.NewIngestServer(builder, metaGen, catalog, store)
+	ingestServer := grpcapi.NewIngestServer(builder, metaGen, catalog, store, nil)
 	proto.RegisterIngestServiceServer(grpcServer, ingestServer)
 
 	// Register closers for graceful shutdown

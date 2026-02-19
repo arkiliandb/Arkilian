@@ -6,11 +6,13 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"time"
 
 	"github.com/arkilian/arkilian/internal/bloom"
 	"github.com/arkilian/arkilian/internal/manifest"
 	"github.com/arkilian/arkilian/internal/partition"
 	"github.com/arkilian/arkilian/internal/storage"
+	"github.com/arkilian/arkilian/internal/wal"
 	"github.com/arkilian/arkilian/pkg/types"
 )
 
@@ -29,6 +31,14 @@ type IngestResponse struct {
 	RequestID   string `json:"request_id"`
 }
 
+// WALIngestResponse represents the ingest response when WAL is enabled.
+type WALIngestResponse struct {
+	LSN       uint64 `json:"lsn"`
+	RowCount  int64  `json:"row_count"`
+	RequestID string `json:"request_id"`
+	Status    string `json:"status"`
+}
+
 // IngestHandler handles POST /v1/ingest requests.
 type IngestHandler struct {
 	builder        partition.PartitionBuilder
@@ -36,6 +46,8 @@ type IngestHandler struct {
 	catalog        manifest.Catalog
 	storage        storage.ObjectStorage
 	adaptiveSizer  *partition.AdaptiveSizer
+	wal            *wal.WAL
+	walEnabled     bool
 }
 
 // NewIngestHandler creates a new ingest handler.
@@ -45,6 +57,7 @@ func NewIngestHandler(
 	catalog manifest.Catalog,
 	store storage.ObjectStorage,
 	adaptiveSizer *partition.AdaptiveSizer,
+	walInstance *wal.WAL,
 ) *IngestHandler {
 	return &IngestHandler{
 		builder:       builder,
@@ -52,6 +65,8 @@ func NewIngestHandler(
 		catalog:       catalog,
 		storage:       store,
 		adaptiveSizer: adaptiveSizer,
+		wal:           walInstance,
+		walEnabled:    walInstance != nil,
 	}
 }
 
@@ -87,6 +102,29 @@ func (h *IngestHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	rows, err := convertRows(req.Rows)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, fmt.Sprintf("invalid row data: %v", err), requestID)
+		return
+	}
+
+	// WAL path: if enabled, append to WAL and return LSN immediately
+	if h.walEnabled && h.wal != nil {
+		entry := &wal.Entry{
+			PartitionKey: req.PartitionKey,
+			Rows:         rows,
+			Schema:       partition.DefaultSchema(),
+			Timestamp:    time.Now().UnixNano(),
+		}
+		lsn, err := h.wal.Append(entry)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("WAL write failed: %v", err), requestID)
+			return
+		}
+		resp := WALIngestResponse{
+			LSN:       lsn,
+			RowCount:  int64(len(rows)),
+			RequestID: requestID,
+			Status:    "accepted",
+		}
+		writeJSON(w, http.StatusOK, resp)
 		return
 	}
 

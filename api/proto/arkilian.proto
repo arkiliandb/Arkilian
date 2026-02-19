@@ -31,6 +31,7 @@ message IngestRequest {
 // IngestResponse represents the response from a batch ingest operation.
 message IngestResponse {
   // partition_id is the unique identifier of the created partition.
+  // Empty when WAL is enabled (partition_id becomes available after flush).
   string partition_id = 1;
 
   // row_count is the number of rows successfully ingested.
@@ -41,6 +42,10 @@ message IngestResponse {
 
   // request_id is the unique identifier for this request (for tracing).
   string request_id = 4;
+
+  // lsn is the Log Sequence Number assigned by the WAL when enabled.
+  // 0 when WAL is disabled or for backward compatibility.
+  uint64 lsn = 5;
 }
 
 // Row represents a single event row to be ingested.

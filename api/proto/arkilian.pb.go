@@ -10,11 +10,12 @@
 package proto
 
 import (
-	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
-	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
 	reflect "reflect"
 	sync "sync"
 	unsafe "unsafe"
+
+	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
+	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
 )
 
 const (
@@ -100,7 +101,10 @@ type IngestResponse struct {
 	// size_bytes is the size of the created partition in bytes.
 	SizeBytes int64 `protobuf:"varint,3,opt,name=size_bytes,json=sizeBytes,proto3" json:"size_bytes,omitempty"`
 	// request_id is the unique identifier for this request (for tracing).
-	RequestId     string `protobuf:"bytes,4,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
+	RequestId string `protobuf:"bytes,4,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
+	// lsn is the Log Sequence Number assigned by the WAL when enabled.
+	// 0 when WAL is disabled or for backward compatibility.
+	Lsn uint64 `protobuf:"varint,5,opt,name=lsn,proto3" json:"lsn,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -161,6 +165,13 @@ func (x *IngestResponse) GetRequestId() string {
 		return x.RequestId
 	}
 	return ""
+}
+
+func (x *IngestResponse) GetLsn() uint64 {
+	if x != nil {
+		return x.Lsn
+	}
+	return 0
 }
 
 // Row represents a single event row to be ingested.
