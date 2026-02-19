@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
@@ -36,6 +37,11 @@ type Catalog interface {
 
 	// DeleteExpired removes partitions past TTL.
 	DeleteExpired(ctx context.Context, ttl time.Duration) ([]string, error)
+
+	// FindHighestIdempotencyLSN finds the highest LSN from idempotency keys matching the given prefix.
+	// This is used by WAL recovery to determine which entries have already been flushed.
+	// The prefix should be "wal-lsn-" to find WAL-flushed entries.
+	FindHighestIdempotencyLSN(ctx context.Context, prefix string) (uint64, error)
 
 	// Close closes the catalog database connection.
 	Close() error
@@ -741,6 +747,65 @@ func (c *SQLiteCatalog) DeleteExpired(ctx context.Context, ttl time.Duration) ([
 	}
 
 	return expiredIDs, nil
+}
+
+// FindHighestIdempotencyLSN finds the highest LSN from idempotency keys matching the given prefix.
+// This is used by WAL recovery to determine which entries have already been flushed.
+// The prefix should be "wal-lsn-" to find WAL-flushed entries.
+// It queries ALL keys matching prefix, parses each numerically, and returns the maximum.
+// DO NOT use ORDER BY key DESC LIMIT 1 - lexicographic string ordering is wrong for numeric LSNs.
+func (c *SQLiteCatalog) FindHighestIdempotencyLSN(ctx context.Context, prefix string) (uint64, error) {
+	rows, err := c.readDB.QueryContext(ctx,
+		"SELECT key FROM idempotency_keys WHERE key LIKE ?",
+		prefix+"%",
+	)
+	if err != nil {
+		return 0, fmt.Errorf("manifest: failed to query idempotency keys: %w", err)
+	}
+	defer rows.Close()
+
+	var highestLSN uint64 = 0
+	for rows.Next() {
+		var key string
+		if err := rows.Scan(&key); err != nil {
+			return 0, fmt.Errorf("manifest: failed to scan idempotency key: %w", err)
+		}
+
+		// Parse the LSN from the key (format: "prefix{lsn}")
+		lsn, err := parseIdempotencyKey(key)
+		if err != nil {
+			// Skip keys that don't match expected format
+			continue
+		}
+
+		if lsn > highestLSN {
+			highestLSN = lsn
+		}
+	}
+
+	if err := rows.Err(); err != nil {
+		return 0, fmt.Errorf("manifest: error iterating idempotency keys: %w", err)
+	}
+
+	return highestLSN, nil
+}
+
+// parseIdempotencyKey extracts the LSN from an idempotency key like "wal-lsn-42".
+func parseIdempotencyKey(key string) (uint64, error) {
+	// Key format: "wal-lsn-{lsn}"
+	prefix := "wal-lsn-"
+	if !strings.HasPrefix(key, prefix) {
+		return 0, fmt.Errorf("invalid idempotency key format: %s", key)
+	}
+
+	lsnStr := strings.TrimPrefix(key, prefix)
+	var lsn uint64
+	_, err := fmt.Sscanf(lsnStr, "%d", &lsn)
+	if err != nil {
+		return 0, fmt.Errorf("failed to parse LSN from key %s: %w", key, err)
+	}
+
+	return lsn, nil
 }
 
 // Close closes the catalog database connections.

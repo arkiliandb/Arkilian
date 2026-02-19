@@ -11,6 +11,7 @@ require (
 	github.com/leanovate/gopter v0.2.11
 	github.com/mattn/go-sqlite3 v1.14.22
 	github.com/spaolacci/murmur3 v1.1.0
+	github.com/stretchr/testify v1.7.0
 	google.golang.org/grpc v1.78.0
 	google.golang.org/protobuf v1.36.10
 )
@@ -32,8 +33,10 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/ssooidc v1.35.13 // indirect
 	github.com/aws/aws-sdk-go-v2/service/sts v1.41.6 // indirect
 	github.com/aws/smithy-go v1.24.0 // indirect
+	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/golang/protobuf v1.5.4 // indirect
 	github.com/joho/godotenv v1.5.1 // indirect
+	github.com/pmezard/go-difflib v1.0.0 // indirect
 	golang.org/x/net v0.47.0 // indirect
 	golang.org/x/sys v0.38.0 // indirect
 	golang.org/x/text v0.31.0 // indirect

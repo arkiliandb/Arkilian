@@ -203,6 +203,35 @@ func (sc *ShardedCatalog) DeleteExpired(ctx context.Context, ttl time.Duration) 
 	return all, nil
 }
 
+// FindHighestIdempotencyLSN queries all shards and returns the maximum LSN found.
+// This fans out to all shards, queries their idempotency_keys table, and returns the max.
+func (sc *ShardedCatalog) FindHighestIdempotencyLSN(ctx context.Context, prefix string) (uint64, error) {
+	type result struct {
+		lsn uint64
+		err error
+	}
+	ch := make(chan result, len(sc.shards))
+
+	for _, shard := range sc.shards {
+		go func(s *SQLiteCatalog) {
+			lsn, err := s.FindHighestIdempotencyLSN(ctx, prefix)
+			ch <- result{lsn, err}
+		}(shard)
+	}
+
+	var highestLSN uint64 = 0
+	for range sc.shards {
+		res := <-ch
+		if res.err != nil {
+			return 0, res.err
+		}
+		if res.lsn > highestLSN {
+			highestLSN = res.lsn
+		}
+	}
+	return highestLSN, nil
+}
+
 // Close closes all shard databases.
 func (sc *ShardedCatalog) Close() error {
 	var firstErr error
