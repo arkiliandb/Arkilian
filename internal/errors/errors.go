@@ -18,6 +18,9 @@ const (
 	ErrCategoryQuery      ErrorCategory = "QUERY"
 	ErrCategoryCompaction ErrorCategory = "COMPACTION"
 	ErrCategoryInternal   ErrorCategory = "INTERNAL"
+	ErrCategoryWAL        ErrorCategory = "WAL"
+	ErrCategoryIndex      ErrorCategory = "INDEX"
+	ErrCategoryCache      ErrorCategory = "CACHE"
 )
 
 // Error codes for each category.
@@ -48,6 +51,20 @@ const (
 
 	// Internal codes
 	CodeUnexpected = "UNEXPECTED"
+
+	// WAL codes
+	CodeWALWriteFailed    = "WAL_WRITE_FAILED"
+	CodeWALRecoveryFailed = "WAL_RECOVERY_FAILED"
+	CodeWALSegmentCorrupt = "WAL_SEGMENT_CORRUPT"
+
+	// Index codes
+	CodeIndexBuildFailed  = "INDEX_BUILD_FAILED"
+	CodeIndexLookupFailed = "INDEX_LOOKUP_FAILED"
+	CodeIndexNotFound     = "INDEX_NOT_FOUND"
+
+	// Cache codes
+	CodeCacheEvictionFailed = "CACHE_EVICTION_FAILED"
+	CodeCacheFull           = "CACHE_FULL"
 )
 
 // ArkilianError is the structured error type used throughout the system.
@@ -150,6 +167,14 @@ func isRetryable(category ErrorCategory, code string) bool {
 		return true
 	case category == ErrCategoryQuery && code == CodeExecutionTimeout:
 		return true
+	case category == ErrCategoryWAL && code == CodeWALWriteFailed:
+		return true
+	case category == ErrCategoryWAL && code == CodeWALSegmentCorrupt:
+		return false
+	case category == ErrCategoryIndex && code == CodeIndexBuildFailed:
+		return true
+	case category == ErrCategoryCache && code == CodeCacheFull:
+		return false
 	default:
 		return false
 	}
@@ -179,4 +204,16 @@ func NewCompactionError(code, message string, cause error) *ArkilianError {
 
 func NewInternalError(message string, cause error) *ArkilianError {
 	return Wrap(ErrCategoryInternal, CodeUnexpected, message, cause)
+}
+
+func NewWALError(code, message string, cause error) *ArkilianError {
+	return Wrap(ErrCategoryWAL, code, message, cause)
+}
+
+func NewIndexError(code, message string, cause error) *ArkilianError {
+	return Wrap(ErrCategoryIndex, code, message, cause)
+}
+
+func NewCacheError(code, message string, cause error) *ArkilianError {
+	return Wrap(ErrCategoryCache, code, message, cause)
 }
