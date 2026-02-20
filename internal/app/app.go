@@ -314,7 +314,7 @@ func (a *App) startQueryService(ctx context.Context) error {
 		},
 	}
 	var err error
-	a.queryExecutor, err = executor.NewParallelExecutor(queryPlanner, a.storage, execConfig)
+	a.queryExecutor, err = executor.NewParallelExecutor(queryPlanner, a.storage, execConfig, nil)
 	if err != nil {
 		return fmt.Errorf("failed to initialize query executor: %w", err)
 	}
@@ -332,7 +332,7 @@ func (a *App) startQueryService(ctx context.Context) error {
 	}
 
 	// Create HTTP handler
-	queryHandler := httpapi.NewQueryHandler(a.queryExecutor)
+	queryHandler := httpapi.NewQueryHandler(a.queryExecutor, nil)
 
 	// Setup HTTP server with middleware
 	mux := http.NewServeMux()

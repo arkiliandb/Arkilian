@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 
+	"github.com/arkilian/arkilian/internal/observability"
 	"github.com/arkilian/arkilian/internal/query/executor"
 	"github.com/arkilian/arkilian/internal/query/parser"
 )
@@ -31,13 +32,15 @@ type QueryStats struct {
 
 // QueryHandler handles POST /v1/query requests.
 type QueryHandler struct {
-	executor executor.QueryExecutor
+	executor   executor.QueryExecutor
+	queryStats *observability.QueryStats
 }
 
 // NewQueryHandler creates a new query handler.
-func NewQueryHandler(exec executor.QueryExecutor) *QueryHandler {
+func NewQueryHandler(exec executor.QueryExecutor, stats *observability.QueryStats) *QueryHandler {
 	return &QueryHandler{
-		executor: exec,
+		executor:   exec,
+		queryStats: stats,
 	}
 }
 
@@ -75,6 +78,14 @@ func (h *QueryHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		writeError(w, http.StatusBadRequest, "only SELECT statements are supported", requestID)
 		return
+	}
+
+	// Record query statistics if enabled
+	if h.queryStats != nil {
+		predicates := parser.ExtractPredicates(selectStmt)
+		for _, pred := range predicates {
+			h.queryStats.RecordPredicate(pred.Column, pred.Operator)
+		}
 	}
 
 	// Execute query

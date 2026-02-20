@@ -119,7 +119,7 @@ func setupQueryTestEnv(t *testing.T) (
 	exec, err := executor.NewParallelExecutor(queryPlanner, store, executor.ExecutorConfig{
 		Concurrency: 4,
 		DownloadDir: downloadDir,
-	})
+	}, nil)
 	if err != nil {
 		catalog.Close()
 		os.RemoveAll(tempDir)
@@ -141,7 +141,7 @@ func TestQueryFlow(t *testing.T) {
 	_, _, exec, _, cleanup := setupQueryTestEnv(t)
 	defer cleanup()
 
-	handler := apihttp.NewQueryHandler(exec)
+	handler := apihttp.NewQueryHandler(exec, nil)
 	wrappedHandler := apihttp.DefaultMiddleware()(handler)
 
 	// Test basic SELECT query
@@ -189,7 +189,7 @@ func TestQueryWithWhere(t *testing.T) {
 	_, _, exec, _, cleanup := setupQueryTestEnv(t)
 	defer cleanup()
 
-	handler := apihttp.NewQueryHandler(exec)
+	handler := apihttp.NewQueryHandler(exec, nil)
 	wrappedHandler := apihttp.DefaultMiddleware()(handler)
 
 	// Query for specific tenant
@@ -222,7 +222,7 @@ func TestQueryWithLimit(t *testing.T) {
 	_, _, exec, _, cleanup := setupQueryTestEnv(t)
 	defer cleanup()
 
-	handler := apihttp.NewQueryHandler(exec)
+	handler := apihttp.NewQueryHandler(exec, nil)
 	wrappedHandler := apihttp.DefaultMiddleware()(handler)
 
 	reqBody := apihttp.QueryRequest{
@@ -258,7 +258,7 @@ func TestQueryPruningEffectiveness(t *testing.T) {
 	// Get total partition count
 	totalPartitions, _ := catalog.GetPartitionCount(ctx)
 
-	handler := apihttp.NewQueryHandler(exec)
+	handler := apihttp.NewQueryHandler(exec, nil)
 	wrappedHandler := apihttp.DefaultMiddleware()(handler)
 
 	// Query that should prune based on user_id range
@@ -297,7 +297,7 @@ func TestQueryValidation(t *testing.T) {
 	_, _, exec, _, cleanup := setupQueryTestEnv(t)
 	defer cleanup()
 
-	handler := apihttp.NewQueryHandler(exec)
+	handler := apihttp.NewQueryHandler(exec, nil)
 	wrappedHandler := apihttp.DefaultMiddleware()(handler)
 
 	tests := []struct {
@@ -345,7 +345,7 @@ func TestQueryRequestID(t *testing.T) {
 	_, _, exec, _, cleanup := setupQueryTestEnv(t)
 	defer cleanup()
 
-	handler := apihttp.NewQueryHandler(exec)
+	handler := apihttp.NewQueryHandler(exec, nil)
 	wrappedHandler := apihttp.DefaultMiddleware()(handler)
 
 	reqBody := apihttp.QueryRequest{
@@ -382,7 +382,7 @@ func TestQueryEmptyResult(t *testing.T) {
 	_, _, exec, _, cleanup := setupQueryTestEnv(t)
 	defer cleanup()
 
-	handler := apihttp.NewQueryHandler(exec)
+	handler := apihttp.NewQueryHandler(exec, nil)
 	wrappedHandler := apihttp.DefaultMiddleware()(handler)
 
 	// Query for non-existent tenant
@@ -493,13 +493,13 @@ func TestQueryMemoryExhaustion(t *testing.T) {
 		Concurrency:    4,
 		DownloadDir:    downloadDir,
 		MaxMemoryBytes: 512, // 512 bytes — will force spill almost immediately
-	})
+	}, nil)
 	if err != nil {
 		t.Fatalf("failed to create executor: %v", err)
 	}
 	defer exec.Close()
 
-	handler := apihttp.NewQueryHandler(exec)
+	handler := apihttp.NewQueryHandler(exec, nil)
 	wrappedHandler := apihttp.DefaultMiddleware()(handler)
 
 	reqBody := apihttp.QueryRequest{

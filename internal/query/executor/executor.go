@@ -90,14 +90,16 @@ type PartialResult struct {
 
 // ParallelExecutor implements QueryExecutor with parallel partition execution.
 type ParallelExecutor struct {
-	planner        *planner.Planner
-	storage        storage.ObjectStorage
-	pool           *ConnectionPool
-	downloadDir    string
-	concurrency    int
-	downloadCache  *DownloadCache
-	maxMemoryBytes int64
-	mu             sync.Mutex
+	planner           *planner.Planner
+	storage           storage.ObjectStorage
+	pool              *ConnectionPool
+	downloadDir       string
+	concurrency       int
+	downloadCache     *DownloadCache
+	maxMemoryBytes    int64
+	batchDownloader   *storage.BatchDownloader
+	coAccessGraph     interface{}
+	mu                sync.Mutex
 }
 
 // ExecutorConfig holds configuration for the executor.
@@ -137,6 +139,7 @@ func NewParallelExecutor(
 	planner *planner.Planner,
 	storage storage.ObjectStorage,
 	config ExecutorConfig,
+	batchDownloader *storage.BatchDownloader,
 ) (*ParallelExecutor, error) {
 	if config.Concurrency <= 0 {
 		config.Concurrency = 10
@@ -156,13 +159,14 @@ func NewParallelExecutor(
 	}
 
 	return &ParallelExecutor{
-		planner:        planner,
-		storage:        storage,
-		pool:           NewConnectionPool(config.PoolConfig),
-		downloadDir:    config.DownloadDir,
-		concurrency:    config.Concurrency,
-		downloadCache:  cache,
-		maxMemoryBytes: config.MaxMemoryBytes,
+		planner:         planner,
+		storage:         storage,
+		pool:            NewConnectionPool(config.PoolConfig),
+		downloadDir:     config.DownloadDir,
+		concurrency:     config.Concurrency,
+		downloadCache:   cache,
+		maxMemoryBytes:  config.MaxMemoryBytes,
+		batchDownloader: batchDownloader,
 	}, nil
 }
 
@@ -209,6 +213,23 @@ func (e *ParallelExecutor) ExecutePlan(ctx context.Context, plan *planner.QueryP
 		}, nil
 	}
 
+	// If batch downloader is enabled, download all partitions upfront
+	var localPaths map[string]string
+	if e.batchDownloader != nil {
+		objectPaths := plan.GetObjectPaths()
+		req := &storage.BatchRequest{
+			ObjectPaths: objectPaths,
+			Priority:    make([]int, len(objectPaths)), // All critical (0)
+		}
+		result, err := e.batchDownloader.Download(ctx, req)
+		if err != nil {
+			return nil, fmt.Errorf("executor: batch download failed: %w", err)
+		}
+		localPaths = result.LocalPaths
+		// Note: result.Errors contains per-partition failures, which will be handled
+		// as cache misses in streamPartitionRows and retried with individual downloads
+	}
+
 	// Create a channel for streaming rows from partition goroutines.
 	rowChan := make(chan streamedRow, e.concurrency*64)
 	// done channel signals early termination (e.g. LIMIT reached).
@@ -234,7 +255,7 @@ func (e *ParallelExecutor) ExecutePlan(ctx context.Context, plan *planner.QueryP
 				return
 			}
 
-			count := e.streamPartitionRows(ctx, plan, part, rowChan, done)
+			count := e.streamPartitionRows(ctx, plan, part, rowChan, done, localPaths)
 			rowCountMu.Lock()
 			totalRowsScanned += count
 			rowCountMu.Unlock()
@@ -272,6 +293,18 @@ func (e *ParallelExecutor) ExecutePlan(ctx context.Context, plan *planner.QueryP
 		ExecutionTimeMs:   time.Since(startTime).Milliseconds(),
 	}
 
+	// Record co-access graph if enabled (placeholder for Phase 3)
+	if e.coAccessGraph != nil {
+		partitionIDs := plan.IdentifyPartitionsToScan()
+		if len(partitionIDs) > 0 {
+			// Type assert to the co-access graph interface when available
+			// For now, this is a placeholder that will be wired in Phase 3
+			if graph, ok := e.coAccessGraph.(interface{ RecordAccess([]string) }); ok {
+				graph.RecordAccess(partitionIDs)
+			}
+		}
+	}
+
 	return result, nil
 }
 
@@ -285,10 +318,29 @@ func (e *ParallelExecutor) streamPartitionRows(
 	partition *manifest.PartitionRecord,
 	rowChan chan<- streamedRow,
 	done <-chan struct{},
+	localPaths map[string]string,
 ) int64 {
-	localPath, err := e.ensurePartitionDownloaded(ctx, partition)
-	if err != nil {
-		return 0
+	var localPath string
+	var err error
+
+	// Use pre-downloaded path if batch downloader was used
+	if localPaths != nil {
+		localPath = localPaths[partition.ObjectPath]
+		if localPath == "" {
+			// Partition not in batch download result (either cache miss or download failed).
+			// Fall back to individual download for resilience. The batch downloader may have
+			// failed for this partition, but we can still try to download it individually.
+			localPath, err = e.ensurePartitionDownloaded(ctx, partition)
+			if err != nil {
+				return 0
+			}
+		}
+	} else {
+		// No batch downloader, use individual download
+		localPath, err = e.ensurePartitionDownloaded(ctx, partition)
+		if err != nil {
+			return 0
+		}
 	}
 
 	db, err := e.pool.Get(ctx, localPath)

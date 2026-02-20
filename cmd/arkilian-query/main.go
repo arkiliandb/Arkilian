@@ -68,7 +68,7 @@ func main() {
 			IdleTimeout:         5 * time.Minute,
 		},
 	}
-	queryExecutor, err := executor.NewParallelExecutor(queryPlanner, store, execConfig)
+	queryExecutor, err := executor.NewParallelExecutor(queryPlanner, store, execConfig, nil)
 	if err != nil {
 		log.Fatalf("Failed to initialize query executor: %v", err)
 	}
@@ -89,7 +89,7 @@ func main() {
 	shutdownMgr := server.NewShutdownManager(shutdownConfig)
 
 	// Create HTTP handler
-	queryHandler := httpapi.NewQueryHandler(queryExecutor)
+	queryHandler := httpapi.NewQueryHandler(queryExecutor, nil)
 
 	// Setup HTTP server with middleware
 	mux := http.NewServeMux()
