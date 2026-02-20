@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/arkilian/arkilian/internal/index"
 	"github.com/arkilian/arkilian/internal/partition"
 	_ "github.com/mattn/go-sqlite3"
 )
@@ -806,6 +807,104 @@ func parseIdempotencyKey(key string) (uint64, error) {
 	}
 
 	return lsn, nil
+}
+
+// RegisterIndexPartition registers a new index partition in the manifest.
+func (c *SQLiteCatalog) RegisterIndexPartition(ctx context.Context, info *index.IndexPartitionInfo) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	_, err := c.db.ExecContext(ctx,
+		`INSERT INTO index_partitions (
+			index_id, collection, column_name, bucket_id,
+			object_path, entry_count, size_bytes, min_time, max_time, created_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		info.IndexID, info.Collection, info.Column, info.BucketID,
+		info.ObjectPath, info.EntryCount, info.SizeBytes,
+		info.CoveredRange.Min, info.CoveredRange.Max, info.CreatedAt.Unix(),
+	)
+	if err != nil {
+		return fmt.Errorf("manifest: failed to register index partition: %w", err)
+	}
+
+	return nil
+}
+
+// FindIndexPartition finds an index partition by collection, column, and bucket ID.
+func (c *SQLiteCatalog) FindIndexPartition(ctx context.Context, collection, column string, bucketID int) (*index.IndexPartitionInfo, error) {
+	query := `
+		SELECT index_id, collection, column_name, bucket_id,
+			object_path, entry_count, size_bytes, min_time, max_time, created_at
+		FROM index_partitions
+		WHERE collection = ? AND column_name = ? AND bucket_id = ?`
+
+	row := c.readDB.QueryRowContext(ctx, query, collection, column, bucketID)
+
+	var info index.IndexPartitionInfo
+	var createdAtUnix int64
+
+	err := row.Scan(
+		&info.IndexID, &info.Collection, &info.Column, &info.BucketID,
+		&info.ObjectPath, &info.EntryCount, &info.SizeBytes,
+		&info.CoveredRange.Min, &info.CoveredRange.Max, &createdAtUnix,
+	)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("manifest: failed to scan index partition: %w", err)
+	}
+
+	info.CreatedAt = time.Unix(createdAtUnix, 0)
+	return &info, nil
+}
+
+// ListIndexes lists all indexed columns for a given collection.
+func (c *SQLiteCatalog) ListIndexes(ctx context.Context, collection string) ([]string, error) {
+	query := `SELECT DISTINCT column_name FROM index_partitions WHERE collection = ?`
+
+	rows, err := c.readDB.QueryContext(ctx, query, collection)
+	if err != nil {
+		return nil, fmt.Errorf("manifest: failed to query indexes: %w", err)
+	}
+	defer rows.Close()
+
+	var columns []string
+	for rows.Next() {
+		var col string
+		if err := rows.Scan(&col); err != nil {
+			return nil, fmt.Errorf("manifest: failed to scan column: %w", err)
+		}
+		columns = append(columns, col)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("manifest: error iterating indexes: %w", err)
+	}
+
+	return columns, nil
+}
+
+// DeleteIndex deletes all index partitions for a given collection and column.
+func (c *SQLiteCatalog) DeleteIndex(ctx context.Context, collection, column string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	result, err := c.db.ExecContext(ctx,
+		`DELETE FROM index_partitions WHERE collection = ? AND column_name = ?`,
+		collection, column,
+	)
+	if err != nil {
+		return fmt.Errorf("manifest: failed to delete index: %w", err)
+	}
+
+	// Check if any rows were affected
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		return fmt.Errorf("manifest: no index found for collection=%s, column=%s", collection, column)
+	}
+
+	return nil
 }
 
 // Close closes the catalog database connections.

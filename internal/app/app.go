@@ -16,6 +16,7 @@ import (
 	"github.com/arkilian/arkilian/internal/compaction"
 	"github.com/arkilian/arkilian/internal/config"
 	"github.com/arkilian/arkilian/internal/manifest"
+	"github.com/arkilian/arkilian/internal/observability"
 	"github.com/arkilian/arkilian/internal/partition"
 	"github.com/arkilian/arkilian/internal/query/executor"
 	"github.com/arkilian/arkilian/internal/query/planner"
@@ -331,8 +332,11 @@ func (a *App) startQueryService(ctx context.Context) error {
 			stats.LRUFilters, stats.LRUMemoryBytes)
 	}
 
+	// Initialize query statistics tracker (for automated index creation)
+	queryStats := observability.NewQueryStats(1 * time.Hour)
+
 	// Create HTTP handler
-	queryHandler := httpapi.NewQueryHandler(a.queryExecutor, nil)
+	queryHandler := httpapi.NewQueryHandler(a.queryExecutor, queryStats)
 
 	// Setup HTTP server with middleware
 	mux := http.NewServeMux()

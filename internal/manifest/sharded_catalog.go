@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/arkilian/arkilian/internal/bloom"
+	"github.com/arkilian/arkilian/internal/index"
 	"github.com/arkilian/arkilian/internal/partition"
 )
 
@@ -565,4 +566,65 @@ func (sc *ShardedCatalog) UpdateZoneMapsFromMetadata(ctx context.Context, partit
 // RebuildZoneMap routes to the shard owning the partition key.
 func (sc *ShardedCatalog) RebuildZoneMap(ctx context.Context, partitionKey string) error {
 	return sc.shards[sc.shardFor(partitionKey)].RebuildZoneMap(ctx, partitionKey)
+}
+
+// ---------------------------------------------------------------------------
+// Index partition methods (route to correct shard by collection)
+// ---------------------------------------------------------------------------
+
+// RegisterIndexPartition routes to the shard that owns the collection.
+func (sc *ShardedCatalog) RegisterIndexPartition(ctx context.Context, info *index.IndexPartitionInfo) error {
+return sc.shards[sc.shardFor(info.Collection)].RegisterIndexPartition(ctx, info)
+}
+
+// FindIndexPartition routes to the shard that owns the collection.
+func (sc *ShardedCatalog) FindIndexPartition(ctx context.Context, collection, column string, bucketID int) (*index.IndexPartitionInfo, error) {
+return sc.shards[sc.shardFor(collection)].FindIndexPartition(ctx, collection, column, bucketID)
+}
+
+// ListIndexes queries all shards and merges results (deduplicates column names).
+func (sc *ShardedCatalog) ListIndexes(ctx context.Context, collection string) ([]string, error) {
+type result struct {
+columns []string
+err     error
+}
+ch := make(chan result, len(sc.shards))
+
+for _, shard := range sc.shards {
+go func(s *SQLiteCatalog) {
+cols, err := s.ListIndexes(ctx, collection)
+ch <- result{cols, err}
+}(shard)
+}
+
+seen := make(map[string]struct{})
+for range sc.shards {
+res := <-ch
+if res.err != nil {
+return nil, res.err
+}
+for _, col := range res.columns {
+seen[col] = struct{}{}
+}
+}
+
+columns := make([]string, 0, len(seen))
+for col := range seen {
+columns = append(columns, col)
+}
+return columns, nil
+}
+
+// DeleteIndex fans out to all shards (only one will have the matching data).
+func (sc *ShardedCatalog) DeleteIndex(ctx context.Context, collection, column string) error {
+var firstErr error
+for _, shard := range sc.shards {
+if err := shard.DeleteIndex(ctx, collection, column); err != nil {
+if firstErr == nil {
+firstErr = err
+}
+// Continue to try all shards
+}
+}
+return firstErr
 }

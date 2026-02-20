@@ -113,6 +113,25 @@ CREATE TABLE IF NOT EXISTS zone_maps (
 const CreateIdempotencyKeysIndexSQL = `
 CREATE INDEX IF NOT EXISTS idx_idempotency_created ON idempotency_keys(created_at)`
 
+// CreateIndexPartitionsTableSQL creates the index_partitions table for secondary index metadata.
+const CreateIndexPartitionsTableSQL = `
+CREATE TABLE IF NOT EXISTS index_partitions (
+    index_id      TEXT PRIMARY KEY,
+    collection    TEXT NOT NULL,
+    column_name   TEXT NOT NULL,
+    bucket_id     INTEGER NOT NULL,
+    object_path   TEXT NOT NULL,
+    entry_count   INTEGER NOT NULL,
+    size_bytes    INTEGER NOT NULL,
+    min_time      INTEGER,
+    max_time      INTEGER,
+    created_at    INTEGER NOT NULL
+)`
+
+// CreateIndexPartitionsIndexSQL creates an index for efficient index lookups.
+const CreateIndexPartitionsIndexSQL = `
+CREATE INDEX IF NOT EXISTS idx_index_col ON index_partitions(collection, column_name)`
+
 // AnalyzeSQL runs ANALYZE to keep the SQLite query planner informed about index statistics.
 const AnalyzeSQL = `ANALYZE`
 
@@ -125,7 +144,9 @@ func AllSchemaSQL() []string {
 		CreateIdempotencyKeysIndexSQL,
 		CreateCompactionIntentsTableSQL,
 		CreateZoneMapsTableSQL,
+		CreateIndexPartitionsTableSQL,
 	}
 	statements = append(statements, CreatePartitionsIndexesSQL...)
+	statements = append(statements, CreateIndexPartitionsIndexSQL)
 	return statements
 }
