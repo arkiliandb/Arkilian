@@ -4,7 +4,9 @@ package planner
 import (
 	"context"
 	"fmt"
+	"log"
 
+	"github.com/arkilian/arkilian/internal/index"
 	"github.com/arkilian/arkilian/internal/manifest"
 	"github.com/arkilian/arkilian/internal/query/parser"
 )
@@ -40,27 +42,45 @@ type PruningStats struct {
 
 	// PruningRatio is the ratio of pruned partitions (0.0 to 1.0).
 	PruningRatio float64
+
+	// IndexUsed indicates whether a secondary index was used for pruning.
+	IndexUsed bool
+
+	// IndexColumn is the column name used for index-based pruning.
+	IndexColumn string
 }
 
 // Planner generates query plans from parsed SQL statements.
 type Planner struct {
-	catalog manifest.CatalogReader
-	pruner  *Pruner
+	catalog     manifest.CatalogReader
+	pruner      *Pruner
+	indexLookup *index.Lookup
 }
 
 // NewPlanner creates a new query planner.
 func NewPlanner(catalog manifest.CatalogReader) *Planner {
 	return &Planner{
-		catalog: catalog,
-		pruner:  NewPruner(catalog, nil), // No storage for basic planner
+		catalog:     catalog,
+		pruner:      NewPruner(catalog, nil), // No storage for basic planner
+		indexLookup: nil,
 	}
 }
 
 // NewPlannerWithPruner creates a new query planner with a custom pruner.
 func NewPlannerWithPruner(catalog manifest.CatalogReader, pruner *Pruner) *Planner {
 	return &Planner{
-		catalog: catalog,
-		pruner:  pruner,
+		catalog:     catalog,
+		pruner:      pruner,
+		indexLookup: nil,
+	}
+}
+
+// NewPlannerWithIndex creates a new query planner with index lookup support.
+func NewPlannerWithIndex(catalog manifest.CatalogReader, pruner *Pruner, indexLookup *index.Lookup) *Planner {
+	return &Planner{
+		catalog:     catalog,
+		pruner:      pruner,
+		indexLookup: indexLookup,
 	}
 }
 
@@ -72,6 +92,47 @@ func (p *Planner) Plan(ctx context.Context, stmt *parser.SelectStatement) (*Quer
 
 	// Extract predicates from WHERE clause
 	predicates := parser.ExtractPredicates(stmt)
+
+	// Derive collection name from the FROM clause
+	collection := ""
+	if stmt.From != nil {
+		collection = stmt.From.Name
+	}
+
+	// Try index lookup if enabled and collection is specified
+	if p.indexLookup != nil && collection != "" {
+		for _, pred := range predicates {
+			if pred.Operator == "=" {
+				partitionIDs, err := p.indexLookup.FindPartitions(ctx, collection, pred.Column, pred.Value)
+				if err != nil {
+					// Index lookup failed — log and fall through to bloom pruning
+					log.Printf("planner: index lookup failed for %s=%v: %v", pred.Column, pred.Value, err)
+					break
+				}
+				if len(partitionIDs) > 0 {
+					// Get full partition records for the index-derived IDs
+					allPartitions, err := p.catalog.FindPartitions(ctx, nil)
+					if err != nil {
+						return nil, fmt.Errorf("planner: failed to get partitions: %w", err)
+					}
+					filtered := filterByIDs(allPartitions, partitionIDs)
+					return &QueryPlan{
+						Statement:  stmt,
+						Partitions: filtered,
+						Predicates: predicates,
+						PruningStats: PruningStats{
+							TotalPartitions:  len(allPartitions),
+							Phase2Candidates: len(filtered),
+							PrunedCount:      len(allPartitions) - len(filtered),
+							IndexUsed:        true,
+							IndexColumn:      pred.Column,
+						},
+					}, nil
+				}
+				// Empty result from index — fall through to bloom pruning
+			}
+		}
+	}
 
 	// Convert parser predicates to manifest predicates for pruning
 	manifestPredicates := convertToManifestPredicates(predicates)
@@ -243,4 +304,22 @@ func hasAggregate(expr parser.Expression) bool {
 		}
 	}
 	return false
+}
+
+// filterByIDs filters partitions to only those whose PartitionID is in the ids set.
+func filterByIDs(partitions []*manifest.PartitionRecord, ids []string) []*manifest.PartitionRecord {
+	// Create a set for O(1) lookup
+	idSet := make(map[string]struct{})
+	for _, id := range ids {
+		idSet[id] = struct{}{}
+	}
+
+	// Filter partitions
+	var result []*manifest.PartitionRecord
+	for _, part := range partitions {
+		if _, exists := idSet[part.PartitionID]; exists {
+			result = append(result, part)
+		}
+	}
+	return result
 }
