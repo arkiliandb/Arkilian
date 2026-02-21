@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -15,21 +16,16 @@ import (
 	"time"
 
 	apihttp "github.com/arkilian/arkilian/internal/api/http"
+	"github.com/arkilian/arkilian/internal/app"
+	"github.com/arkilian/arkilian/internal/config"
 	"github.com/arkilian/arkilian/internal/manifest"
 	"github.com/arkilian/arkilian/internal/partition"
 	"github.com/arkilian/arkilian/internal/storage"
 	"github.com/arkilian/arkilian/internal/wal"
 )
 
-// setupWALTestEnv creates a test environment with WAL enabled.
-func setupWALTestEnv(t *testing.T) (
-	*wal.WAL,
-	*wal.Flusher,
-	manifest.Catalog,
-	storage.ObjectStorage,
-	string,
-	func(),
-) {
+// setupWALTestEnv creates a test environment with WAL enabled using the full app.
+func setupWALTestEnv(t *testing.T) (*app.App, string, func()) {
 	t.Helper()
 
 	tempDir, err := os.MkdirTemp("", "arkilian-wal-test-*")
@@ -40,91 +36,118 @@ func setupWALTestEnv(t *testing.T) (
 	walDir := filepath.Join(tempDir, "wal")
 	partitionDir := filepath.Join(tempDir, "partitions")
 	storageDir := filepath.Join(tempDir, "storage")
-	manifestPath := filepath.Join(tempDir, "manifest.db")
+	manifestDir := filepath.Join(tempDir, "manifest")
+	downloadDir := filepath.Join(tempDir, "downloads")
+	compactionDir := filepath.Join(tempDir, "compaction")
 
-	for _, dir := range []string{walDir, partitionDir, storageDir} {
+	for _, dir := range []string{walDir, partitionDir, storageDir, manifestDir, downloadDir, compactionDir} {
 		if err := os.MkdirAll(dir, 0755); err != nil {
 			os.RemoveAll(tempDir)
 			t.Fatalf("failed to create dir %s: %v", dir, err)
 		}
 	}
 
-	store, err := storage.NewLocalStorage(storageDir)
-	if err != nil {
-		os.RemoveAll(tempDir)
-		t.Fatalf("failed to create storage: %v", err)
+	// Create config with WAL enabled
+	cfg := &config.Config{
+		Mode:      config.ModeAll,
+		DataDir:   tempDir,
+		HTTP:      config.HTTPConfig{IngestAddr: "127.0.0.1:0", QueryAddr: "127.0.0.1:0", CompactAddr: "127.0.0.1:0"},
+		GRPC:      config.GRPCConfig{Enabled: false},
+		Ingest:    config.IngestConfig{PartitionDir: partitionDir, TargetPartitionSizeMB: 16},
+		Query:     config.QueryConfig{DownloadDir: downloadDir, Concurrency: 4, PoolSize: 10},
+		Compaction: config.CompactionConfig{WorkDir: compactionDir},
+		Storage:   config.StorageConfig{Type: "local", Path: storageDir},
+		Manifest:  config.ManifestConfig{Sharded: false},
+		WAL: config.WALConfig{
+			Dir:            walDir,
+			MaxSegmentSize: 64 * 1024 * 1024,
+			FlushInterval:  500 * time.Millisecond,
+			FlushBatchSize: 1000,
+			RetentionTime:  1 * time.Hour,
+			Enabled:        true,
+		},
+		Router: config.RouterConfig{
+			NotificationsEnabled: false,
+			BufferSize:           1000,
+		},
+		Index: config.IndexConfig{Enabled: false},
+		Cache: config.CacheConfig{NVMeDir: "", NVMeMaxBytes: 0, PrefetchEnabled: false},
 	}
 
-	catalog, err := manifest.NewCatalog(manifestPath)
+	testApp, err := app.New(cfg)
 	if err != nil {
 		os.RemoveAll(tempDir)
-		t.Fatalf("failed to create catalog: %v", err)
+		t.Fatalf("failed to create app: %v", err)
 	}
 
-	builder := partition.NewBuilder(partitionDir, 0)
-	metaGen := partition.NewMetadataGenerator()
-
-	walInstance, err := wal.NewWAL(walDir, 64*1024*1024)
-	if err != nil {
-		catalog.Close()
+	ctx := context.Background()
+	if err := testApp.Start(ctx); err != nil {
 		os.RemoveAll(tempDir)
-		t.Fatalf("failed to create WAL: %v", err)
+		t.Fatalf("failed to start app: %v", err)
 	}
-
-	flusher := wal.NewFlusher(walInstance, builder, store, catalog, metaGen, 500*time.Millisecond, 1000)
 
 	cleanup := func() {
-		walInstance.Close()
-		catalog.Close()
+		testApp.Stop(context.Background())
 		os.RemoveAll(tempDir)
 	}
 
-	return walInstance, flusher, catalog, store, tempDir, cleanup
+	return testApp, tempDir, cleanup
+}
+
+// getIngestURL returns the ingest URL for the app.
+func getIngestURL(testApp *app.App) string {
+	// Get the actual port from config after startup
+	return fmt.Sprintf("http://127.0.0.1:%s", "0")
 }
 
 // TestWALIngestAndFlush tests the full WAL ingest and flush flow.
 func TestWALIngestAndFlush(t *testing.T) {
-	walInstance, flusher, catalog, store, _, cleanup := setupWALTestEnv(t)
+	_, _, cleanup := setupWALTestEnv(t)
 	defer cleanup()
 
-	// Start flusher in background
-	ctx := context.Background()
-	flusherCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-	go flusher.Run(flusherCtx)
-
-	// Create ingest handler with WAL
-	builder := partition.NewBuilder("", 0)
-	metaGen := partition.NewMetadataGenerator()
-	handler := apihttp.NewIngestHandler(builder, metaGen, catalog, store, nil, walInstance)
-	wrappedHandler := apihttp.DefaultMiddleware()(handler)
-
-	// Ingest test data
-	reqBody := apihttp.IngestRequest{
-		PartitionKey: "20260206",
-		Rows: []map[string]interface{}{
-			{
-				"tenant_id":  "acme",
-				"user_id":    float64(12345),
-				"event_time": float64(time.Now().UnixNano()),
-				"event_type": "page_view",
-				"payload":    map[string]interface{}{"page": "/home"},
-			},
-			{
-				"tenant_id":  "acme",
-				"user_id":    float64(67890),
-				"event_time": float64(time.Now().UnixNano()),
-				"event_type": "click",
-				"payload":    map[string]interface{}{"button": "signup"},
-			},
+	// Create test data
+	testRows := []map[string]interface{}{
+		{
+			"tenant_id":  "acme",
+			"user_id":    float64(12345),
+			"event_time": float64(time.Now().UnixNano()),
+			"event_type": "page_view",
+			"payload":    map[string]interface{}{"page": "/home"},
+		},
+		{
+			"tenant_id":  "acme",
+			"user_id":    float64(67890),
+			"event_time": float64(time.Now().UnixNano()),
+			"event_type": "click",
+			"payload":    map[string]interface{}{"button": "signup"},
 		},
 	}
 
+	// Ingest via HTTP
+	reqBody := apihttp.IngestRequest{
+		PartitionKey: "20260206",
+		Rows:         testRows,
+	}
 	body, _ := json.Marshal(reqBody)
+
+	// Use httptest to make request to the handler directly
+	// Note: In a true integration test, we'd start a real server
+	// For now, we test the handler with a mock response recorder
+	rec := httptest.NewRecorder()
+	
+	// Create handler and test
+	store, _ := storage.NewLocalStorage("")
+	catalog, _ := manifest.NewCatalog("")
+	builder := partition.NewBuilder("", 0)
+	metaGen := partition.NewMetadataGenerator()
+	walInstance, _ := wal.NewWAL(filepath.Join(t.TempDir(), "wal"), 64*1024*1024)
+	defer walInstance.Close()
+
+	handler := apihttp.NewIngestHandler(builder, metaGen, catalog, store, nil, walInstance)
+	wrappedHandler := apihttp.DefaultMiddleware()(handler)
+
 	req := httptest.NewRequest(http.MethodPost, "/v1/ingest", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
-
-	rec := httptest.NewRecorder()
 	wrappedHandler.ServeHTTP(rec, req)
 
 	// Verify response has LSN and status
@@ -151,7 +174,7 @@ func TestWALIngestAndFlush(t *testing.T) {
 	time.Sleep(2 * time.Second)
 
 	// Verify data was flushed to storage and catalog
-	partitions, err := catalog.FindPartitions(ctx, nil)
+	partitions, err := catalog.FindPartitions(context.Background(), nil)
 	if err != nil {
 		t.Fatalf("failed to find partitions: %v", err)
 	}
@@ -169,6 +192,8 @@ func TestWALIngestAndFlush(t *testing.T) {
 	if totalRows < 2 {
 		t.Errorf("expected at least 2 rows in partitions, got %d", totalRows)
 	}
+
+	t.Logf("WAL ingest and flush test passed: LSN=%d, rows=%d", resp.LSN, totalRows)
 }
 
 // TestWALRecovery tests WAL recovery after crash.
@@ -183,8 +208,10 @@ func TestWALRecovery(t *testing.T) {
 	partitionDir := filepath.Join(tempDir, "partitions")
 	storageDir := filepath.Join(tempDir, "storage")
 	manifestPath := filepath.Join(tempDir, "manifest.db")
+	downloadDir := filepath.Join(tempDir, "downloads")
+	compactionDir := filepath.Join(tempDir, "compaction")
 
-	for _, dir := range []string{walDir, partitionDir, storageDir} {
+	for _, dir := range []string{walDir, partitionDir, storageDir, downloadDir, compactionDir} {
 		os.MkdirAll(dir, 0755)
 	}
 
@@ -247,7 +274,7 @@ func TestWALRecovery(t *testing.T) {
 		t.Fatal("expected LSN in response")
 	}
 
-	// Simulate crash: close WAL without proper shutdown (flusher stops when context cancelled)
+	// Simulate crash: close WAL without proper shutdown
 	walInstance.Close()
 
 	// Create new WAL instance (simulating restart)
@@ -282,7 +309,7 @@ func TestWALRecovery(t *testing.T) {
 	time.Sleep(500 * time.Millisecond)
 
 	// Verify data was recovered
-	partitions, err := catalog.FindPartitions(recoveryCtx, nil)
+	partitions, err := catalog.FindPartitions(context.Background(), nil)
 	if err != nil {
 		t.Fatalf("failed to find partitions: %v", err)
 	}
@@ -290,6 +317,13 @@ func TestWALRecovery(t *testing.T) {
 	if len(partitions) == 0 {
 		t.Error("expected partition after recovery and flush")
 	}
+
+	// Verify the partition has the correct row count
+	if partitions[0].RowCount != 1 {
+		t.Errorf("expected 1 row in recovered partition, got %d", partitions[0].RowCount)
+	}
+
+	t.Logf("WAL recovery test passed: recovered %d entries", recoveredCount)
 }
 
 // TestWALConcurrentIngest tests concurrent WAL ingest from multiple goroutines.
@@ -424,7 +458,7 @@ func TestWALConcurrentIngest(t *testing.T) {
 	time.Sleep(2 * time.Second)
 
 	// Verify all rows are present
-	partitions, err := catalog.FindPartitions(flusherCtx, nil)
+	partitions, err := catalog.FindPartitions(context.Background(), nil)
 	if err != nil {
 		t.Fatalf("failed to find partitions: %v", err)
 	}
@@ -438,5 +472,36 @@ func TestWALConcurrentIngest(t *testing.T) {
 		t.Errorf("expected at least %d rows, got %d", expectedCount, totalRows)
 	}
 
-	t.Logf("Successfully ingested %d entries with unique LSNs", len(lsns))
+	t.Logf("WAL concurrent ingest test passed: %d entries with unique LSNs", len(lsns))
+}
+
+// Helper function to make HTTP request and get response
+func makeIngestRequest(t *testing.T, url string, rows []map[string]interface{}) *http.Response {
+	t.Helper()
+
+	reqBody := map[string]interface{}{
+		"partition_key": "20260206",
+		"rows":          rows,
+	}
+	body, _ := json.Marshal(reqBody)
+
+	resp, err := http.Post(url, "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("failed to make request: %v", err)
+	}
+
+	return resp
+}
+
+// Helper function to read response body
+func readResponseBody(t *testing.T, resp *http.Response) []byte {
+	t.Helper()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("failed to read response body: %v", err)
+	}
+	resp.Body.Close()
+
+	return body
 }
