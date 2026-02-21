@@ -359,8 +359,14 @@ func (a *App) startQueryService(ctx context.Context) error {
 	// Initialize query planner
 	var queryPlanner *planner.Planner
 	if a.cfg.Index.Enabled {
+		// Type-assert to get IndexCatalog interface
+		indexCatalog, ok := a.catalog.(index.IndexCatalog)
+		if !ok {
+			return fmt.Errorf("catalog does not implement IndexCatalog interface")
+		}
+
 		// Create index lookup for planner
-		indexLookup := index.NewLookup(a.storage, a.catalog, a.cfg.Query.DownloadDir, a.cfg.Index.BucketCount)
+		indexLookup := index.NewLookup(a.storage, indexCatalog, a.cfg.Query.DownloadDir, a.cfg.Index.BucketCount)
 		queryPlanner = planner.NewPlannerWithIndex(a.catalogReader, pruner, indexLookup)
 		log.Printf("Query planner initialized with index lookup: bucket_count=%d", a.cfg.Index.BucketCount)
 	} else {
@@ -515,8 +521,14 @@ func (a *App) startCompactService(ctx context.Context) error {
 		log.Printf("Index policy enabled: create_threshold=%d, drop_threshold=%d, max_indexes=%d",
 			a.cfg.Index.CreateThreshold, a.cfg.Index.DropThreshold, a.cfg.Index.MaxIndexes)
 
+		// Type-assert to get IndexCatalog interface
+		indexCatalog, ok := a.catalog.(index.IndexCatalog)
+		if !ok {
+			return fmt.Errorf("catalog does not implement IndexCatalog interface")
+		}
+
 		// Create index builder
-		indexBuilder := index.NewBuilder(a.storage, a.catalog, a.cfg.Compaction.WorkDir, a.cfg.Index.BucketCount)
+		indexBuilder := index.NewBuilder(a.storage, indexCatalog, a.cfg.Compaction.WorkDir, a.cfg.Index.BucketCount)
 
 		// Create partition provider adapter
 		partitionProvider := &manifestPartitionProvider{catalog: a.catalog}
@@ -525,7 +537,7 @@ func (a *App) startCompactService(ctx context.Context) error {
 		indexPolicy := index.NewPolicy(
 			nil, // queryStats - nil when observability disabled
 			indexBuilder,
-			a.catalog,
+			indexCatalog,
 			partitionProvider,
 			a.storage,
 			a.cfg.Index,
@@ -708,4 +720,28 @@ func (q *catalogVolumeQuerier) TotalVolumeBytes(ctx context.Context, partitionKe
 		total += p.SizeBytes
 	}
 	return total, nil
+}
+
+// manifestPartitionProvider adapts manifest.Catalog to index.PartitionProvider.
+type manifestPartitionProvider struct {
+	catalog manifest.Catalog
+}
+
+func (p *manifestPartitionProvider) GetPartitions(ctx context.Context) ([]*index.PartitionInfo, error) {
+	partitions, err := p.catalog.FindPartitions(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	result := make([]*index.PartitionInfo, len(partitions))
+	for i, part := range partitions {
+		result[i] = &index.PartitionInfo{
+			PartitionID:  part.PartitionID,
+			ObjectPath:   part.ObjectPath,
+			RowCount:     part.RowCount,
+			MinEventTime: part.MinEventTime,
+			MaxEventTime: part.MaxEventTime,
+		}
+	}
+	return result, nil
 }
