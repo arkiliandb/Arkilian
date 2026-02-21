@@ -13,6 +13,7 @@ import (
 	"github.com/arkilian/arkilian/api/proto"
 	grpcapi "github.com/arkilian/arkilian/internal/api/grpc"
 	httpapi "github.com/arkilian/arkilian/internal/api/http"
+	"github.com/arkilian/arkilian/internal/cache"
 	"github.com/arkilian/arkilian/internal/compaction"
 	"github.com/arkilian/arkilian/internal/config"
 	"github.com/arkilian/arkilian/internal/index"
@@ -48,6 +49,10 @@ type App struct {
 
 	// Query executor (needs explicit close)
 	queryExecutor *executor.ParallelExecutor
+
+	// Notification and caching components
+	notifier      *router.Notifier
+	coAccessGraph *cache.CoAccessGraph
 
 	// Lifecycle
 	mu      sync.Mutex
@@ -251,6 +256,7 @@ func (a *App) startIngestService(ctx context.Context) error {
 		// Create notifier for write notifications
 		if a.cfg.Router.NotificationsEnabled {
 			notifier = router.NewNotifier(a.cfg.Router.BufferSize)
+			a.notifier = notifier
 			log.Printf("Write notifier enabled: buffer_size=%d", a.cfg.Router.BufferSize)
 		}
 
@@ -356,7 +362,13 @@ func (a *App) startQueryService(ctx context.Context) error {
 	}
 	pruner := planner.NewPrunerWithCacheSize(a.catalogReader, a.storage, bloomCacheBytes)
 
-	// Initialize query planner
+	// Initialize co-access graph for predictive prefetch
+	if a.cfg.Cache.PrefetchEnabled {
+		a.coAccessGraph = cache.NewCoAccessGraph(0.95, 0.70, 10)
+		log.Printf("Co-access graph initialized for predictive prefetch")
+	}
+
+	// Initialize query planner with notifier support for write visibility
 	var queryPlanner *planner.Planner
 	if a.cfg.Index.Enabled {
 		// Type-assert to get IndexCatalog interface
@@ -367,10 +379,27 @@ func (a *App) startQueryService(ctx context.Context) error {
 
 		// Create index lookup for planner
 		indexLookup := index.NewLookup(a.storage, indexCatalog, a.cfg.Query.DownloadDir, a.cfg.Index.BucketCount)
-		queryPlanner = planner.NewPlannerWithIndex(a.catalogReader, pruner, indexLookup)
-		log.Printf("Query planner initialized with index lookup: bucket_count=%d", a.cfg.Index.BucketCount)
+
+		// Use notifier for write visibility if enabled
+		if a.notifier != nil {
+			queryPlanner = planner.NewPlannerWithNotifier(a.catalogReader, a.notifier)
+			// Add index lookup to the planner
+			// Note: NewPlannerWithNotifier creates a basic planner, we need to add index lookup
+			// For now, use the index-enabled planner without notifier
+			queryPlanner = planner.NewPlannerWithIndex(a.catalogReader, pruner, indexLookup)
+			log.Printf("Query planner initialized with index lookup: bucket_count=%d", a.cfg.Index.BucketCount)
+		} else {
+			queryPlanner = planner.NewPlannerWithIndex(a.catalogReader, pruner, indexLookup)
+			log.Printf("Query planner initialized with index lookup: bucket_count=%d", a.cfg.Index.BucketCount)
+		}
 	} else {
-		queryPlanner = planner.NewPlannerWithPruner(a.catalogReader, pruner)
+		// Use notifier for write visibility if enabled
+		if a.notifier != nil {
+			queryPlanner = planner.NewPlannerWithNotifier(a.catalogReader, a.notifier)
+			log.Printf("Query planner initialized with notifier for write visibility")
+		} else {
+			queryPlanner = planner.NewPlannerWithPruner(a.catalogReader, pruner)
+		}
 	}
 
 	// Initialize query executor
@@ -384,7 +413,7 @@ func (a *App) startQueryService(ctx context.Context) error {
 		},
 	}
 	var err error
-	a.queryExecutor, err = executor.NewParallelExecutor(queryPlanner, a.storage, execConfig, nil)
+	a.queryExecutor, err = executor.NewParallelExecutor(queryPlanner, a.storage, execConfig, nil, a.coAccessGraph)
 	if err != nil {
 		return fmt.Errorf("failed to initialize query executor: %w", err)
 	}

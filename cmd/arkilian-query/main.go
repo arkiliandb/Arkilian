@@ -68,7 +68,7 @@ func main() {
 			IdleTimeout:         5 * time.Minute,
 		},
 	}
-	queryExecutor, err := executor.NewParallelExecutor(queryPlanner, store, execConfig, nil)
+	queryExecutor, err := executor.NewParallelExecutor(queryPlanner, store, execConfig, nil, nil)
 	if err != nil {
 		log.Fatalf("Failed to initialize query executor: %v", err)
 	}

@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/arkilian/arkilian/internal/cache"
 	"github.com/arkilian/arkilian/internal/manifest"
 	"github.com/arkilian/arkilian/internal/query/aggregator"
 	"github.com/arkilian/arkilian/internal/query/parser"
@@ -98,7 +99,7 @@ type ParallelExecutor struct {
 	downloadCache     *DownloadCache
 	maxMemoryBytes    int64
 	batchDownloader   *storage.BatchDownloader
-	coAccessGraph     interface{}
+	coAccessGraph     *cache.CoAccessGraph
 	mu                sync.Mutex
 }
 
@@ -134,12 +135,12 @@ func DefaultExecutorConfig() ExecutorConfig {
 }
 
 // NewParallelExecutor creates a new parallel query executor.
-// NewParallelExecutor creates a new parallel query executor.
 func NewParallelExecutor(
 	planner *planner.Planner,
 	storage storage.ObjectStorage,
 	config ExecutorConfig,
 	batchDownloader *storage.BatchDownloader,
+	coAccessGraph *cache.CoAccessGraph,
 ) (*ParallelExecutor, error) {
 	if config.Concurrency <= 0 {
 		config.Concurrency = 10
@@ -167,6 +168,7 @@ func NewParallelExecutor(
 		downloadCache:   cache,
 		maxMemoryBytes:  config.MaxMemoryBytes,
 		batchDownloader: batchDownloader,
+		coAccessGraph:   coAccessGraph,
 	}, nil
 }
 
@@ -217,9 +219,44 @@ func (e *ParallelExecutor) ExecutePlan(ctx context.Context, plan *planner.QueryP
 	var localPaths map[string]string
 	if e.batchDownloader != nil {
 		objectPaths := plan.GetObjectPaths()
+		priority := make([]int, len(objectPaths))
+
+		// If co-access graph is enabled, get prefetch candidates and add them with priority 1
+		if e.coAccessGraph != nil && len(objectPaths) > 0 {
+			partitionKeys := make([]string, len(plan.Partitions))
+			for i, part := range plan.Partitions {
+				partitionKeys[i] = part.PartitionKey
+			}
+
+			// Collect prefetch candidates from all accessed partitions
+			var prefetchCandidates []string
+			for _, key := range partitionKeys {
+				candidates := e.coAccessGraph.GetPrefetchCandidates(key)
+				prefetchCandidates = append(prefetchCandidates, candidates...)
+			}
+
+			// Add prefetch candidates to the batch request
+			if len(prefetchCandidates) > 0 {
+				// Create a set of existing object paths to avoid duplicates
+				existingPaths := make(map[string]struct{})
+				for _, path := range objectPaths {
+					existingPaths[path] = struct{}{}
+				}
+
+				// Add prefetch candidates that aren't already in the request
+				for _, candidate := range prefetchCandidates {
+					if _, exists := existingPaths[candidate]; !exists {
+						objectPaths = append(objectPaths, candidate)
+						priority = append(priority, 1) // Priority 1 = prefetch
+						existingPaths[candidate] = struct{}{}
+					}
+				}
+			}
+		}
+
 		req := &storage.BatchRequest{
 			ObjectPaths: objectPaths,
-			Priority:    make([]int, len(objectPaths)), // All critical (0)
+			Priority:    priority,
 		}
 		result, err := e.batchDownloader.Download(ctx, req)
 		if err != nil {
@@ -293,15 +330,11 @@ func (e *ParallelExecutor) ExecutePlan(ctx context.Context, plan *planner.QueryP
 		ExecutionTimeMs:   time.Since(startTime).Milliseconds(),
 	}
 
-	// Record co-access graph if enabled (placeholder for Phase 3)
+	// Record co-access graph if enabled
 	if e.coAccessGraph != nil {
 		partitionIDs := plan.IdentifyPartitionsToScan()
 		if len(partitionIDs) > 0 {
-			// Type assert to the co-access graph interface when available
-			// For now, this is a placeholder that will be wired in Phase 3
-			if graph, ok := e.coAccessGraph.(interface{ RecordAccess([]string) }); ok {
-				graph.RecordAccess(partitionIDs)
-			}
+			e.coAccessGraph.RecordAccess(partitionIDs)
 		}
 	}
 

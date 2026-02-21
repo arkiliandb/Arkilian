@@ -8,6 +8,10 @@ type CatalogReader interface {
 	// FindPartitions returns partitions matching the given predicates.
 	FindPartitions(ctx context.Context, predicates []Predicate) ([]*PartitionRecord, error)
 
+	// GetPartition returns a single partition by its ID.
+	// Returns nil if not found.
+	GetPartition(ctx context.Context, partitionID string) (*PartitionRecord, error)
+
 	// GetPartitionCount returns the total number of active (non-compacted) partitions.
 	GetPartitionCount(ctx context.Context) (int64, error)
 

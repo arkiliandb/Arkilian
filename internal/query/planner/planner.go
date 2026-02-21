@@ -5,11 +5,50 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"sync"
 
 	"github.com/arkilian/arkilian/internal/index"
 	"github.com/arkilian/arkilian/internal/manifest"
 	"github.com/arkilian/arkilian/internal/query/parser"
+	"github.com/arkilian/arkilian/internal/router"
 )
+
+// recentPartitionBuffer is a thread-safe bounded ring buffer for recently flushed partitions.
+type recentPartitionBuffer struct {
+	mu         sync.RWMutex
+	partitions []*manifest.PartitionRecord
+	maxSize    int
+}
+
+// newRecentPartitionBuffer creates a new recent partition buffer.
+func newRecentPartitionBuffer(maxSize int) *recentPartitionBuffer {
+	if maxSize <= 0 {
+		maxSize = 1000
+	}
+	return &recentPartitionBuffer{
+		partitions: make([]*manifest.PartitionRecord, 0, maxSize),
+		maxSize:    maxSize,
+	}
+}
+
+// Add adds a partition to the buffer, dropping the oldest if at capacity.
+func (b *recentPartitionBuffer) Add(p *manifest.PartitionRecord) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if len(b.partitions) >= b.maxSize {
+		b.partitions = b.partitions[1:]
+	}
+	b.partitions = append(b.partitions, p)
+}
+
+// GetAll returns a copy of all partitions in the buffer.
+func (b *recentPartitionBuffer) GetAll() []*manifest.PartitionRecord {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	result := make([]*manifest.PartitionRecord, len(b.partitions))
+	copy(result, b.partitions)
+	return result
+}
 
 // QueryPlan represents a plan for executing a query across partitions.
 type QueryPlan struct {
@@ -52,35 +91,79 @@ type PruningStats struct {
 
 // Planner generates query plans from parsed SQL statements.
 type Planner struct {
-	catalog     manifest.CatalogReader
-	pruner      *Pruner
-	indexLookup *index.Lookup
+	catalog          manifest.CatalogReader
+	pruner           *Pruner
+	indexLookup      *index.Lookup
+	notifier         *router.Notifier
+	recentPartitions *recentPartitionBuffer
+	notificationCh   chan router.Notification
 }
 
 // NewPlanner creates a new query planner.
 func NewPlanner(catalog manifest.CatalogReader) *Planner {
 	return &Planner{
-		catalog:     catalog,
-		pruner:      NewPruner(catalog, nil), // No storage for basic planner
-		indexLookup: nil,
+		catalog:          catalog,
+		pruner:           NewPruner(catalog, nil),
+		indexLookup:      nil,
+		recentPartitions: nil,
 	}
 }
 
 // NewPlannerWithPruner creates a new query planner with a custom pruner.
 func NewPlannerWithPruner(catalog manifest.CatalogReader, pruner *Pruner) *Planner {
 	return &Planner{
-		catalog:     catalog,
-		pruner:      pruner,
-		indexLookup: nil,
+		catalog:          catalog,
+		pruner:           pruner,
+		indexLookup:      nil,
+		recentPartitions: nil,
 	}
 }
 
 // NewPlannerWithIndex creates a new query planner with index lookup support.
 func NewPlannerWithIndex(catalog manifest.CatalogReader, pruner *Pruner, indexLookup *index.Lookup) *Planner {
 	return &Planner{
-		catalog:     catalog,
-		pruner:      pruner,
-		indexLookup: indexLookup,
+		catalog:          catalog,
+		pruner:           pruner,
+		indexLookup:      indexLookup,
+		recentPartitions: nil,
+	}
+}
+
+// NewPlannerWithNotifier creates a new query planner with notification support for write visibility.
+func NewPlannerWithNotifier(catalog manifest.CatalogReader, notifier *router.Notifier) *Planner {
+	p := &Planner{
+		catalog:          catalog,
+		pruner:           NewPruner(catalog, nil),
+		indexLookup:      nil,
+		notifier:         notifier,
+		recentPartitions: newRecentPartitionBuffer(1000),
+	}
+
+	// Subscribe to notifications if notifier is provided
+	if notifier != nil {
+		p.notificationCh = notifier.SubscribeAutoID()
+		go p.notificationHandler()
+	}
+
+	return p
+}
+
+// notificationHandler processes notifications from the notifier.
+func (p *Planner) notificationHandler() {
+	if p.notificationCh == nil {
+		return
+	}
+
+	for notif := range p.notificationCh {
+		// Fetch the specific partition from the catalog using GetPartition (O(1) lookup)
+		part, err := p.catalog.GetPartition(context.Background(), notif.PartitionID)
+		if err != nil {
+			log.Printf("planner: failed to fetch partition %s for notification: %v", notif.PartitionID, err)
+			continue
+		}
+		if part != nil {
+			p.recentPartitions.Add(part)
+		}
 	}
 }
 
@@ -154,6 +237,14 @@ func (p *Planner) Plan(ctx context.Context, stmt *parser.SelectStatement) (*Quer
 			PrunedCount:      pruneResult.TotalPartitions - pruneResult.Phase2Candidates,
 			PruningRatio:     pruneResult.PruningRatio,
 		},
+	}
+
+	// Merge recent partitions for <100ms write visibility
+	if p.recentPartitions != nil {
+		recent := p.recentPartitions.GetAll()
+		if len(recent) > 0 {
+			plan.Partitions = mergePartitions(plan.Partitions, recent)
+		}
 	}
 
 	return plan, nil
@@ -321,5 +412,28 @@ func filterByIDs(partitions []*manifest.PartitionRecord, ids []string) []*manife
 			result = append(result, part)
 		}
 	}
+	return result
+}
+
+// mergePartitions merges two partition lists and deduplicates by PartitionID.
+func mergePartitions(a, b []*manifest.PartitionRecord) []*manifest.PartitionRecord {
+	// Create a set of existing PartitionIDs
+	existing := make(map[string]struct{})
+	for _, part := range a {
+		existing[part.PartitionID] = struct{}{}
+	}
+
+	// Start with existing partitions
+	result := make([]*manifest.PartitionRecord, len(a))
+	copy(result, a)
+
+	// Add new partitions from b that aren't already present
+	for _, part := range b {
+		if _, exists := existing[part.PartitionID]; !exists {
+			result = append(result, part)
+			existing[part.PartitionID] = struct{}{}
+		}
+	}
+
 	return result
 }

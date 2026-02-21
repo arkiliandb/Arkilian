@@ -119,7 +119,7 @@ func setupQueryTestEnv(t *testing.T) (
 	exec, err := executor.NewParallelExecutor(queryPlanner, store, executor.ExecutorConfig{
 		Concurrency: 4,
 		DownloadDir: downloadDir,
-	}, nil)
+	}, nil, nil)
 	if err != nil {
 		catalog.Close()
 		os.RemoveAll(tempDir)
@@ -493,7 +493,7 @@ func TestQueryMemoryExhaustion(t *testing.T) {
 		Concurrency:    4,
 		DownloadDir:    downloadDir,
 		MaxMemoryBytes: 512, // 512 bytes — will force spill almost immediately
-	}, nil)
+	}, nil, nil)
 	if err != nil {
 		t.Fatalf("failed to create executor: %v", err)
 	}
