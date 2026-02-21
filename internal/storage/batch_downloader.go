@@ -8,6 +8,7 @@ import (
 	"sort"
 	"sync"
 
+	"github.com/arkilian/arkilian/internal/cache"
 	"golang.org/x/sync/semaphore"
 )
 
@@ -17,6 +18,7 @@ type BatchDownloader struct {
 	storage     ObjectStorage
 	concurrency int
 	cacheDir    string
+	nvmeCache   *cache.NVMeCache  // nil = disabled
 }
 
 // BatchRequest specifies which objects to download with optional priorities.
@@ -37,11 +39,13 @@ type BatchResult struct {
 // storage: the ObjectStorage implementation to download from
 // concurrency: maximum number of parallel downloads
 // cacheDir: directory to cache downloaded files (empty = no caching)
-func NewBatchDownloader(storage ObjectStorage, concurrency int, cacheDir string) *BatchDownloader {
+// nvmeCache: optional NVMe cache for hot partitions (nil = disabled)
+func NewBatchDownloader(storage ObjectStorage, concurrency int, cacheDir string, nvmeCache *cache.NVMeCache) *BatchDownloader {
 	return &BatchDownloader{
 		storage:     storage,
 		concurrency: concurrency,
 		cacheDir:    cacheDir,
+		nvmeCache:   nvmeCache,
 	}
 }
 
@@ -96,7 +100,16 @@ func (b *BatchDownloader) Download(ctx context.Context, req *BatchRequest) (*Bat
 	sem := semaphore.NewWeighted(int64(b.concurrency))
 
 	for _, p := range paths {
-		// Check if file exists in cache
+		// Check NVMe cache first
+		if b.nvmeCache != nil {
+			if localPath, ok := b.nvmeCache.Get(p.path); ok {
+				result.LocalPaths[p.path] = localPath
+				result.CacheHits++
+				continue
+			}
+		}
+
+		// Check filesystem cache
 		if b.cacheDir != "" {
 			if _, err := os.Stat(p.localPath); err == nil {
 				result.LocalPaths[p.path] = p.localPath
@@ -133,6 +146,17 @@ func (b *BatchDownloader) Download(ctx context.Context, req *BatchRequest) (*Bat
 				return
 			}
 
+			// Get file size for NVMe cache
+			var sizeBytes int64
+			if info, err := os.Stat(local); err == nil {
+				sizeBytes = info.Size()
+			}
+
+			// Add to NVMe cache if enabled
+			if b.nvmeCache != nil && sizeBytes > 0 {
+				b.nvmeCache.Put(path, local, sizeBytes)
+			}
+
 			mu.Lock()
 			result.LocalPaths[path] = local
 			result.Downloads++
@@ -146,16 +170,29 @@ func (b *BatchDownloader) Download(ctx context.Context, req *BatchRequest) (*Bat
 }
 
 // localPath returns the local filesystem path for an object.
-// It sanitizes the object path by replacing directory separators.
+// It uses a hash for long paths to avoid filename length limits and collisions.
 func (b *BatchDownloader) localPath(objectPath string) string {
-	// Sanitize object path: replace / with _ to avoid directory traversal
-	sanitized := filepath.FromSlash(objectPath)
-	sanitized = filepath.Base(sanitized) // Just the filename
-
 	if b.cacheDir == "" {
-		// When no cache dir is specified, use current directory
-		return sanitized
+		return hashFileName(objectPath)
 	}
+	return filepath.Join(b.cacheDir, hashFileName(objectPath))
+}
 
-	return filepath.Join(b.cacheDir, sanitized)
+// hashFileName creates a unique filename from an object path.
+func hashFileName(objectPath string) string {
+	// Replace / with _ for short paths
+	result := filepath.FromSlash(objectPath)
+	if len(result) <= 100 {
+		return result
+	}
+	// Use hash for long paths
+	return fmt.Sprintf("%x", hashString(objectPath))
+}
+
+func hashString(s string) uint64 {
+	var h uint64
+	for _, c := range s {
+		h = h*31 + uint64(c)
+	}
+	return h
 }

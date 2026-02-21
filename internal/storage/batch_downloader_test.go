@@ -15,7 +15,7 @@ func TestBatchDownloader_BasicDownload(t *testing.T) {
 	}
 
 	cacheDir := t.TempDir()
-	downloader := NewBatchDownloader(storage, 3, cacheDir)
+	downloader := NewBatchDownloader(storage, 3, cacheDir, nil)
 
 	ctx := context.Background()
 
@@ -80,7 +80,7 @@ func TestBatchDownloader_CacheHit(t *testing.T) {
 	}
 
 	cacheDir := t.TempDir()
-	downloader := NewBatchDownloader(storage, 3, cacheDir)
+	downloader := NewBatchDownloader(storage, 3, cacheDir, nil)
 
 	ctx := context.Background()
 
@@ -133,7 +133,7 @@ func TestBatchDownloader_PartialFailure(t *testing.T) {
 	}
 
 	cacheDir := t.TempDir()
-	downloader := NewBatchDownloader(storage, 3, cacheDir)
+	downloader := NewBatchDownloader(storage, 3, cacheDir, nil)
 
 	ctx := context.Background()
 
@@ -192,7 +192,7 @@ func TestBatchDownloader_PriorityOrdering(t *testing.T) {
 	}
 
 	cacheDir := t.TempDir()
-	downloader := NewBatchDownloader(storage, 1, cacheDir) // concurrency 1 for deterministic order
+	downloader := NewBatchDownloader(storage, 1, cacheDir, nil) // concurrency 1 for deterministic order
 
 	ctx := context.Background()
 
@@ -238,7 +238,7 @@ func TestBatchDownloader_EmptyRequest(t *testing.T) {
 	}
 
 	cacheDir := t.TempDir()
-	downloader := NewBatchDownloader(storage, 3, cacheDir)
+	downloader := NewBatchDownloader(storage, 3, cacheDir, nil)
 
 	ctx := context.Background()
 
@@ -267,7 +267,7 @@ func TestBatchDownloader_NoCacheDir(t *testing.T) {
 	}
 
 	// No cache directory
-	downloader := NewBatchDownloader(storage, 3, "")
+	downloader := NewBatchDownloader(storage, 3, "", nil)
 
 	ctx := context.Background()
 
@@ -307,7 +307,7 @@ func TestBatchDownloader_PriorityMismatch(t *testing.T) {
 	}
 
 	cacheDir := t.TempDir()
-	downloader := NewBatchDownloader(storage, 3, cacheDir)
+	downloader := NewBatchDownloader(storage, 3, cacheDir, nil)
 
 	ctx := context.Background()
 
