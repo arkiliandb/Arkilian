@@ -53,11 +53,24 @@ func (n *Notifier) Publish(notif Notification) {
 	})
 }
 
-// Subscribe adds a new subscriber to the notifier.
-func (n *Notifier) Subscribe(filters ...string) chan Notification {
+// Subscribe adds a new subscriber to the notifier with a custom ID.
+func (n *Notifier) Subscribe(id string, filters []string) *Subscriber {
 	ch := make(chan Notification, n.bufferSize)
 	sub := &Subscriber{
-		ID:      generateSubscriberID(),
+		ID:      id,
+		Filters: filters,
+		Ch:      ch,
+	}
+	n.subscribers.Store(sub.ID, sub)
+	return sub
+}
+
+// SubscribeAutoID adds a new subscriber to the notifier with an auto-generated ID.
+func (n *Notifier) SubscribeAutoID(filters ...string) chan Notification {
+	id := generateSubscriberID()
+	ch := make(chan Notification, n.bufferSize)
+	sub := &Subscriber{
+		ID:      id,
 		Filters: filters,
 		Ch:      ch,
 	}
@@ -65,9 +78,12 @@ func (n *Notifier) Subscribe(filters ...string) chan Notification {
 	return ch
 }
 
-// Unsubscribe removes a subscriber from the notifier.
+// Unsubscribe removes a subscriber from the notifier and closes their channel.
 func (n *Notifier) Unsubscribe(subID string) {
-	n.subscribers.Delete(subID)
+	if value, ok := n.subscribers.LoadAndDelete(subID); ok {
+		sub := value.(*Subscriber)
+		close(sub.Ch)
+	}
 }
 
 // matchesFilter checks if the notification matches the subscriber's filters.
@@ -76,7 +92,10 @@ func (n *Notifier) matchesFilter(sub *Subscriber, partitionKey string) bool {
 		return true // No filters - receive all notifications
 	}
 	for _, filter := range sub.Filters {
-		if len(filter) == 0 || partitionKey == filter {
+		if len(filter) == 0 {
+			return true
+		}
+		if len(partitionKey) >= len(filter) && partitionKey[:len(filter)] == filter {
 			return true
 		}
 	}
