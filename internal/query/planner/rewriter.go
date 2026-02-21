@@ -123,21 +123,33 @@ func (r *Rewriter) RewriteForPartitions(ctx context.Context, plan *QueryPlan) ([
 
 		if len(missing) == 0 {
 			// No missing columns — use original statement
+			// Load materialized columns from metadata sidecar
+			var materializedCols []partition.MaterializedColumn
+			if p.ObjectPath != "" {
+				metaPath := partition.GenerateMetadataPath(p.ObjectPath)
+				materializedCols, _ = partition.LoadMaterializedColumnsFromFile(metaPath)
+			}
 			results[i] = &RewrittenQuery{
 				Statement:          plan.Statement,
 				Partition:          p,
 				SchemaVersion:      p.SchemaVersion,
-				MaterializedColumns: nil, // TODO: Load from metadata sidecar
+				MaterializedColumns: materializedCols,
 			}
 		} else {
 			// Rewrite the statement to replace missing columns with NULL
-			rewritten := rewriteStatement(plan.Statement, missing, nil)
+			// Load materialized columns from metadata sidecar
+			var materializedCols []partition.MaterializedColumn
+			if p.ObjectPath != "" {
+				metaPath := partition.GenerateMetadataPath(p.ObjectPath)
+				materializedCols, _ = partition.LoadMaterializedColumnsFromFile(metaPath)
+			}
+			rewritten := rewriteStatement(plan.Statement, missing, materializedCols)
 			results[i] = &RewrittenQuery{
 				Statement:          rewritten,
 				Partition:          p,
 				SchemaVersion:      p.SchemaVersion,
 				MissingColumns:     missing,
-				MaterializedColumns: nil, // TODO: Load from metadata sidecar
+				MaterializedColumns: materializedCols,
 			}
 		}
 	}
