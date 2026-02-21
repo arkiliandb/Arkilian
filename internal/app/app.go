@@ -20,8 +20,10 @@ import (
 	"github.com/arkilian/arkilian/internal/partition"
 	"github.com/arkilian/arkilian/internal/query/executor"
 	"github.com/arkilian/arkilian/internal/query/planner"
+	"github.com/arkilian/arkilian/internal/router"
 	"github.com/arkilian/arkilian/internal/server"
 	"github.com/arkilian/arkilian/internal/storage"
+	"github.com/arkilian/arkilian/internal/wal"
 	"google.golang.org/grpc"
 )
 
@@ -229,8 +231,60 @@ func (a *App) startIngestService(ctx context.Context) error {
 	}
 	log.Printf("Partition builder initialized: %s", a.cfg.Ingest.PartitionDir)
 
+	// Initialize WAL if enabled
+	var walInstance *wal.WAL
+	var flusher *wal.Flusher
+	var notifier *router.Notifier
+
+	if a.cfg.WAL.Enabled {
+		log.Printf("WAL enabled: dir=%s, max_segment_size=%d, flush_interval=%v",
+			a.cfg.WAL.Dir, a.cfg.WAL.MaxSegmentSize, a.cfg.WAL.FlushInterval)
+
+		// Create WAL
+		walInstance, err := wal.NewWAL(a.cfg.WAL.Dir, a.cfg.WAL.MaxSegmentSize)
+		if err != nil {
+			return fmt.Errorf("failed to initialize WAL: %w", err)
+		}
+		log.Printf("WAL initialized: dir=%s", a.cfg.WAL.Dir)
+
+		// Create notifier for write notifications
+		if a.cfg.Router.NotificationsEnabled {
+			notifier = router.NewNotifier(a.cfg.Router.BufferSize)
+			log.Printf("Write notifier enabled: buffer_size=%d", a.cfg.Router.BufferSize)
+		}
+
+		// Create flusher
+		flusher = wal.NewFlusher(walInstance, builder, a.storage, a.catalog, metaGen,
+			a.cfg.WAL.FlushInterval, a.cfg.WAL.FlushBatchSize)
+		flusher.SetNotifier(notifier)
+
+		// Start flusher in background
+		flusherCtx, flusherCancel := context.WithCancel(ctx)
+		a.shutdown.RegisterCloser(server.CloserFunc(func() error {
+			flusherCancel()
+			return nil
+		}))
+		a.wg.Add(1)
+		go func() {
+			defer a.wg.Done()
+			flusher.Run(flusherCtx)
+		}()
+		log.Printf("WAL flusher started: interval=%v, batch_size=%d",
+			a.cfg.WAL.FlushInterval, a.cfg.WAL.FlushBatchSize)
+
+		// Run recovery to replay any unflushed entries from previous crash
+		recovery := wal.NewRecovery(walInstance, flusher, a.catalog)
+		recoveredCount, err := recovery.Recover(ctx)
+		if err != nil {
+			log.Printf("WAL recovery failed: %v", err)
+			// Continue anyway - recovery failures shouldn't prevent startup
+		} else if recoveredCount > 0 {
+			log.Printf("WAL recovery completed: %d entries replayed", recoveredCount)
+		}
+	}
+
 	// Create HTTP handler
-	ingestHandler := httpapi.NewIngestHandler(builder, metaGen, a.catalog, a.storage, adaptiveSizer, nil)
+	ingestHandler := httpapi.NewIngestHandler(builder, metaGen, a.catalog, a.storage, adaptiveSizer, walInstance)
 
 	// Setup HTTP server with middleware
 	mux := http.NewServeMux()
@@ -265,7 +319,7 @@ func (a *App) startIngestService(ctx context.Context) error {
 	// Start gRPC server if enabled
 	if a.cfg.GRPC.Enabled {
 		a.grpcServer = grpc.NewServer()
-		ingestServer := grpcapi.NewIngestServer(builder, metaGen, a.catalog, a.storage, nil)
+		ingestServer := grpcapi.NewIngestServer(builder, metaGen, a.catalog, a.storage, walInstance)
 		proto.RegisterIngestServiceServer(a.grpcServer, ingestServer)
 
 		var err error

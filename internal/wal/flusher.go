@@ -310,6 +310,13 @@ func (f *Flusher) FlushedLSN() uint64 {
 	return f.flushedTo
 }
 
+// SetNotifier sets the notification bus for write notifications.
+func (f *Flusher) SetNotifier(notifier *router.Notifier) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.notifier = notifier
+}
+
 // deleteOldSegments removes WAL segments that are fully flushed and older than retention period.
 func (f *Flusher) deleteOldSegments(ctx context.Context) {
 	// TODO: Implement segment deletion based on retention period
