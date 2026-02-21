@@ -55,7 +55,7 @@ func setupWALTestEnv(t *testing.T) (*app.App, string, func()) {
 		GRPC:      config.GRPCConfig{Enabled: false},
 		Ingest:    config.IngestConfig{PartitionDir: partitionDir, TargetPartitionSizeMB: 16},
 		Query:     config.QueryConfig{DownloadDir: downloadDir, Concurrency: 4, PoolSize: 10},
-		Compaction: config.CompactionConfig{WorkDir: compactionDir},
+		Compaction: config.CompactionConfig{WorkDir: compactionDir, CheckInterval: 1 * time.Minute},
 		Storage:   config.StorageConfig{Type: "local", Path: storageDir},
 		Manifest:  config.ManifestConfig{Sharded: false},
 		WAL: config.WALConfig{
@@ -70,7 +70,7 @@ func setupWALTestEnv(t *testing.T) (*app.App, string, func()) {
 			NotificationsEnabled: false,
 			BufferSize:           1000,
 		},
-		Index: config.IndexConfig{Enabled: false},
+		Index: config.IndexConfig{Enabled: false, BucketCount: 64, MaxIndexes: 10, CreateThreshold: 100, DropThreshold: 5},
 		Cache: config.CacheConfig{NVMeDir: "", NVMeMaxBytes: 0, PrefetchEnabled: false},
 	}
 
