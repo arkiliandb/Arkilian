@@ -139,7 +139,7 @@ func BenchmarkIndexLookup(b *testing.B) {
 	b.ReportMetric(float64(p50.Microseconds()), "us_p50_latency")
 	b.ReportMetric(float64(p90.Microseconds()), "us_p90_latency")
 	b.ReportMetric(float64(p99.Microseconds()), "us_p99_latency")
-	b.ReportMetric(float64(b.N)/b.Elapsed().Seconds(), "lookups/sec")
+	b.ReportMetric(float64(b.N)/b.Elapsed().Seconds(), "lookups_per_sec")
 
 	if p99 > 10*time.Millisecond {
 		b.Logf("WARNING: P99 latency %v exceeds 10ms target", p99)
@@ -223,8 +223,8 @@ func BenchmarkIndexBuild(b *testing.B) {
 		b.Fatalf("Failed to build index: %v", err)
 	}
 
-	b.ReportMetric(elapsed.Seconds(), "s total_time")
-	b.ReportMetric(float64(len(partitions))/elapsed.Seconds(), "partitions/sec")
+	b.ReportMetric(elapsed.Seconds(), "s_total_time")
+	b.ReportMetric(float64(len(partitions))/elapsed.Seconds(), "partitions_per_sec")
 	b.Logf("Index build completed in %v for %d partitions", elapsed, numPartitions)
 	b.Logf("Index partitions created: %d", len(indexInfos))
 
@@ -323,7 +323,7 @@ func BenchmarkIndexLookupCacheHit(b *testing.B) {
 	}
 
 	throughput := float64(b.N) / b.Elapsed().Seconds()
-	b.ReportMetric(throughput, "lookups/sec")
+	b.ReportMetric(throughput, "lookups_per_sec")
 	b.Logf("Cache hit lookup throughput: %.0f lookups/sec", throughput)
 }
 

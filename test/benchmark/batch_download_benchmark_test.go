@@ -162,8 +162,8 @@ func BenchmarkBatchDownloadWithCache(b *testing.B) {
 
 	// Pre-populate cache with all files
 	for _, objectPath := range partitions {
-		// Download each file to cache
-		localPath := filepath.Join(cacheDir, filepath.Base(objectPath))
+		// Download each file to cache using the same path calculation as the batch downloader
+		localPath := filepath.Join(cacheDir, hashFileName(objectPath))
 		if err := st.Download(context.Background(), objectPath, localPath); err != nil {
 			b.Fatalf("Failed to pre-populate cache: %v", err)
 		}
@@ -391,4 +391,23 @@ func createTestPartitionInfos(count int) []string {
 		partitions[i] = fmt.Sprintf("partitions/2024/01/%02d/partition_%06d.sqlite", i%31, i)
 	}
 	return partitions
+}
+
+// hashFileName creates a unique filename from an object path (copied from batch_downloader.go)
+func hashFileName(objectPath string) string {
+	// Replace / with _ for short paths
+	result := filepath.FromSlash(objectPath)
+	if len(result) <= 100 {
+		return result
+	}
+	// Use hash for long paths
+	return fmt.Sprintf("%x", hashString(objectPath))
+}
+
+func hashString(s string) uint64 {
+	var h uint64
+	for _, c := range s {
+		h = h*31 + uint64(c)
+	}
+	return h
 }
