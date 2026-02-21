@@ -302,12 +302,14 @@ func (c *testCatalog) ListIndexes(ctx context.Context, collection string) ([]str
 }
 
 // DeleteIndex deletes all index partitions for a given collection and column.
-func (c *testCatalog) DeleteIndex(ctx context.Context, collection, column string) error {
+func (c *testCatalog) DeleteIndex(ctx context.Context, collection, column string) ([]string, error) {
 	prefix := fmt.Sprintf("%s_%s_", collection, column)
+	var deletedPaths []string
 	for indexID := range c.indexes {
 		if len(indexID) > len(prefix) && indexID[:len(prefix)] == prefix {
 			delete(c.indexes, indexID)
+			deletedPaths = append(deletedPaths, fmt.Sprintf("indexes/%s/%s/0.sqlite", collection, column))
 		}
 	}
-	return nil
+	return deletedPaths, nil
 }

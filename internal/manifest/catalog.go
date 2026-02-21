@@ -886,25 +886,53 @@ func (c *SQLiteCatalog) ListIndexes(ctx context.Context, collection string) ([]s
 }
 
 // DeleteIndex deletes all index partitions for a given collection and column.
-func (c *SQLiteCatalog) DeleteIndex(ctx context.Context, collection, column string) error {
+// Returns the object paths that were deleted (caller should delete from S3).
+func (c *SQLiteCatalog) DeleteIndex(ctx context.Context, collection, column string) ([]string, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	// First, collect the object paths to return
+	var objectPaths []string
+	rows, err := c.db.QueryContext(ctx,
+		`SELECT object_path FROM index_partitions WHERE collection = ? AND column_name = ?`,
+		collection, column,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("manifest: failed to query index paths: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var path string
+		if err := rows.Scan(&path); err != nil {
+			return nil, fmt.Errorf("manifest: failed to scan index path: %w", err)
+		}
+		objectPaths = append(objectPaths, path)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("manifest: error iterating index paths: %w", err)
+	}
+
+	if len(objectPaths) == 0 {
+		return nil, fmt.Errorf("manifest: no index found for collection=%s, column=%s", collection, column)
+	}
+
+	// Now delete from the database
 	result, err := c.db.ExecContext(ctx,
 		`DELETE FROM index_partitions WHERE collection = ? AND column_name = ?`,
 		collection, column,
 	)
 	if err != nil {
-		return fmt.Errorf("manifest: failed to delete index: %w", err)
+		return nil, fmt.Errorf("manifest: failed to delete index: %w", err)
 	}
 
-	// Check if any rows were affected
+	// Verify rows were affected
 	rowsAffected, _ := result.RowsAffected()
 	if rowsAffected == 0 {
-		return fmt.Errorf("manifest: no index found for collection=%s, column=%s", collection, column)
+		return nil, fmt.Errorf("manifest: no index found for collection=%s, column=%s", collection, column)
 	}
 
-	return nil
+	return objectPaths, nil
 }
 
 // Close closes the catalog database connections.

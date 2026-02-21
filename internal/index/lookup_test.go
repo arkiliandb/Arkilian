@@ -133,16 +133,18 @@ func (m *mockCatalog) ListIndexes(ctx context.Context, collection string) ([]str
 	return result, nil
 }
 
-func (m *mockCatalog) DeleteIndex(ctx context.Context, collection, column string) error {
+func (m *mockCatalog) DeleteIndex(ctx context.Context, collection, column string) ([]string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	var deletedPaths []string
 	for id, info := range m.partitions {
 		if info.Collection == collection && info.Column == column {
 			delete(m.partitions, id)
+			deletedPaths = append(deletedPaths, info.ObjectPath)
 		}
 	}
-	return nil
+	return deletedPaths, nil
 }
 
 // createTestIndexFile creates a test SQLite index file with sample data.

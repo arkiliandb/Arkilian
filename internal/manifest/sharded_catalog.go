@@ -616,15 +616,25 @@ return columns, nil
 }
 
 // DeleteIndex fans out to all shards (only one will have the matching data).
-func (sc *ShardedCatalog) DeleteIndex(ctx context.Context, collection, column string) error {
-var firstErr error
-for _, shard := range sc.shards {
-if err := shard.DeleteIndex(ctx, collection, column); err != nil {
-if firstErr == nil {
-firstErr = err
-}
-// Continue to try all shards
-}
-}
-return firstErr
+// Returns all object paths deleted across all shards.
+func (sc *ShardedCatalog) DeleteIndex(ctx context.Context, collection, column string) ([]string, error) {
+	var allPaths []string
+	var firstErr error
+
+	for _, shard := range sc.shards {
+		paths, err := shard.DeleteIndex(ctx, collection, column)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		allPaths = append(allPaths, paths...)
+	}
+
+	if firstErr != nil && len(allPaths) == 0 {
+		return nil, firstErr
+	}
+
+	return allPaths, nil
 }

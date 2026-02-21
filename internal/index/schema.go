@@ -53,5 +53,6 @@ type IndexCatalog interface {
 	ListIndexes(ctx context.Context, collection string) ([]string, error)
 
 	// DeleteIndex deletes all index partitions for a given collection and column.
-	DeleteIndex(ctx context.Context, collection, column string) error
+	// Returns the object paths that were deleted from the manifest (caller should delete from S3).
+	DeleteIndex(ctx context.Context, collection, column string) ([]string, error)
 }
