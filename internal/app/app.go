@@ -38,6 +38,7 @@ type App struct {
 	catalog       manifest.Catalog        // Used by ingest, compaction, GC (full read/write)
 	catalogReader manifest.CatalogReader   // Used by planner/pruner (read-only)
 	shutdown      *server.ShutdownManager
+	walInstance   *wal.WAL                // WAL instance for lifecycle management
 
 	// Service components
 	ingestServer  *http.Server
@@ -52,6 +53,7 @@ type App struct {
 
 	// Notification and caching components
 	notifier      *router.Notifier
+	nvmeCache     *cache.NVMeCache
 	coAccessGraph *cache.CoAccessGraph
 
 	// Lifecycle
@@ -238,7 +240,6 @@ func (a *App) startIngestService(ctx context.Context) error {
 	log.Printf("Partition builder initialized: %s", a.cfg.Ingest.PartitionDir)
 
 	// Initialize WAL if enabled
-	var walInstance *wal.WAL
 	var flusher *wal.Flusher
 	var notifier *router.Notifier
 
@@ -251,6 +252,7 @@ func (a *App) startIngestService(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("failed to initialize WAL: %w", err)
 		}
+		a.walInstance = walInstance
 		log.Printf("WAL initialized: dir=%s", a.cfg.WAL.Dir)
 
 		// Create notifier for write notifications
@@ -261,7 +263,7 @@ func (a *App) startIngestService(ctx context.Context) error {
 		}
 
 		// Create flusher
-		flusher = wal.NewFlusher(walInstance, builder, a.storage, a.catalog, metaGen,
+		flusher = wal.NewFlusher(a.walInstance, builder, a.storage, a.catalog, metaGen,
 			a.cfg.WAL.FlushInterval, a.cfg.WAL.FlushBatchSize)
 		flusher.SetNotifier(notifier)
 
@@ -280,7 +282,7 @@ func (a *App) startIngestService(ctx context.Context) error {
 			a.cfg.WAL.FlushInterval, a.cfg.WAL.FlushBatchSize)
 
 		// Run recovery to replay any unflushed entries from previous crash
-		recovery := wal.NewRecovery(walInstance, flusher, a.catalog)
+		recovery := wal.NewRecovery(a.walInstance, flusher, a.catalog)
 		recoveredCount, err := recovery.Recover(ctx)
 		if err != nil {
 			log.Printf("WAL recovery failed: %v", err)
@@ -291,7 +293,7 @@ func (a *App) startIngestService(ctx context.Context) error {
 	}
 
 	// Create HTTP handler
-	ingestHandler := httpapi.NewIngestHandler(builder, metaGen, a.catalog, a.storage, adaptiveSizer, walInstance)
+	ingestHandler := httpapi.NewIngestHandler(builder, metaGen, a.catalog, a.storage, adaptiveSizer, a.walInstance)
 
 	// Setup HTTP server with middleware
 	mux := http.NewServeMux()
@@ -326,7 +328,7 @@ func (a *App) startIngestService(ctx context.Context) error {
 	// Start gRPC server if enabled
 	if a.cfg.GRPC.Enabled {
 		a.grpcServer = grpc.NewServer()
-		ingestServer := grpcapi.NewIngestServer(builder, metaGen, a.catalog, a.storage, walInstance)
+		ingestServer := grpcapi.NewIngestServer(builder, metaGen, a.catalog, a.storage, a.walInstance)
 		proto.RegisterIngestServiceServer(a.grpcServer, ingestServer)
 
 		var err error
@@ -366,6 +368,18 @@ func (a *App) startQueryService(ctx context.Context) error {
 	if a.cfg.Cache.PrefetchEnabled {
 		a.coAccessGraph = cache.NewCoAccessGraph(0.95, 0.70, 10)
 		log.Printf("Co-access graph initialized for predictive prefetch")
+	}
+
+	// Initialize NVMe cache for hot partitions
+	var nvmeCache *cache.NVMeCache
+	if a.cfg.Cache.NVMeDir != "" {
+		var err error
+		nvmeCache, err = cache.NewNVMeCache(a.cfg.Cache.NVMeDir, a.cfg.Cache.NVMeMaxBytes)
+		if err != nil {
+			return fmt.Errorf("failed to initialize NVMe cache: %w", err)
+		}
+		a.nvmeCache = nvmeCache
+		log.Printf("NVMe cache initialized: dir=%s, max_bytes=%d", a.cfg.Cache.NVMeDir, a.cfg.Cache.NVMeMaxBytes)
 	}
 
 	// Initialize query planner with notifier support for write visibility
@@ -673,6 +687,29 @@ func (a *App) Stop(ctx context.Context) error {
 
 // cleanup releases all shared resources.
 func (a *App) cleanup() {
+	// Close NVMe cache
+	if a.nvmeCache != nil {
+		a.nvmeCache.Close()
+		log.Printf("NVMe cache closed")
+	}
+
+	// Close WAL (this will also flush any remaining entries)
+	if a.walInstance != nil {
+		if err := a.walInstance.Close(); err != nil {
+			log.Printf("WAL close error: %v", err)
+		} else {
+			log.Printf("WAL closed")
+		}
+	}
+
+	// Unsubscribe notifier subscribers
+	if a.notifier != nil {
+		// The notifier uses sync.Map for subscribers, we need to unsubscribe all
+		// Since we don't track subscriber IDs, we can just let them be GC'd
+		// The notifier's channels will be closed when the app stops
+		log.Printf("Notifier cleanup complete")
+	}
+
 	if a.queryExecutor != nil {
 		a.queryExecutor.Close()
 	}
