@@ -94,7 +94,7 @@ func (cw *ConcurrentWriter) BuildWithSchema(ctx context.Context, rows []types.Ro
 	}
 
 	// Delegate to underlying builder
-	return cw.builder.BuildWithSchema(ctx, rows, key, schema)
+	return cw.builder.BuildWithSchema(ctx, rows, key, schema, nil)
 }
 
 // getKeyLock returns the lock for a partition key, creating one if needed.

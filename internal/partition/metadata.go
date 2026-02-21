@@ -13,11 +13,12 @@ import (
 
 // MetadataSidecar represents the .meta.json file structure.
 type MetadataSidecar struct {
-	PartitionID   string                       `json:"partition_id"`
-	SchemaVersion int                          `json:"schema_version"`
-	Stats         PartitionStats               `json:"stats"`
-	BloomFilters  map[string]*BloomFilterMeta  `json:"bloom_filters"`
-	CreatedAt     int64                        `json:"created_at"`
+	PartitionID         string                       `json:"partition_id"`
+	SchemaVersion       int                          `json:"schema_version"`
+	Stats               PartitionStats               `json:"stats"`
+	BloomFilters        map[string]*BloomFilterMeta  `json:"bloom_filters"`
+	MaterializedColumns []MaterializedColumn         `json:"materialized_columns,omitempty"`
+	CreatedAt           int64                        `json:"created_at"`
 }
 
 // PartitionStats holds partition-level statistics.
@@ -127,8 +128,8 @@ func (g *MetadataGenerator) Generate(info *PartitionInfo, rows []types.Row) (*Me
 	}
 
 	sidecar := &MetadataSidecar{
-		PartitionID:   info.PartitionID,
-		SchemaVersion: info.SchemaVersion,
+		PartitionID:         info.PartitionID,
+		SchemaVersion:       info.SchemaVersion,
 		Stats: PartitionStats{
 			RowCount:     info.RowCount,
 			SizeBytes:    info.SizeBytes,
@@ -139,8 +140,9 @@ func (g *MetadataGenerator) Generate(info *PartitionInfo, rows []types.Row) (*Me
 			MinTenantID:  minTenantID,
 			MaxTenantID:  maxTenantID,
 		},
-		BloomFilters: bloomFilters,
-		CreatedAt:    info.CreatedAt.Unix(),
+		BloomFilters:        bloomFilters,
+		MaterializedColumns: info.MaterializedColumns,
+		CreatedAt:           info.CreatedAt.Unix(),
 	}
 
 	return sidecar, nil
@@ -305,4 +307,18 @@ func FromJSON(data []byte) (*MetadataSidecar, error) {
 // CreatedAtTime returns the creation time as time.Time.
 func (s *MetadataSidecar) CreatedAtTime() time.Time {
 	return time.Unix(s.CreatedAt, 0)
+}
+
+// GetMaterializedColumns returns the materialized columns for this partition.
+func (s *MetadataSidecar) GetMaterializedColumns() []MaterializedColumn {
+	return s.MaterializedColumns
+}
+
+// LoadMaterializedColumnsFromFile loads materialized columns from a metadata file.
+func LoadMaterializedColumnsFromFile(metadataPath string) ([]MaterializedColumn, error) {
+	sidecar, err := ReadMetadataFromFile(metadataPath)
+	if err != nil {
+		return nil, err
+	}
+	return sidecar.MaterializedColumns, nil
 }

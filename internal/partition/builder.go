@@ -38,7 +38,14 @@ type PartitionBuilder interface {
 	Build(ctx context.Context, rows []types.Row, key types.PartitionKey) (*PartitionInfo, error)
 
 	// BuildWithSchema creates a partition with explicit schema
-	BuildWithSchema(ctx context.Context, rows []types.Row, key types.PartitionKey, schema types.Schema) (*PartitionInfo, error)
+	BuildWithSchema(ctx context.Context, rows []types.Row, key types.PartitionKey, schema types.Schema, materializedColumns []MaterializedColumn) (*PartitionInfo, error)
+}
+
+// MaterializedColumn represents a materialized JSON column.
+type MaterializedColumn struct {
+	JSONPath   string
+	ColumnName string
+	SQLiteType string
 }
 
 // Builder implements PartitionBuilder.
@@ -50,15 +57,16 @@ type Builder struct {
 
 // PartitionInfo contains metadata about a created partition.
 type PartitionInfo struct {
-	PartitionID   string
-	PartitionKey  string
-	SQLitePath    string
-	MetadataPath  string
-	RowCount      int64
-	SizeBytes     int64
-	MinMaxStats   map[string]MinMax
-	SchemaVersion int
-	CreatedAt     time.Time
+	PartitionID         string
+	PartitionKey        string
+	SQLitePath          string
+	MetadataPath        string
+	RowCount            int64
+	SizeBytes           int64
+	MinMaxStats         map[string]MinMax
+	SchemaVersion       int
+	CreatedAt           time.Time
+	MaterializedColumns []MaterializedColumn
 }
 
 // MinMax holds min/max values for a column.
@@ -86,12 +94,12 @@ func (b *Builder) TargetSizeBytes() int64 {
 
 // Build creates a partition from rows using the default schema.
 func (b *Builder) Build(ctx context.Context, rows []types.Row, key types.PartitionKey) (*PartitionInfo, error) {
-	return b.BuildWithSchema(ctx, rows, key, DefaultSchema())
+	return b.BuildWithSchema(ctx, rows, key, DefaultSchema(), nil)
 }
 
 
 // BuildWithSchema creates a partition with explicit schema.
-func (b *Builder) BuildWithSchema(ctx context.Context, rows []types.Row, key types.PartitionKey, schema types.Schema) (*PartitionInfo, error) {
+func (b *Builder) BuildWithSchema(ctx context.Context, rows []types.Row, key types.PartitionKey, schema types.Schema, materializedColumns []MaterializedColumn) (*PartitionInfo, error) {
 	if len(rows) == 0 {
 		return nil, fmt.Errorf("partition: cannot build partition with empty rows")
 	}
@@ -213,6 +221,25 @@ func (b *Builder) BuildWithSchema(ctx context.Context, rows []types.Row, key typ
 		stats.Update(row)
 	}
 
+	// Add materialized columns if specified
+	if len(materializedColumns) > 0 {
+		for _, mc := range materializedColumns {
+			// Add generated column
+			alterSQL := fmt.Sprintf(
+				"ALTER TABLE events ADD COLUMN %s %s GENERATED ALWAYS AS (json_extract(payload, '%s'))",
+				mc.ColumnName, mc.SQLiteType, mc.JSONPath)
+			if _, err := db.ExecContext(ctx, alterSQL); err != nil {
+				return nil, fmt.Errorf("partition: failed to add materialized column %s: %w", mc.ColumnName, err)
+			}
+
+			// Create index on the materialized column
+			indexSQL := fmt.Sprintf("CREATE INDEX idx_%s ON events(%s)", mc.ColumnName, mc.ColumnName)
+			if _, err := db.ExecContext(ctx, indexSQL); err != nil {
+				return nil, fmt.Errorf("partition: failed to create index on materialized column %s: %w", mc.ColumnName, err)
+			}
+		}
+	}
+
 	// Create internal statistics table
 	statsTableSQL := `
 		CREATE TABLE _arkilian_stats (
@@ -250,14 +277,15 @@ func (b *Builder) BuildWithSchema(ctx context.Context, rows []types.Row, key typ
 
 	// Build partition info
 	info := &PartitionInfo{
-		PartitionID:   partitionID,
-		PartitionKey:  key.Value,
-		SQLitePath:    sqlitePath,
-		RowCount:      int64(len(rows)),
-		SizeBytes:     fileInfo.Size(),
-		MinMaxStats:   stats.GetMinMaxStats(),
-		SchemaVersion: schema.Version,
-		CreatedAt:     createdAt,
+		PartitionID:         partitionID,
+		PartitionKey:        key.Value,
+		SQLitePath:          sqlitePath,
+		RowCount:            int64(len(rows)),
+		SizeBytes:           fileInfo.Size(),
+		MinMaxStats:         stats.GetMinMaxStats(),
+		SchemaVersion:       schema.Version,
+		CreatedAt:           createdAt,
+		MaterializedColumns: materializedColumns,
 	}
 
 	return info, nil

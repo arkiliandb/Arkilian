@@ -181,7 +181,7 @@ func (f *Flusher) flushGroup(ctx context.Context, partitionKey string, entries [
 
 	// Check if WAL entry has a non-zero Schema for schema evolution support
 	if entries[0].Schema.Version > 0 {
-		info, err = f.builder.BuildWithSchema(ctx, allRows, key, entries[0].Schema)
+		info, err = f.builder.BuildWithSchema(ctx, allRows, key, entries[0].Schema, nil)
 	} else {
 		info, err = f.builder.Build(ctx, allRows, key)
 	}

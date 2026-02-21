@@ -3,8 +3,10 @@ package planner
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/arkilian/arkilian/internal/manifest"
+	"github.com/arkilian/arkilian/internal/partition"
 	"github.com/arkilian/arkilian/internal/query/parser"
 	"github.com/arkilian/arkilian/pkg/types"
 )
@@ -47,6 +49,9 @@ type RewrittenQuery struct {
 
 	// MissingColumns lists columns referenced in the query but absent in this partition's schema.
 	MissingColumns []string
+
+	// MaterializedColumns lists materialized columns available in this partition.
+	MaterializedColumns []partition.MaterializedColumn
 }
 
 // RewriteForPartitions takes a query plan and returns per-partition rewritten queries.
@@ -119,18 +124,20 @@ func (r *Rewriter) RewriteForPartitions(ctx context.Context, plan *QueryPlan) ([
 		if len(missing) == 0 {
 			// No missing columns — use original statement
 			results[i] = &RewrittenQuery{
-				Statement:     plan.Statement,
-				Partition:     p,
-				SchemaVersion: p.SchemaVersion,
+				Statement:          plan.Statement,
+				Partition:          p,
+				SchemaVersion:      p.SchemaVersion,
+				MaterializedColumns: nil, // TODO: Load from metadata sidecar
 			}
 		} else {
 			// Rewrite the statement to replace missing columns with NULL
-			rewritten := rewriteStatement(plan.Statement, missing)
+			rewritten := rewriteStatement(plan.Statement, missing, nil)
 			results[i] = &RewrittenQuery{
-				Statement:      rewritten,
-				Partition:      p,
-				SchemaVersion:  p.SchemaVersion,
-				MissingColumns: missing,
+				Statement:          rewritten,
+				Partition:          p,
+				SchemaVersion:      p.SchemaVersion,
+				MissingColumns:     missing,
+				MaterializedColumns: nil, // TODO: Load from metadata sidecar
 			}
 		}
 	}
@@ -166,17 +173,23 @@ func NeedsRewriting(partitions []*manifest.PartitionRecord) bool {
 }
 
 // rewriteStatement creates a copy of the statement with missing columns replaced by NULL.
-func rewriteStatement(stmt *parser.SelectStatement, missingColumns []string) *parser.SelectStatement {
+func rewriteStatement(stmt *parser.SelectStatement, missingColumns []string, materializedColumns []partition.MaterializedColumn) *parser.SelectStatement {
 	missingSet := make(map[string]bool)
 	for _, col := range missingColumns {
 		missingSet[col] = true
+	}
+
+	// Build a set of materialized column names for quick lookup
+	materializedSet := make(map[string]bool)
+	for _, mc := range materializedColumns {
+		materializedSet[mc.ColumnName] = true
 	}
 
 	// Deep copy and rewrite SELECT columns
 	newColumns := make([]parser.SelectColumn, len(stmt.Columns))
 	for i, col := range stmt.Columns {
 		newColumns[i] = parser.SelectColumn{
-			Expr:  rewriteExpr(col.Expr, missingSet),
+			Expr:  rewriteExpr(col.Expr, missingSet, materializedSet),
 			Alias: col.Alias,
 		}
 	}
@@ -184,26 +197,26 @@ func rewriteStatement(stmt *parser.SelectStatement, missingColumns []string) *pa
 	// Rewrite WHERE clause
 	var newWhere parser.Expression
 	if stmt.Where != nil {
-		newWhere = rewriteExpr(stmt.Where, missingSet)
+		newWhere = rewriteExpr(stmt.Where, missingSet, materializedSet)
 	}
 
 	// Rewrite GROUP BY
 	var newGroupBy []parser.Expression
 	for _, g := range stmt.GroupBy {
-		newGroupBy = append(newGroupBy, rewriteExpr(g, missingSet))
+		newGroupBy = append(newGroupBy, rewriteExpr(g, missingSet, materializedSet))
 	}
 
 	// Rewrite HAVING
 	var newHaving parser.Expression
 	if stmt.Having != nil {
-		newHaving = rewriteExpr(stmt.Having, missingSet)
+		newHaving = rewriteExpr(stmt.Having, missingSet, materializedSet)
 	}
 
 	// Rewrite ORDER BY
 	var newOrderBy []parser.OrderByClause
 	for _, o := range stmt.OrderBy {
 		newOrderBy = append(newOrderBy, parser.OrderByClause{
-			Expr: rewriteExpr(o.Expr, missingSet),
+			Expr: rewriteExpr(o.Expr, missingSet, materializedSet),
 			Desc: o.Desc,
 		})
 	}
@@ -222,7 +235,9 @@ func rewriteStatement(stmt *parser.SelectStatement, missingColumns []string) *pa
 }
 
 // rewriteExpr replaces ColumnRef nodes for missing columns with NULL literals.
-func rewriteExpr(expr parser.Expression, missingCols map[string]bool) parser.Expression {
+// It also rewrites json_extract(payload, '$.path') to materialized column references
+// when the partition has the materialized column.
+func rewriteExpr(expr parser.Expression, missingCols map[string]bool, materializedSet map[string]bool) parser.Expression {
 	if expr == nil {
 		return nil
 	}
@@ -236,28 +251,44 @@ func rewriteExpr(expr parser.Expression, missingCols map[string]bool) parser.Exp
 
 	case *parser.BinaryExpr:
 		return &parser.BinaryExpr{
-			Left:     rewriteExpr(e.Left, missingCols),
+			Left:     rewriteExpr(e.Left, missingCols, materializedSet),
 			Operator: e.Operator,
-			Right:    rewriteExpr(e.Right, missingCols),
+			Right:    rewriteExpr(e.Right, missingCols, materializedSet),
 		}
 
 	case *parser.UnaryExpr:
 		return &parser.UnaryExpr{
 			Operator: e.Operator,
-			Operand:  rewriteExpr(e.Operand, missingCols),
+			Operand:  rewriteExpr(e.Operand, missingCols, materializedSet),
 		}
 
 	case *parser.AggregateExpr:
 		return &parser.AggregateExpr{
 			Function: e.Function,
-			Arg:      rewriteExpr(e.Arg, missingCols),
+			Arg:      rewriteExpr(e.Arg, missingCols, materializedSet),
 			Distinct: e.Distinct,
 		}
 
 	case *parser.FunctionCall:
+		// Check for json_extract(payload, '$.path') that can be rewritten to materialized column
+		if strings.EqualFold(e.Name, "json_extract") && len(e.Args) == 2 {
+			if colRef, ok := e.Args[0].(*parser.ColumnRef); ok {
+				if colRef.Column == "payload" {
+					if lit, ok := e.Args[1].(*parser.Literal); ok {
+						if pathStr, ok := lit.Value.(string); ok {
+							// Only rewrite if the materialized column exists in this partition
+							expectedColName := jsonPathToColumnName(pathStr)
+							if materializedSet[expectedColName] {
+								return &parser.ColumnRef{Column: expectedColName}
+							}
+						}
+					}
+				}
+			}
+		}
 		newArgs := make([]parser.Expression, len(e.Args))
 		for i, arg := range e.Args {
-			newArgs[i] = rewriteExpr(arg, missingCols)
+			newArgs[i] = rewriteExpr(arg, missingCols, materializedSet)
 		}
 		return &parser.FunctionCall{
 			Name: e.Name,
@@ -267,38 +298,38 @@ func rewriteExpr(expr parser.Expression, missingCols map[string]bool) parser.Exp
 	case *parser.InExpr:
 		newValues := make([]parser.Expression, len(e.Values))
 		for i, v := range e.Values {
-			newValues[i] = rewriteExpr(v, missingCols)
+			newValues[i] = rewriteExpr(v, missingCols, materializedSet)
 		}
 		return &parser.InExpr{
-			Expr:   rewriteExpr(e.Expr, missingCols),
+			Expr:   rewriteExpr(e.Expr, missingCols, materializedSet),
 			Values: newValues,
 			Not:    e.Not,
 		}
 
 	case *parser.BetweenExpr:
 		return &parser.BetweenExpr{
-			Expr: rewriteExpr(e.Expr, missingCols),
-			Low:  rewriteExpr(e.Low, missingCols),
-			High: rewriteExpr(e.High, missingCols),
+			Expr: rewriteExpr(e.Expr, missingCols, materializedSet),
+			Low:  rewriteExpr(e.Low, missingCols, materializedSet),
+			High: rewriteExpr(e.High, missingCols, materializedSet),
 			Not:  e.Not,
 		}
 
 	case *parser.IsNullExpr:
 		return &parser.IsNullExpr{
-			Expr: rewriteExpr(e.Expr, missingCols),
+			Expr: rewriteExpr(e.Expr, missingCols, materializedSet),
 			Not:  e.Not,
 		}
 
 	case *parser.LikeExpr:
 		return &parser.LikeExpr{
-			Expr:    rewriteExpr(e.Expr, missingCols),
-			Pattern: rewriteExpr(e.Pattern, missingCols),
+			Expr:    rewriteExpr(e.Expr, missingCols, materializedSet),
+			Pattern: rewriteExpr(e.Pattern, missingCols, materializedSet),
 			Not:     e.Not,
 		}
 
 	case *parser.ParenExpr:
 		return &parser.ParenExpr{
-			Expr: rewriteExpr(e.Expr, missingCols),
+			Expr: rewriteExpr(e.Expr, missingCols, materializedSet),
 		}
 
 	case *parser.StarExpr, *parser.Literal:
@@ -395,4 +426,22 @@ func columnSet(schema *types.Schema) map[string]bool {
 		cols[col.Name] = true
 	}
 	return cols
+}
+
+// findMaterializedColumn finds a materialized column for a given JSON path.
+func findMaterializedColumn(columns []partition.MaterializedColumn, jsonPath string) *partition.MaterializedColumn {
+	for _, mc := range columns {
+		if mc.JSONPath == jsonPath {
+			return &mc
+		}
+	}
+	return nil
+}
+
+// jsonPathToColumnName converts a JSON path to a materialized column name.
+// This mirrors the logic in internal/schema/materializer.go
+func jsonPathToColumnName(jsonPath string) string {
+	result := strings.TrimPrefix(jsonPath, "$.")
+	result = strings.ReplaceAll(result, ".", "_")
+	return "payload_" + result
 }
