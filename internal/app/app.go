@@ -15,6 +15,7 @@ import (
 	httpapi "github.com/arkilian/arkilian/internal/api/http"
 	"github.com/arkilian/arkilian/internal/compaction"
 	"github.com/arkilian/arkilian/internal/config"
+	"github.com/arkilian/arkilian/internal/index"
 	"github.com/arkilian/arkilian/internal/manifest"
 	"github.com/arkilian/arkilian/internal/observability"
 	"github.com/arkilian/arkilian/internal/partition"
@@ -356,7 +357,15 @@ func (a *App) startQueryService(ctx context.Context) error {
 	pruner := planner.NewPrunerWithCacheSize(a.catalogReader, a.storage, bloomCacheBytes)
 
 	// Initialize query planner
-	queryPlanner := planner.NewPlannerWithPruner(a.catalogReader, pruner)
+	var queryPlanner *planner.Planner
+	if a.cfg.Index.Enabled {
+		// Create index lookup for planner
+		indexLookup := index.NewLookup(a.storage, a.catalog, a.cfg.Query.DownloadDir, a.cfg.Index.BucketCount)
+		queryPlanner = planner.NewPlannerWithIndex(a.catalogReader, pruner, indexLookup)
+		log.Printf("Query planner initialized with index lookup: bucket_count=%d", a.cfg.Index.BucketCount)
+	} else {
+		queryPlanner = planner.NewPlannerWithPruner(a.catalogReader, pruner)
+	}
 
 	// Initialize query executor
 	execConfig := executor.ExecutorConfig{
@@ -500,6 +509,35 @@ func (a *App) startCompactService(ctx context.Context) error {
 		return fmt.Errorf("failed to start compaction daemon: %w", err)
 	}
 	log.Printf("Compaction daemon started")
+
+	// Start index policy if enabled (runs in compact service, not ingest)
+	if a.cfg.Index.Enabled {
+		log.Printf("Index policy enabled: create_threshold=%d, drop_threshold=%d, max_indexes=%d",
+			a.cfg.Index.CreateThreshold, a.cfg.Index.DropThreshold, a.cfg.Index.MaxIndexes)
+
+		// Create index builder
+		indexBuilder := index.NewBuilder(a.storage, a.catalog, a.cfg.Compaction.WorkDir, a.cfg.Index.BucketCount)
+
+		// Create partition provider adapter
+		partitionProvider := &manifestPartitionProvider{catalog: a.catalog}
+
+		// Create and start index policy
+		indexPolicy := index.NewPolicy(
+			nil, // queryStats - nil when observability disabled
+			indexBuilder,
+			a.catalog,
+			partitionProvider,
+			a.storage,
+			a.cfg.Index,
+		)
+
+		a.wg.Add(1)
+		go func() {
+			defer a.wg.Done()
+			indexPolicy.Run(ctx)
+		}()
+		log.Printf("Index policy started: check_interval=%v", a.cfg.Index.CheckInterval)
+	}
 
 	return nil
 }
