@@ -95,8 +95,8 @@ func (f *Flusher) flushOnce(ctx context.Context) error {
 	// Step 3: Process each group
 	var highestFlushed uint64 = currentFlushedTo
 	for partitionKey, groupEntries := range groups {
-		if err := f.flushGroup(ctx, partitionKey, groupEntries); err != nil {
-			// CRITICAL: If flushGroup fails for one partition key, continue with others
+		if err := f.FlushGroup(ctx, partitionKey, groupEntries); err != nil {
+			// CRITICAL: If FlushGroup fails for one partition key, continue with others
 			fmt.Printf("WAL flusher: failed to flush partition key %s: %v\n", partitionKey, err)
 			continue
 		}
@@ -157,8 +157,9 @@ func (f *Flusher) readUnflushedEntries(ctx context.Context, startLSN, endLSN uin
 	return allEntries, nil
 }
 
-// flushGroup builds a partition from entries, uploads to storage, and registers in catalog.
-func (f *Flusher) flushGroup(ctx context.Context, partitionKey string, entries []*Entry) error {
+// FlushGroup builds a partition from entries, uploads to storage, and registers in catalog.
+// Exported for use by WAL recovery.
+func (f *Flusher) FlushGroup(ctx context.Context, partitionKey string, entries []*Entry) error {
 	if len(entries) == 0 {
 		return nil
 	}
@@ -280,7 +281,7 @@ func (f *Flusher) FlushUpTo(ctx context.Context, lsn uint64) error {
 	// Process each group
 	var highestFlushed uint64 = currentFlushedTo
 	for partitionKey, groupEntries := range groups {
-		if err := f.flushGroup(ctx, partitionKey, groupEntries); err != nil {
+		if err := f.FlushGroup(ctx, partitionKey, groupEntries); err != nil {
 			fmt.Printf("WAL flusher: failed to flush partition key %s during FlushUpTo: %v\n", partitionKey, err)
 			continue
 		}

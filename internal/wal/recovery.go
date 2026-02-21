@@ -68,7 +68,7 @@ func (r *Recovery) Recover(ctx context.Context) (int, error) {
 	var highestReplayedLSN uint64 = flushedLSN
 
 	for partitionKey, groupEntries := range groups {
-		if err := r.flusher.flushGroup(ctx, partitionKey, groupEntries); err != nil {
+		if err := r.flusher.FlushGroup(ctx, partitionKey, groupEntries); err != nil {
 			fmt.Printf("recovery: failed to flush partition key %s: %v\n", partitionKey, err)
 			continue
 		}

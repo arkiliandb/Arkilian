@@ -77,7 +77,7 @@ func TestRecovery_ReplaysUnflushedEntries(t *testing.T) {
 
 	// Flush entries 1-5 (LSN 1-5)
 	flushEntries := entries[:5]
-	err = flusher.flushGroup(context.Background(), "20220101", flushEntries)
+	err = flusher.FlushGroup(context.Background(), "20220101", flushEntries)
 	assert.NoError(t, err)
 
 	// Verify partition was created
@@ -271,8 +271,8 @@ func TestRecovery_IdempotencyPreventsDuplicate(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Len(t, entries, 1)
 	
-	// Call flushGroup to register the idempotency key
-	err = flusher.flushGroup(context.Background(), "20220101", entries)
+	// Call FlushGroup to register the idempotency key
+	err = flusher.FlushGroup(context.Background(), "20220101", entries)
 	assert.NoError(t, err)
 
 	// Simulate crash: close WAL without updating flusher's in-memory state
