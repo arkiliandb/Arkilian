@@ -39,6 +39,7 @@ type App struct {
 	catalogReader manifest.CatalogReader   // Used by planner/pruner (read-only)
 	shutdown      *server.ShutdownManager
 	walInstance   *wal.WAL                // WAL instance for lifecycle management
+	flusher       *wal.Flusher            // Flusher for WAL background flush (needed for shutdown coordination)
 
 	// Service components
 	ingestServer  *http.Server
@@ -240,7 +241,6 @@ func (a *App) startIngestService(ctx context.Context) error {
 	log.Printf("Partition builder initialized: %s", a.cfg.Ingest.PartitionDir)
 
 	// Initialize WAL if enabled
-	var flusher *wal.Flusher
 	var notifier *router.Notifier
 
 	if a.cfg.WAL.Enabled {
@@ -263,9 +263,9 @@ func (a *App) startIngestService(ctx context.Context) error {
 		}
 
 		// Create flusher
-		flusher = wal.NewFlusher(a.walInstance, builder, a.storage, a.catalog, metaGen,
+		a.flusher = wal.NewFlusher(a.walInstance, builder, a.storage, a.catalog, metaGen,
 			a.cfg.WAL.FlushInterval, a.cfg.WAL.FlushBatchSize)
-		flusher.SetNotifier(notifier)
+		a.flusher.SetNotifier(notifier)
 
 		// Start flusher in background
 		flusherCtx, flusherCancel := context.WithCancel(ctx)
@@ -276,13 +276,13 @@ func (a *App) startIngestService(ctx context.Context) error {
 		a.wg.Add(1)
 		go func() {
 			defer a.wg.Done()
-			flusher.Run(flusherCtx)
+			a.flusher.Run(flusherCtx)
 		}()
 		log.Printf("WAL flusher started: interval=%v, batch_size=%d",
 			a.cfg.WAL.FlushInterval, a.cfg.WAL.FlushBatchSize)
 
 		// Run recovery to replay any unflushed entries from previous crash
-		recovery := wal.NewRecovery(a.walInstance, flusher, a.catalog)
+		recovery := wal.NewRecovery(a.walInstance, a.flusher, a.catalog)
 		recoveredCount, err := recovery.Recover(ctx)
 		if err != nil {
 			log.Printf("WAL recovery failed: %v", err)
@@ -687,13 +687,28 @@ func (a *App) Stop(ctx context.Context) error {
 
 // cleanup releases all shared resources.
 func (a *App) cleanup() {
+	// Flush remaining WAL entries before closing resources
+	// This ensures all pending entries are persisted before shutdown
+	if a.flusher != nil && a.walInstance != nil {
+		// Create a background context for final flush (non-cancellable)
+		flushCtx, flushCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer flushCancel()
+
+		// Flush all entries up to the current LSN
+		if err := a.flusher.FlushUpTo(flushCtx, a.walInstance.CurrentLSN()); err != nil {
+			log.Printf("Final WAL flush error: %v", err)
+		} else {
+			log.Printf("Final WAL flush completed")
+		}
+	}
+
 	// Close NVMe cache
 	if a.nvmeCache != nil {
 		a.nvmeCache.Close()
 		log.Printf("NVMe cache closed")
 	}
 
-	// Close WAL (this will also flush any remaining entries)
+	// Close WAL
 	if a.walInstance != nil {
 		if err := a.walInstance.Close(); err != nil {
 			log.Printf("WAL close error: %v", err)
@@ -704,9 +719,9 @@ func (a *App) cleanup() {
 
 	// Unsubscribe notifier subscribers
 	if a.notifier != nil {
-		// The notifier uses sync.Map for subscribers, we need to unsubscribe all
-		// Since we don't track subscriber IDs, we can just let them be GC'd
-		// The notifier's channels will be closed when the app stops
+		// The notifier uses sync.Map for subscribers
+		// We iterate and close all subscriber channels for clean shutdown
+		a.notifier.Close()
 		log.Printf("Notifier cleanup complete")
 	}
 

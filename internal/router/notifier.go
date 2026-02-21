@@ -2,6 +2,7 @@
 package router
 
 import (
+	"log"
 	"sync"
 	"time"
 )
@@ -84,6 +85,17 @@ func (n *Notifier) Unsubscribe(subID string) {
 		sub := value.(*Subscriber)
 		close(sub.Ch)
 	}
+}
+
+// Close unsubscribes all subscribers and cleans up resources.
+func (n *Notifier) Close() {
+	n.subscribers.Range(func(key, value interface{}) bool {
+		sub := value.(*Subscriber)
+		close(sub.Ch)
+		return true
+	})
+	n.subscribers = sync.Map{} // Clear the map
+	log.Printf("router: notifier closed, all subscribers unsubscribed")
 }
 
 // matchesFilter checks if the notification matches the subscriber's filters.
