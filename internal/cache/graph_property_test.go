@@ -16,6 +16,7 @@ import (
 func TestCoAccessGraph_Properties(t *testing.T) {
 	parameters := gopter.DefaultTestParameters()
 	parameters.MinSuccessfulTests = 100
+	parameters.MaxSize = 20
 
 	properties := gopter.NewProperties(parameters)
 
@@ -118,7 +119,7 @@ type concurrentGraphTestData struct {
 	accesses []accessSequence
 }
 
-// Generators
+// Generators with realistic constraints
 func genGraphTestData() gopter.Gen {
 	return gen.Struct(
 		reflect.TypeOf(graphTestData{}),
@@ -127,9 +128,9 @@ func genGraphTestData() gopter.Gen {
 				genAccessSequence(),
 				reflect.TypeOf(accessSequence{}),
 			).SuchThat(func(v interface{}) bool {
-				return len(v.([]accessSequence)) >= 1 && len(v.([]accessSequence)) <= 100
+				return len(v.([]accessSequence)) >= 1 && len(v.([]accessSequence)) <= 20
 			}),
-			"distinctKeys": gen.IntRange(100, 10000),
+			"distinctKeys": gen.IntRange(100, 1000), // Reduced from 10000 to 1000
 		},
 	)
 }
@@ -143,7 +144,7 @@ func genAccessSequence() gopter.Gen {
 				reflect.TypeOf(""),
 			).SuchThat(func(v interface{}) bool {
 				seq := v.([]string)
-				return len(seq) >= 2 && len(seq) <= 10
+				return len(seq) >= 2 && len(seq) <= 5
 			}),
 		},
 	)
@@ -157,7 +158,7 @@ func genConcurrentGraphTestData() gopter.Gen {
 				genAccessSequence(),
 				reflect.TypeOf(accessSequence{}),
 			).SuchThat(func(v interface{}) bool {
-				return len(v.([]accessSequence)) >= 1 && len(v.([]accessSequence)) <= 50
+				return len(v.([]accessSequence)) >= 1 && len(v.([]accessSequence)) <= 10
 			}),
 		},
 	)

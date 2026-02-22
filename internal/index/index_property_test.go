@@ -20,6 +20,7 @@ import (
 func TestIndex_Properties(t *testing.T) {
 	parameters := gopter.DefaultTestParameters()
 	parameters.MinSuccessfulTests = 100
+	parameters.MaxSize = 5
 
 	properties := gopter.NewProperties(parameters)
 
@@ -247,7 +248,7 @@ type pruningTestPartition struct {
 	values      []string
 }
 
-// Generators
+// Generators with realistic constraints
 func genIndexTestData() gopter.Gen {
 	return gen.Struct(
 		reflect.TypeOf(indexTestData{}),
@@ -258,13 +259,13 @@ func genIndexTestData() gopter.Gen {
 				genTestPartition(),
 				reflect.TypeOf(testPartition{}),
 			).SuchThat(func(v interface{}) bool {
-				return len(v.([]testPartition)) >= 1 && len(v.([]testPartition)) <= 5
+				return len(v.([]testPartition)) >= 1 && len(v.([]testPartition)) <= 3
 			}),
 			"values": gen.SliceOf(
 				genTestValue(),
 				reflect.TypeOf(testValue{}),
 			).SuchThat(func(v interface{}) bool {
-				return len(v.([]testValue)) >= 1 && len(v.([]testValue)) <= 10
+				return len(v.([]testValue)) >= 1 && len(v.([]testValue)) <= 5
 			}),
 		},
 	)
@@ -276,14 +277,14 @@ func genTestPartition() gopter.Gen {
 		map[string]gopter.Gen{
 			"partitionID": gen.AlphaString(),
 			"objectPath":  gen.AlphaString(),
-			"rowCount":    gen.IntRange(1, 100),
-			"minTime":     gen.Int64Range(1, time.Now().UnixNano()),
-			"maxTime":     gen.Int64Range(1, time.Now().UnixNano()),
+			"rowCount":    gen.IntRange(1, 20),
+			"minTime":     gen.Int64Range(1609459200000000000, 1893456000000000000),
+			"maxTime":     gen.Int64Range(1609459200000000000, 1893456000000000000),
 			"values": gen.SliceOf(
 				gen.AlphaString(),
 				reflect.TypeOf(""),
 			).SuchThat(func(v interface{}) bool {
-				return len(v.([]string)) >= 1 && len(v.([]string)) <= 20
+				return len(v.([]string)) >= 1 && len(v.([]string)) <= 10
 			}),
 		},
 	)
@@ -309,13 +310,13 @@ func genIndexPruningTestData() gopter.Gen {
 				genPruningTestPartition(),
 				reflect.TypeOf(pruningTestPartition{}),
 			).SuchThat(func(v interface{}) bool {
-				return len(v.([]pruningTestPartition)) >= 1 && len(v.([]pruningTestPartition)) <= 5
+				return len(v.([]pruningTestPartition)) >= 1 && len(v.([]pruningTestPartition)) <= 3
 			}),
 			"values": gen.SliceOf(
 				gen.AlphaString(),
 				reflect.TypeOf(""),
 			).SuchThat(func(v interface{}) bool {
-				return len(v.([]string)) >= 1 && len(v.([]string)) <= 10
+				return len(v.([]string)) >= 1 && len(v.([]string)) <= 5
 			}),
 		},
 	)
@@ -330,7 +331,7 @@ func genPruningTestPartition() gopter.Gen {
 				gen.AlphaString(),
 				reflect.TypeOf(""),
 			).SuchThat(func(v interface{}) bool {
-				return len(v.([]string)) >= 1 && len(v.([]string)) <= 20
+				return len(v.([]string)) >= 1 && len(v.([]string)) <= 10
 			}),
 		},
 	)

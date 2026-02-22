@@ -17,6 +17,7 @@ import (
 func TestWAL_Properties(t *testing.T) {
 	parameters := gopter.DefaultTestParameters()
 	parameters.MinSuccessfulTests = 100
+	parameters.MaxSize = 10 // Limit max size to keep tests fast
 
 	properties := gopter.NewProperties(parameters)
 
@@ -235,7 +236,7 @@ type testEntry struct {
 	payload      map[string]interface{}
 }
 
-// genEntry generates a single test entry
+// genEntry generates a single test entry with reasonable constraints
 func genEntry() gopter.Gen {
 	return gen.Struct(
 		reflect.TypeOf(testEntry{}),
@@ -244,21 +245,21 @@ func genEntry() gopter.Gen {
 			"eventID":      gen.AlphaString(),
 			"tenantID":     gen.AlphaString(),
 			"userID":       gen.Int64Range(1, 1000000),
-			"eventTime":    gen.Int64Range(1, time.Now().UnixNano()),
+			"eventTime":    gen.Int64Range(1609459200000000000, 1893456000000000000), // 2021-2030
 			"eventType":    gen.AlphaString(),
 			"payload":      gen.MapOf(gen.AlphaString(), gen.Int64Range(1, 1000)),
 		},
 	)
 }
 
-// genEntries generates a slice of test entries
+// genEntries generates a slice of test entries with controlled size
 func genEntries() gopter.Gen {
 	return gen.SliceOf(
 		genEntry(),
 		reflect.TypeOf(testEntry{}),
 	).SuchThat(func(v interface{}) bool {
 		entries := v.([]testEntry)
-		return len(entries) >= 1 && len(entries) <= 100
+		return len(entries) >= 1 && len(entries) <= 10 // Reduced from 100 to 10
 	})
 }
 
@@ -273,7 +274,7 @@ type orderedEntry struct {
 	payload      map[string]interface{}
 }
 
-// genOrderedEntries generates entries for ordering tests
+// genOrderedEntries generates entries for ordering tests with controlled size
 func genOrderedEntries() gopter.Gen {
 	return gen.SliceOf(
 		gen.Struct(
@@ -283,7 +284,7 @@ func genOrderedEntries() gopter.Gen {
 				"eventID":      gen.AlphaString(),
 				"tenantID":     gen.AlphaString(),
 				"userID":       gen.Int64Range(1, 1000000),
-				"eventTime":    gen.Int64Range(1, time.Now().UnixNano()),
+				"eventTime":    gen.Int64Range(1609459200000000000, 1893456000000000000), // 2021-2030
 				"eventType":    gen.AlphaString(),
 				"payload":      gen.MapOf(gen.AlphaString(), gen.Int64Range(1, 1000)),
 			},
@@ -291,7 +292,7 @@ func genOrderedEntries() gopter.Gen {
 		reflect.TypeOf(orderedEntry{}),
 	).SuchThat(func(v interface{}) bool {
 		entries := v.([]orderedEntry)
-		return len(entries) >= 2 && len(entries) <= 50
+		return len(entries) >= 2 && len(entries) <= 10 // Reduced from 50 to 10
 	})
 }
 

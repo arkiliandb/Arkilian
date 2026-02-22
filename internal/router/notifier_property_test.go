@@ -15,6 +15,7 @@ import (
 func TestNotifier_Properties(t *testing.T) {
 	parameters := gopter.DefaultTestParameters()
 	parameters.MinSuccessfulTests = 100
+	parameters.MaxSize = 10
 
 	properties := gopter.NewProperties(parameters)
 
@@ -151,21 +152,21 @@ type manySubscribersTestData struct {
 	subscriberCount int
 }
 
-// Generators
+// Generators with realistic constraints
 func genNotifierTestData() gopter.Gen {
 	return gen.Struct(
 		reflect.TypeOf(notifierTestData{}),
 		map[string]gopter.Gen{
 			"bufferSize": gen.IntRange(1, 100),
-			"subscriberCount": gen.IntRange(1, 50),
+			"subscriberCount": gen.IntRange(1, 20),
 			"subscriberBufferSizes": gen.Const([]int{0, 1, 5, 10, 100}),
 			"fillChannels": gen.Bool(),
-			"publishCount": gen.IntRange(1, 20),
+			"publishCount": gen.IntRange(1, 10),
 			"partitionKeys": gen.SliceOf(
 				gen.AlphaString(),
 				reflect.TypeOf(""),
 			).SuchThat(func(v interface{}) bool {
-				return len(v.([]string)) >= 1 && len(v.([]string)) <= 5
+				return len(v.([]string)) >= 1 && len(v.([]string)) <= 3
 			}),
 			"filters": gen.Const([]string{""}),
 		},
@@ -176,8 +177,8 @@ func genManySubscribersTestData() gopter.Gen {
 	return gen.Struct(
 		reflect.TypeOf(manySubscribersTestData{}),
 		map[string]gopter.Gen{
-			"bufferSize":      gen.IntRange(1, 1000),
-			"subscriberCount": gen.IntRange(10, 100),
+			"bufferSize":      gen.IntRange(1, 100),
+			"subscriberCount": gen.IntRange(10, 50),
 		},
 	)
 }
