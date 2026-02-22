@@ -29,6 +29,10 @@ const (
 	CodeInvalidSchema       = "INVALID_SCHEMA"
 	CodeInvalidPartitionKey = "INVALID_PARTITION_KEY"
 	CodeEmptyBatch          = "EMPTY_BATCH"
+	CodeInvalidWALConfig    = "INVALID_WAL_CONFIG"
+	CodeInvalidIndexConfig  = "INVALID_INDEX_CONFIG"
+	CodeInvalidCacheConfig  = "INVALID_CACHE_CONFIG"
+	CodeInvalidRouterConfig = "INVALID_ROUTER_CONFIG"
 
 	// Storage codes
 	CodeUploadFailed   = "UPLOAD_FAILED"

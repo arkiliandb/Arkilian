@@ -11,6 +11,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	arkilianerrors "github.com/arkilian/arkilian/internal/errors"
 	"github.com/joho/godotenv"
 )
 
@@ -390,47 +391,85 @@ func (c *Config) Validate() error {
 	case ModeAll, ModeIngest, ModeQuery, ModeCompact:
 		// Valid modes
 	default:
-		return fmt.Errorf("invalid mode: %s (must be all, ingest, query, or compact)", c.Mode)
+		return arkilianerrors.New(arkilianerrors.ErrCategoryValidation, "INVALID_MODE",
+			fmt.Sprintf("invalid mode: %s (must be all, ingest, query, or compact)", c.Mode))
 	}
 
 	if c.DataDir == "" {
-		return fmt.Errorf("data_dir is required")
+		return arkilianerrors.New(arkilianerrors.ErrCategoryValidation, "MISSING_DATA_DIR", "data_dir is required")
 	}
 
 	if c.Storage.Type != "local" && c.Storage.Type != "s3" {
-		return fmt.Errorf("invalid storage type: %s (must be local or s3)", c.Storage.Type)
+		return arkilianerrors.New(arkilianerrors.ErrCategoryValidation, "INVALID_STORAGE_TYPE",
+			fmt.Sprintf("invalid storage type: %s (must be local or s3)", c.Storage.Type))
 	}
 
 	if c.Storage.Type == "s3" && c.Storage.S3.Bucket == "" {
-		return fmt.Errorf("s3.bucket is required when storage type is s3")
+		return arkilianerrors.New(arkilianerrors.ErrCategoryValidation, "MISSING_S3_BUCKET", "s3.bucket is required when storage type is s3")
 	}
 
 	if c.Ingest.TargetPartitionSizeMB < 8 || c.Ingest.TargetPartitionSizeMB > 256 {
-		return fmt.Errorf("ingest.target_partition_size_mb must be between 8 and 256, got %d", c.Ingest.TargetPartitionSizeMB)
+		return arkilianerrors.New(arkilianerrors.ErrCategoryValidation, "INVALID_PARTITION_SIZE",
+			fmt.Sprintf("ingest.target_partition_size_mb must be between 8 and 256, got %d", c.Ingest.TargetPartitionSizeMB))
 	}
 
 	// Validate WAL config
 	if c.WAL.Enabled {
 		if c.WAL.Dir == "" {
-			return fmt.Errorf("wal.dir is required when wal.enabled is true")
+			return arkilianerrors.New(arkilianerrors.ErrCategoryValidation, "INVALID_WAL_CONFIG", "wal.dir is required when wal.enabled is true")
 		}
 		if c.WAL.FlushInterval < 100*time.Millisecond {
-			return fmt.Errorf("wal.flush_interval must be >= 100ms, got %v", c.WAL.FlushInterval)
+			return arkilianerrors.New(arkilianerrors.ErrCategoryValidation, "INVALID_WAL_CONFIG",
+				fmt.Sprintf("wal.flush_interval must be >= 100ms, got %v", c.WAL.FlushInterval))
 		}
-	}
-	if c.Cache.NVMeDir != "" {
-		// NVMe dir existence check happens at runtime
+		if c.WAL.MaxSegmentSize < 1024*1024 {
+			return arkilianerrors.New(arkilianerrors.ErrCategoryValidation, "INVALID_WAL_CONFIG",
+				fmt.Sprintf("wal.max_segment_size must be >= 1MB, got %d", c.WAL.MaxSegmentSize))
+		}
+		if c.WAL.FlushBatchSize < 1 {
+			return arkilianerrors.New(arkilianerrors.ErrCategoryValidation, "INVALID_WAL_CONFIG",
+				fmt.Sprintf("wal.flush_batch_size must be >= 1, got %d", c.WAL.FlushBatchSize))
+		}
+		if c.WAL.RetentionTime < 1*time.Minute {
+			return arkilianerrors.New(arkilianerrors.ErrCategoryValidation, "INVALID_WAL_CONFIG",
+				fmt.Sprintf("wal.retention_time must be >= 1m, got %v", c.WAL.RetentionTime))
+		}
 	}
 
 	// Validate Index config
-	if c.Index.BucketCount <= 0 || c.Index.BucketCount > 65536 {
-		return fmt.Errorf("index.bucket_count must be > 0 and <= 65536, got %d", c.Index.BucketCount)
+	if c.Index.Enabled {
+		if c.Index.BucketCount <= 0 || c.Index.BucketCount > 65536 {
+			return arkilianerrors.New(arkilianerrors.ErrCategoryValidation, "INVALID_INDEX_CONFIG",
+				fmt.Sprintf("index.bucket_count must be > 0 and <= 65536, got %d", c.Index.BucketCount))
+		}
+		if c.Index.MaxIndexes < 1 {
+			return arkilianerrors.New(arkilianerrors.ErrCategoryValidation, "INVALID_INDEX_CONFIG",
+				fmt.Sprintf("index.max_indexes must be >= 1, got %d", c.Index.MaxIndexes))
+		}
+		if c.Index.CreateThreshold <= c.Index.DropThreshold {
+			return arkilianerrors.New(arkilianerrors.ErrCategoryValidation, "INVALID_INDEX_CONFIG",
+				fmt.Sprintf("index.create_threshold (%d) must be > drop_threshold (%d)", c.Index.CreateThreshold, c.Index.DropThreshold))
+		}
+		if c.Index.CheckInterval < 1*time.Second {
+			return arkilianerrors.New(arkilianerrors.ErrCategoryValidation, "INVALID_INDEX_CONFIG",
+				fmt.Sprintf("index.check_interval must be >= 1s, got %v", c.Index.CheckInterval))
+		}
 	}
-	if c.Index.MaxIndexes <= 0 {
-		return fmt.Errorf("index.max_indexes must be > 0, got %d", c.Index.MaxIndexes)
+
+	// Validate Cache config
+	if c.Cache.NVMeDir != "" {
+		if c.Cache.NVMeMaxBytes <= 0 {
+			return arkilianerrors.New(arkilianerrors.ErrCategoryValidation, "INVALID_CACHE_CONFIG",
+				fmt.Sprintf("cache.nvme_max_bytes must be > 0 when nvme_dir is set, got %d", c.Cache.NVMeMaxBytes))
+		}
 	}
-	if c.Index.CreateThreshold <= c.Index.DropThreshold {
-		return fmt.Errorf("index.create_threshold (%d) must be > drop_threshold (%d)", c.Index.CreateThreshold, c.Index.DropThreshold)
+
+	// Validate Router config
+	if c.Router.NotificationsEnabled {
+		if c.Router.BufferSize <= 0 {
+			return arkilianerrors.New(arkilianerrors.ErrCategoryValidation, "INVALID_ROUTER_CONFIG",
+				fmt.Sprintf("router.buffer_size must be > 0 when notifications are enabled, got %d", c.Router.BufferSize))
+		}
 	}
 
 	// Validate adaptive sizing config
@@ -449,30 +488,37 @@ func (c *Config) validateAdaptiveSizing() error {
 	}
 
 	if as.MinSizeMB < 8 {
-		return fmt.Errorf("ingest.adaptive_sizing.min_size_mb must be >= 8, got %d", as.MinSizeMB)
+		return arkilianerrors.New(arkilianerrors.ErrCategoryValidation, "INVALID_ADAPTIVE_SIZING",
+			fmt.Sprintf("ingest.adaptive_sizing.min_size_mb must be >= 8, got %d", as.MinSizeMB))
 	}
 	if as.MaxSizeMB > 256 {
-		return fmt.Errorf("ingest.adaptive_sizing.max_size_mb must be <= 256, got %d", as.MaxSizeMB)
+		return arkilianerrors.New(arkilianerrors.ErrCategoryValidation, "INVALID_ADAPTIVE_SIZING",
+			fmt.Sprintf("ingest.adaptive_sizing.max_size_mb must be <= 256, got %d", as.MaxSizeMB))
 	}
 	if as.MinSizeMB > as.MaxSizeMB {
-		return fmt.Errorf("ingest.adaptive_sizing.min_size_mb (%d) must be <= max_size_mb (%d)", as.MinSizeMB, as.MaxSizeMB)
+		return arkilianerrors.New(arkilianerrors.ErrCategoryValidation, "INVALID_ADAPTIVE_SIZING",
+			fmt.Sprintf("ingest.adaptive_sizing.min_size_mb (%d) must be <= max_size_mb (%d)", as.MinSizeMB, as.MaxSizeMB))
 	}
 
 	if len(as.Tiers) == 0 {
-		return fmt.Errorf("ingest.adaptive_sizing.tiers must have at least one entry")
+		return arkilianerrors.New(arkilianerrors.ErrCategoryValidation, "INVALID_ADAPTIVE_SIZING",
+			"ingest.adaptive_sizing.tiers must have at least one entry")
 	}
 
 	prevThreshold := -1.0
 	for i, tier := range as.Tiers {
 		if tier.ThresholdGB < 0 {
-			return fmt.Errorf("ingest.adaptive_sizing.tiers[%d].threshold_gb must be >= 0", i)
+			return arkilianerrors.New(arkilianerrors.ErrCategoryValidation, "INVALID_ADAPTIVE_SIZING",
+				fmt.Sprintf("ingest.adaptive_sizing.tiers[%d].threshold_gb must be >= 0", i))
 		}
 		if tier.ThresholdGB <= prevThreshold && i > 0 {
-			return fmt.Errorf("ingest.adaptive_sizing.tiers must be sorted ascending by threshold_gb")
+			return arkilianerrors.New(arkilianerrors.ErrCategoryValidation, "INVALID_ADAPTIVE_SIZING",
+				"ingest.adaptive_sizing.tiers must be sorted ascending by threshold_gb")
 		}
 		if tier.TargetSizeMB < as.MinSizeMB || tier.TargetSizeMB > as.MaxSizeMB {
-			return fmt.Errorf("ingest.adaptive_sizing.tiers[%d].target_size_mb (%d) must be between %d and %d",
-				i, tier.TargetSizeMB, as.MinSizeMB, as.MaxSizeMB)
+			return arkilianerrors.New(arkilianerrors.ErrCategoryValidation, "INVALID_ADAPTIVE_SIZING",
+				fmt.Sprintf("ingest.adaptive_sizing.tiers[%d].target_size_mb (%d) must be between %d and %d",
+					i, tier.TargetSizeMB, as.MinSizeMB, as.MaxSizeMB))
 		}
 		prevThreshold = tier.ThresholdGB
 	}
