@@ -82,19 +82,26 @@ func TestFlusher_ProducesValidPartition(t *testing.T) {
 
 	go flusher.Run(ctx)
 
-	// Wait for flush to complete
-	time.Sleep(100 * time.Millisecond)
+	// Wait for flush to complete with retry (race detector makes things slower)
+	var objects []string
+	for i := 0; i < 50; i++ {
+		time.Sleep(100 * time.Millisecond)
+		objects, err = storage.ListObjects(ctx, "partitions/")
+		if err == nil && len(objects) > 0 {
+			break
+		}
+	}
 
 	// Verify partition was created in storage
-	objects, err := storage.ListObjects(ctx, "partitions/")
 	assert.NoError(t, err)
 	assert.NotEmpty(t, objects)
 
 	// Verify partition was registered in catalog
 	partitions, err := catalog.FindPartitions(ctx, nil)
 	assert.NoError(t, err)
-	assert.Len(t, partitions, 1)
-	assert.Equal(t, "20220101", partitions[0].PartitionKey)
+	if assert.Len(t, partitions, 1) {
+		assert.Equal(t, "20220101", partitions[0].PartitionKey)
+	}
 }
 
 func TestFlusher_AdvancesFlushedLSN(t *testing.T) {
