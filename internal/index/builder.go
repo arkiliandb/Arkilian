@@ -45,10 +45,22 @@ type PartitionInfo struct {
 	MaxEventTime *int64
 }
 
+// allowedCollections defines valid table names for index building.
+// This is a security measure to prevent SQL injection via collection parameter.
+// Extend this list if Arkilian adds support for additional collections.
+var allowedCollections = map[string]bool{
+	"events": true,
+}
+
 // BuildIndex builds secondary index partitions for a given collection and column.
 // It scans all data partitions, extracts distinct values, hashes them into buckets,
 // and creates index SQLite files for each non-empty bucket.
 func (b *Builder) BuildIndex(ctx context.Context, collection, column string, partitions []*PartitionInfo) ([]*IndexPartitionInfo, error) {
+	// Validate collection name to prevent SQL injection
+	if !allowedCollections[collection] {
+		return nil, fmt.Errorf("invalid collection name: %s (must be one of: events)", collection)
+	}
+
 	// Create semaphore channel for bounded concurrency
 	sem := make(chan struct{}, 32)
 
@@ -92,7 +104,7 @@ func (b *Builder) BuildIndex(ctx context.Context, collection, column string, par
 			}
 			defer db.Close()
 
-			query := fmt.Sprintf("SELECT DISTINCT %s FROM events", column)
+			query := fmt.Sprintf("SELECT DISTINCT %s FROM %s", column, collection)
 			rows, err := db.QueryContext(ctx, query)
 			if err != nil {
 				result.err = fmt.Errorf("failed to query partition %s: %w", dp.PartitionID, err)

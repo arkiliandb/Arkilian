@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"fmt"
 	"hash/fnv"
+	"io"
 	"os"
 	"path/filepath"
 
@@ -64,13 +65,35 @@ func (l *Lookup) FindPartitions(ctx context.Context, collection, column string, 
 		return nil, fmt.Errorf("index lookup: failed to download index partition: %w", err)
 	}
 
-	// Move temp file to cache location
-	if err := os.Rename(tempPath, cachePath); err != nil {
+	// Copy temp file to cache location (use copy, not rename, to preserve source)
+	if err := copyFile(tempPath, cachePath); err != nil {
 		os.Remove(tempPath)
 		return nil, fmt.Errorf("index lookup: failed to cache index partition: %w", err)
 	}
+	// Clean up temp file after successful copy
+	os.Remove(tempPath)
 
 	return l.queryIndex(ctx, cachePath, value)
+}
+
+// copyFile copies a file from src to dst.
+func copyFile(src, dst string) error {
+	srcFile, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer srcFile.Close()
+
+	dstFile, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer dstFile.Close()
+
+	if _, err := io.Copy(dstFile, srcFile); err != nil {
+		return err
+	}
+	return dstFile.Sync()
 }
 
 // queryIndex queries the index SQLite file for partition IDs.

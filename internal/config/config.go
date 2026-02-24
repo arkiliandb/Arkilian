@@ -80,6 +80,7 @@ type WALConfig struct {
 // IndexConfig holds secondary index configuration.
 type IndexConfig struct {
 	Enabled         bool          `json:"enabled" yaml:"enabled"`
+	Collection      string        `json:"collection" yaml:"collection"`
 	CreateThreshold int64         `json:"create_threshold" yaml:"create_threshold"`
 	DropThreshold   int64         `json:"drop_threshold" yaml:"drop_threshold"`
 	CheckInterval   time.Duration `json:"check_interval" yaml:"check_interval"`
@@ -330,6 +331,7 @@ func DefaultConfig() *Config {
 		},
 		Index: IndexConfig{
 			Enabled:         false,
+			Collection:      "events",
 			CreateThreshold: 100,
 			DropThreshold:   5,
 			CheckInterval:   5 * time.Minute,

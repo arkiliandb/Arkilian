@@ -45,7 +45,7 @@ type Policy struct {
 	dropThreshold   int64
 	checkInterval   time.Duration
 	maxIndexes      int
-	collection      string // For MVP, "events" is the only collection
+	collection      string // The collection name for index operations
 	mu              sync.Mutex
 }
 
@@ -68,7 +68,7 @@ func NewPolicy(
 		dropThreshold:   cfg.DropThreshold,
 		checkInterval:   cfg.CheckInterval,
 		maxIndexes:      cfg.MaxIndexes,
-		collection:      "events", // MVP: only "events" collection
+		collection:      cfg.Collection,
 	}
 }
 
