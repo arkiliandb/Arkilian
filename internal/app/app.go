@@ -221,27 +221,6 @@ func (a *App) startIngestService(ctx context.Context) error {
 	// Initialize partition builder with static target size as baseline
 	builder := partition.NewBuilder(a.cfg.Ingest.PartitionDir, a.cfg.Ingest.TargetPartitionSizeMB)
 	metaGen := partition.NewMetadataGenerator()
-
-	// Initialize adaptive sizer for dynamic partition sizing at scale
-	var sizerOpts []partition.AdaptiveSizerOption
-	asCfg := a.cfg.Ingest.AdaptiveSizing
-	if asCfg.Enabled {
-		sizerOpts = append(sizerOpts, partition.WithBoundsMB(asCfg.MinSizeMB, asCfg.MaxSizeMB))
-		for _, tier := range asCfg.Tiers {
-			sizerOpts = append(sizerOpts, partition.WithTierMB(tier.ThresholdGB, tier.TargetSizeMB))
-		}
-	}
-	adaptiveSizer := partition.NewAdaptiveSizer(
-		asCfg.Enabled,
-		a.cfg.Ingest.TargetPartitionSizeMB,
-		&catalogVolumeQuerier{reader: a.catalogReader},
-		sizerOpts...,
-	)
-
-	if asCfg.Enabled {
-		log.Printf("Adaptive partition sizing enabled: min=%dMB, max=%dMB, %d tiers",
-			asCfg.MinSizeMB, asCfg.MaxSizeMB, len(asCfg.Tiers))
-	}
 	log.Printf("Partition builder initialized: %s", a.cfg.Ingest.PartitionDir)
 
 	// Initialize query statistics for materialized columns
@@ -249,60 +228,52 @@ func (a *App) startIngestService(ctx context.Context) error {
 	a.materializer = schema.NewMaterializer(queryStats, 50, 20)
 	log.Printf("Materializer initialized for JSON column materialization")
 
-	// Initialize WAL if enabled
-	var notifier *router.Notifier
+	// Initialize WAL
+	log.Printf("WAL enabled: dir=%s, max_segment_size=%d, flush_interval=%v",
+		a.cfg.WAL.Dir, a.cfg.WAL.MaxSegmentSize, a.cfg.WAL.FlushInterval)
 
-	if a.cfg.WAL.Enabled {
-		log.Printf("WAL enabled: dir=%s, max_segment_size=%d, flush_interval=%v",
-			a.cfg.WAL.Dir, a.cfg.WAL.MaxSegmentSize, a.cfg.WAL.FlushInterval)
+	walInstance, err := wal.NewWAL(a.cfg.WAL.Dir, a.cfg.WAL.MaxSegmentSize)
+	if err != nil {
+		return fmt.Errorf("failed to initialize WAL: %w", err)
+	}
+	a.walInstance = walInstance
+	log.Printf("WAL initialized: dir=%s", a.cfg.WAL.Dir)
 
-		// Create WAL
-		walInstance, err := wal.NewWAL(a.cfg.WAL.Dir, a.cfg.WAL.MaxSegmentSize)
-		if err != nil {
-			return fmt.Errorf("failed to initialize WAL: %w", err)
-		}
-		a.walInstance = walInstance
-		log.Printf("WAL initialized: dir=%s", a.cfg.WAL.Dir)
+	// Create notifier for write notifications
+	notifier := router.NewNotifier(a.cfg.Router.BufferSize)
+	a.notifier = notifier
+	log.Printf("Write notifier enabled: buffer_size=%d", a.cfg.Router.BufferSize)
 
-		// Create notifier for write notifications
-		if a.cfg.Router.NotificationsEnabled {
-			notifier = router.NewNotifier(a.cfg.Router.BufferSize)
-			a.notifier = notifier
-			log.Printf("Write notifier enabled: buffer_size=%d", a.cfg.Router.BufferSize)
-		}
+	// Create flusher
+	a.flusher = wal.NewFlusher(a.walInstance, builder, a.storage, a.catalog, metaGen,
+		a.cfg.WAL.FlushInterval, a.cfg.WAL.FlushBatchSize)
+	a.flusher.SetNotifier(notifier)
 
-		// Create flusher
-		a.flusher = wal.NewFlusher(a.walInstance, builder, a.storage, a.catalog, metaGen,
-			a.cfg.WAL.FlushInterval, a.cfg.WAL.FlushBatchSize)
-		a.flusher.SetNotifier(notifier)
+	// Start flusher in background
+	flusherCtx, flusherCancel := context.WithCancel(ctx)
+	a.shutdown.RegisterCloser(server.CloserFunc(func() error {
+		flusherCancel()
+		return nil
+	}))
+	a.wg.Add(1)
+	go func() {
+		defer a.wg.Done()
+		a.flusher.Run(flusherCtx)
+	}()
+	log.Printf("WAL flusher started: interval=%v, batch_size=%d",
+		a.cfg.WAL.FlushInterval, a.cfg.WAL.FlushBatchSize)
 
-		// Start flusher in background
-		flusherCtx, flusherCancel := context.WithCancel(ctx)
-		a.shutdown.RegisterCloser(server.CloserFunc(func() error {
-			flusherCancel()
-			return nil
-		}))
-		a.wg.Add(1)
-		go func() {
-			defer a.wg.Done()
-			a.flusher.Run(flusherCtx)
-		}()
-		log.Printf("WAL flusher started: interval=%v, batch_size=%d",
-			a.cfg.WAL.FlushInterval, a.cfg.WAL.FlushBatchSize)
-
-		// Run recovery to replay any unflushed entries from previous crash
-		recovery := wal.NewRecovery(a.walInstance, a.flusher, a.catalog)
-		recoveredCount, err := recovery.Recover(ctx)
-		if err != nil {
-			log.Printf("WAL recovery failed: %v", err)
-			// Continue anyway - recovery failures shouldn't prevent startup
-		} else if recoveredCount > 0 {
-			log.Printf("WAL recovery completed: %d entries replayed", recoveredCount)
-		}
+	// Run recovery to replay any unflushed entries from previous crash
+	recovery := wal.NewRecovery(a.walInstance, a.flusher, a.catalog)
+	recoveredCount, err := recovery.Recover(ctx)
+	if err != nil {
+		log.Printf("WAL recovery failed: %v", err)
+	} else if recoveredCount > 0 {
+		log.Printf("WAL recovery completed: %d entries replayed", recoveredCount)
 	}
 
 	// Create HTTP handler
-	ingestHandler := httpapi.NewIngestHandler(builder, metaGen, a.catalog, a.storage, adaptiveSizer, a.walInstance, a.materializer)
+	ingestHandler := httpapi.NewIngestHandler(builder, metaGen, a.catalog, a.storage, a.walInstance, a.materializer)
 
 	// Setup HTTP server with middleware
 	mux := http.NewServeMux()
@@ -337,7 +308,7 @@ func (a *App) startIngestService(ctx context.Context) error {
 	// Start gRPC server if enabled
 	if a.cfg.GRPC.Enabled {
 		a.grpcServer = grpc.NewServer()
-		ingestServer := grpcapi.NewIngestServer(builder, metaGen, a.catalog, a.storage, a.walInstance, a.materializer)
+		ingestServer := grpcapi.NewIngestServer(a.walInstance)
 		proto.RegisterIngestServiceServer(a.grpcServer, ingestServer)
 
 		var err error
@@ -391,39 +362,15 @@ func (a *App) startQueryService(ctx context.Context) error {
 		log.Printf("NVMe cache initialized: dir=%s, max_bytes=%d", a.cfg.Cache.NVMeDir, a.cfg.Cache.NVMeMaxBytes)
 	}
 
-	// Initialize query planner with notifier support for write visibility
-	var queryPlanner *planner.Planner
-	if a.cfg.Index.Enabled {
-		// Type-assert to get IndexCatalog interface
-		indexCatalog, ok := a.catalog.(index.IndexCatalog)
-		if !ok {
-			return fmt.Errorf("catalog does not implement IndexCatalog interface")
-		}
-
-		// Create index lookup for planner
-		indexLookup := index.NewLookup(a.storage, indexCatalog, a.cfg.Query.DownloadDir, a.cfg.Index.BucketCount)
-
-		// Use notifier for write visibility if enabled
-		if a.notifier != nil {
-			queryPlanner = planner.NewPlannerWithNotifier(a.catalogReader, a.notifier)
-			// Add index lookup to the planner
-			// Note: NewPlannerWithNotifier creates a basic planner, we need to add index lookup
-			// For now, use the index-enabled planner without notifier
-			queryPlanner = planner.NewPlannerWithIndex(a.catalogReader, pruner, indexLookup)
-			log.Printf("Query planner initialized with index lookup: bucket_count=%d", a.cfg.Index.BucketCount)
-		} else {
-			queryPlanner = planner.NewPlannerWithIndex(a.catalogReader, pruner, indexLookup)
-			log.Printf("Query planner initialized with index lookup: bucket_count=%d", a.cfg.Index.BucketCount)
-		}
-	} else {
-		// Use notifier for write visibility if enabled
-		if a.notifier != nil {
-			queryPlanner = planner.NewPlannerWithNotifier(a.catalogReader, a.notifier)
-			log.Printf("Query planner initialized with notifier for write visibility")
-		} else {
-			queryPlanner = planner.NewPlannerWithPruner(a.catalogReader, pruner)
-		}
+	// Initialize query planner with index lookup and notifier for write visibility
+	indexCatalog, ok := a.catalog.(index.IndexCatalog)
+	if !ok {
+		return fmt.Errorf("catalog does not implement IndexCatalog interface")
 	}
+	indexLookup := index.NewLookup(a.storage, indexCatalog, a.cfg.Query.DownloadDir, a.cfg.Index.BucketCount)
+	queryPlanner := planner.NewPlannerWithIndex(a.catalogReader, pruner, indexLookup)
+	queryPlanner = planner.NewPlannerWithNotifierWithPlanner(queryPlanner, a.notifier)
+	log.Printf("Query planner initialized with index lookup and notifier: bucket_count=%d", a.cfg.Index.BucketCount)
 
 	// Initialize query executor
 	execConfig := executor.ExecutorConfig{
@@ -568,40 +515,38 @@ func (a *App) startCompactService(ctx context.Context) error {
 	}
 	log.Printf("Compaction daemon started")
 
-	// Start index policy if enabled (runs in compact service, not ingest)
-	if a.cfg.Index.Enabled {
-		log.Printf("Index policy enabled: create_threshold=%d, drop_threshold=%d, max_indexes=%d",
-			a.cfg.Index.CreateThreshold, a.cfg.Index.DropThreshold, a.cfg.Index.MaxIndexes)
+	// Start index policy (runs in compact service)
+	log.Printf("Index policy enabled: create_threshold=%d, drop_threshold=%d, max_indexes=%d",
+		a.cfg.Index.CreateThreshold, a.cfg.Index.DropThreshold, a.cfg.Index.MaxIndexes)
 
-		// Type-assert to get IndexCatalog interface
-		indexCatalog, ok := a.catalog.(index.IndexCatalog)
-		if !ok {
-			return fmt.Errorf("catalog does not implement IndexCatalog interface")
-		}
-
-		// Create index builder
-		indexBuilder := index.NewBuilder(a.storage, indexCatalog, a.cfg.Compaction.WorkDir, a.cfg.Index.BucketCount)
-
-		// Create partition provider adapter
-		partitionProvider := &manifestPartitionProvider{catalog: a.catalog}
-
-		// Create and start index policy
-		indexPolicy := index.NewPolicy(
-			nil, // queryStats - nil when observability disabled
-			indexBuilder,
-			indexCatalog,
-			partitionProvider,
-			a.storage,
-			a.cfg.Index,
-		)
-
-		a.wg.Add(1)
-		go func() {
-			defer a.wg.Done()
-			indexPolicy.Run(ctx)
-		}()
-		log.Printf("Index policy started: check_interval=%v", a.cfg.Index.CheckInterval)
+	// Type-assert to get IndexCatalog interface
+	indexCatalog, ok := a.catalog.(index.IndexCatalog)
+	if !ok {
+		return fmt.Errorf("catalog does not implement IndexCatalog interface")
 	}
+
+	// Create index builder
+	indexBuilder := index.NewBuilder(a.storage, indexCatalog, a.cfg.Compaction.WorkDir, a.cfg.Index.BucketCount)
+
+	// Create partition provider adapter
+	partitionProvider := &manifestPartitionProvider{catalog: a.catalog}
+
+	// Create and start index policy
+	indexPolicy := index.NewPolicy(
+		nil, // queryStats - nil when observability disabled
+		indexBuilder,
+		indexCatalog,
+		partitionProvider,
+		a.storage,
+		a.cfg.Index,
+	)
+
+	a.wg.Add(1)
+	go func() {
+		defer a.wg.Done()
+		indexPolicy.Run(ctx)
+	}()
+	log.Printf("Index policy started: check_interval=%v", a.cfg.Index.CheckInterval)
 
 	return nil
 }

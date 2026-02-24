@@ -81,7 +81,6 @@ func TestPolicy_ColumnAboveThresholdTriggersCreate(t *testing.T) {
 	mockDataCatalog := newMockPartitionProvider()
 
 	cfg := config.IndexConfig{
-		Enabled:         true,
 		CreateThreshold: 3,
 		DropThreshold:   1,
 		CheckInterval:   1 * time.Minute,
@@ -123,7 +122,6 @@ func TestPolicy_ColumnBelowThresholdTriggersDrop(t *testing.T) {
 	mockDataCatalog := newMockPartitionProvider()
 
 	cfg := config.IndexConfig{
-		Enabled:         true,
 		Collection:      "events",
 		CreateThreshold: 100,
 		DropThreshold:   5,
@@ -171,7 +169,6 @@ func TestPolicy_MaxIndexesLimitRespected(t *testing.T) {
 	mockDataCatalog := newMockPartitionProvider()
 
 	cfg := config.IndexConfig{
-		Enabled:         true,
 		CreateThreshold: 3,
 		DropThreshold:   1,
 		CheckInterval:   1 * time.Minute,
@@ -214,7 +211,6 @@ func TestPolicy_ExistingIndexNotRecreated(t *testing.T) {
 	mockDataCatalog := newMockPartitionProvider()
 
 	cfg := config.IndexConfig{
-		Enabled:         true,
 		Collection:      "events",
 		CreateThreshold: 3,
 		DropThreshold:   1,
@@ -250,7 +246,6 @@ func TestPolicy_NoActionsWhenThresholdsNotMet(t *testing.T) {
 	mockDataCatalog := newMockPartitionProvider()
 
 	cfg := config.IndexConfig{
-		Enabled:         true,
 		CreateThreshold: 100, // High threshold
 		DropThreshold:   5,
 		CheckInterval:   1 * time.Minute,

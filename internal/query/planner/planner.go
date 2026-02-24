@@ -148,6 +148,20 @@ func NewPlannerWithNotifier(catalog manifest.CatalogReader, notifier *router.Not
 	return p
 }
 
+// NewPlannerWithNotifierWithPlanner wraps an existing planner with notifier support.
+func NewPlannerWithNotifierWithPlanner(existing *Planner, notifier *router.Notifier) *Planner {
+	if existing == nil {
+		return NewPlannerWithNotifier(existing.catalog, notifier)
+	}
+	existing.notifier = notifier
+	existing.recentPartitions = newRecentPartitionBuffer(1000)
+	if notifier != nil {
+		existing.notificationCh = notifier.SubscribeAutoID()
+		go existing.notificationHandler()
+	}
+	return existing
+}
+
 // notificationHandler processes notifications from the notifier.
 func (p *Planner) notificationHandler() {
 	if p.notificationCh == nil {

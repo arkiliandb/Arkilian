@@ -74,12 +74,10 @@ type WALConfig struct {
 	FlushInterval  time.Duration `json:"flush_interval" yaml:"flush_interval"`
 	FlushBatchSize int           `json:"flush_batch_size" yaml:"flush_batch_size"`
 	RetentionTime  time.Duration `json:"retention_time" yaml:"retention_time"`
-	Enabled        bool          `json:"enabled" yaml:"enabled"`
 }
 
 // IndexConfig holds secondary index configuration.
 type IndexConfig struct {
-	Enabled         bool          `json:"enabled" yaml:"enabled"`
 	Collection      string        `json:"collection" yaml:"collection"`
 	CreateThreshold int64         `json:"create_threshold" yaml:"create_threshold"`
 	DropThreshold   int64         `json:"drop_threshold" yaml:"drop_threshold"`
@@ -97,8 +95,7 @@ type CacheConfig struct {
 
 // RouterConfig holds write notification router configuration.
 type RouterConfig struct {
-	NotificationsEnabled bool `json:"notifications_enabled" yaml:"notifications_enabled"`
-	BufferSize           int  `json:"buffer_size" yaml:"buffer_size"`
+	BufferSize int `json:"buffer_size" yaml:"buffer_size"`
 }
 
 // ManifestConfig holds manifest catalog configuration.
@@ -324,13 +321,11 @@ func DefaultConfig() *Config {
 		WAL: WALConfig{
 			Dir:            "./data/arkilian/wal",
 			MaxSegmentSize: 67108864,
-			FlushInterval:  1 * time.Second,
+			FlushInterval:  500 * time.Millisecond,
 			FlushBatchSize: 10000,
 			RetentionTime:  1 * time.Hour,
-			Enabled:        false,
 		},
 		Index: IndexConfig{
-			Enabled:         false,
 			Collection:      "events",
 			CreateThreshold: 100,
 			DropThreshold:   5,
@@ -339,13 +334,12 @@ func DefaultConfig() *Config {
 			BucketCount:     64,
 		},
 		Cache: CacheConfig{
-			NVMeDir:         "",
+			NVMeDir:         "./data/arkilian/nvme",
 			NVMeMaxBytes:    536870912000,
-			PrefetchEnabled: false,
+			PrefetchEnabled: true,
 		},
 		Router: RouterConfig{
-			NotificationsEnabled: false,
-			BufferSize:           1000,
+			BufferSize: 1000,
 		},
 	}
 }
@@ -416,62 +410,54 @@ func (c *Config) Validate() error {
 	}
 
 	// Validate WAL config
-	if c.WAL.Enabled {
-		if c.WAL.Dir == "" {
-			return arkilianerrors.New(arkilianerrors.ErrCategoryValidation, "INVALID_WAL_CONFIG", "wal.dir is required when wal.enabled is true")
-		}
-		if c.WAL.FlushInterval < 100*time.Millisecond {
-			return arkilianerrors.New(arkilianerrors.ErrCategoryValidation, "INVALID_WAL_CONFIG",
-				fmt.Sprintf("wal.flush_interval must be >= 100ms, got %v", c.WAL.FlushInterval))
-		}
-		if c.WAL.MaxSegmentSize < 1024*1024 {
-			return arkilianerrors.New(arkilianerrors.ErrCategoryValidation, "INVALID_WAL_CONFIG",
-				fmt.Sprintf("wal.max_segment_size must be >= 1MB, got %d", c.WAL.MaxSegmentSize))
-		}
-		if c.WAL.FlushBatchSize < 1 {
-			return arkilianerrors.New(arkilianerrors.ErrCategoryValidation, "INVALID_WAL_CONFIG",
-				fmt.Sprintf("wal.flush_batch_size must be >= 1, got %d", c.WAL.FlushBatchSize))
-		}
-		if c.WAL.RetentionTime < 1*time.Minute {
-			return arkilianerrors.New(arkilianerrors.ErrCategoryValidation, "INVALID_WAL_CONFIG",
-				fmt.Sprintf("wal.retention_time must be >= 1m, got %v", c.WAL.RetentionTime))
-		}
+	if c.WAL.Dir == "" {
+		return arkilianerrors.New(arkilianerrors.ErrCategoryValidation, "INVALID_WAL_CONFIG", "wal.dir is required")
+	}
+	if c.WAL.FlushInterval < 100*time.Millisecond {
+		return arkilianerrors.New(arkilianerrors.ErrCategoryValidation, "INVALID_WAL_CONFIG",
+			fmt.Sprintf("wal.flush_interval must be >= 100ms, got %v", c.WAL.FlushInterval))
+	}
+	if c.WAL.MaxSegmentSize < 1024*1024 {
+		return arkilianerrors.New(arkilianerrors.ErrCategoryValidation, "INVALID_WAL_CONFIG",
+			fmt.Sprintf("wal.max_segment_size must be >= 1MB, got %d", c.WAL.MaxSegmentSize))
+	}
+	if c.WAL.FlushBatchSize < 1 {
+		return arkilianerrors.New(arkilianerrors.ErrCategoryValidation, "INVALID_WAL_CONFIG",
+			fmt.Sprintf("wal.flush_batch_size must be >= 1, got %d", c.WAL.FlushBatchSize))
+	}
+	if c.WAL.RetentionTime < 1*time.Minute {
+		return arkilianerrors.New(arkilianerrors.ErrCategoryValidation, "INVALID_WAL_CONFIG",
+			fmt.Sprintf("wal.retention_time must be >= 1m, got %v", c.WAL.RetentionTime))
 	}
 
 	// Validate Index config
-	if c.Index.Enabled {
-		if c.Index.BucketCount <= 0 || c.Index.BucketCount > 65536 {
-			return arkilianerrors.New(arkilianerrors.ErrCategoryValidation, "INVALID_INDEX_CONFIG",
-				fmt.Sprintf("index.bucket_count must be > 0 and <= 65536, got %d", c.Index.BucketCount))
-		}
-		if c.Index.MaxIndexes < 1 {
-			return arkilianerrors.New(arkilianerrors.ErrCategoryValidation, "INVALID_INDEX_CONFIG",
-				fmt.Sprintf("index.max_indexes must be >= 1, got %d", c.Index.MaxIndexes))
-		}
-		if c.Index.CreateThreshold <= c.Index.DropThreshold {
-			return arkilianerrors.New(arkilianerrors.ErrCategoryValidation, "INVALID_INDEX_CONFIG",
-				fmt.Sprintf("index.create_threshold (%d) must be > drop_threshold (%d)", c.Index.CreateThreshold, c.Index.DropThreshold))
-		}
-		if c.Index.CheckInterval < 1*time.Second {
-			return arkilianerrors.New(arkilianerrors.ErrCategoryValidation, "INVALID_INDEX_CONFIG",
-				fmt.Sprintf("index.check_interval must be >= 1s, got %v", c.Index.CheckInterval))
-		}
+	if c.Index.BucketCount <= 0 || c.Index.BucketCount > 65536 {
+		return arkilianerrors.New(arkilianerrors.ErrCategoryValidation, "INVALID_INDEX_CONFIG",
+			fmt.Sprintf("index.bucket_count must be > 0 and <= 65536, got %d", c.Index.BucketCount))
+	}
+	if c.Index.MaxIndexes < 1 {
+		return arkilianerrors.New(arkilianerrors.ErrCategoryValidation, "INVALID_INDEX_CONFIG",
+			fmt.Sprintf("index.max_indexes must be >= 1, got %d", c.Index.MaxIndexes))
+	}
+	if c.Index.CreateThreshold <= c.Index.DropThreshold {
+		return arkilianerrors.New(arkilianerrors.ErrCategoryValidation, "INVALID_INDEX_CONFIG",
+			fmt.Sprintf("index.create_threshold (%d) must be > drop_threshold (%d)", c.Index.CreateThreshold, c.Index.DropThreshold))
+	}
+	if c.Index.CheckInterval < 1*time.Second {
+		return arkilianerrors.New(arkilianerrors.ErrCategoryValidation, "INVALID_INDEX_CONFIG",
+			fmt.Sprintf("index.check_interval must be >= 1s, got %v", c.Index.CheckInterval))
 	}
 
 	// Validate Cache config
-	if c.Cache.NVMeDir != "" {
-		if c.Cache.NVMeMaxBytes <= 0 {
-			return arkilianerrors.New(arkilianerrors.ErrCategoryValidation, "INVALID_CACHE_CONFIG",
-				fmt.Sprintf("cache.nvme_max_bytes must be > 0 when nvme_dir is set, got %d", c.Cache.NVMeMaxBytes))
-		}
+	if c.Cache.NVMeDir != "" && c.Cache.NVMeMaxBytes <= 0 {
+		return arkilianerrors.New(arkilianerrors.ErrCategoryValidation, "INVALID_CACHE_CONFIG",
+			fmt.Sprintf("cache.nvme_max_bytes must be > 0 when nvme_dir is set, got %d", c.Cache.NVMeMaxBytes))
 	}
 
 	// Validate Router config
-	if c.Router.NotificationsEnabled {
-		if c.Router.BufferSize <= 0 {
-			return arkilianerrors.New(arkilianerrors.ErrCategoryValidation, "INVALID_ROUTER_CONFIG",
-				fmt.Sprintf("router.buffer_size must be > 0 when notifications are enabled, got %d", c.Router.BufferSize))
-		}
+	if c.Router.BufferSize <= 0 {
+		return arkilianerrors.New(arkilianerrors.ErrCategoryValidation, "INVALID_ROUTER_CONFIG",
+			fmt.Sprintf("router.buffer_size must be > 0, got %d", c.Router.BufferSize))
 	}
 
 	// Validate adaptive sizing config
@@ -680,9 +666,6 @@ func LoadFromEnv(cfg *Config) {
 	}
 
 	// WAL configuration
-	if v := os.Getenv("ARKILIAN_WAL_ENABLED"); v != "" {
-		cfg.WAL.Enabled = v == "true" || v == "1"
-	}
 	if v := os.Getenv("ARKILIAN_WAL_DIR"); v != "" {
 		cfg.WAL.Dir = v
 	}
@@ -704,9 +687,6 @@ func LoadFromEnv(cfg *Config) {
 	}
 
 	// Index configuration
-	if v := os.Getenv("ARKILIAN_INDEX_ENABLED"); v != "" {
-		cfg.Index.Enabled = v == "true" || v == "1"
-	}
 	if v := os.Getenv("ARKILIAN_INDEX_CREATE_THRESHOLD"); v != "" {
 		fmt.Sscanf(v, "%d", &cfg.Index.CreateThreshold)
 	}
@@ -737,9 +717,6 @@ func LoadFromEnv(cfg *Config) {
 	}
 
 	// Router configuration
-	if v := os.Getenv("ARKILIAN_ROUTER_NOTIFICATIONS_ENABLED"); v != "" {
-		cfg.Router.NotificationsEnabled = v == "true" || v == "1"
-	}
 	if v := os.Getenv("ARKILIAN_ROUTER_BUFFER_SIZE"); v != "" {
 		fmt.Sscanf(v, "%d", &cfg.Router.BufferSize)
 	}

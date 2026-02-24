@@ -8,10 +8,10 @@
 </p>
 
 <!-- [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/CodeDynasty-dev/birth-of-Arkilian/blob/next/contributing.md) -->
+
 ![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
 ![Arkilian](https://img.shields.io/github/v/release/CodeDynasty-dev/birth-of-Arkilian)
 [![Stargazers](https://img.shields.io/github/stars/CodeDynasty-dev/birth-of-Arkilian?style=social)](https://github.com/CodeDynasty-dev/birth-of-Arkilian)
-
 
 ### An immutable database that follows Snowflake architecture, designed for scalable, replayable systems beyond analytics.
 
@@ -52,6 +52,13 @@ Unlike monolithic SQLite distribution attempts (rqlite, LiteFS), Arkilian embrac
 │   (Writers)   │         │  (Readers)    │         │  (Background) │
 └───────┬───────┘         └───────┬───────┘         └───────┬───────┘
         │                         │                         │
+        │                         │                         │
+        ▼                         ▼                         │
+┌───────────────┐         ┌───────────────┐                 │
+│      WAL      │         │   Co-Access   │                 │
+│  (fsync <10ms)│         │     Graph     │                 │
+└───────┬───────┘         └───────┬───────┘                 │
+        │                         │                         │
         └─────────────────────────┼─────────────────────────┘
                                   │
                                   ▼
@@ -67,8 +74,25 @@ Unlike monolithic SQLite distribution attempts (rqlite, LiteFS), Arkilian embrac
 │  │ events_20260205 │  │ events_20260205 │  │ events_20260206 │   │
 │  │ _001.sqlite     │  │ _001.meta.json  │  │ _001.sqlite     │   │
 │  └─────────────────┘  └─────────────────┘  └─────────────────┘   │
+│  ┌─────────────────┐  ┌─────────────────┐                        │
+│  │ indexes/        │  │ cache/          │                        │
+│  │ user_id/        │  │ nvme/           │                        │
+│  │ 0.sqlite        │  │                 │                        │
+│  └─────────────────┘  └─────────────────┘                        │
 └──────────────────────────────────────────────────────────────────┘
 ```
+
+### Features
+
+| Feature                 | Description                                                 | Benefit                                       |
+| ----------------------- | ----------------------------------------------------------- | --------------------------------------------- |
+| **WAL**                 | Write-Ahead Log with local fsync before S3 upload           | <10ms write acknowledgment                    |
+| **Secondary Indexes**   | Hash-partitioned index maps for point lookups on any column | <200ms queries on high-cardinality columns    |
+| **NVMe Cache**          | Tiered L1 (RAM) → L2 (NVMe) → L3 (S3) cache                 | <1ms cache hits vs 50-200ms S3 GET            |
+| **Co-Access Graph**     | Markov-like graph tracking partition access sequences       | Predictive prefetch for common query patterns |
+| **Write Notifications** | In-process pub/sub for partition flush events               | <100ms write visibility                       |
+
+All v2 features are enabled by default. The v1 synchronous ingest path has been removed.
 
 ## Core Principles
 
@@ -80,7 +104,7 @@ Unlike monolithic SQLite distribution attempts (rqlite, LiteFS), Arkilian embrac
 ### Building
 
 - Prerequisites
-- Go 1.21+ in  
+- Go 1.21+ in
 
 ![Go](https://img.shields.io/badge/Go-00ADD8?style=flat&logo=go&logoColor=white)
 
@@ -127,16 +151,18 @@ curl -X POST http://localhost:8080/v1/ingest \
   }'
 ```
 
-Response:
+**Response:**
 
 ```json
 {
-  "partition_id": "events:20260206:abc123",
+  "lsn": 42,
   "row_count": 1,
-  "size_bytes": 4096,
-  "request_id": "req-xyz789"
+  "request_id": "req-xyz789",
+  "status": "accepted"
 }
 ```
+
+The response includes an LSN (Log Sequence Number) for tracking. The partition_id becomes available after the background flusher processes the WAL entry (typically <1s).
 
 ### Query Data
 
@@ -188,13 +214,15 @@ Example: For a query on 100K partitions with `tenant_id = 'acme'`:
 
 ## Performance Targets
 
-| Metric                  | Target                 |
-| ----------------------- | ---------------------- |
-| Ingest throughput       | 50K rows/sec/node      |
-| P95 query latency       | <500ms (point queries) |
-| Partition pruning ratio | 99.5%                  |
-| Storage overhead        | <5%                    |
-| Recovery time           | <10s                   |
+| Metric                  | Target            |
+| ----------------------- | ----------------- |
+| Write ack latency (P99) | <10ms             |
+| Write visibility        | <100ms            |
+| Indexed query latency   | <200ms            |
+| Cold query latency      | <5s               |
+| Cache hit latency       | <1ms              |
+| Ingest throughput       | 50K rows/sec/node |
+| Partition pruning ratio | 99.5%             |
 
 ## Testing
 
@@ -282,6 +310,41 @@ storage:
 | `ARKILIAN_HTTP_PORT`     | `8080`              | HTTP server port         |
 | `ARKILIAN_GRPC_PORT`     | `9090`              | gRPC server port         |
 
+| Environment Variable              | Default                | Description                     |
+| --------------------------------- | ---------------------- | ------------------------------- |
+| `ARKILIAN_WAL_DIR`                | `./data/arkilian/wal`  | WAL segment directory           |
+| `ARKILIAN_WAL_FLUSH_INTERVAL`     | `500ms`                | How often to flush WAL to S3    |
+| `ARKILIAN_WAL_MAX_SEGMENT_SIZE`   | `67108864`             | Max WAL segment size (bytes)    |
+| `ARKILIAN_INDEX_BUCKET_COUNT`     | `64`                   | Hash buckets per index column   |
+| `ARKILIAN_INDEX_CREATE_THRESHOLD` | `100`                  | Queries/hour to trigger index   |
+| `ARKILIAN_INDEX_DROP_THRESHOLD`   | `5`                    | Queries/hour to drop index      |
+| `ARKILIAN_CACHE_NVME_DIR`         | `./data/arkilian/nvme` | NVMe cache directory            |
+| `ARKILIAN_CACHE_NVME_MAX_BYTES`   | `536870912000`         | Maximum NVMe cache size (500GB) |
+| `ARKILIAN_CACHE_PREFETCH_ENABLED` | `true`                 | Enable predictive prefetch      |
+| `ARKILIAN_ROUTER_BUFFER_SIZE`     | `1000`                 | Subscriber channel buffer size  |
+
+**Example config:**
+
+```yaml
+wal:
+  dir: /data/arkilian/wal
+  flush_interval: 500ms
+  max_segment_size: 67108864 # 64MB
+
+index:
+  bucket_count: 64
+  create_threshold: 100
+  drop_threshold: 5
+
+cache:
+  nvme_dir: /data/arkilian/nvme
+  nvme_max_bytes: 536870912000 # 500GB
+  prefetch_enabled: true
+
+router:
+  buffer_size: 1000
+```
+
 ## Limitations
 
 - No distributed ACID transactions across partitions
@@ -312,16 +375,21 @@ Inspired by:
 Arkilian includes a multi-stage `Dockerfile` that builds minimal, secure images for all services.
 
 \`\`\`bash
+
 # Build the image
+
 docker build -t arkilian:latest .
 
 # Run Ingest Service (Default)
+
 docker run -p 8080:8080 arkilian:latest
 
 # Run Query Service
+
 docker run -p 8081:8081 --entrypoint /usr/local/bin/arkilian-query arkilian:latest
 
 # Run Compaction Service
+
 docker run --entrypoint /usr/local/bin/arkilian-compact arkilian:latest
 \`\`\`
 
