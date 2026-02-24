@@ -500,8 +500,8 @@ func TestFeatureFlagAllEnabled(t *testing.T) {
 		t.Error("expected notification within 500ms")
 	}
 
-	// Create planner with co-access graph and query stats, executor
-	queryPlanner := planner.NewPlanner(env.catalog)
+	// Create planner with co-access graph, query stats, and notifier for write visibility
+	queryPlanner := planner.NewPlannerWithNotifier(env.catalog, notifier)
 	exec, err := executor.NewParallelExecutor(queryPlanner, env.store, executor.ExecutorConfig{
 		Concurrency: 4,
 		DownloadDir: env.downloadDir,

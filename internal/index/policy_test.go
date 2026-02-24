@@ -124,6 +124,7 @@ func TestPolicy_ColumnBelowThresholdTriggersDrop(t *testing.T) {
 
 	cfg := config.IndexConfig{
 		Enabled:         true,
+		Collection:      "events",
 		CreateThreshold: 100,
 		DropThreshold:   5,
 		CheckInterval:   1 * time.Minute,
@@ -214,6 +215,7 @@ func TestPolicy_ExistingIndexNotRecreated(t *testing.T) {
 
 	cfg := config.IndexConfig{
 		Enabled:         true,
+		Collection:      "events",
 		CreateThreshold: 3,
 		DropThreshold:   1,
 		CheckInterval:   1 * time.Minute,
