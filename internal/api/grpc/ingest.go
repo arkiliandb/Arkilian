@@ -12,6 +12,7 @@ import (
 	"github.com/arkilian/arkilian/internal/bloom"
 	"github.com/arkilian/arkilian/internal/manifest"
 	"github.com/arkilian/arkilian/internal/partition"
+	"github.com/arkilian/arkilian/internal/schema"
 	"github.com/arkilian/arkilian/internal/storage"
 	"github.com/arkilian/arkilian/internal/wal"
 	"github.com/arkilian/arkilian/pkg/types"
@@ -24,12 +25,13 @@ import (
 // IngestServer implements the IngestService gRPC server.
 type IngestServer struct {
 	proto.UnimplementedIngestServiceServer
-	builder partition.PartitionBuilder
-	metaGen *partition.MetadataGenerator
-	catalog manifest.Catalog
-	storage storage.ObjectStorage
-	wal     *wal.WAL
-	walEnabled bool
+	builder     partition.PartitionBuilder
+	metaGen     *partition.MetadataGenerator
+	catalog     manifest.Catalog
+	storage     storage.ObjectStorage
+	wal         *wal.WAL
+	walEnabled  bool
+	materializer *schema.Materializer
 }
 
 // NewIngestServer creates a new gRPC ingest server.
@@ -39,14 +41,16 @@ func NewIngestServer(
 	catalog manifest.Catalog,
 	store storage.ObjectStorage,
 	walInstance *wal.WAL,
+	materializer *schema.Materializer,
 ) *IngestServer {
 	return &IngestServer{
-		builder: builder,
-		metaGen: metaGen,
-		catalog: catalog,
-		storage: store,
-		wal:     walInstance,
-		walEnabled: walInstance != nil,
+		builder:     builder,
+		metaGen:     metaGen,
+		catalog:     catalog,
+		storage:     store,
+		wal:         walInstance,
+		walEnabled:  walInstance != nil,
+		materializer: materializer,
 	}
 }
 
@@ -98,7 +102,22 @@ func (s *IngestServer) BatchIngest(ctx context.Context, req *proto.IngestRequest
 		Value:    req.PartitionKey,
 	}
 
-	info, err := s.builder.Build(ctx, rows, key)
+	// Get materialized columns if materializer is configured
+	var materializedCols []partition.MaterializedColumn
+	if s.materializer != nil {
+		schemaCols := s.materializer.GetMaterializedColumns("events")
+		materializedCols = make([]partition.MaterializedColumn, len(schemaCols))
+		for i, sc := range schemaCols {
+			materializedCols[i] = partition.MaterializedColumn{
+				JSONPath:   sc.JSONPath,
+				ColumnName: sc.ColumnName,
+				SQLiteType: sc.SQLiteType,
+			}
+		}
+	}
+
+	// Build partition with schema and materialized columns
+	info, err := s.builder.BuildWithSchema(ctx, rows, key, partition.DefaultSchema(), materializedCols)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to build partition: %v", err)
 	}

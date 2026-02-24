@@ -143,7 +143,7 @@ func TestWALIngestAndFlush(t *testing.T) {
 	walInstance, _ := wal.NewWAL(filepath.Join(t.TempDir(), "wal"), 64*1024*1024)
 	defer walInstance.Close()
 
-	handler := apihttp.NewIngestHandler(builder, metaGen, catalog, store, nil, walInstance)
+	handler := apihttp.NewIngestHandler(builder, metaGen, catalog, store, nil, walInstance, nil)
 	wrappedHandler := apihttp.DefaultMiddleware()(handler)
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/ingest", bytes.NewReader(body))
@@ -239,7 +239,7 @@ func TestWALRecovery(t *testing.T) {
 	_ = wal.NewFlusher(walInstance, builder, store, catalog, metaGen, 10*time.Second, 1000)
 
 	// Create ingest handler
-	handler := apihttp.NewIngestHandler(builder, metaGen, catalog, store, nil, walInstance)
+	handler := apihttp.NewIngestHandler(builder, metaGen, catalog, store, nil, walInstance, nil)
 	wrappedHandler := apihttp.DefaultMiddleware()(handler)
 
 	// Ingest data (will be in WAL, not flushed due to long flush interval)
@@ -365,7 +365,7 @@ func TestWALConcurrentIngest(t *testing.T) {
 
 	flusher := wal.NewFlusher(walInstance, builder, store, catalog, metaGen, 500*time.Millisecond, 1000)
 
-	handler := apihttp.NewIngestHandler(builder, metaGen, catalog, store, nil, walInstance)
+	handler := apihttp.NewIngestHandler(builder, metaGen, catalog, store, nil, walInstance, nil)
 	wrappedHandler := apihttp.DefaultMiddleware()(handler)
 
 	// Concurrent ingest from 10 goroutines

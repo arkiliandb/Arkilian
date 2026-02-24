@@ -23,6 +23,7 @@ import (
 	"github.com/arkilian/arkilian/internal/query/executor"
 	"github.com/arkilian/arkilian/internal/query/planner"
 	"github.com/arkilian/arkilian/internal/router"
+	"github.com/arkilian/arkilian/internal/schema"
 	"github.com/arkilian/arkilian/internal/server"
 	"github.com/arkilian/arkilian/internal/storage"
 	"github.com/arkilian/arkilian/internal/wal"
@@ -56,6 +57,9 @@ type App struct {
 	notifier      *router.Notifier
 	nvmeCache     *cache.NVMeCache
 	coAccessGraph *cache.CoAccessGraph
+
+	// Materializer for JSON column materialization
+	materializer *schema.Materializer
 
 	// Lifecycle
 	mu      sync.Mutex
@@ -240,6 +244,11 @@ func (a *App) startIngestService(ctx context.Context) error {
 	}
 	log.Printf("Partition builder initialized: %s", a.cfg.Ingest.PartitionDir)
 
+	// Initialize query statistics for materialized columns
+	queryStats := observability.NewQueryStats(1 * time.Hour)
+	a.materializer = schema.NewMaterializer(queryStats, 50, 20)
+	log.Printf("Materializer initialized for JSON column materialization")
+
 	// Initialize WAL if enabled
 	var notifier *router.Notifier
 
@@ -293,7 +302,7 @@ func (a *App) startIngestService(ctx context.Context) error {
 	}
 
 	// Create HTTP handler
-	ingestHandler := httpapi.NewIngestHandler(builder, metaGen, a.catalog, a.storage, adaptiveSizer, a.walInstance)
+	ingestHandler := httpapi.NewIngestHandler(builder, metaGen, a.catalog, a.storage, adaptiveSizer, a.walInstance, a.materializer)
 
 	// Setup HTTP server with middleware
 	mux := http.NewServeMux()
@@ -328,7 +337,7 @@ func (a *App) startIngestService(ctx context.Context) error {
 	// Start gRPC server if enabled
 	if a.cfg.GRPC.Enabled {
 		a.grpcServer = grpc.NewServer()
-		ingestServer := grpcapi.NewIngestServer(builder, metaGen, a.catalog, a.storage, a.walInstance)
+		ingestServer := grpcapi.NewIngestServer(builder, metaGen, a.catalog, a.storage, a.walInstance, a.materializer)
 		proto.RegisterIngestServiceServer(a.grpcServer, ingestServer)
 
 		var err error

@@ -11,6 +11,7 @@ import (
 	"github.com/arkilian/arkilian/internal/bloom"
 	"github.com/arkilian/arkilian/internal/manifest"
 	"github.com/arkilian/arkilian/internal/partition"
+	"github.com/arkilian/arkilian/internal/schema"
 	"github.com/arkilian/arkilian/internal/storage"
 	"github.com/arkilian/arkilian/internal/wal"
 	"github.com/arkilian/arkilian/pkg/types"
@@ -41,13 +42,14 @@ type WALIngestResponse struct {
 
 // IngestHandler handles POST /v1/ingest requests.
 type IngestHandler struct {
-	builder        partition.PartitionBuilder
-	metaGen        *partition.MetadataGenerator
-	catalog        manifest.Catalog
-	storage        storage.ObjectStorage
-	adaptiveSizer  *partition.AdaptiveSizer
-	wal            *wal.WAL
-	walEnabled     bool
+	builder         partition.PartitionBuilder
+	metaGen         *partition.MetadataGenerator
+	catalog         manifest.Catalog
+	storage         storage.ObjectStorage
+	adaptiveSizer   *partition.AdaptiveSizer
+	wal             *wal.WAL
+	walEnabled      bool
+	materializer    *schema.Materializer
 }
 
 // NewIngestHandler creates a new ingest handler.
@@ -58,15 +60,17 @@ func NewIngestHandler(
 	store storage.ObjectStorage,
 	adaptiveSizer *partition.AdaptiveSizer,
 	walInstance *wal.WAL,
+	materializer *schema.Materializer,
 ) *IngestHandler {
 	return &IngestHandler{
-		builder:       builder,
-		metaGen:       metaGen,
-		catalog:       catalog,
-		storage:       store,
-		adaptiveSizer: adaptiveSizer,
-		wal:           walInstance,
-		walEnabled:    walInstance != nil,
+		builder:        builder,
+		metaGen:        metaGen,
+		catalog:        catalog,
+		storage:        store,
+		adaptiveSizer:  adaptiveSizer,
+		wal:            walInstance,
+		walEnabled:     walInstance != nil,
+		materializer:   materializer,
 	}
 }
 
@@ -149,7 +153,22 @@ func (h *IngestHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	info, err := h.builder.Build(r.Context(), rows, key)
+	// Get materialized columns if materializer is configured
+	var materializedCols []partition.MaterializedColumn
+	if h.materializer != nil {
+		schemaCols := h.materializer.GetMaterializedColumns("events")
+		materializedCols = make([]partition.MaterializedColumn, len(schemaCols))
+		for i, sc := range schemaCols {
+			materializedCols[i] = partition.MaterializedColumn{
+				JSONPath:   sc.JSONPath,
+				ColumnName: sc.ColumnName,
+				SQLiteType: sc.SQLiteType,
+			}
+		}
+	}
+
+	// Build partition with schema and materialized columns
+	info, err := h.builder.BuildWithSchema(r.Context(), rows, key, partition.DefaultSchema(), materializedCols)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, fmt.Sprintf("failed to build partition: %v", err), requestID)
 		return

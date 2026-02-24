@@ -107,7 +107,7 @@ func TestWriteVisibility(t *testing.T) {
 	// Create ingest handler with WAL
 	builder := partition.NewBuilder("", 0)
 	metaGen := partition.NewMetadataGenerator()
-	handler := apihttp.NewIngestHandler(builder, metaGen, catalog, store, nil, walInstance)
+	handler := apihttp.NewIngestHandler(builder, metaGen, catalog, store, nil, walInstance, nil)
 	wrappedHandler := apihttp.DefaultMiddleware()(handler)
 
 	// Ingest test data
@@ -204,7 +204,7 @@ func TestNotificationFiltering(t *testing.T) {
 	os.MkdirAll(partitionDir, 0755)
 	builder := partition.NewBuilder(partitionDir, 0)
 	metaGen := partition.NewMetadataGenerator()
-	walHandler := apihttp.NewIngestHandler(builder, metaGen, catalog, store, nil, nil)
+	walHandler := apihttp.NewIngestHandler(builder, metaGen, catalog, store, nil, nil, nil)
 	wrappedHandler := apihttp.DefaultMiddleware()(walHandler)
 
 	// Ingest to "20260206"
