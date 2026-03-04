@@ -1,8 +1,7 @@
-// Package router provides property-based tests for notification non-blocking behavior.
+// Package router provides an in-process write notification bus for query node cache invalidation and write visibility.
 package router
 
 import (
-	"reflect"
 	"testing"
 	"time"
 
@@ -11,174 +10,724 @@ import (
 	"github.com/leanovate/gopter/prop"
 )
 
-// Validates: Requirements 11.4
-func TestNotifier_Properties(t *testing.T) {
+// TestProperty_NotifierNonBlocking tests Property V2-10: Non-Blocking
+// For any state of subscriber channels, Publish completes within 1ms
+func TestProperty_NotifierNonBlocking(t *testing.T) {
 	parameters := gopter.DefaultTestParameters()
 	parameters.MinSuccessfulTests = 100
-	parameters.MaxSize = 10
 
 	properties := gopter.NewProperties(parameters)
 
-	// Property V2-10: Non-Blocking
-	// For any state of subscriber channels, Publish completes within 1ms
-	properties.Property("Non-Blocking - Publish completes within 1ms regardless of channel state", prop.ForAll(
-		func(testData notifierTestData) bool {
-			// Skip invalid data
-			if testData.bufferSize <= 0 || testData.subscriberCount <= 0 || testData.publishCount <= 0 || len(testData.partitionKeys) == 0 {
-				return true
+	properties.Property("V2-10: Non-Blocking - Publish completes within 1ms", prop.ForAll(
+		func(seed int) bool {
+			n := NewNotifier(100)
+
+			// Create multiple subscribers with various filter states
+			numSubscribers := (seed % 10) + 1
+			for i := 0; i < numSubscribers; i++ {
+				filters := make([]string, 0)
+				if i%2 == 0 {
+					filters = []string{"prefix-"}
+				}
+				n.Subscribe("sub_"+string(rune('0'+i)), filters)
 			}
 
-			// Create notifier with small buffer to test blocking scenarios
-			n := NewNotifier(testData.bufferSize)
-			defer func() {
-				// Cleanup subscribers
-				n.subscribers.Range(func(key, value interface{}) bool {
-					sub := value.(*Subscriber)
-					close(sub.Ch)
-					return true
-				})
-			}()
-
-			// Create subscribers with various buffer sizes
-			subscribers := make([]*Subscriber, 0, testData.subscriberCount)
-			for i := 0; i < testData.subscriberCount; i++ {
-				subBuffer := testData.subscriberBufferSizes[i%len(testData.subscriberBufferSizes)]
-				sub := n.Subscribe("sub-"+string(rune('A'+i)), testData.filters)
-				// Resize channel to test different buffer states
-				sub.Ch = make(chan Notification, subBuffer)
-				subscribers = append(subscribers, sub)
-			}
-
-			// Fill some channels to capacity to test non-blocking
-			if testData.fillChannels {
-				for i, sub := range subscribers {
-					if i%2 == 0 {
-						for j := 0; j < cap(sub.Ch); j++ {
-							sub.Ch <- Notification{
-								Type:         PartitionCreated,
-								PartitionKey: "test-key",
-								PartitionID:  "test-id",
-								LSN:          uint64(j),
-								Timestamp:    time.Now().UnixNano(),
-							}
-						}
+			// Fill some subscriber channels to simulate full state
+			for i := 0; i < numSubscribers; i++ {
+				sub := n.Subscribe("sub_full_"+string(rune('0'+i)), nil)
+				ch := sub.Ch
+				// Fill the channel to capacity
+				for j := 0; j < 100; j++ {
+					select {
+					case ch <- Notification{Type: PartitionCreated, PartitionKey: "fill"}:
+					default:
+						// Channel full
 					}
 				}
 			}
 
-			// Time the publish operation
+			// Measure Publish duration
 			start := time.Now()
-			for i := 0; i < testData.publishCount; i++ {
-				n.Publish(Notification{
-					Type:         PartitionCreated,
-					PartitionKey: testData.partitionKeys[i%len(testData.partitionKeys)],
-					PartitionID:  "test-id-" + string(rune('0'+i%10)),
-					LSN:          uint64(i),
-					Timestamp:    time.Now().UnixNano(),
-				})
-			}
-			elapsed := time.Since(start)
 
-			// Publish should complete within 1ms per notification
-			maxDuration := time.Duration(testData.publishCount) * time.Millisecond
-			if elapsed > maxDuration {
-				return false
-			}
-
-			return true
-		},
-		genNotifierTestData(),
-	))
-
-	// Additional property: Non-blocking with many subscribers
-	properties.Property("Non-Blocking - Publish to many subscribers completes quickly", prop.ForAll(
-		func(testData manySubscribersTestData) bool {
-			n := NewNotifier(testData.bufferSize)
-			defer func() {
-				n.subscribers.Range(func(key, value interface{}) bool {
-					if sub, ok := value.(*Subscriber); ok {
-						close(sub.Ch)
-					}
-					return true
-				})
-			}()
-
-			// Create many subscribers
-			for i := 0; i < testData.subscriberCount; i++ {
-				filters := []string{}
-				if i%3 == 0 {
-					filters = []string{"prefix-" + string(rune('A'+i%26))}
-				}
-				n.Subscribe("sub-"+string(rune('A'+i%26))+string(rune('0'+i%10)), filters)
-			}
-
-			// Time publish with many subscribers
-			start := time.Now()
 			n.Publish(Notification{
 				Type:         PartitionCreated,
-				PartitionKey: "prefix-A0",
+				PartitionKey: "test-key",
 				PartitionID:  "test-id",
 				LSN:          1,
 				Timestamp:    time.Now().UnixNano(),
 			})
+
 			elapsed := time.Since(start)
 
-			// Should complete within 10ms even with many subscribers
-			if elapsed > 10*time.Millisecond {
+			// Publish should complete within 1ms
+			if elapsed > 1*time.Millisecond {
+				t.Errorf("Publish took %v, expected < 1ms", elapsed)
 				return false
 			}
 
 			return true
 		},
-		genManySubscribersTestData(),
+		gen.Int(),
 	))
 
 	properties.TestingRun(t)
 }
 
-// Test data structures
-type notifierTestData struct {
-	bufferSize            int
-	subscriberCount       int
-	subscriberBufferSizes []int
-	fillChannels          bool
-	publishCount          int
-	partitionKeys         []string
-	filters               []string
-}
+// TestProperty_NotifierPublishNoSubscribers tests that Publish works with no subscribers
+func TestProperty_NotifierPublishNoSubscribers(t *testing.T) {
+	parameters := gopter.DefaultTestParameters()
+	parameters.MinSuccessfulTests = 100
 
-type manySubscribersTestData struct {
-	bufferSize      int
-	subscriberCount int
-}
+	properties := gopter.NewProperties(parameters)
 
-// Generators with realistic constraints
-func genNotifierTestData() gopter.Gen {
-	return gen.Struct(
-		reflect.TypeOf(notifierTestData{}),
-		map[string]gopter.Gen{
-			"bufferSize": gen.IntRange(1, 100),
-			"subscriberCount": gen.IntRange(1, 20),
-			"subscriberBufferSizes": gen.Const([]int{0, 1, 5, 10, 100}),
-			"fillChannels": gen.Bool(),
-			"publishCount": gen.IntRange(1, 10),
-			"partitionKeys": gen.SliceOf(
-				gen.AlphaString(),
-				reflect.TypeOf(""),
-			).SuchThat(func(v interface{}) bool {
-				return len(v.([]string)) >= 1 && len(v.([]string)) <= 3
-			}),
-			"filters": gen.Const([]string{""}),
+	properties.Property("Notifier Publish No Subscribers - no panic, no block", prop.ForAll(
+		func(seed int) bool {
+			n := NewNotifier(100)
+
+			// Should not panic and should not block
+			done := make(chan bool)
+			go func() {
+				n.Publish(Notification{
+					Type:         PartitionCreated,
+					PartitionKey: "test-key",
+					PartitionID:  "test-id",
+					LSN:          1,
+					Timestamp:    time.Now().UnixNano(),
+				})
+				done <- true
+			}()
+
+			select {
+			case <-done:
+				return true
+			case <-time.After(100 * time.Millisecond):
+				t.Error("Publish blocked")
+				return false
+			}
 		},
-	)
+		gen.Int(),
+	))
+
+	properties.TestingRun(t)
 }
 
-func genManySubscribersTestData() gopter.Gen {
-	return gen.Struct(
-		reflect.TypeOf(manySubscribersTestData{}),
-		map[string]gopter.Gen{
-			"bufferSize":      gen.IntRange(1, 100),
-			"subscriberCount": gen.IntRange(10, 50),
+// TestProperty_NotifierSubscribeReceives tests that subscribers receive notifications
+func TestProperty_NotifierSubscribeReceives(t *testing.T) {
+	parameters := gopter.DefaultTestParameters()
+	parameters.MinSuccessfulTests = 100
+
+	properties := gopter.NewProperties(parameters)
+
+	properties.Property("Notifier Subscribe Receives - subscriber gets notification", prop.ForAll(
+		func(seed int) bool {
+			n := NewNotifier(100)
+			sub := n.Subscribe("sub_"+string(rune('0'+(seed%10))), nil)
+			ch := sub.Ch
+
+			done := make(chan bool)
+			go func() {
+				notif := <-ch
+				if notif.PartitionKey != "test-key" {
+					t.Errorf("expected partition key 'test-key', got '%s'", notif.PartitionKey)
+				}
+				close(done)
+			}()
+
+			n.Publish(Notification{
+				Type:         PartitionCreated,
+				PartitionKey: "test-key",
+				PartitionID:  "test-id",
+				LSN:          1,
+				Timestamp:    time.Now().UnixNano(),
+			})
+
+			select {
+			case <-done:
+				return true
+			case <-time.After(time.Second):
+				t.Error("subscriber did not receive notification within timeout")
+				return false
+			}
 		},
-	)
+		gen.Int(),
+	))
+
+	properties.TestingRun(t)
+}
+
+// TestProperty_NotifierFilterExcludes tests that filters exclude non-matching notifications
+func TestProperty_NotifierFilterExcludes(t *testing.T) {
+	parameters := gopter.DefaultTestParameters()
+	parameters.MinSuccessfulTests = 100
+
+	properties := gopter.NewProperties(parameters)
+
+	properties.Property("Notifier Filter Excludes - non-matching keys filtered out", prop.ForAll(
+		func(seed int) bool {
+			n := NewNotifier(100)
+			sub := n.Subscribe("sub_"+string(rune('0'+(seed%10))), []string{"prefix-"})
+			ch := sub.Ch
+
+			done := make(chan bool)
+			go func() {
+				select {
+				case <-ch:
+					t.Fatal("should not receive notification")
+				case <-time.After(100 * time.Millisecond):
+					// Expected - notification filtered out
+					close(done)
+				}
+			}()
+
+			n.Publish(Notification{
+				Type:         PartitionCreated,
+				PartitionKey: "other-key",
+				PartitionID:  "test-id",
+				LSN:          1,
+				Timestamp:    time.Now().UnixNano(),
+			})
+
+			select {
+			case <-done:
+				return true
+			case <-time.After(time.Second):
+				t.Error("timeout waiting for filter to work")
+				return false
+			}
+		},
+		gen.Int(),
+	))
+
+	properties.TestingRun(t)
+}
+
+// TestProperty_NotifierFilterIncludes tests that filters include matching notifications
+func TestProperty_NotifierFilterIncludes(t *testing.T) {
+	parameters := gopter.DefaultTestParameters()
+	parameters.MinSuccessfulTests = 100
+
+	properties := gopter.NewProperties(parameters)
+
+	properties.Property("Notifier Filter Includes - matching keys received", prop.ForAll(
+		func(seed int) bool {
+			n := NewNotifier(100)
+			sub := n.Subscribe("sub_"+string(rune('0'+(seed%10))), []string{"prefix-"})
+			ch := sub.Ch
+
+			done := make(chan bool)
+			go func() {
+				notif := <-ch
+				if notif.PartitionKey != "prefix-test" {
+					t.Errorf("expected 'prefix-test', got '%s'", notif.PartitionKey)
+				}
+				close(done)
+			}()
+
+			n.Publish(Notification{
+				Type:         PartitionCreated,
+				PartitionKey: "prefix-test",
+				PartitionID:  "test-id",
+				LSN:          1,
+				Timestamp:    time.Now().UnixNano(),
+			})
+
+			select {
+			case <-done:
+				return true
+			case <-time.After(time.Second):
+				t.Error("subscriber did not receive notification within timeout")
+				return false
+			}
+		},
+		gen.Int(),
+	))
+
+	properties.TestingRun(t)
+}
+
+// TestProperty_NotifierFullChannelDrops tests that full channels drop notifications without blocking
+func TestProperty_NotifierFullChannelDrops(t *testing.T) {
+	parameters := gopter.DefaultTestParameters()
+	parameters.MinSuccessfulTests = 100
+
+	properties := gopter.NewProperties(parameters)
+
+	properties.Property("Notifier Full Channel Drops - no blocking on full channel", prop.ForAll(
+		func(seed int) bool {
+			n := NewNotifier(1) // Small buffer
+			sub := n.Subscribe("sub_"+string(rune('0'+(seed%10))), nil)
+			ch := sub.Ch
+
+			// Fill the channel
+			ch <- Notification{Type: PartitionCreated, PartitionKey: "fill"}
+
+			// This should not block
+			done := make(chan bool)
+			go func() {
+				n.Publish(Notification{
+					Type:         PartitionCreated,
+					PartitionKey: "test-key",
+					PartitionID:  "test-id",
+					LSN:          1,
+					Timestamp:    time.Now().UnixNano(),
+				})
+				close(done)
+			}()
+
+			select {
+			case <-done:
+				// Success - publish returned without blocking
+			case <-time.After(100 * time.Millisecond):
+				t.Error("publish blocked when channel was full")
+				return false
+			}
+
+			// Original notification should still be there
+			select {
+			case notif := <-ch:
+				if notif.PartitionKey != "fill" {
+					t.Errorf("expected 'fill', got '%s'", notif.PartitionKey)
+					return false
+				}
+			case <-time.After(100 * time.Millisecond):
+				t.Error("original notification was lost")
+				return false
+			}
+
+			return true
+		},
+		gen.Int(),
+	))
+
+	properties.TestingRun(t)
+}
+
+// TestProperty_NotifierUnsubscribeCloses tests that unsubscribe closes the channel
+func TestProperty_NotifierUnsubscribeCloses(t *testing.T) {
+	parameters := gopter.DefaultTestParameters()
+	parameters.MinSuccessfulTests = 100
+
+	properties := gopter.NewProperties(parameters)
+
+	properties.Property("Notifier Unsubscribe Closes - channel closed after unsubscribe", prop.ForAll(
+		func(seed int) bool {
+			n := NewNotifier(100)
+			sub := n.Subscribe("sub_"+string(rune('0'+(seed%10))), nil)
+			ch := sub.Ch
+
+			n.Unsubscribe("sub_" + string(rune('0'+(seed%10))))
+
+			// Channel should be closed
+			select {
+			case _, ok := <-ch:
+				if ok {
+					t.Fatal("channel should be closed after unsubscribe")
+					return false
+				}
+				return true
+			case <-time.After(100 * time.Millisecond):
+				t.Fatal("channel was not closed within timeout")
+				return false
+			}
+		},
+		gen.Int(),
+	))
+
+	properties.TestingRun(t)
+}
+
+// TestProperty_NotifierMultipleSubscribers tests that multiple subscribers work correctly
+func TestProperty_NotifierMultipleSubscribers(t *testing.T) {
+	parameters := gopter.DefaultTestParameters()
+	parameters.MinSuccessfulTests = 100
+
+	properties := gopter.NewProperties(parameters)
+
+	properties.Property("Notifier Multiple Subscribers - all subscribers receive", prop.ForAll(
+		func(seed int) bool {
+			n := NewNotifier(100)
+			sub1 := n.Subscribe("sub_"+string(rune('0'+(seed%10))), nil)
+			ch1 := sub1.Ch
+			sub2 := n.Subscribe("sub_"+string(rune('0'+((seed+1)%10))), []string{"prefix-"})
+			ch2 := sub2.Ch
+
+			// ch1 should receive both notifications (no filter)
+			// ch2 should receive only "prefix-key" (has "prefix-" filter)
+
+			done1 := make(chan bool)
+			go func() {
+				count := 0
+				for range ch1 {
+					count++
+					if count == 2 {
+						close(done1)
+						return
+					}
+				}
+			}()
+
+			done2 := make(chan bool)
+			go func() {
+				notif := <-ch2
+				if notif.PartitionKey != "prefix-key" {
+					t.Errorf("ch2: expected 'prefix-key', got '%s'", notif.PartitionKey)
+				}
+				close(done2)
+			}()
+
+			// Give receivers time to start
+			time.Sleep(10 * time.Millisecond)
+
+			n.Publish(Notification{
+				Type:         PartitionCreated,
+				PartitionKey: "any-key",
+				PartitionID:  "id1",
+				LSN:          1,
+				Timestamp:    time.Now().UnixNano(),
+			})
+
+			n.Publish(Notification{
+				Type:         PartitionCreated,
+				PartitionKey: "prefix-key",
+				PartitionID:  "id2",
+				LSN:          2,
+				Timestamp:    time.Now().UnixNano(),
+			})
+
+			select {
+			case <-done1:
+				// Success
+			case <-time.After(time.Second):
+				t.Error("ch1 did not receive all notifications")
+				return false
+			}
+
+			select {
+			case <-done2:
+				// Success
+			case <-time.After(time.Second):
+				t.Error("ch2 did not receive 'prefix-key' notification")
+				return false
+			}
+
+			return true
+		},
+		gen.Int(),
+	))
+
+	properties.TestingRun(t)
+}
+
+// TestProperty_NotifierEmptyFilter tests that empty filter matches all
+func TestProperty_NotifierEmptyFilter(t *testing.T) {
+	parameters := gopter.DefaultTestParameters()
+	parameters.MinSuccessfulTests = 100
+
+	properties := gopter.NewProperties(parameters)
+
+	properties.Property("Notifier Empty Filter - empty filter matches all", prop.ForAll(
+		func(seed int) bool {
+			n := NewNotifier(100)
+			sub := n.Subscribe("sub_"+string(rune('0'+(seed%10))), []string{""})
+			ch := sub.Ch
+
+			done := make(chan bool)
+			go func() {
+				notif := <-ch
+				if notif.PartitionKey != "test-key" {
+					t.Errorf("expected 'test-key', got '%s'", notif.PartitionKey)
+				}
+				close(done)
+			}()
+
+			n.Publish(Notification{
+				Type:         PartitionCreated,
+				PartitionKey: "test-key",
+				PartitionID:  "test-id",
+				LSN:          1,
+				Timestamp:    time.Now().UnixNano(),
+			})
+
+			select {
+			case <-done:
+				return true
+			case <-time.After(time.Second):
+				t.Error("subscriber did not receive notification within timeout")
+				return false
+			}
+		},
+		gen.Int(),
+	))
+
+	properties.TestingRun(t)
+}
+
+// TestProperty_NotifierNilFilter tests that nil filter matches all
+func TestProperty_NotifierNilFilter(t *testing.T) {
+	parameters := gopter.DefaultTestParameters()
+	parameters.MinSuccessfulTests = 100
+
+	properties := gopter.NewProperties(parameters)
+
+	properties.Property("Notifier Nil Filter - nil filter matches all", prop.ForAll(
+		func(seed int) bool {
+			n := NewNotifier(100)
+			sub := n.Subscribe("sub_"+string(rune('0'+(seed%10))), nil)
+			ch := sub.Ch
+
+			done := make(chan bool)
+			go func() {
+				notif := <-ch
+				if notif.PartitionKey != "test-key" {
+					t.Errorf("expected 'test-key', got '%s'", notif.PartitionKey)
+				}
+				close(done)
+			}()
+
+			n.Publish(Notification{
+				Type:         PartitionCreated,
+				PartitionKey: "test-key",
+				PartitionID:  "test-id",
+				LSN:          1,
+				Timestamp:    time.Now().UnixNano(),
+			})
+
+			select {
+			case <-done:
+				return true
+			case <-time.After(time.Second):
+				t.Error("subscriber did not receive notification within timeout")
+				return false
+			}
+		},
+		gen.Int(),
+	))
+
+	properties.TestingRun(t)
+}
+
+// TestProperty_NotifierPrefixFilter tests prefix matching
+func TestProperty_NotifierPrefixFilter(t *testing.T) {
+	parameters := gopter.DefaultTestParameters()
+	parameters.MinSuccessfulTests = 100
+
+	properties := gopter.NewProperties(parameters)
+
+	properties.Property("Notifier Prefix Filter - prefix matching works", prop.ForAll(
+		func(seed int) bool {
+			n := NewNotifier(100)
+			sub := n.Subscribe("sub_"+string(rune('0'+(seed%10))), []string{"test-"})
+			ch := sub.Ch
+
+			done := make(chan bool)
+			go func() {
+				notif := <-ch
+				if notif.PartitionKey != "test-key" {
+					t.Errorf("expected 'test-key', got '%s'", notif.PartitionKey)
+				}
+				close(done)
+			}()
+
+			n.Publish(Notification{
+				Type:         PartitionCreated,
+				PartitionKey: "test-key",
+				PartitionID:  "test-id",
+				LSN:          1,
+				Timestamp:    time.Now().UnixNano(),
+			})
+
+			select {
+			case <-done:
+				return true
+			case <-time.After(time.Second):
+				t.Error("subscriber did not receive notification within timeout")
+				return false
+			}
+		},
+		gen.Int(),
+	))
+
+	properties.TestingRun(t)
+}
+
+// TestProperty_NotifierNoMatchFilter tests that non-matching prefix doesn't receive
+func TestProperty_NotifierNoMatchFilter(t *testing.T) {
+	parameters := gopter.DefaultTestParameters()
+	parameters.MinSuccessfulTests = 100
+
+	properties := gopter.NewProperties(parameters)
+
+	properties.Property("Notifier No Match Filter - non-matching prefix not received", prop.ForAll(
+		func(seed int) bool {
+			n := NewNotifier(100)
+			sub := n.Subscribe("sub_"+string(rune('0'+(seed%10))), []string{"other-"})
+			ch := sub.Ch
+
+			done := make(chan bool)
+			go func() {
+				select {
+				case <-ch:
+					t.Fatal("should not receive notification")
+				case <-time.After(100 * time.Millisecond):
+					close(done)
+				}
+			}()
+
+			n.Publish(Notification{
+				Type:         PartitionCreated,
+				PartitionKey: "test-key",
+				PartitionID:  "test-id",
+				LSN:          1,
+				Timestamp:    time.Now().UnixNano(),
+			})
+
+			select {
+			case <-done:
+				return true
+			case <-time.After(time.Second):
+				t.Error("timeout waiting for filter to work")
+				return false
+			}
+		},
+		gen.Int(),
+	))
+
+	properties.TestingRun(t)
+}
+
+// TestProperty_NotifierMultipleFilters tests multiple filters
+func TestProperty_NotifierMultipleFilters(t *testing.T) {
+	parameters := gopter.DefaultTestParameters()
+	parameters.MinSuccessfulTests = 100
+
+	properties := gopter.NewProperties(parameters)
+
+	properties.Property("Notifier Multiple Filters - any matching filter works", prop.ForAll(
+		func(seed int) bool {
+			n := NewNotifier(100)
+			sub := n.Subscribe("sub_"+string(rune('0'+(seed%10))), []string{"prefix1-", "prefix2-"})
+			ch := sub.Ch
+
+			done := make(chan bool)
+			go func() {
+				notif := <-ch
+				if notif.PartitionKey != "prefix2-key" {
+					t.Errorf("expected 'prefix2-key', got '%s'", notif.PartitionKey)
+				}
+				close(done)
+			}()
+
+			n.Publish(Notification{
+				Type:         PartitionCreated,
+				PartitionKey: "prefix2-key",
+				PartitionID:  "test-id",
+				LSN:          1,
+				Timestamp:    time.Now().UnixNano(),
+			})
+
+			select {
+			case <-done:
+				return true
+			case <-time.After(time.Second):
+				t.Error("subscriber did not receive notification within timeout")
+				return false
+			}
+		},
+		gen.Int(),
+	))
+
+	properties.TestingRun(t)
+}
+
+// TestProperty_NotifierConcurrentPublish tests concurrent publish safety
+func TestProperty_NotifierConcurrentPublish(t *testing.T) {
+	parameters := gopter.DefaultTestParameters()
+	parameters.MinSuccessfulTests = 100
+
+	properties := gopter.NewProperties(parameters)
+
+	properties.Property("Notifier Concurrent Publish - no race conditions", prop.ForAll(
+		func(seed int) bool {
+			n := NewNotifier(100)
+
+			// Create subscribers
+			numSubscribers := 10
+			for i := 0; i < numSubscribers; i++ {
+				n.Subscribe("sub_"+string(rune('0'+i)), nil)
+			}
+
+			// Concurrently publish from multiple goroutines
+			numGoroutines := 10
+			notificationsPerGoroutine := 100
+
+			done := make(chan bool, numGoroutines)
+
+			for i := 0; i < numGoroutines; i++ {
+				go func(goroutineID int) {
+					for j := 0; j < notificationsPerGoroutine; j++ {
+						n.Publish(Notification{
+							Type:         PartitionCreated,
+							PartitionKey: "key_" + string(rune('0'+goroutineID)) + "_" + string(rune('0'+j)),
+							PartitionID:  "id_" + string(rune('0'+goroutineID)) + "_" + string(rune('0'+j)),
+							LSN:          uint64(goroutineID*1000 + j),
+							Timestamp:    time.Now().UnixNano(),
+						})
+					}
+					done <- true
+				}(i)
+			}
+
+			for i := 0; i < numGoroutines; i++ {
+				<-done
+			}
+
+			return true
+		},
+		gen.Int(),
+	))
+
+	properties.TestingRun(t)
+}
+
+// TestProperty_NotifierClose tests Close functionality
+func TestProperty_NotifierClose(t *testing.T) {
+	parameters := gopter.DefaultTestParameters()
+	parameters.MinSuccessfulTests = 100
+
+	properties := gopter.NewProperties(parameters)
+
+	properties.Property("Notifier Close - all channels closed", prop.ForAll(
+		func(seed int) bool {
+			n := NewNotifier(100)
+
+			// Create subscribers
+			numSubscribers := 10
+			channels := make([]chan Notification, numSubscribers)
+			for i := 0; i < numSubscribers; i++ {
+				sub := n.Subscribe("sub_"+string(rune('0'+i)), nil)
+				channels[i] = sub.Ch
+			}
+
+			n.Close()
+
+			// All channels should be closed
+			for i := 0; i < numSubscribers; i++ {
+				select {
+				case _, ok := <-channels[i]:
+					if ok {
+						t.Errorf("channel %d should be closed", i)
+						return false
+					}
+				case <-time.After(100 * time.Millisecond):
+					t.Errorf("channel %d was not closed within timeout", i)
+					return false
+				}
+			}
+
+			return true
+		},
+		gen.Int(),
+	))
+
+	properties.TestingRun(t)
 }

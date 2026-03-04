@@ -72,6 +72,17 @@ func TestWALRecovery(t *testing.T) {
 		Router: config.RouterConfig{BufferSize: 1000},
 		Index:  config.IndexConfig{BucketCount: 64, MaxIndexes: 10, CreateThreshold: 100, DropThreshold: 5, CheckInterval: 5 * time.Minute},
 		Cache:  config.CacheConfig{NVMeDir: "", NVMeMaxBytes: 0, PrefetchEnabled: false},
+		Compaction: config.CompactionConfig{
+			CheckInterval:       2 * time.Minute,
+			MinPartitionSize:    64 * 1024 * 1024,
+			MaxPartitionsPerKey: 100,
+			TTLDays:             7,
+			Backpressure: config.BackpressureConfig{
+				MaxConcurrency:   8,
+				MinConcurrency:   1,
+				FailureThreshold: 0.05,
+			},
+		},
 	}
 
 	testApp, err := app.New(cfg)

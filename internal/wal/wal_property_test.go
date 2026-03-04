@@ -1,11 +1,10 @@
-// Package wal provides property-based tests for WAL durability and integrity.
+// Package wal provides a write-ahead log for durable write acknowledgment before asynchronous S3 upload.
 package wal
 
 import (
+	"os"
 	"path/filepath"
-	"reflect"
 	"testing"
-	"time"
 
 	"github.com/arkilian/arkilian/pkg/types"
 	"github.com/leanovate/gopter"
@@ -13,314 +12,460 @@ import (
 	"github.com/leanovate/gopter/prop"
 )
 
-// Validates: Requirements 16.1
-func TestWAL_Properties(t *testing.T) {
+// TestProperty_WAL_Durability tests Property V2-1: WAL Durability
+// For any sequence of Append calls, all entries are recoverable after close+reopen
+func TestProperty_WAL_Durability(t *testing.T) {
 	parameters := gopter.DefaultTestParameters()
 	parameters.MinSuccessfulTests = 100
-	parameters.MaxSize = 10 // Limit max size to keep tests fast
 
 	properties := gopter.NewProperties(parameters)
 
-	// Property V2-1: WAL Durability
-	// For any sequence of Append calls, all entries are recoverable after close+reopen
-	properties.Property("WAL Durability - all entries recoverable after close+reopen", prop.ForAll(
-		func(entries []testEntry) bool {
-			if len(entries) == 0 {
-				return true
-			}
-
+	properties.Property("V2-1: WAL Durability - all entries recoverable after close+reopen", prop.ForAll(
+		func(numEntries int) bool {
 			dir := t.TempDir()
 			wal, err := NewWAL(dir, 64*1024*1024)
 			if err != nil {
-				return false
+				t.Fatalf("failed to create WAL: %v", err)
 			}
 
-			// Append all entries
-			lsns := make([]uint64, len(entries))
-			for i, e := range entries {
-				entry := createTestEntry(e)
+			lsns := make([]uint64, numEntries)
+
+			for i := 0; i < numEntries; i++ {
+				entry := &Entry{
+					LSN:          0,
+					PartitionKey: "test-key",
+					Rows: []types.Row{
+						{
+							EventID:   []byte("01ARZ3NDEKTSV4RRFFQ69G5FAV"),
+							TenantID:  "tenant-1",
+							UserID:    123,
+							EventTime: 1640000000000000000,
+							EventType: "test",
+							Payload:   map[string]interface{}{"index": i},
+						},
+					},
+					Schema:    types.Schema{Version: 1},
+					Timestamp: 1640000000000000000,
+				}
+
 				lsn, err := wal.Append(entry)
 				if err != nil {
-					wal.Close()
-					return false
+					t.Fatalf("failed to append entry: %v", err)
 				}
 				lsns[i] = lsn
 			}
 
-			// Close WAL
 			if err := wal.Close(); err != nil {
-				return false
+				t.Fatalf("failed to close WAL: %v", err)
 			}
 
-			// Reopen WAL
 			wal2, err := NewWAL(dir, 64*1024*1024)
 			if err != nil {
-				return false
+				t.Fatalf("failed to reopen WAL: %v", err)
 			}
 			defer wal2.Close()
 
-			// Verify LSN continues from where it left off
-			if wal2.CurrentLSN() != lsns[len(lsns)-1] {
+			expectedLSN := uint64(numEntries)
+			if wal2.CurrentLSN() != expectedLSN {
+				t.Errorf("expected LSN %d, got %d", expectedLSN, wal2.CurrentLSN())
 				return false
 			}
 
-			// Read all entries from segment
 			segmentPath := filepath.Join(dir, "wal_0000000000000000.log")
-			readEntries, err := ReadEntries(segmentPath)
+			entries, err := ReadEntries(segmentPath)
 			if err != nil {
+				t.Fatalf("failed to read entries: %v", err)
+			}
+
+			if len(entries) != numEntries {
+				t.Errorf("expected %d entries, got %d", numEntries, len(entries))
 				return false
 			}
 
-			// Verify all entries are recoverable
-			if len(readEntries) != len(entries) {
-				return false
-			}
-
-			// Verify LSN ordering
-			for i, entry := range readEntries {
-				if entry.LSN != lsns[i] {
+			for i := 0; i < numEntries; i++ {
+				payloadIndex := entries[i].Rows[0].Payload["index"]
+				var index int
+				switch v := payloadIndex.(type) {
+				case float64:
+					index = int(v)
+				case int:
+					index = v
+				default:
+					t.Errorf("unexpected payload type: %T", payloadIndex)
+					return false
+				}
+				if index != i {
+					t.Errorf("expected entry %d, got %d", i, index)
 					return false
 				}
 			}
 
 			return true
 		},
-		genEntries(),
-	))
-
-	// Property V2-3: CRC Integrity
-	// For any entry, CRC at write matches CRC at read
-	properties.Property("CRC Integrity - CRC at write matches CRC at read", prop.ForAll(
-		func(entry testEntry) bool {
-			dir := t.TempDir()
-			wal, err := NewWAL(dir, 64*1024*1024)
-			if err != nil {
-				return false
-			}
-			defer wal.Close()
-
-			testEntry := createTestEntry(entry)
-			lsn, err := wal.Append(testEntry)
-			if err != nil {
-				return false
-			}
-
-			// Read entries back
-			segmentPath := filepath.Join(dir, "wal_0000000000000000.log")
-			readEntries, err := ReadEntries(segmentPath)
-			if err != nil {
-				return false
-			}
-
-			if len(readEntries) != 1 {
-				return false
-			}
-
-			readEntry := readEntries[0]
-			if readEntry.LSN != lsn {
-				return false
-			}
-
-			// Verify partition key
-			if readEntry.PartitionKey != testEntry.PartitionKey {
-				return false
-			}
-
-			// Verify row count
-			if len(readEntry.Rows) != len(testEntry.Rows) {
-				return false
-			}
-
-			return true
-		},
-		genEntry(),
-	))
-
-	// Property V2-4: WAL Ordering
-	// For any two entries, LSN ordering matches file ordering
-	properties.Property("WAL Ordering - LSN ordering matches file ordering", prop.ForAll(
-		func(entries []orderedEntry) bool {
-			if len(entries) < 2 {
-				return true
-			}
-
-			dir := t.TempDir()
-			wal, err := NewWAL(dir, 64*1024*1024)
-			if err != nil {
-				return false
-			}
-			defer wal.Close()
-
-			// Append entries in specific order
-			expectedOrder := make([]string, len(entries))
-			lsns := make([]uint64, len(entries))
-
-			for i, e := range entries {
-				entry := &Entry{
-					PartitionKey: e.partitionKey,
-					Rows: []types.Row{
-						{
-							EventID:   []byte(e.eventID),
-							TenantID:  e.tenantID,
-							UserID:    e.userID,
-							EventTime: e.eventTime,
-							EventType: e.eventType,
-							Payload:   e.payload,
-						},
-					},
-					Schema: types.Schema{
-						Version: 1,
-						Columns: []types.ColumnDef{
-							{Name: "event_id", Type: "TEXT", Nullable: false, PrimaryKey: true},
-							{Name: "tenant_id", Type: "TEXT", Nullable: false, PrimaryKey: false},
-							{Name: "user_id", Type: "INTEGER", Nullable: false, PrimaryKey: false},
-							{Name: "event_time", Type: "INTEGER", Nullable: false, PrimaryKey: false},
-							{Name: "event_type", Type: "TEXT", Nullable: false, PrimaryKey: false},
-							{Name: "payload", Type: "BLOB", Nullable: false, PrimaryKey: false},
-						},
-					},
-					Timestamp: time.Now().UnixNano(),
-				}
-				lsn, err := wal.Append(entry)
-				if err != nil {
-					return false
-				}
-				lsns[i] = lsn
-				expectedOrder[i] = e.partitionKey
-			}
-
-			// Read entries back
-			segmentPath := filepath.Join(dir, "wal_0000000000000000.log")
-			readEntries, err := ReadEntries(segmentPath)
-			if err != nil {
-				return false
-			}
-
-			if len(readEntries) != len(entries) {
-				return false
-			}
-
-			// Verify LSNs are monotonically increasing
-			for i := 1; i < len(lsns); i++ {
-				if lsns[i] <= lsns[i-1] {
-					return false
-				}
-			}
-
-			// Verify file order matches LSN order
-			for i, readEntry := range readEntries {
-				if readEntry.LSN != lsns[i] {
-					return false
-				}
-				if readEntry.PartitionKey != expectedOrder[i] {
-					return false
-				}
-			}
-
-			return true
-		},
-		genOrderedEntries(),
+		gen.IntRange(1, 100),
 	))
 
 	properties.TestingRun(t)
 }
 
-// testEntry is a generator-friendly entry structure
-type testEntry struct {
-	partitionKey string
-	eventID      string
-	tenantID     string
-	userID       int64
-	eventTime    int64
-	eventType    string
-	payload      map[string]interface{}
-}
+// TestProperty_WAL_CRCIntegrity tests Property V2-3: CRC Integrity
+// For any entry, CRC at write matches CRC at read
+func TestProperty_WAL_CRCIntegrity(t *testing.T) {
+	parameters := gopter.DefaultTestParameters()
+	parameters.MinSuccessfulTests = 100
 
-// genEntry generates a single test entry with reasonable constraints
-func genEntry() gopter.Gen {
-	return gen.Struct(
-		reflect.TypeOf(testEntry{}),
-		map[string]gopter.Gen{
-			"partitionKey": gen.AlphaString(),
-			"eventID":      gen.AlphaString(),
-			"tenantID":     gen.AlphaString(),
-			"userID":       gen.Int64Range(1, 1000000),
-			"eventTime":    gen.Int64Range(1609459200000000000, 1893456000000000000), // 2021-2030
-			"eventType":    gen.AlphaString(),
-			"payload":      gen.MapOf(gen.AlphaString(), gen.Int64Range(1, 1000)),
+	properties := gopter.NewProperties(parameters)
+
+	properties.Property("V2-3: CRC Integrity - CRC matches at read", prop.ForAll(
+		func(seed int) bool {
+			dir := t.TempDir()
+			wal, err := NewWAL(dir, 64*1024*1024)
+			if err != nil {
+				t.Fatalf("failed to create WAL: %v", err)
+			}
+
+			entry := &Entry{
+				LSN:          0,
+				PartitionKey: "test-key",
+				Rows: []types.Row{
+					{
+						EventID:   []byte("01ARZ3NDEKTSV4RRFFQ69G5FAV"),
+						TenantID:  "tenant-1",
+						UserID:    123,
+						EventTime: 1640000000000000000,
+						EventType: "test",
+						Payload:   map[string]interface{}{"value": seed},
+					},
+				},
+				Schema:    types.Schema{Version: 1},
+				Timestamp: 1640000000000000000,
+			}
+
+			_, err = wal.Append(entry)
+			if err != nil {
+				t.Fatalf("failed to append entry: %v", err)
+			}
+
+			if err := wal.Close(); err != nil {
+				t.Fatalf("failed to close WAL: %v", err)
+			}
+
+			segmentPath := filepath.Join(dir, "wal_0000000000000000.log")
+			entries, err := ReadEntries(segmentPath)
+			if err != nil {
+				t.Fatalf("failed to read entries: %v", err)
+			}
+
+			if len(entries) != 1 {
+				t.Errorf("expected 1 entry, got %d", len(entries))
+				return false
+			}
+
+			payloadValue := entries[0].Rows[0].Payload["value"]
+			var value int
+			switch v := payloadValue.(type) {
+			case float64:
+				value = int(v)
+			case int:
+				value = v
+			default:
+				t.Errorf("unexpected payload type: %T", payloadValue)
+				return false
+			}
+
+			return value == seed
 		},
-	)
+		gen.Int(),
+	))
+
+	properties.TestingRun(t)
 }
 
-// genEntries generates a slice of test entries with controlled size
-func genEntries() gopter.Gen {
-	return gen.SliceOf(
-		genEntry(),
-		reflect.TypeOf(testEntry{}),
-	).SuchThat(func(v interface{}) bool {
-		entries := v.([]testEntry)
-		return len(entries) >= 1 && len(entries) <= 10 // Reduced from 100 to 10
-	})
-}
+// TestProperty_WAL_Ordering tests Property V2-4: WAL Ordering
+// For any two entries, LSN ordering matches file ordering
+func TestProperty_WAL_Ordering(t *testing.T) {
+	parameters := gopter.DefaultTestParameters()
+	parameters.MinSuccessfulTests = 100
 
-// orderedEntry for ordering tests
-type orderedEntry struct {
-	partitionKey string
-	eventID      string
-	tenantID     string
-	userID       int64
-	eventTime    int64
-	eventType    string
-	payload      map[string]interface{}
-}
+	properties := gopter.NewProperties(parameters)
 
-// genOrderedEntries generates entries for ordering tests with controlled size
-func genOrderedEntries() gopter.Gen {
-	return gen.SliceOf(
-		gen.Struct(
-			reflect.TypeOf(orderedEntry{}),
-			map[string]gopter.Gen{
-				"partitionKey": gen.AlphaString(),
-				"eventID":      gen.AlphaString(),
-				"tenantID":     gen.AlphaString(),
-				"userID":       gen.Int64Range(1, 1000000),
-				"eventTime":    gen.Int64Range(1609459200000000000, 1893456000000000000), // 2021-2030
-				"eventType":    gen.AlphaString(),
-				"payload":      gen.MapOf(gen.AlphaString(), gen.Int64Range(1, 1000)),
-			},
-		),
-		reflect.TypeOf(orderedEntry{}),
-	).SuchThat(func(v interface{}) bool {
-		entries := v.([]orderedEntry)
-		return len(entries) >= 2 && len(entries) <= 10 // Reduced from 50 to 10
-	})
-}
+	properties.Property("V2-4: WAL Ordering - LSN ordering matches file ordering", prop.ForAll(
+		func(numEntries int) bool {
+			dir := t.TempDir()
+			wal, err := NewWAL(dir, 64*1024*1024)
+			if err != nil {
+				t.Fatalf("failed to create WAL: %v", err)
+			}
 
-// createTestEntry converts testEntry to Entry
-func createTestEntry(e testEntry) *Entry {
-	return &Entry{
-		PartitionKey: e.partitionKey,
-		Rows: []types.Row{
-			{
-				EventID:   []byte(e.eventID),
-				TenantID:  e.tenantID,
-				UserID:    e.userID,
-				EventTime: e.eventTime,
-				EventType: e.eventType,
-				Payload:   e.payload,
-			},
+			lsns := make([]uint64, numEntries)
+
+			for i := 0; i < numEntries; i++ {
+				entry := &Entry{
+					LSN:          0,
+					PartitionKey: "test-key",
+					Rows: []types.Row{
+						{
+							EventID:   []byte("01ARZ3NDEKTSV4RRFFQ69G5FAV"),
+							TenantID:  "tenant-1",
+							UserID:    123,
+							EventTime: 1640000000000000000,
+							EventType: "test",
+							Payload:   map[string]interface{}{"index": i},
+						},
+					},
+					Schema:    types.Schema{Version: 1},
+					Timestamp: 1640000000000000000,
+				}
+
+				lsn, err := wal.Append(entry)
+				if err != nil {
+					t.Fatalf("failed to append entry: %v", err)
+				}
+				lsns[i] = lsn
+			}
+
+			if err := wal.Close(); err != nil {
+				t.Fatalf("failed to close WAL: %v", err)
+			}
+
+			segmentPath := filepath.Join(dir, "wal_0000000000000000.log")
+			entries, err := ReadEntries(segmentPath)
+			if err != nil {
+				t.Fatalf("failed to read entries: %v", err)
+			}
+
+			for i := 0; i < len(entries)-1; i++ {
+				if entries[i].LSN >= entries[i+1].LSN {
+					t.Errorf("LSN ordering violation: entry %d has LSN %d, entry %d has LSN %d",
+						i, entries[i].LSN, i+1, entries[i+1].LSN)
+					return false
+				}
+			}
+
+			if len(entries) != numEntries {
+				t.Errorf("expected %d entries, got %d", numEntries, len(entries))
+				return false
+			}
+
+			for i := 0; i < numEntries; i++ {
+				if entries[i].LSN != uint64(i+1) {
+					t.Errorf("expected LSN %d, got %d", uint64(i+1), entries[i].LSN)
+					return false
+				}
+			}
+
+			return true
 		},
-		Schema: types.Schema{
-			Version: 1,
-			Columns: []types.ColumnDef{
-				{Name: "event_id", Type: "TEXT", Nullable: false, PrimaryKey: true},
-				{Name: "tenant_id", Type: "TEXT", Nullable: false, PrimaryKey: false},
-				{Name: "user_id", Type: "INTEGER", Nullable: false, PrimaryKey: false},
-				{Name: "event_time", Type: "INTEGER", Nullable: false, PrimaryKey: false},
-				{Name: "event_type", Type: "TEXT", Nullable: false, PrimaryKey: false},
-				{Name: "payload", Type: "BLOB", Nullable: false, PrimaryKey: false},
-			},
+		gen.IntRange(10, 50),
+	))
+
+	properties.TestingRun(t)
+}
+
+// TestWALProperty_AppendRecoveryRoundTrip tests a comprehensive round-trip property
+func TestWALProperty_AppendRecoveryRoundTrip(t *testing.T) {
+	parameters := gopter.DefaultTestParameters()
+	parameters.MinSuccessfulTests = 100
+
+	properties := gopter.NewProperties(parameters)
+
+	properties.Property("WAL Append-Recovery RoundTrip", prop.ForAll(
+		func(numEntries int) bool {
+			dir := t.TempDir()
+
+			wal, err := NewWAL(dir, 64*1024*1024)
+			if err != nil {
+				t.Fatalf("failed to create WAL: %v", err)
+			}
+
+			createdEntries := make([]*Entry, numEntries)
+
+			for i := 0; i < numEntries; i++ {
+				entry := &Entry{
+					LSN:          0,
+					PartitionKey: "test-key",
+					Rows: []types.Row{
+						{
+							EventID:   []byte("01ARZ3NDEKTSV4RRFFQ69G5FAV"),
+							TenantID:  "tenant-1",
+							UserID:    123,
+							EventTime: 1640000000000000000,
+							EventType: "test",
+							Payload:   map[string]interface{}{"index": i, "seed": numEntries},
+						},
+					},
+					Schema:    types.Schema{Version: 1},
+					Timestamp: 1640000000000000000,
+				}
+
+				_, err := wal.Append(entry)
+				if err != nil {
+					t.Fatalf("failed to append entry: %v", err)
+				}
+				createdEntries[i] = entry
+			}
+
+			if err := wal.Close(); err != nil {
+				t.Fatalf("failed to close WAL: %v", err)
+			}
+
+			wal2, err := NewWAL(dir, 64*1024*1024)
+			if err != nil {
+				t.Fatalf("failed to reopen WAL: %v", err)
+			}
+			defer wal2.Close()
+
+			segmentPath := filepath.Join(dir, "wal_0000000000000000.log")
+			readEntries, err := ReadEntries(segmentPath)
+			if err != nil {
+				t.Fatalf("failed to read entries: %v", err)
+			}
+
+			if len(readEntries) != numEntries {
+				t.Errorf("expected %d entries, got %d", numEntries, len(readEntries))
+				return false
+			}
+
+			for i := 0; i < numEntries; i++ {
+				if readEntries[i].PartitionKey != createdEntries[i].PartitionKey {
+					t.Errorf("entry %d: partition key mismatch", i)
+					return false
+				}
+
+				if len(readEntries[i].Rows) != len(createdEntries[i].Rows) {
+					t.Errorf("entry %d: row count mismatch", i)
+					return false
+				}
+
+				readPayload := readEntries[i].Rows[0].Payload
+				createdPayload := createdEntries[i].Rows[0].Payload
+
+				readIndex := readPayload["index"]
+				createdIndex := createdPayload["index"]
+
+				var readIdxVal, createdIdxVal int
+				switch v := readIndex.(type) {
+				case float64:
+					readIdxVal = int(v)
+				case int:
+					readIdxVal = v
+				}
+				switch v := createdIndex.(type) {
+				case float64:
+					createdIdxVal = int(v)
+				case int:
+					createdIdxVal = v
+				}
+
+				if readIdxVal != createdIdxVal {
+					t.Errorf("entry %d: index mismatch - read %d, created %d", i, readIdxVal, createdIdxVal)
+					return false
+				}
+			}
+
+			return true
 		},
-		Timestamp: time.Now().UnixNano(),
-	}
+		gen.IntRange(1, 100),
+	))
+
+	properties.TestingRun(t)
+}
+
+// TestWALProperty_MultipleSegments tests ordering across segment boundaries
+func TestWALProperty_MultipleSegments(t *testing.T) {
+	parameters := gopter.DefaultTestParameters()
+	parameters.MinSuccessfulTests = 100
+
+	properties := gopter.NewProperties(parameters)
+
+	properties.Property("WAL Multiple Segments - LSN ordering preserved", prop.ForAll(
+		func(seed int) bool {
+			dir := t.TempDir()
+			wal, err := NewWAL(dir, 1024)
+			if err != nil {
+				t.Fatalf("failed to create WAL: %v", err)
+			}
+
+			numEntries := 50
+			lsns := make([]uint64, numEntries)
+
+			for i := 0; i < numEntries; i++ {
+				entry := &Entry{
+					LSN:          0,
+					PartitionKey: "test-key",
+					Rows: []types.Row{
+						{
+							EventID:   []byte("01ARZ3NDEKTSV4RRFFQ69G5FAV"),
+							TenantID:  "tenant-1",
+							UserID:    123,
+							EventTime: 1640000000000000000,
+							EventType: "test",
+							Payload:   map[string]interface{}{"index": i, "large": "x"},
+						},
+					},
+					Schema:    types.Schema{Version: 1},
+					Timestamp: 1640000000000000000,
+				}
+
+				lsn, err := wal.Append(entry)
+				if err != nil {
+					t.Fatalf("failed to append entry: %v", err)
+				}
+				lsns[i] = lsn
+			}
+
+			if err := wal.Close(); err != nil {
+				t.Fatalf("failed to close WAL: %v", err)
+			}
+
+			entries, err := os.ReadDir(dir)
+			if err != nil {
+				t.Fatalf("failed to read dir: %v", err)
+			}
+
+			segmentCount := 0
+			for _, e := range entries {
+				if e.Name()[:4] == "wal_" {
+					segmentCount++
+				}
+			}
+
+			if segmentCount < 2 {
+				t.Errorf("expected multiple segments, got %d", segmentCount)
+				return false
+			}
+
+			var allEntries []*Entry
+			for i := 0; i < len(entries); i++ {
+				if entries[i].Name()[:4] != "wal_" {
+					continue
+				}
+				segmentPath := filepath.Join(dir, entries[i].Name())
+				segEntries, err := ReadEntries(segmentPath)
+				if err != nil {
+					t.Logf("failed to read segment %s: %v", segmentPath, err)
+					continue
+				}
+				allEntries = append(allEntries, segEntries...)
+			}
+
+			if len(allEntries) != numEntries {
+				t.Errorf("expected %d entries, got %d", numEntries, len(allEntries))
+				return false
+			}
+
+			for i := 0; i < len(allEntries)-1; i++ {
+				if allEntries[i].LSN >= allEntries[i+1].LSN {
+					t.Errorf("LSN ordering violation at entry %d: %d >= %d",
+						i, allEntries[i].LSN, allEntries[i+1].LSN)
+					return false
+				}
+			}
+
+			return true
+		},
+		gen.Int(),
+	))
+
+	properties.TestingRun(t)
 }
