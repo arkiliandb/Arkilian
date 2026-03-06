@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"testing"
 
+	_ "github.com/mattn/go-sqlite3"
+
 	"github.com/arkilian/arkilian/internal/storage"
 	"github.com/leanovate/gopter"
 	"github.com/leanovate/gopter/gen"

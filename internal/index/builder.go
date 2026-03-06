@@ -11,7 +11,6 @@ import (
 	"sync"
 
 	"github.com/arkilian/arkilian/internal/storage"
-	_ "github.com/mattn/go-sqlite3"
 )
 
 // Builder builds secondary index partitions from data partitions.

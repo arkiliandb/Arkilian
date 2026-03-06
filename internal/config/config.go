@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -65,6 +66,9 @@ type Config struct {
 
 	// Router configuration
 	Router RouterConfig `json:"router" yaml:"router"`
+
+	// V3 configuration (ArkFormat, shared WAL, etc.)
+	V3 V3Config `json:"v3" yaml:"v3"`
 }
 
 // WALConfig holds write-ahead log configuration.
@@ -258,6 +262,63 @@ type S3Config struct {
 	Endpoint string `json:"endpoint" yaml:"endpoint"`
 }
 
+// V3Config holds Arkilian V3 configuration (ArkFormat, shared WAL, etc.)
+type V3Config struct {
+	ArkFormat  ArkFormatConfig    `json:"ark_format" yaml:"ark_format"`
+	SharedWAL  SharedWALConfig    `json:"shared_wal" yaml:"shared_wal"`
+	Compaction V3CompactionConfig `json:"v3_compaction" yaml:"v3_compaction"`
+	Catalog    CatalogConfig      `json:"catalog" yaml:"catalog"`
+	HotColumn  HotColumnConfig    `json:"hot_column" yaml:"hot_column"`
+	Migration  MigrationConfig    `json:"migration" yaml:"migration"`
+}
+
+// ArkFormatConfig holds ArkFormat file format configuration.
+type ArkFormatConfig struct {
+	TargetFileSizeMB int     `json:"target_file_size_mb" yaml:"target_file_size_mb"` // default: 128
+	Compression      string  `json:"compression" yaml:"compression"`                  // default: "zstd"
+	BloomFPR         float64 `json:"bloom_fpr" yaml:"bloom_fpr"`                      // default: 0.003
+	PGMEpsilon       int     `json:"pgm_epsilon" yaml:"pgm_epsilon"`                  // default: 64
+}
+
+// SharedWALConfig holds shared distributed WAL configuration.
+type SharedWALConfig struct {
+	Enabled       bool     `json:"enabled" yaml:"enabled"`                         // default: false
+	RaftPeers     []string `json:"raft_peers" yaml:"raft_peers"`                   // required if enabled
+	RaftDataDir   string   `json:"raft_data_dir" yaml:"raft_data_dir"`             // required if enabled
+	SegmentSizeMB int      `json:"segment_size_mb" yaml:"segment_size_mb"`         // default: 64
+	GRPCPort      int      `json:"grpc_port" yaml:"grpc_port"`                     // default: 9090
+}
+
+// V3CompactionConfig holds V3 compaction engine configuration.
+type V3CompactionConfig struct {
+	HourlyCron  string `json:"hourly_cron" yaml:"hourly_cron"`       // default: "0 * * * *"
+	Workers     int    `json:"workers" yaml:"workers"`               // default: runtime.NumCPU() * 2
+	RAMBudgetMB int    `json:"ram_budget_mb" yaml:"ram_budget_mb"`   // default: 2048
+	TmpDir      string `json:"tmp_dir" yaml:"tmp_dir"`
+}
+
+// CatalogConfig holds catalog service configuration.
+type CatalogConfig struct {
+	ShardCount  int    `json:"shard_count" yaml:"shard_count"`     // default: 64
+	SnapshotDir string `json:"snapshot_dir" yaml:"snapshot_dir"`
+	GRPCPort    int    `json:"grpc_port" yaml:"grpc_port"`         // default: 9091
+}
+
+// HotColumnConfig holds hot-column detection and sorted run configuration.
+type HotColumnConfig struct {
+	CreateThreshold int64         `json:"create_threshold" yaml:"create_threshold"` // default: 200
+	DropThreshold   int64         `json:"drop_threshold" yaml:"drop_threshold"`     // default: 10
+	CheckInterval   time.Duration `json:"check_interval" yaml:"check_interval"`     // default: 5m
+	MaxHotColumns   int           `json:"max_hot_columns" yaml:"max_hot_columns"`   // default: 10
+}
+
+// MigrationConfig holds V2 → V3 migration configuration.
+type MigrationConfig struct {
+	Phase     string `json:"phase" yaml:"phase"`           // "A", "B", "C", or empty
+	Workers   int    `json:"workers" yaml:"workers"`       // default: 32
+	DualWrite bool   `json:"dual_write" yaml:"dual_write"` // Phase A only
+}
+
 // DefaultConfig returns the default configuration for local development.
 func DefaultConfig() *Config {
 	return &Config{
@@ -340,6 +401,43 @@ func DefaultConfig() *Config {
 		},
 		Router: RouterConfig{
 			BufferSize: 1000,
+		},
+		V3: V3Config{
+			ArkFormat: ArkFormatConfig{
+				TargetFileSizeMB: 128,
+				Compression:      "zstd",
+				BloomFPR:         0.003,
+				PGMEpsilon:       64,
+			},
+			SharedWAL: SharedWALConfig{
+				Enabled:       false,
+				RaftPeers:     nil,
+				RaftDataDir:   "",
+				SegmentSizeMB: 64,
+				GRPCPort:      9090,
+			},
+			Compaction: V3CompactionConfig{
+				HourlyCron:  "0 * * * *",
+				Workers:     runtime.NumCPU() * 2,
+				RAMBudgetMB: 2048,
+				TmpDir:      "",
+			},
+			Catalog: CatalogConfig{
+				ShardCount:  64,
+				SnapshotDir: "",
+				GRPCPort:    9091,
+			},
+			HotColumn: HotColumnConfig{
+				CreateThreshold: 200,
+				DropThreshold:   10,
+				CheckInterval:   5 * time.Minute,
+				MaxHotColumns:   10,
+			},
+			Migration: MigrationConfig{
+				Phase:     "",
+				Workers:   32,
+				DualWrite: false,
+			},
 		},
 	}
 }
@@ -465,6 +563,11 @@ func (c *Config) Validate() error {
 		return err
 	}
 
+	// Validate V3 config
+	if err := c.validateV3Config(); err != nil {
+		return err
+	}
+
 	return nil
 }
 
@@ -511,6 +614,97 @@ func (c *Config) validateAdaptiveSizing() error {
 		prevThreshold = tier.ThresholdGB
 	}
 
+	return nil
+}
+
+// validateV3Config checks the V3 configuration.
+func (c *Config) validateV3Config() error {
+	v3 := c.V3
+	
+	// Only validate V3 config if V3 is being used (SharedWAL enabled or any V3 field set)
+	// Check if any V3 field is non-zero (indicating user explicitly set it)
+	v3InUse := v3.SharedWAL.Enabled ||
+		v3.ArkFormat.TargetFileSizeMB != 0 ||
+		v3.ArkFormat.Compression != "" ||
+		v3.ArkFormat.BloomFPR != 0 ||
+		v3.ArkFormat.PGMEpsilon != 0 ||
+		len(v3.SharedWAL.RaftPeers) > 0 ||
+		v3.SharedWAL.RaftDataDir != "" ||
+		v3.SharedWAL.SegmentSizeMB != 0 ||
+		v3.SharedWAL.GRPCPort != 0 ||
+		v3.Compaction.HourlyCron != "" ||
+		v3.Compaction.Workers != 0 ||
+		v3.Compaction.RAMBudgetMB != 0 ||
+		v3.Compaction.TmpDir != "" ||
+		v3.Catalog.ShardCount != 0 ||
+		v3.Catalog.SnapshotDir != "" ||
+		v3.Catalog.GRPCPort != 0 ||
+		v3.HotColumn.CreateThreshold != 0 ||
+		v3.HotColumn.DropThreshold != 0 ||
+		v3.HotColumn.CheckInterval != 0 ||
+		v3.HotColumn.MaxHotColumns != 0 ||
+		v3.Migration.Phase != "" ||
+		v3.Migration.Workers != 0 ||
+		v3.Migration.DualWrite
+	
+	if !v3InUse {
+		// V3 not in use, skip validation
+		return nil
+	}
+	
+	// Validate SharedWAL config
+	if v3.SharedWAL.Enabled {
+		if len(v3.SharedWAL.RaftPeers) == 0 {
+			return arkilianerrors.New(arkilianerrors.ErrCategoryValidation, "INVALID_V3_CONFIG",
+				"v3.shared_wal.raft_peers must not be empty when shared_wal.enabled is true")
+		}
+		if v3.SharedWAL.RaftDataDir == "" {
+			return arkilianerrors.New(arkilianerrors.ErrCategoryValidation, "INVALID_V3_CONFIG",
+				"v3.shared_wal.raft_data_dir must not be empty when shared_wal.enabled is true")
+		}
+	}
+	
+	// Validate ArkFormat config (only if set)
+	if v3.ArkFormat.TargetFileSizeMB != 0 {
+		if v3.ArkFormat.TargetFileSizeMB != 64 && v3.ArkFormat.TargetFileSizeMB != 128 && v3.ArkFormat.TargetFileSizeMB != 256 {
+			return arkilianerrors.New(arkilianerrors.ErrCategoryValidation, "INVALID_V3_CONFIG",
+				fmt.Sprintf("v3.ark_format.target_file_size_mb must be 64, 128, or 256, got %d", v3.ArkFormat.TargetFileSizeMB))
+		}
+	}
+	if v3.ArkFormat.BloomFPR != 0 {
+		if v3.ArkFormat.BloomFPR <= 0 || v3.ArkFormat.BloomFPR >= 0.1 {
+			return arkilianerrors.New(arkilianerrors.ErrCategoryValidation, "INVALID_V3_CONFIG",
+				fmt.Sprintf("v3.ark_format.bloom_fpr must be > 0 and < 0.1, got %f", v3.ArkFormat.BloomFPR))
+		}
+	}
+	if v3.ArkFormat.PGMEpsilon != 0 {
+		if v3.ArkFormat.PGMEpsilon <= 0 {
+			return arkilianerrors.New(arkilianerrors.ErrCategoryValidation, "INVALID_V3_CONFIG",
+				fmt.Sprintf("v3.ark_format.pgm_epsilon must be > 0, got %d", v3.ArkFormat.PGMEpsilon))
+		}
+	}
+	
+	// Validate HotColumn config (only if set)
+	if v3.HotColumn.CreateThreshold != 0 || v3.HotColumn.DropThreshold != 0 {
+		if v3.HotColumn.CreateThreshold <= v3.HotColumn.DropThreshold {
+			return arkilianerrors.New(arkilianerrors.ErrCategoryValidation, "INVALID_V3_CONFIG",
+				fmt.Sprintf("v3.hot_column.create_threshold (%d) must be > drop_threshold (%d)", 
+					v3.HotColumn.CreateThreshold, v3.HotColumn.DropThreshold))
+		}
+	}
+	if v3.HotColumn.MaxHotColumns != 0 {
+		if v3.HotColumn.MaxHotColumns <= 0 || v3.HotColumn.MaxHotColumns > 50 {
+			return arkilianerrors.New(arkilianerrors.ErrCategoryValidation, "INVALID_V3_CONFIG",
+				fmt.Sprintf("v3.hot_column.max_hot_columns must be > 0 and <= 50, got %d", v3.HotColumn.MaxHotColumns))
+		}
+	}
+	
+	// Validate Migration config
+	if v3.Migration.Phase != "" && v3.Migration.Phase != "A" && v3.Migration.Phase != "B" && v3.Migration.Phase != "C" {
+		return arkilianerrors.New(arkilianerrors.ErrCategoryValidation, "INVALID_V3_CONFIG",
+			fmt.Sprintf("v3.migration.phase must be one of \"A\", \"B\", \"C\", or empty, got %s", v3.Migration.Phase))
+	}
+	
 	return nil
 }
 
@@ -719,6 +913,92 @@ func LoadFromEnv(cfg *Config) {
 	// Router configuration
 	if v := os.Getenv("ARKILIAN_ROUTER_BUFFER_SIZE"); v != "" {
 		fmt.Sscanf(v, "%d", &cfg.Router.BufferSize)
+	}
+
+	// V3 configuration
+	if v := os.Getenv("ARKILIAN_V3_ENABLED"); v != "" {
+		cfg.V3.ArkFormat.TargetFileSizeMB = 128 // Default when V3 enabled
+		cfg.V3.SharedWAL.Enabled = v == "true" || v == "1"
+	}
+	
+	// Shared WAL configuration
+	if v := os.Getenv("ARKILIAN_V3_WAL_RAFT_PEERS"); v != "" {
+		cfg.V3.SharedWAL.RaftPeers = strings.Split(v, ",")
+	}
+	if v := os.Getenv("ARKILIAN_V3_WAL_RAFT_DATA_DIR"); v != "" {
+		cfg.V3.SharedWAL.RaftDataDir = v
+	}
+	if v := os.Getenv("ARKILIAN_V3_WAL_SEGMENT_SIZE_MB"); v != "" {
+		fmt.Sscanf(v, "%d", &cfg.V3.SharedWAL.SegmentSizeMB)
+	}
+	if v := os.Getenv("ARKILIAN_V3_WAL_GRPC_PORT"); v != "" {
+		fmt.Sscanf(v, "%d", &cfg.V3.SharedWAL.GRPCPort)
+	}
+	
+	// ArkFormat configuration
+	if v := os.Getenv("ARKILIAN_V3_ARKFORMAT_TARGET_FILE_SIZE_MB"); v != "" {
+		fmt.Sscanf(v, "%d", &cfg.V3.ArkFormat.TargetFileSizeMB)
+	}
+	if v := os.Getenv("ARKILIAN_V3_ARKFORMAT_COMPRESSION"); v != "" {
+		cfg.V3.ArkFormat.Compression = v
+	}
+	if v := os.Getenv("ARKILIAN_V3_ARKFORMAT_BLOOM_FPR"); v != "" {
+		fmt.Sscanf(v, "%f", &cfg.V3.ArkFormat.BloomFPR)
+	}
+	if v := os.Getenv("ARKILIAN_V3_ARKFORMAT_PGM_EPSILON"); v != "" {
+		fmt.Sscanf(v, "%d", &cfg.V3.ArkFormat.PGMEpsilon)
+	}
+	
+	// Compaction configuration
+	if v := os.Getenv("ARKILIAN_V3_COMPACTION_WORKERS"); v != "" {
+		fmt.Sscanf(v, "%d", &cfg.V3.Compaction.Workers)
+	}
+	if v := os.Getenv("ARKILIAN_V3_COMPACTION_RAM_BUDGET_MB"); v != "" {
+		fmt.Sscanf(v, "%d", &cfg.V3.Compaction.RAMBudgetMB)
+	}
+	if v := os.Getenv("ARKILIAN_V3_COMPACTION_TMP_DIR"); v != "" {
+		cfg.V3.Compaction.TmpDir = v
+	}
+	if v := os.Getenv("ARKILIAN_V3_COMPACTION_HOURLY_CRON"); v != "" {
+		cfg.V3.Compaction.HourlyCron = v
+	}
+	
+	// Catalog configuration
+	if v := os.Getenv("ARKILIAN_V3_CATALOG_SHARD_COUNT"); v != "" {
+		fmt.Sscanf(v, "%d", &cfg.V3.Catalog.ShardCount)
+	}
+	if v := os.Getenv("ARKILIAN_V3_CATALOG_SNAPSHOT_DIR"); v != "" {
+		cfg.V3.Catalog.SnapshotDir = v
+	}
+	if v := os.Getenv("ARKILIAN_V3_CATALOG_GRPC_PORT"); v != "" {
+		fmt.Sscanf(v, "%d", &cfg.V3.Catalog.GRPCPort)
+	}
+	
+	// Hot column configuration
+	if v := os.Getenv("ARKILIAN_V3_HOT_COLUMN_CREATE_THRESHOLD"); v != "" {
+		fmt.Sscanf(v, "%d", &cfg.V3.HotColumn.CreateThreshold)
+	}
+	if v := os.Getenv("ARKILIAN_V3_HOT_COLUMN_DROP_THRESHOLD"); v != "" {
+		fmt.Sscanf(v, "%d", &cfg.V3.HotColumn.DropThreshold)
+	}
+	if v := os.Getenv("ARKILIAN_V3_HOT_COLUMN_CHECK_INTERVAL"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			cfg.V3.HotColumn.CheckInterval = d
+		}
+	}
+	if v := os.Getenv("ARKILIAN_V3_HOT_COLUMN_MAX_COLUMNS"); v != "" {
+		fmt.Sscanf(v, "%d", &cfg.V3.HotColumn.MaxHotColumns)
+	}
+	
+	// Migration configuration
+	if v := os.Getenv("ARKILIAN_V3_MIGRATION_PHASE"); v != "" {
+		cfg.V3.Migration.Phase = v
+	}
+	if v := os.Getenv("ARKILIAN_V3_MIGRATION_WORKERS"); v != "" {
+		fmt.Sscanf(v, "%d", &cfg.V3.Migration.Workers)
+	}
+	if v := os.Getenv("ARKILIAN_V3_MIGRATION_DUAL_WRITE"); v != "" {
+		cfg.V3.Migration.DualWrite = v == "true" || v == "1"
 	}
 
 	// Map ARKILIAN_AWS_ credentials to standard AWS_ credentials for the SDK

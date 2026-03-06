@@ -136,3 +136,43 @@ func TestConvenienceConstructors(t *testing.T) {
 		t.Error("NewInternalError mismatch")
 	}
 }
+
+func TestV3ErrorCategories(t *testing.T) {
+	// Test V3 error categories
+	formatErr := NewFormatError(CodeFormatCorrupt, "corrupt file", nil)
+	if formatErr.Category != ErrCategoryFormat {
+		t.Errorf("Expected ErrCategoryFormat, got %v", formatErr.Category)
+	}
+
+	raftErr := NewRaftError(CodeRaftLeaderLost, "leader lost", nil)
+	if raftErr.Category != ErrCategoryRaft {
+		t.Errorf("Expected ErrCategoryRaft, got %v", raftErr.Category)
+	}
+
+	catalogErr := NewCatalogError(CodeCatalogShardDown, "shard down", nil)
+	if catalogErr.Category != ErrCategoryCatalog {
+		t.Errorf("Expected ErrCategoryCatalog, got %v", catalogErr.Category)
+	}
+}
+
+func TestV3ErrorRetryableFlags(t *testing.T) {
+	// Test retryable flags for V3 errors
+	tests := []struct {
+		category ErrorCategory
+		code     string
+		expected bool
+	}{
+		{ErrCategoryRaft, CodeRaftLeaderLost, true},
+		{ErrCategoryRaft, CodeRaftCommitFailed, true},
+		{ErrCategoryFormat, CodeFormatCorrupt, false},
+		{ErrCategoryCatalog, CodeCatalogShardDown, true},
+	}
+
+	for _, tt := range tests {
+		err := New(tt.category, tt.code, "test")
+		if IsRetryable(err) != tt.expected {
+			t.Errorf("IsRetryable for %s:%s = %v, want %v", 
+				tt.category, tt.code, IsRetryable(err), tt.expected)
+		}
+	}
+}

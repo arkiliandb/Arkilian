@@ -373,6 +373,10 @@ func (p *Parser) getPrecedence() int {
 		return precOr
 	case TokenAnd:
 		return precAnd
+	case TokenNot:
+		// NOT has high precedence as a prefix operator, but when followed by IN/LIKE/BETWEEN
+		// it should be treated as part of those operators
+		return precCompare
 	case TokenEq, TokenNe, TokenLt, TokenGt, TokenLe, TokenGe, TokenLike, TokenIn, TokenBetween, TokenIs:
 		return precCompare
 	case TokenPlus, TokenMinus:
@@ -418,6 +422,10 @@ func (p *Parser) parsePrefixExpression() (Expression, error) {
 	case TokenLParen:
 		return p.parseGroupedExpression()
 	case TokenNot:
+		// Check for NOT IN, NOT LIKE, NOT BETWEEN
+		if p.peekTokenIs(TokenIn) || p.peekTokenIs(TokenLike) || p.peekTokenIs(TokenBetween) {
+			return p.parseNotInfix(nil)
+		}
 		return p.parseNotExpression()
 	case TokenMinus:
 		return p.parseUnaryMinus()
@@ -778,8 +786,11 @@ func (p *Parser) parseIsExpression(left Expression) (Expression, error) {
 
 // parseNotInfix parses NOT IN, NOT LIKE, NOT BETWEEN.
 func (p *Parser) parseNotInfix(left Expression) (Expression, error) {
-	p.nextToken() // Skip NOT
-
+	// left has already been parsed (e.g., "tenant_id" in "tenant_id NOT IN (...)")
+	// The NOT token has already been consumed by parseInfixExpression (matched in switch)
+	// But we need to skip it to get to IN/LIKE/BETWEEN
+	p.nextToken()
+	
 	switch p.curToken.Type {
 	case TokenIn:
 		return p.parseInExpression(left, true)

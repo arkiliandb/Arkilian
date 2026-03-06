@@ -21,6 +21,12 @@ const (
 	ErrCategoryWAL        ErrorCategory = "WAL"
 	ErrCategoryIndex      ErrorCategory = "INDEX"
 	ErrCategoryCache      ErrorCategory = "CACHE"
+	// V3 error categories
+	ErrCategoryFormat  ErrorCategory = "FORMAT"
+	ErrCategoryRaft    ErrorCategory = "RAFT"
+	ErrCategoryPGM     ErrorCategory = "PGM"
+	ErrCategoryRoaring ErrorCategory = "ROARING"
+	ErrCategoryCatalog ErrorCategory = "CATALOG"
 )
 
 // Error codes for each category.
@@ -69,6 +75,26 @@ const (
 	// Cache codes
 	CodeCacheEvictionFailed = "CACHE_EVICTION_FAILED"
 	CodeCacheFull           = "CACHE_FULL"
+
+	// V3 Format codes
+	CodeFormatCorrupt      = "FORMAT_CORRUPT"
+	CodeFormatChecksumFail = "FORMAT_CHECKSUM_FAIL"
+	CodeFormatUnsupported  = "FORMAT_UNSUPPORTED_VERSION"
+
+	// V3 Raft codes
+	CodeRaftLeaderLost      = "RAFT_LEADER_LOST"
+	CodeRaftCommitFailed    = "RAFT_COMMIT_FAILED"
+	CodeRaftElectionTimeout = "RAFT_ELECTION_TIMEOUT"
+
+	// V3 PGM codes
+	CodePGMLookupFailed = "PGM_LOOKUP_FAILED"
+
+	// V3 Roaring codes
+	CodeRoaringOOM = "ROARING_OOM"
+
+	// V3 Catalog codes
+	CodeCatalogShardDown    = "CATALOG_SHARD_DOWN"
+	CodeCatalogRecoveryFail = "CATALOG_RECOVERY_FAIL"
 )
 
 // ArkilianError is the structured error type used throughout the system.
@@ -179,6 +205,15 @@ func isRetryable(category ErrorCategory, code string) bool {
 		return true
 	case category == ErrCategoryCache && code == CodeCacheFull:
 		return false
+	// V3 retryable flags
+	case category == ErrCategoryRaft && code == CodeRaftLeaderLost:
+		return true
+	case category == ErrCategoryRaft && code == CodeRaftCommitFailed:
+		return true
+	case category == ErrCategoryFormat && code == CodeFormatCorrupt:
+		return false
+	case category == ErrCategoryCatalog && code == CodeCatalogShardDown:
+		return true
 	default:
 		return false
 	}
@@ -220,4 +255,18 @@ func NewIndexError(code, message string, cause error) *ArkilianError {
 
 func NewCacheError(code, message string, cause error) *ArkilianError {
 	return Wrap(ErrCategoryCache, code, message, cause)
+}
+
+// V3 convenience constructors
+
+func NewFormatError(code, message string, cause error) *ArkilianError {
+	return Wrap(ErrCategoryFormat, code, message, cause)
+}
+
+func NewRaftError(code, message string, cause error) *ArkilianError {
+	return Wrap(ErrCategoryRaft, code, message, cause)
+}
+
+func NewCatalogError(code, message string, cause error) *ArkilianError {
+	return Wrap(ErrCategoryCatalog, code, message, cause)
 }
