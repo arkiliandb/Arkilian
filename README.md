@@ -130,9 +130,57 @@ go test -v -bench=BenchmarkProd -run=TestProd -benchtime=2x -timeout=300s ./test
 ./arkilian --mode compact --data-dir /data/arkilian
 ```
 
+### Local-Only Mode (No Ports)
+
+For local development and simple use cases, use `arkilian-local` which runs all services in a single process without network ports:
+
+```bash
+# Run local mode (all services, no network ports)
+./arkilian-local --data-dir /data/arkilian-local
+
+# Or with a config file
+./arkilian-local --config config-local.yaml
+```
+
+**Key differences from the main binary:**
+
+- No HTTP ports (8080, 8081, 8082)
+- No gRPC server
+- All services run in-process
+- Simpler configuration
+- Perfect for local development and testing
+
+**When to use `arkilian-local`:**
+
+- Local development and testing
+- Single-node deployments
+- CI/CD environments
+- Learning and experimentation
+- When you want a simpler setup without managing multiple services
+
+**When to use the main `arkilian` binary:**
+
+- Production deployments
+- Multi-node clusters
+- When you need HTTP/gRPC APIs
+- When you need to run services separately
+- When you need to expose the database to other services
+
 ## API
 
-### Ingest Data
+### Using the Local Binary
+
+When using `arkilian-local`, you access the database directly through the data directory. The database files are stored in:
+
+- **Data directory**: `--data-dir` (default: `./data/arkilian`)
+- **Manifest**: `{data-dir}/manifest.db` (or sharded in `{data-dir}/manifest_*.db`)
+- **Storage**: `{data-dir}/storage/` (partition files)
+- **Downloads**: `{data-dir}/downloads/` (cached partitions for queries)
+- **Compaction**: `{data-dir}/compaction/` (work files)
+
+### Ingest Data (HTTP API)
+
+For the main `arkilian` binary with HTTP API:
 
 ```bash
 curl -X POST http://localhost:8080/v1/ingest \
@@ -164,7 +212,9 @@ curl -X POST http://localhost:8080/v1/ingest \
 
 The response includes an LSN (Log Sequence Number) for tracking. The partition_id becomes available after the background flusher processes the WAL entry (typically <1s).
 
-### Query Data
+### Query Data (HTTP API)
+
+For the main `arkilian` binary with HTTP API:
 
 ```bash
 curl -X POST http://localhost:8081/v1/query \

@@ -18,7 +18,8 @@ COPY . .
 # Build binaries for all services
 RUN CGO_ENABLED=1 GOOS=linux go build -ldflags="-w -s" -o /go/bin/arkilian-ingest ./cmd/arkilian-ingest && \
     CGO_ENABLED=1 GOOS=linux go build -ldflags="-w -s" -o /go/bin/arkilian-query ./cmd/arkilian-query && \
-    CGO_ENABLED=1 GOOS=linux go build -ldflags="-w -s" -o /go/bin/arkilian-compact ./cmd/arkilian-compact
+    CGO_ENABLED=1 GOOS=linux go build -ldflags="-w -s" -o /go/bin/arkilian-compact ./cmd/arkilian-compact && \
+    CGO_ENABLED=1 GOOS=linux go build -ldflags="-w -s" -o /go/bin/arkilian-local ./cmd/arkilian-local
 
 # Stage 2: Runtime
 # Use distroless for security (no shell, no package manager)
@@ -30,6 +31,7 @@ WORKDIR /
 COPY --from=builder /go/bin/arkilian-ingest /usr/local/bin/
 COPY --from=builder /go/bin/arkilian-query /usr/local/bin/
 COPY --from=builder /go/bin/arkilian-compact /usr/local/bin/
+COPY --from=builder /go/bin/arkilian-local /usr/local/bin/
 
 # Expose ports (Ingest: 8080. Query: 8081)
 EXPOSE 8080 8081
