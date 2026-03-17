@@ -1,0 +1,3 @@
+[submodule "dep/sqlite"]
+	path = dep/sqlite
+	url = git@github.com:/sqlite/sqlite
