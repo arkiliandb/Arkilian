@@ -75,7 +75,7 @@ int db_init(arkilian **db_ptr, const char *filename) {
   if (hThread == NULL) {
     fprintf(stderr, "Failed to create backup thread\n");
   } else {
-    CloseHandle(hThread); // Detach equivalent 
+    CloseHandle(hThread); // Detach equivalent
   }
 #else
   pthread_t backup_thread;
@@ -185,8 +185,8 @@ void *run_hourly_backup(void *arg) {
       printf("Backup file made\n");
       const char *api_endpoint = "http://localhost:3000/get-signed-url";
       char *signed_url = get_signed_url(api_endpoint);
-      printf("Signed URL: %s\n", signed_url);
-      if (signed_url) {
+      // printf("Signed URL: %s\n", signed_url);
+      if (signed_url && signed_url != NULL && strlen(signed_url) > 5) {
         int status = upload_to_s3(signed_url, backup_path);
         if (status == 0) {
           printf("S3 Upload Successful!\n");
@@ -194,8 +194,9 @@ void *run_hourly_backup(void *arg) {
           fprintf(stderr, "S3 Upload Failed with status: %d\n", status);
         }
         free(signed_url);
+      } else {
+        fprintf(stderr, "Backup failed: Signed URL is null or empty\n");
       }
-      printf("\nBackup file uploaded\n");
     } else {
       fprintf(stderr, "Backup failed with error code: %d\n", status);
     }
