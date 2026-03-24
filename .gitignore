@@ -14,3 +14,4 @@ src/app.sqlite
 src/backup.sqlite
 serve.js
 .DS_Store
+build/
