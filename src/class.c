@@ -2,11 +2,15 @@
 
 #include "class.h"
 #include <curl/curl.h>
+#ifdef _WIN32
+#include <windows.h>
+#else
 #include <pthread.h>
+#include <unistd.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 // deps
 #include "deps/sqlite/sqlite3.h"
 
@@ -25,7 +29,11 @@ struct Memory {
 
 // forward declarations
 int backup_database(sqlite3 *pSource, const char *zFilename);
+#ifdef _WIN32
+DWORD WINAPI run_hourly_backup(LPVOID arg);
+#else
 void *run_hourly_backup(void *arg);
+#endif
 char *get_signed_url(const char *api_endpoint);
 int upload_to_s3(const char *signed_url, const char *file_path);
 
@@ -62,13 +70,22 @@ int db_init(arkilian **db_ptr, const char *filename) {
   // run_hourly_backup(db);
 
   // NOTE TO ME: Use this for prod
+#ifdef _WIN32
+  HANDLE hThread = CreateThread(NULL, 0, run_hourly_backup, db, 0, NULL);
+  if (hThread == NULL) {
+    fprintf(stderr, "Failed to create backup thread\n");
+  } else {
+    CloseHandle(hThread); // Detach equivalent 
+  }
+#else
   pthread_t backup_thread;
   if (pthread_create(&backup_thread, NULL, run_hourly_backup, db) != 0) {
     fprintf(stderr, "Failed to create backup thread\n");
   } else {
-    // Detach the thread so it cleans up after itself and runs independently????
+    // Detach the thread so it cleans up after itself and runs independently
     pthread_detach(backup_thread);
   }
+#endif
   return 0;
 }
 
@@ -142,13 +159,26 @@ int backup_database(sqlite3 *pSource, const char *zFilename) {
   return rc;
 }
 
+#ifdef _WIN32
+DWORD WINAPI run_hourly_backup(LPVOID arg) {
+#else
 void *run_hourly_backup(void *arg) {
+#endif
   const char *backup_path = "backup.sqlite";
   arkilian *db = (arkilian *)arg;
   while (1) {
-    sleep(10);
+#ifdef _WIN32
+    Sleep(10 * 1000); // milliseconds
+#else
+    sleep(10); // seconds
+#endif
+
     if (!db->is_open || db->handle == NULL) {
+#ifdef _WIN32
+      return 0;
+#else
       pthread_exit(NULL);
+#endif
     }
     int status = backup_database(db->handle, backup_path);
     if (status == SQLITE_OK) {
@@ -170,7 +200,11 @@ void *run_hourly_backup(void *arg) {
       fprintf(stderr, "Backup failed with error code: %d\n", status);
     }
   }
+#ifdef _WIN32
+  return 0;
+#else
   return NULL;
+#endif
 }
 
 static size_t write_cb(void *data, size_t size, size_t nmemb, void *userp) {

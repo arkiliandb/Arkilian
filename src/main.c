@@ -1,20 +1,17 @@
 // Arkilian SQLite Wrapper - C API
 
-/*
-TODOs
 
-- [ ] Set up CMakeLists.txt for cross-platform builds (Windows MSVC, macOS
-Clang, Linux GCC)
-- [ ] Verify clean compilation on all three OS targets with strict warnings
-enabled
-- [ ] Set up CI (GitHub Actions) for Windows, macOS, Linux builds
-*/
 
 // main.c
 #include "class.h"
 #include <stdio.h>
 #include <stdlib.h>
+#ifdef _WIN32
+#include <windows.h>
+#define sleep(x) Sleep((x) * 1000)
+#else
 #include <unistd.h>
+#endif
 
 int main(void) {
   arkilian *db = NULL;
