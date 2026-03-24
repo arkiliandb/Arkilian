@@ -187,11 +187,11 @@ void *run_hourly_backup(void *arg) {
       char *signed_url = get_signed_url(api_endpoint);
       // printf("Signed URL: %s\n", signed_url);
       if (signed_url && signed_url != NULL && strlen(signed_url) > 5) {
-        int status = upload_to_s3(signed_url, backup_path);
-        if (status == 0) {
+        int upload_status = upload_to_s3(signed_url, backup_path);
+        if (upload_status == 0) {
           printf("S3 Upload Successful!\n");
         } else {
-          fprintf(stderr, "S3 Upload Failed with status: %d\n", status);
+          fprintf(stderr, "S3 Upload Failed with status: %d\n", upload_status);
         }
         free(signed_url);
       } else {
@@ -250,8 +250,8 @@ int upload_to_s3(const char *signed_url, const char *file_path) {
 
   // Get file size
   fseek(fd, 0L, SEEK_END);
-  float file_size = ftell(fd);
-  printf("Backup size: %fmb\n", (file_size / 1024) / 1024);
+  long file_size = ftell(fd);
+  printf("Backup size: %fmb\n", ((float)file_size / 1024.0f) / 1024.0f);
   rewind(fd);
 
   curl_easy_setopt(curl, CURLOPT_URL, signed_url);
