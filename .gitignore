@@ -3,6 +3,14 @@ video.mp4
 .env  
 todo-app
 .DS_Store
+./**/.DS_Store
 sqlite-amalgamation-3510300.zip
 arkilian
-source/**.db
+src/**.db
+src/main.c
+uploaded_backup.sqlite
+uploaded_backup.db
+src/app.sqlite
+src/backup.sqlite
+serve.js
+.DS_Store
