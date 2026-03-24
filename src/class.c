@@ -75,7 +75,7 @@ int db_init(arkilian **db_ptr, const char *filename) {
   if (hThread == NULL) {
     fprintf(stderr, "Failed to create backup thread\n");
   } else {
-    CloseHandle(hThread); // Detach equivalent
+    CloseHandle(hThread);
   }
 #else
   pthread_t backup_thread;
