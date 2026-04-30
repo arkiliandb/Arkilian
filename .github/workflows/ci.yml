@@ -40,14 +40,16 @@ jobs:
     - name: Install Dependencies (Windows)
       if: matrix.os == 'windows-latest'
       run: |
-        git clone https://github.com/microsoft/vcpkg.git $env:RUNNER_TEMP/vcpkg
-        $env:RUNNER_TEMP/vcpkg/bootstrap-vcpkg.bat
-        $env:RUNNER_TEMP/vcpkg/vcpkg install curl:x64-windows
+        $vcpkgPath = "${{ runner.temp }}/vcpkg"
+        git clone https://github.com/microsoft/vcpkg.git $vcpkgPath
+        & "$vcpkgPath/bootstrap-vcpkg.bat"
+        & "$vcpkgPath/vcpkg" install curl:x64-windows
+        echo "VCPKG_ROOT=$vcpkgPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
       shell: pwsh
 
     - name: Configure CMake (Windows)
       if: matrix.os == 'windows-latest'
-      run: cmake -B build -S . -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE="$env:RUNNER_TEMP/vcpkg/scripts/buildsystems/vcpkg.cmake" -DARKILIAN_BUILD_EXAMPLES=OFF
+      run: cmake -B build -S . -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" -DARKILIAN_BUILD_EXAMPLES=OFF
       shell: pwsh
 
     - name: Configure CMake (Unix)
