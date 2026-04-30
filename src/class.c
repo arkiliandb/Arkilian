@@ -1,5 +1,10 @@
 // Arkilian SQLite Wrapper - C API
 
+// Enable POSIX features for portable functions
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#endif
+
 #include "class.h"
 #include <curl/curl.h>
 #ifdef _WIN32
@@ -77,9 +82,15 @@ int db_init(arkilian **db_ptr, const char *filename) {
   const char *db_path = (filename != NULL) ? filename :
                         get_env_default("ARKILIAN_DB_PATH", DEFAULT_DB_PATH);
 
-  // Backup configuration
-  db->backup_path = strdup(get_env_default("ARKILIAN_BACKUP_PATH", DEFAULT_BACKUP_PATH));
-  db->signed_url_endpoint = strdup(get_env_default("ARKILIAN_SIGNED_URL_ENDPOINT", DEFAULT_SIGNED_URL_ENDPOINT));
+  // Backup configuration (using portable string copy instead of strdup)
+  const char *backup_path_tmp = get_env_default("ARKILIAN_BACKUP_PATH", DEFAULT_BACKUP_PATH);
+  db->backup_path = malloc(strlen(backup_path_tmp) + 1);
+  if (db->backup_path) strcpy(db->backup_path, backup_path_tmp);
+  
+  const char *signed_url_tmp = get_env_default("ARKILIAN_SIGNED_URL_ENDPOINT", DEFAULT_SIGNED_URL_ENDPOINT);
+  db->signed_url_endpoint = malloc(strlen(signed_url_tmp) + 1);
+  if (db->signed_url_endpoint) strcpy(db->signed_url_endpoint, signed_url_tmp);
+  
   db->backup_interval = get_env_int_default("ARKILIAN_BACKUP_INTERVAL", DEFAULT_BACKUP_INTERVAL);
   db->backup_enabled = get_env_int_default("ARKILIAN_ENABLE_BACKUP", 1);
 
