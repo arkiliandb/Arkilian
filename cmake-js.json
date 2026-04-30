@@ -1,0 +1,10 @@
+{
+  "name": "arkilian",
+  "version": "1.0.0",
+  "description": "CMake.js configuration for Arkilian",
+  "binary": {
+    "module_name": "arkilian",
+    "module_path": "./prebuilds/{platform}-{arch}",
+    "host": "https://github.com/CodeDynasty-dev/birth-of-Arkilian/releases/download/{version}"
+  }
+}

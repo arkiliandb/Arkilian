@@ -20,12 +20,38 @@ struct arkilian {
   char last_error_msg[256];
   int is_open;
   int has_new_writes;
+  // Backup config
+  char *backup_path;
+  char *signed_url_endpoint;
+  int backup_interval;
+  int backup_enabled;
 };
 
 struct Memory {
   char *response;
   size_t size;
 };
+
+// Config defaults
+#define DEFAULT_DB_PATH "app.sqlite"
+#define DEFAULT_BACKUP_PATH "backup.sqlite"
+#define DEFAULT_BACKUP_INTERVAL 3600
+#define DEFAULT_SIGNED_URL_ENDPOINT ""
+
+// Helper to get env var with default
+static const char* get_env_default(const char *env_var, const char *default_val) {
+  const char *val = getenv(env_var);
+  return (val && strlen(val) > 0) ? val : default_val;
+}
+
+// Helper to get env var as int with default
+static int get_env_int_default(const char *env_var, int default_val) {
+  const char *val = getenv(env_var);
+  if (val && strlen(val) > 0) {
+    return atoi(val);
+  }
+  return default_val;
+}
 
 // forward declarations
 int backup_database(sqlite3 *pSource, const char *zFilename);
@@ -44,16 +70,27 @@ int db_init(arkilian **db_ptr, const char *filename) {
   if (!db)
     return 1;
   db->is_open = 0;
+  db->has_new_writes = 0;
+  db->last_error_msg[0] = '\0';
 
-  const char *actualPath = (filename != NULL) ? filename : "app.sqlite";
+  // Get configuration from environment
+  const char *db_path = (filename != NULL) ? filename :
+                        get_env_default("ARKILIAN_DB_PATH", DEFAULT_DB_PATH);
+
+  // Backup configuration
+  db->backup_path = strdup(get_env_default("ARKILIAN_BACKUP_PATH", DEFAULT_BACKUP_PATH));
+  db->signed_url_endpoint = strdup(get_env_default("ARKILIAN_SIGNED_URL_ENDPOINT", DEFAULT_SIGNED_URL_ENDPOINT));
+  db->backup_interval = get_env_int_default("ARKILIAN_BACKUP_INTERVAL", DEFAULT_BACKUP_INTERVAL);
+  db->backup_enabled = get_env_int_default("ARKILIAN_ENABLE_BACKUP", 1);
 
   int rc = sqlite3_open_v2(
-      actualPath, &db->handle,
+      db_path, &db->handle,
       SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX, NULL);
 
   if (rc != SQLITE_OK) {
-    // Capture the error
-    const char *err = sqlite3_errmsg(db->handle);
+    db->handle = NULL;
+    // Capture error using error code (no handle needed)
+    const char *err = sqlite3_errstr(rc);
     strncpy(db->last_error_msg, err, sizeof(db->last_error_msg) - 1);
     db->last_error_msg[sizeof(db->last_error_msg) - 1] = '\0';
     *db_ptr = db;
@@ -61,31 +98,32 @@ int db_init(arkilian **db_ptr, const char *filename) {
   }
 
   db->is_open = 1;
-  db->has_new_writes = 0;
-  db->last_error_msg[0] = '\0';
   *db_ptr = db;
-
   // Backup system
   // NOTE TO ME: Use this for test
   // run_hourly_backup(db);
-
-  // NOTE TO ME: Use this for prod
+  // Start backup thread if enabled
+  if (db->backup_enabled && db->signed_url_endpoint && strlen(db->signed_url_endpoint) > 0) {
 #ifdef _WIN32
-  HANDLE hThread = CreateThread(NULL, 0, run_hourly_backup, db, 0, NULL);
-  if (hThread == NULL) {
-    fprintf(stderr, "Failed to create backup thread\n");
-  } else {
-    CloseHandle(hThread);
-  }
+    HANDLE hThread = CreateThread(NULL, 0, run_hourly_backup, db, 0, NULL);
+    if (hThread == NULL) {
+      fprintf(stderr, "Failed to create backup thread\n");
+    } else {
+      CloseHandle(hThread);
+    }
 #else
-  pthread_t backup_thread;
-  if (pthread_create(&backup_thread, NULL, run_hourly_backup, db) != 0) {
-    fprintf(stderr, "Failed to create backup thread\n");
-  } else {
-    // Detach the thread so it cleans up after itself and runs independently
-    pthread_detach(backup_thread);
-  }
+    pthread_t backup_thread;
+    if (pthread_create(&backup_thread, NULL, run_hourly_backup, db) != 0) {
+      fprintf(stderr, "Failed to create backup thread\n");
+    } else {
+      // Detach the thread so it cleans up after itself and runs independently
+      pthread_detach(backup_thread);
+    }
 #endif
+  } else if (db->backup_enabled) {
+    fprintf(stderr, "Backup disabled: ARKILIAN_SIGNED_URL_ENDPOINT not set\n");
+  }
+
   return 0;
 }
 
@@ -97,6 +135,8 @@ void db_close(arkilian *db) {
     db->handle = NULL;
     db->is_open = 0;
   }
+  if (db->backup_path) free(db->backup_path);
+  if (db->signed_url_endpoint) free(db->signed_url_endpoint);
   free(db);
 }
 
@@ -117,8 +157,9 @@ int backup_database(sqlite3 *pSource, const char *zFilename) {
   sqlite3 *pDest = NULL;
   sqlite3_backup *pBackup = NULL;
 
-  const char *actualPath = (zFilename != NULL) ? zFilename : "backup.sqlite";
-  rc = sqlite3_open_v2(actualPath, &pDest, SQLITE_OPEN_READWRITE, NULL);
+  const char *actualPath = (zFilename != NULL) ? zFilename : DEFAULT_BACKUP_PATH;
+  rc = sqlite3_open_v2(actualPath, &pDest,
+                       SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, NULL);
 
   if (rc != SQLITE_OK) {
     fprintf(stderr, "Backup Error: Cannot open destination file %s: %s\n",
@@ -164,13 +205,12 @@ DWORD WINAPI run_hourly_backup(LPVOID arg) {
 #else
 void *run_hourly_backup(void *arg) {
 #endif
-  const char *backup_path = "backup.sqlite";
   arkilian *db = (arkilian *)arg;
   while (1) {
 #ifdef _WIN32
-    Sleep(10 * 1000); // milliseconds
+    Sleep(db->backup_interval * 1000);
 #else
-    sleep(10); // seconds
+    sleep(db->backup_interval);
 #endif
 
     if (!db->is_open || db->handle == NULL) {
@@ -180,14 +220,13 @@ void *run_hourly_backup(void *arg) {
       pthread_exit(NULL);
 #endif
     }
-    int status = backup_database(db->handle, backup_path);
+
+    int status = backup_database(db->handle, db->backup_path);
     if (status == SQLITE_OK) {
       printf("Backup file made\n");
-      const char *api_endpoint = "http://localhost:3000/get-signed-url";
-      char *signed_url = get_signed_url(api_endpoint);
-      // printf("Signed URL: %s\n", signed_url);
+      char *signed_url = get_signed_url(db->signed_url_endpoint);
       if (signed_url && signed_url != NULL && strlen(signed_url) > 5) {
-        int upload_status = upload_to_s3(signed_url, backup_path);
+        int upload_status = upload_to_s3(signed_url, db->backup_path);
         if (upload_status == 0) {
           printf("S3 Upload Successful!\n");
         } else {
@@ -271,5 +310,3 @@ int upload_to_s3(const char *signed_url, const char *file_path) {
 
   return (res == CURLE_OK) ? 0 : 1;
 }
-
-// ============================================================================

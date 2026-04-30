@@ -1,17 +1,47 @@
-.kiro/ 
-video.mp4
-.env  
-todo-app
-.DS_Store
-./**/.DS_Store
-sqlite-amalgamation-3510300.zip
-arkilian
-src/**.db
-src/main.c
-uploaded_backup.sqlite
-uploaded_backup.db
-src/app.sqlite
-src/backup.sqlite
-serve.js
-.DS_Store
+# IDE and editor files
+.kiro/
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Build artifacts
 build/
+cmake-build-*/
+*.o
+*.obj
+*.exe
+arkilian
+arkilian_example
+
+# macOS
+.DS_Store
+/**/.DS_Store
+
+# Logs and databases
+*.sqlite
+*.db
+*.sqlite-journal
+*.sqlite-wal
+uploaded_backup.*
+
+# Environment and secrets
+.env
+.env.local
+
+# Archives
+*.zip
+*.tar.gz
+*.tgz
+
+# Media
+video.mp4
+
+# Application specific
+todo-app/
+serve.js
+
+# Testing
+*.gcov
+*.gcda
+*.gcno

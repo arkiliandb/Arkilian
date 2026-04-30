@@ -5,13 +5,27 @@ on:
     branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
+  release:
+    types: [created]
 
 jobs:
   build:
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-    
+        include:
+          - os: ubuntu-latest
+            artifact-suffix: linux-x64
+            shared-lib: libarkilian.so
+            static-lib: libarkilian.a
+          - os: macos-latest
+            artifact-suffix: darwin-x64
+            shared-lib: libarkilian.dylib
+            static-lib: libarkilian.a
+          - os: windows-latest
+            artifact-suffix: windows-x64
+            shared-lib: arkilian.dll
+            static-lib: arkilian.lib
+
     runs-on: ${{ matrix.os }}
 
     steps:
@@ -27,15 +41,65 @@ jobs:
       if: matrix.os == 'windows-latest'
       run: vcpkg install curl:x64-windows
 
-    - name: Configure CMake
-      run: |
-        if [ "$RUNNER_OS" == "Windows" ]; then
-          cmake -B build -S . -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE="$VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
-        else
-          cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
-        fi
-      shell: bash
+    - name: Configure CMake (Windows)
+      if: matrix.os == 'windows-latest'
+      run: cmake -B build -S . -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE="$VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" -DARKILIAN_BUILD_EXAMPLES=OFF
+
+    - name: Configure CMake (Unix)
+      if: matrix.os != 'windows-latest'
+      run: cmake -B build -S . -DCMAKE_BUILD_TYPE=Release -DARKILIAN_BUILD_EXAMPLES=OFF
 
     - name: Build
       run: cmake --build build --config Release
 
+    - name: Upload Build Artifacts (Shared)
+      if: github.event_name == 'release'
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ github.event.release.upload_url }}
+        asset_path: ./build/${{ matrix.shared-lib }}
+        asset_name: ${{ matrix.shared-lib }}
+        asset_content_type: application/octet-stream
+
+    - name: Upload Build Artifacts (Static)
+      if: github.event_name == 'release'
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ github.event.release.upload_url }}
+        asset_path: ./build/${{ matrix.static-lib }}
+        asset_name: ${{ matrix.static-lib }}
+        asset_content_type: application/octet-stream
+
+    - name: Upload Header
+      if: github.event_name == 'release' && matrix.os == 'ubuntu-latest'
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ github.event.release.upload_url }}
+        asset_path: ./src/class.h
+        asset_name: class.h
+        asset_content_type: text/plain
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libcurl4-openssl-dev
+
+    - name: Configure CMake
+      run: cmake -B build -S . -DCMAKE_BUILD_TYPE=Debug -DARKILIAN_BUILD_EXAMPLES=ON
+
+    - name: Build
+      run: cmake --build build --config Debug
+
+    - name: Run Example
+      run: ./build/arkilian_example

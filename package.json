@@ -1,0 +1,38 @@
+{
+  "name": "arkilian",
+  "version": "1.0.0",
+  "description": "Arkilian - SQLite wrapper with automated cloud backup for C, C++, Node.js, and Python",
+  "main": "index.js",
+  "scripts": {
+    "install": "node-pre-gyp install || cmake-js compile",
+    "build": "cmake-js compile",
+    "test": "echo \"Tests not yet implemented\" && exit 0"
+  },
+  "keywords": [
+    "sqlite",
+    "database",
+    "backup",
+    "s3",
+    "c",
+    "cpp",
+    "node",
+    "python"
+  ],
+  "author": "CodeDynasty-dev",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/CodeDynasty-dev/birth-of-Arkilian.git"
+  },
+  "dependencies": {
+    "@mapbox/node-pre-gyp": "^1.0.11"
+  },
+  "devDependencies": {
+    "cmake-js": "^6.2.1"
+  },
+  "binary": {
+    "module_name": "arkilian",
+    "module_path": "./lib/binding/{configuration}/{toolset}/{name}",
+    "host": "https://github.com/CodeDynasty-dev/birth-of-Arkilian/releases/download/{version}"
+  }
+}

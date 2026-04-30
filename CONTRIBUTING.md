@@ -12,6 +12,9 @@ In order to keep Arkilian legally secure and technically robust, we place a barr
 1. **Discuss First:** You must open a GitHub Issue and receive explicit design approval from a core maintainer before opening a Pull Request. **No unapproved PRs will be reviewed.**
 2. **Immaculate Code:** Your code must compile with absolutely zero warnings under `-Wall -Wextra -Wpedantic -Werror` across macOS, Linux, and Windows. A single warning failing the CI pipeline immediately closes the PR.
 3. **Comprehensive Testing:** Every logic change must include tests and undergo rigorous memory safety verification. Memory leaks or undefined behavior are automatic grounds for rejection.
+   - Tests should be placed in the `tests/` directory
+   - Enable tests with: `cmake -B build -S . -DARKILIAN_BUILD_TESTS=ON`
+   - Run tests: `./build/test_basic`
 4. **Atomic, Clean History:** Commits must be squashed and logically separated.
 
 ## Bug Reports
@@ -22,6 +25,7 @@ When reporting a bug, please:
 1. Provide a clear description of the problem.
 2. Include reproducible steps and any relevant log traces.
 3. State what version of Arkilian and operating system you are using.
+4. Include relevant environment variables (with secrets redacted).
 
 **Important:** If you intend to submit a patch to fix the bug, please explicitly state your intentions within the issue. Wait for a core maintainer to assign or approve the fix before writing code.
 
@@ -30,6 +34,30 @@ When reporting a bug, please:
 You are welcome to suggest new features.
 
 Please open an Issue for discussion. Major architectural or API changes require extensive technical vetting from the core team and will face rigorous scrutiny. Only after the core team explicitly approves the proposal should you begin implementing the feature. 
+
+## Build Instructions for Contributors
+
+```bash
+# Clone the repository
+git clone https://github.com/CodeDynasty-dev/birth-of-Arkilian.git
+cd birth-of-Arkilian
+
+# Build with all options enabled (for development)
+cmake -B build -S . -DCMAKE_BUILD_TYPE=Debug -DARKILIAN_BUILD_TESTS=ON -DARKILIAN_BUILD_EXAMPLES=ON
+
+# Compile
+cmake --build build --config Debug
+
+# Run tests
+./build/test_basic
+
+# Run example
+./build/arkilian_example
+```
+
+## Environment Variables
+
+When contributing, be aware that Arkilian uses `ARKILIAN_` prefixed environment variables for configuration. See `README.md` for the full list.
 
 ## Your Own Forks
 
