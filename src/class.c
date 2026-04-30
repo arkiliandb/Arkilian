@@ -43,6 +43,7 @@ struct arkilian {
 struct Memory {
   char *response;
   size_t size;
+  int shutdown_flag; // Pointer to arkilian->shutdown_requested
 };
 
 // Config defaults
@@ -91,7 +92,7 @@ DWORD WINAPI run_hourly_backup(LPVOID arg);
 #else
 void *run_hourly_backup(void *arg);
 #endif
-char *get_signed_url(const char *api_endpoint);
+char *get_signed_url(const char *api_endpoint, int *shutdown_flag);
 int upload_to_s3(const char *signed_url, const char *file_path);
 
 int db_init(arkilian **db_ptr, const char *filename) {
@@ -285,7 +286,7 @@ void *run_hourly_backup(void *arg) {
     int status = backup_database(db->handle, db->backup_path);
     if (status == SQLITE_OK) {
       printf("Backup file made\n");
-      char *signed_url = get_signed_url(db->signed_url_endpoint);
+      char *signed_url = get_signed_url(db->signed_url_endpoint, &db->shutdown_requested);
       printf("----> %s", signed_url);
       if (signed_url && signed_url != NULL && strlen(signed_url) > 5) {
         int upload_status = upload_to_s3(signed_url, db->backup_path);
@@ -310,8 +311,14 @@ void *run_hourly_backup(void *arg) {
 }
 
 static size_t write_cb(void *data, size_t size, size_t nmemb, void *userp) {
-  size_t realsize = size * nmemb;
   struct Memory *mem = (struct Memory *)userp;
+
+  // Check shutdown flag - return 0 to abort transfer
+  if (mem->shutdown_flag) {
+    return 0;
+  }
+
+  size_t realsize = size * nmemb;
   char *ptr = realloc(mem->response, mem->size + realsize + 1);
   if (!ptr)
     return 0;
@@ -322,13 +329,20 @@ static size_t write_cb(void *data, size_t size, size_t nmemb, void *userp) {
   return realsize;
 }
 
-char *get_signed_url(const char *api_endpoint) {
+char *get_signed_url(const char *api_endpoint, int *shutdown_flag) {
   CURL *curl = curl_easy_init();
-  struct Memory chunk = {malloc(1), 0};
+  struct Memory chunk;
+  chunk.response = malloc(1);
+  chunk.size = 0;
+  chunk.shutdown_flag = shutdown_flag ? *shutdown_flag : 0;
+
   if (curl) {
     curl_easy_setopt(curl, CURLOPT_URL, api_endpoint);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_cb);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)&chunk);
+    // Timeout settings - fail fast if endpoint is unresponsive
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L); // 10 second total timeout
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5L); // 5 second connection timeout
 
     CURLcode res = curl_easy_perform(curl);
     curl_easy_cleanup(curl);
