@@ -37,13 +37,23 @@ jobs:
         sudo apt-get update
         sudo apt-get install -y libcurl4-openssl-dev
 
+    - name: Install vcpkg (Windows)
+      if: matrix.os == 'windows-latest'
+      uses: lukka/run-vcpkg@v11
+      with:
+        vcpkgDirectory: '${{ runner.temp }}/vcpkg'
+        vcpkgGitCommitId: '3b3bd424827a1f7f7f2d793a1d7ea5d5a8ebdead'
+
     - name: Install Dependencies (Windows)
       if: matrix.os == 'windows-latest'
-      run: vcpkg install curl:x64-windows
+      run: |
+        ${{ runner.temp }}/vcpkg/vcpkg install curl:x64-windows
+      shell: pwsh
 
     - name: Configure CMake (Windows)
       if: matrix.os == 'windows-latest'
-      run: cmake -B build -S . -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE="$VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" -DARKILIAN_BUILD_EXAMPLES=OFF
+      run: cmake -B build -S . -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE="${{ runner.temp }}/vcpkg/scripts/buildsystems/vcpkg.cmake" -DARKILIAN_BUILD_EXAMPLES=OFF
+      shell: pwsh
 
     - name: Configure CMake (Unix)
       if: matrix.os != 'windows-latest'
