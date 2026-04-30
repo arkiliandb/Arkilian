@@ -41,7 +41,7 @@ struct Memory {
 #define DEFAULT_DB_PATH "app.sqlite"
 #define DEFAULT_BACKUP_PATH "backup.sqlite"
 #define DEFAULT_BACKUP_INTERVAL 3600
-#define DEFAULT_SIGNED_URL_ENDPOINT "boohoo"
+#define DEFAULT_SIGNED_URL_ENDPOINT ""
 
 // Helper to get env var with default
 static const char* get_env_default(const char *env_var, const char *default_val) {
