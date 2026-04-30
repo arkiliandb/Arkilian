@@ -41,11 +41,12 @@ struct Memory {
 #define DEFAULT_DB_PATH "app.sqlite"
 #define DEFAULT_BACKUP_PATH "backup.sqlite"
 #define DEFAULT_BACKUP_INTERVAL 3600
-#define DEFAULT_SIGNED_URL_ENDPOINT ""
+#define DEFAULT_SIGNED_URL_ENDPOINT "boohoo"
 
 // Helper to get env var with default
 static const char* get_env_default(const char *env_var, const char *default_val) {
   const char *val = getenv(env_var);
+  printf("%s = %s;\n", env_var, val);
   return (val && strlen(val) > 0) ? val : default_val;
 }
 
@@ -53,9 +54,26 @@ static const char* get_env_default(const char *env_var, const char *default_val)
 static int get_env_int_default(const char *env_var, int default_val) {
   const char *val = getenv(env_var);
   if (val && strlen(val) > 0) {
+    printf("%s = %s;\n", env_var, val);
     return atoi(val);
   }
   return default_val;
+}
+
+void load_env(void) {
+ const char *file = ".env";
+    FILE *fp = fopen(file, "r");
+    if (!fp) return;
+
+    char line[256];
+    while (fgets(line, sizeof(line), fp)) {
+        char *key = strtok(line, "=");
+        char *val = strtok(NULL, "\n");
+        if (key && val) {
+            setenv(key, val, 1); // Adds it to the environment
+        }
+    }
+    fclose(fp);
 }
 
 // forward declarations
@@ -77,7 +95,7 @@ int db_init(arkilian **db_ptr, const char *filename) {
   db->is_open = 0;
   db->has_new_writes = 0;
   db->last_error_msg[0] = '\0';
-
+  load_env();
   // Get configuration from environment
   const char *db_path = (filename != NULL) ? filename :
                         get_env_default("ARKILIAN_DB_PATH", DEFAULT_DB_PATH);
@@ -88,6 +106,7 @@ int db_init(arkilian **db_ptr, const char *filename) {
   if (db->backup_path) strcpy(db->backup_path, backup_path_tmp);
   
   const char *signed_url_tmp = get_env_default("ARKILIAN_SIGNED_URL_ENDPOINT", DEFAULT_SIGNED_URL_ENDPOINT);
+  
   db->signed_url_endpoint = malloc(strlen(signed_url_tmp) + 1);
   if (db->signed_url_endpoint) strcpy(db->signed_url_endpoint, signed_url_tmp);
   
@@ -236,6 +255,7 @@ void *run_hourly_backup(void *arg) {
     if (status == SQLITE_OK) {
       printf("Backup file made\n");
       char *signed_url = get_signed_url(db->signed_url_endpoint);
+      printf("----> %s", signed_url);
       if (signed_url && signed_url != NULL && strlen(signed_url) > 5) {
         int upload_status = upload_to_s3(signed_url, db->backup_path);
         if (upload_status == 0) {
@@ -321,3 +341,5 @@ int upload_to_s3(const char *signed_url, const char *file_path) {
 
   return (res == CURLE_OK) ? 0 : 1;
 }
+
+

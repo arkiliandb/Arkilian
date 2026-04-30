@@ -42,7 +42,7 @@ int main(void) {
   } else {
     printf("Inserted Bob successfully!\n");
   }
-
+  
   sqlite3_finalize(stmt);
   db_close(db);
 
