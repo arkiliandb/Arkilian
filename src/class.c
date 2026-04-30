@@ -30,6 +30,14 @@ struct arkilian {
   char *signed_url_endpoint;
   int backup_interval;
   int backup_enabled;
+  // Backup thread tracking
+  int shutdown_requested;
+#ifdef _WIN32
+  HANDLE backup_thread_handle;
+#else
+  pthread_t backup_thread_id;
+  int backup_thread_running;
+#endif
 };
 
 struct Memory {
@@ -128,26 +136,22 @@ int db_init(arkilian **db_ptr, const char *filename) {
   }
 
   db->is_open = 1;
+  db->shutdown_requested = 0;
   *db_ptr = db;
-  // Backup system
-  // NOTE TO ME: Use this for test
-  // run_hourly_backup(db);
+
   // Start backup thread if enabled
   if (db->backup_enabled && db->signed_url_endpoint && strlen(db->signed_url_endpoint) > 0) {
 #ifdef _WIN32
-    HANDLE hThread = CreateThread(NULL, 0, run_hourly_backup, db, 0, NULL);
-    if (hThread == NULL) {
+    db->backup_thread_handle = CreateThread(NULL, 0, run_hourly_backup, db, 0, NULL);
+    if (db->backup_thread_handle == NULL) {
       fprintf(stderr, "Failed to create backup thread\n");
-    } else {
-      CloseHandle(hThread);
     }
 #else
-    pthread_t backup_thread;
-    if (pthread_create(&backup_thread, NULL, run_hourly_backup, db) != 0) {
+    db->backup_thread_running = 0;
+    if (pthread_create(&db->backup_thread_id, NULL, run_hourly_backup, db) != 0) {
       fprintf(stderr, "Failed to create backup thread\n");
     } else {
-      // Detach the thread so it cleans up after itself and runs independently
-      pthread_detach(backup_thread);
+      db->backup_thread_running = 1;
     }
 #endif
   } else if (db->backup_enabled) {
@@ -160,6 +164,24 @@ int db_init(arkilian **db_ptr, const char *filename) {
 void db_close(arkilian *db) {
   if (!db)
     return;
+
+  // Signal backup thread to stop
+  db->shutdown_requested = 1;
+
+  // Wait for backup thread to finish if it's running
+#ifndef _WIN32
+  if (db->backup_thread_running) {
+    pthread_join(db->backup_thread_id, NULL);
+    db->backup_thread_running = 0;
+  }
+#else
+  if (db->backup_thread_handle != NULL) {
+    WaitForSingleObject(db->backup_thread_handle, INFINITE);
+    CloseHandle(db->backup_thread_handle);
+    db->backup_thread_handle = NULL;
+  }
+#endif
+
   if (db->is_open && db->handle) {
     sqlite3_close(db->handle);
     db->handle = NULL;
@@ -243,11 +265,20 @@ void *run_hourly_backup(void *arg) {
     sleep(db->backup_interval);
 #endif
 
+    // Check for shutdown request
+    if (db->shutdown_requested) {
+#ifdef _WIN32
+      return 0;
+#else
+      return NULL;
+#endif
+    }
+
     if (!db->is_open || db->handle == NULL) {
 #ifdef _WIN32
       return 0;
 #else
-      pthread_exit(NULL);
+      return NULL;
 #endif
     }
 
