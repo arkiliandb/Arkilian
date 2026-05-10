@@ -79,7 +79,11 @@ void load_env(void) {
     char *key = strtok(line, "=");
     char *val = strtok(NULL, "\n");
     if (key && val) {
+#ifdef _WIN32
+      _putenv_s(key, val);
+#else
       setenv(key, val, 1);
+#endif
     }
   }
   fclose(fp);
