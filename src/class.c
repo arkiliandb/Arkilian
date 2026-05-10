@@ -70,19 +70,19 @@ static int get_env_int_default(const char *env_var, int default_val) {
 }
 
 void load_env(void) {
- const char *file = ".env";
-    FILE *fp = fopen(file, "r");
-    if (!fp) return;
+  const char *file = ".env";
+  FILE *fp = fopen(file, "r");
+  if (!fp) return;
 
-    char line[256];
-    while (fgets(line, sizeof(line), fp)) {
-        char *key = strtok(line, "=");
-        char *val = strtok(NULL, "\n");
-        if (key && val) {
-            setenv(key, val, 1); // Adds it to the environment
-        }
+  char line[256];
+  while (fgets(line, sizeof(line), fp)) {
+    char *key = strtok(line, "=");
+    char *val = strtok(NULL, "\n");
+    if (key && val) {
+      setenv(key, val, 1);
     }
-    fclose(fp);
+  }
+  fclose(fp);
 }
 
 // forward declarations
@@ -377,6 +377,10 @@ int upload_to_s3(const char *signed_url, const char *file_path) {
   struct curl_slist *headers = NULL;
   headers = curl_slist_append(headers, "Content-Type: application/x-sqlite3");
   curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+
+  // Timeout settings
+  curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
+  curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
 
   CURLcode res = curl_easy_perform(curl);
 

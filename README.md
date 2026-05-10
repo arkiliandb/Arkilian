@@ -15,7 +15,7 @@
 # Arkilian
 
 
-Arkilian is a scalability and durability architecture that wraps SQLite and is written in C, designed to extend SQLite with seamless capabilities, like automated cloud backup functionality, and horizontal scaling (in the coming updates). Arkilian can be integrated into applications distributed across multiple environments.
+Arkilian is a managed embedded databas that wraps SQLite and is written in C, designed to extend SQLite with  automated cloud backup functionality and horizontal scaling (in the coming updates).
 
 ### Key Features
 * **Simplified SQLite Binding:** Exposes fundamental SQLite session management alongside fully permissive raw handle extraction.
