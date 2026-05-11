@@ -166,6 +166,8 @@ int db_init(arkilian **db_ptr, const char *filename) {
   return 0;
 }
 
+static sqlite3_stmt *current_stmt = NULL;
+
 void db_close(arkilian *db) {
   if (!db)
     return;
@@ -187,6 +189,10 @@ void db_close(arkilian *db) {
   }
 #endif
 
+  if (current_stmt) {
+    sqlite3_finalize(current_stmt);
+    current_stmt = NULL;
+  }
   if (db->is_open && db->handle) {
     sqlite3_close(db->handle);
     db->handle = NULL;
@@ -393,6 +399,104 @@ int upload_to_s3(const char *signed_url, const char *file_path) {
   curl_easy_cleanup(curl);
 
   return (res == CURLE_OK) ? 0 : 1;
+}
+
+int db_exec(arkilian *db, const char *sql) {
+  if (!db || !db->handle || !sql)
+    return SQLITE_ERROR;
+  sqlite3_stmt *stmt = NULL;
+  int rc = sqlite3_prepare_v2(db->handle, sql, -1, &stmt, NULL);
+  if (rc != SQLITE_OK) {
+    snprintf(db->last_error_msg, sizeof(db->last_error_msg), "%s", sqlite3_errmsg(db->handle));
+    return rc;
+  }
+  rc = sqlite3_step(stmt);
+  sqlite3_finalize(stmt);
+  return rc;
+}
+
+int db_prepare(arkilian *db, const char *sql) {
+  if (!db || !db->handle || !sql)
+    return SQLITE_ERROR;
+  if (current_stmt) {
+    sqlite3_finalize(current_stmt);
+    current_stmt = NULL;
+  }
+  int rc = sqlite3_prepare_v2(db->handle, sql, -1, &current_stmt, NULL);
+  if (rc != SQLITE_OK) {
+    snprintf(db->last_error_msg, sizeof(db->last_error_msg), "%s", sqlite3_errmsg(db->handle));
+  }
+  return rc;
+}
+
+int db_step(arkilian *db) {
+  if (!db || !current_stmt)
+    return SQLITE_ERROR;
+  return sqlite3_step(current_stmt);
+}
+
+int db_finalize(arkilian *db) {
+  if (!db)
+    return SQLITE_ERROR;
+  if (current_stmt) {
+    sqlite3_finalize(current_stmt);
+    current_stmt = NULL;
+  }
+  return SQLITE_OK;
+}
+
+int db_reset(arkilian *db) {
+  if (!db || !current_stmt)
+    return SQLITE_ERROR;
+  return sqlite3_reset(current_stmt);
+}
+
+int db_column_count(arkilian *db) {
+  if (!db || !current_stmt)
+    return 0;
+  return sqlite3_column_count(current_stmt);
+}
+
+const char* db_column_name(arkilian *db, int col) {
+  if (!db || !current_stmt)
+    return NULL;
+  return (const char*)sqlite3_column_name(current_stmt, col);
+}
+
+const char* db_column_text(arkilian *db, int col) {
+  if (!db || !current_stmt)
+    return NULL;
+  return (const char*)sqlite3_column_text(current_stmt, col);
+}
+
+int db_column_int(arkilian *db, int col) {
+  if (!db || !current_stmt)
+    return 0;
+  return sqlite3_column_int(current_stmt, col);
+}
+
+double db_column_double(arkilian *db, int col) {
+  if (!db || !current_stmt)
+    return 0.0;
+  return sqlite3_column_double(current_stmt, col);
+}
+
+int db_bind_text(arkilian *db, int idx, const char *val) {
+  if (!db || !current_stmt || !val)
+    return SQLITE_ERROR;
+  return sqlite3_bind_text(current_stmt, idx, val, -1, SQLITE_TRANSIENT);
+}
+
+int db_bind_int(arkilian *db, int idx, int val) {
+  if (!db || !current_stmt)
+    return SQLITE_ERROR;
+  return sqlite3_bind_int(current_stmt, idx, val);
+}
+
+int db_bind_double(arkilian *db, int idx, double val) {
+  if (!db || !current_stmt)
+    return SQLITE_ERROR;
+  return sqlite3_bind_double(current_stmt, idx, val);
 }
 
 

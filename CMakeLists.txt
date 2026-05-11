@@ -71,6 +71,50 @@ if(ARKILIAN_BUILD_EXAMPLES)
     endif()
 endif()
 
+# Node.js N-API Addon (built via cmake-js)
+option(ARKILIAN_BUILD_NAPI "Build Node.js N-API addon" OFF)
+
+if(CMAKE_JS_VERSION OR ARKILIAN_BUILD_NAPI)
+    # cmake-js helper sources (needed for Windows delay-load hook)
+    if(CMAKE_JS_SRC)
+        file(GLOB CMAKE_JS_SRC_FILES "${CMAKE_JS_SRC}/*.cc" "${CMAKE_JS_SRC}/*.c")
+    else()
+        set(CMAKE_JS_SRC_FILES "")
+    endif()
+
+    add_library(arkilian_napi SHARED
+        bindings/node/addon.c
+        ${ARKILIAN_SOURCES}
+        ${CMAKE_JS_SRC_FILES}
+    )
+
+    set_target_properties(arkilian_napi PROPERTIES
+        PREFIX ""
+        SUFFIX ".node"
+        OUTPUT_NAME "arkilian"
+    )
+
+    target_include_directories(arkilian_napi PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/deps/sqlite
+    )
+
+    # Node.js headers (provided by cmake-js)
+    if(CMAKE_JS_INC)
+        target_include_directories(arkilian_napi PRIVATE ${CMAKE_JS_INC})
+    endif()
+
+    target_link_libraries(arkilian_napi PRIVATE CURL::libcurl Threads::Threads)
+
+    # Node.js import library (needed on Windows)
+    if(CMAKE_JS_LIB)
+        target_link_libraries(arkilian_napi PRIVATE ${CMAKE_JS_LIB})
+    endif()
+
+    # Target N-API version 8 (Node 12.22+, Bun compatible)
+    target_compile_definitions(arkilian_napi PRIVATE NAPI_VERSION=8)
+endif()
+
 # Install rules
 include(GNUInstallDirs)
 
