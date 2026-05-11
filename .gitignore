@@ -45,3 +45,5 @@ serve.js
 *.gcov
 *.gcda
 *.gcno
+Arkilian-web
+node_modules

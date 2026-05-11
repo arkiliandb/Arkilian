@@ -1,0 +1,156 @@
+'use strict';
+
+const native = require('./build/Release/arkilian');
+
+const SQLITE_OK = 0;
+const SQLITE_ROW = 100;
+const SQLITE_DONE = 101;
+
+class Arkilian {
+  constructor(dbPath = 'app.sqlite') {
+    this.id = native.db_init(dbPath);
+    if (!this.id) {
+      throw new Error('Failed to initialize database');
+    }
+  }
+
+  close() {
+    if (this.id) {
+      native.db_close(this.id);
+      this.id = null;
+    }
+  }
+
+  exec(sql) {
+    const result = native.db_exec(this.id, sql);
+    if (result !== SQLITE_OK && result !== SQLITE_DONE) {
+      throw new Error(native.db_errmsg(this.id));
+    }
+    return result;
+  }
+
+  prepare(sql) {
+    const result = native.db_prepare(this.id, sql);
+    if (result !== SQLITE_OK) {
+      throw new Error(native.db_errmsg(this.id));
+    }
+    return this;
+  }
+
+  step() {
+    return native.db_step(this.id);
+  }
+
+  finalize() {
+    const result = native.db_finalize(this.id);
+    if (result !== SQLITE_OK) {
+      throw new Error(native.db_errmsg(this.id));
+    }
+    return this;
+  }
+
+  reset() {
+    const result = native.db_reset(this.id);
+    if (result !== SQLITE_OK) {
+      throw new Error(native.db_errmsg(this.id));
+    }
+    return this;
+  }
+
+  getColumns() {
+    const count = native.db_column_count(this.id);
+    const columns = [];
+    for (let i = 0; i < count; i++) {
+      columns.push(native.db_column_name(this.id, i));
+    }
+    return columns;
+  }
+
+  get(index) {
+    return native.db_column_text(this.id, index);
+  }
+
+  getInt(index) {
+    return native.db_column_int(this.id, index);
+  }
+
+  getDouble(index) {
+    return native.db_column_double(this.id, index);
+  }
+
+  bindText(index, value) {
+    const result = native.db_bind_text(this.id, index, value);
+    if (result !== SQLITE_OK) {
+      throw new Error(native.db_errmsg(this.id));
+    }
+    return this;
+  }
+
+  bindInt(index, value) {
+    const result = native.db_bind_int(this.id, index, value);
+    if (result !== SQLITE_OK) {
+      throw new Error(native.db_errmsg(this.id));
+    }
+    return this;
+  }
+
+  bindDouble(index, value) {
+    const result = native.db_bind_double(this.id, index, value);
+    if (result !== SQLITE_OK) {
+      throw new Error(native.db_errmsg(this.id));
+    }
+    return this;
+  }
+
+  run(sql, params = []) {
+    this.prepare(sql);
+    for (let i = 0; i < params.length; i++) {
+      const p = params[i];
+      if (typeof p === 'string') {
+        this.bindText(i + 1, p);
+      } else if (Number.isInteger(p)) {
+        this.bindInt(i + 1, p);
+      } else {
+        this.bindDouble(i + 1, p);
+      }
+    }
+    this.step();
+    this.finalize();
+    return this;
+  }
+
+  all(sql, params = []) {
+    const results = [];
+    this.prepare(sql);
+    for (let i = 0; i < params.length; i++) {
+      const p = params[i];
+      if (typeof p === 'string') {
+        this.bindText(i + 1, p);
+      } else if (Number.isInteger(p)) {
+        this.bindInt(i + 1, p);
+      } else {
+        this.bindDouble(i + 1, p);
+      }
+    }
+    const columns = this.getColumns();
+    while (this.step() === SQLITE_ROW) {
+      const row = {};
+      for (let i = 0; i < columns.length; i++) {
+        row[columns[i]] = this.get(i);
+      }
+      results.push(row);
+    }
+    this.finalize();
+    return results;
+  }
+
+  get lastError() {
+    return native.db_errmsg(this.id);
+  }
+
+  static get SQLITE_OK() { return SQLITE_OK; }
+  static get SQLITE_ROW() { return SQLITE_ROW; }
+  static get SQLITE_DONE() { return SQLITE_DONE; }
+}
+
+module.exports = Arkilian;
