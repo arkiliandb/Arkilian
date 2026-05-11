@@ -1,7 +1,7 @@
 {
   "name": "arkilian",
   "version": "1.0.0",
-  "description": "Arkilian - SQLite wrapper with automated cloud backup for C, C++, Node.js, and Python",
+  "description": "Arkilian - SQLite wrapper with automated cloud backup for Node.js/Bun",
   "main": "index.js",
   "scripts": {
     "install": "node-gyp configure && node-gyp build",
@@ -14,10 +14,8 @@
     "database",
     "backup",
     "s3",
-    "c",
-    "cpp",
     "node",
-    "python",
+    "bun",
     "ffi"
   ],
   "author": "CodeDynasty-dev",
@@ -33,9 +31,22 @@
     "node-gyp": "^10.0.0"
   },
   "gypfile": true,
+  "files": [
+    "index.js",
+    "test.js",
+    "binding.gyp",
+    "package.json",
+    "LICENSE",
+    "README.md",
+    "src/class.h",
+    "src/arkilian.cc",
+    "src/deps/sqlite/sqlite3.h",
+    "src/deps/sqlite/sqlite3ext.h",
+    "build/Release/arkilian.node"
+  ],
   "binary": {
     "module_name": "arkilian",
-    "module_path": "./lib/binding/{configuration}/{toolset}/{name}",
+    "module_path": "./build/Release",
     "host": "https://github.com/CodeDynasty-dev/birth-of-Arkilian/releases/download/{version}"
   }
 }
