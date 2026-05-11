@@ -85,13 +85,13 @@ npm install arkilian
 cd /path/to/birth-of-Arkilian/bindings/python
 
 # Install build dependencies
-pip install -e .
+pip3 install -e .
 
 # Or install build tools
-pip install build twine
+pip3 install build twine
 
 # Build the package
-python -m build
+python3 -m build
 
 # This creates:
 # dist/arkilian-1.0.0-py3-none-any.whl
@@ -194,10 +194,34 @@ crate-type = ["cdylib", "rlib"]
 ```
 
 ### Linking the C Library
-The crate expects the C library to be available. Options:
-1. **System library**: Link to installed libarkilian
-2. **Bundled**: Include C source in crate and compile statically
-3. **FFI**: Use dynamic linking with libc::dlopen
+The crate expects the C library to be available at `build/Release/libarkilian.dylib`.
+
+**Build Steps:**
+
+```bash
+# From project root, run:
+npm run build
+
+# This creates build/Release/arkilian.node
+# The shared library build/Release/libarkilian.dylib may need to be created:
+
+# Only if libarkilian.dylib doesn't exist:
+clang -dynamiclib -o build/Release/libarkilian.dylib \
+    build/Release/obj.target/arkilian/src/class.o \
+    build/Release/obj.target/arkilian/src/deps/sqlite/sqlite3.o \
+    -lcurl -lpthread
+```
+
+**Rust binding:**
+
+```bash
+cd bindings/rust/arkilian
+cargo build --lib
+```
+
+**Note**: 
+- The library compiles without linking (`cargo build --lib`)
+- Running examples/tests requires linking to the C library
 
 ### Post-Publish
 Users can add to their Cargo.toml:

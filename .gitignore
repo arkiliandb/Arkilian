@@ -33,7 +33,7 @@ uploaded_backup.*
 *.zip
 *.tar.gz
 *.tgz
-
+*.gz
 # Media
 video.mp4
 
@@ -47,3 +47,6 @@ serve.js
 *.gcno
 Arkilian-web
 node_modules
+bindings/python/dist
+*.whl
+bindings/python/arkilian.egg-info
