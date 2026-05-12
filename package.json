@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "description": "Arkilian - SQLite wrapper with automated cloud backup for Node.js/Bun",
   "main": "index.js",
+  "type": "module",
   "scripts": {
     "install": "node-gyp configure && node-gyp build",
     "build": "node-gyp configure && node-gyp build",

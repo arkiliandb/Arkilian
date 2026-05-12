@@ -1,14 +1,17 @@
-'use strict';
+import { createRequire } from "node:module";
 
-const native = require('./build/Release/arkilian');
+const require = createRequire(import.meta.url);
+const native = require("./build/Release/arkilian");
 
 const SQLITE_OK = 0;
 const SQLITE_ROW = 100;
 const SQLITE_DONE = 101;
 
 class Arkilian {
-  constructor(dbPath = "app.sqlite") {
+  constructor(token, dbPath = "app.sqlite") {
+    if (!token) throw new Error("Your data token is required");
     this.id = native.db_init(dbPath);
+    this.setToken(token);
     if (!this.id) {
       throw new Error("Failed to initialize database");
     }
@@ -209,4 +212,4 @@ class Arkilian {
   }
 }
 
-module.exports = Arkilian;
+export default Arkilian;

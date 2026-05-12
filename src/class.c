@@ -56,7 +56,7 @@ struct Memory {
 // Helper to get env var with default
 static const char* get_env_default(const char *env_var, const char *default_val) {
   const char *val = getenv(env_var);
-  printf("%s = %s;\n", env_var, val);
+  // printf("%s = %s;\n", env_var, val);
   return (val && strlen(val) > 0) ? val : default_val;
 }
 
@@ -64,7 +64,7 @@ static const char* get_env_default(const char *env_var, const char *default_val)
 static int get_env_int_default(const char *env_var, int default_val) {
   const char *val = getenv(env_var);
   if (val && strlen(val) > 0) {
-    printf("%s = %s;\n", env_var, val);
+    // printf("%s = %s;\n", env_var, val);
     return atoi(val);
   }
   return default_val;
