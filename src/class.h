@@ -17,6 +17,7 @@ int db_init(arkilian **db, const char *connection_url);
 void db_close(arkilian *db);
 const char* db_errmsg(arkilian *db);
 sqlite3* db_get_handle(arkilian *db);
+int db_set_token(arkilian *db, const char *token);
 
 int db_exec(arkilian *db, const char *sql);
 int db_prepare(arkilian *db, const char *sql);

@@ -25,6 +25,14 @@ class Arkilian {
     });
   }
 
+  setToken(token) {
+    const result = native.db_set_token(this.id, token);
+    if (result !== SQLITE_OK) {
+      throw new Error("Failed to set account token");
+    }
+    return this;
+  }
+
   async close() {
     return new Promise((resolve, reject) => {
       try {

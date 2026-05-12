@@ -302,6 +302,26 @@ Napi::Value db_errmsg(const Napi::CallbackInfo& info) {
   return msg ? Napi::String::New(env, msg) : env.Null();
 }
 
+Napi::Value db_set_token(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  arkilian* db = getDbFromArg(info);
+  
+  if (!db) {
+    Napi::Error::New(env, "Invalid database id").ThrowAsJavaScriptException();
+    return env.Null();
+  }
+  
+  if (info.Length() < 2 || !info[1].IsString()) {
+    Napi::TypeError::New(env, "String expected for token").ThrowAsJavaScriptException();
+    return env.Null();
+  }
+  
+  std::string token = info[1].As<Napi::String>().Utf8Value();
+  int result = db_set_token(db, token.c_str());
+  
+  return Napi::Number::New(env, result);
+}
+
 Napi::Object Init(Napi::Env env, Napi::Object exports) {
   exports.Set("db_init", Napi::Function::New<db_init>(env));
   exports.Set("db_close", Napi::Function::New<db_close>(env));
@@ -319,6 +339,7 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
   exports.Set("db_bind_int", Napi::Function::New<db_bind_int>(env));
   exports.Set("db_bind_double", Napi::Function::New<db_bind_double>(env));
   exports.Set("db_errmsg", Napi::Function::New<db_errmsg>(env));
+  exports.Set("db_set_token", Napi::Function::New<db_set_token>(env));
   
   exports.Set("SQLITE_OK", Napi::Number::New(env, 0));
   exports.Set("SQLITE_ROW", Napi::Number::New(env, 100));

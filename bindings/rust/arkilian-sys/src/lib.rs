@@ -40,6 +40,7 @@ extern "C" {
     pub fn db_close(db: *mut arkilian);
     pub fn db_errmsg(db: *mut arkilian) -> *const c_char;
     pub fn db_get_handle(db: *mut arkilian) -> *mut sqlite3;
+    pub fn db_set_token(db: *mut arkilian, token: *const c_char) -> c_int;
 }
 
 // ── SQLite3 API (subset) ──────────────────────────────────────────────────

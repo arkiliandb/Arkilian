@@ -13,7 +13,7 @@ class Arkilian {
     private $ffi;
     private $isOpen = false;
 
-    public function __construct(string $dbPath = 'app.sqlite') {
+    public function __construct(string $dbPath = 'app.sqlite', ?string $token = null) {
         $this->ffi = $this->loadFFI();
         
         $dbPtr = $this->ffi->new('arkilian*');
@@ -26,6 +26,10 @@ class Arkilian {
         
         $this->db = $dbPtr;
         $this->isOpen = true;
+
+        if ($token !== null) {
+            $this->setToken($token);
+        }
     }
 
     private function loadFFI(): FFI {
@@ -41,6 +45,7 @@ class Arkilian {
             int db_init(arkilian **db, const char *connection_url);
             void db_close(arkilian *db);
             const char* db_errmsg(arkilian *db);
+            int db_set_token(arkilian *db, const char *token);
             
             int db_exec(arkilian *db, const char *sql);
             int db_prepare(arkilian *db, const char *sql);
@@ -85,6 +90,16 @@ class Arkilian {
             $this->db = null;
             $this->isOpen = false;
         }
+    }
+
+    public function setToken(string $token): self {
+        $result = $this->ffi->db_set_token($this->db, $token);
+        
+        if ($result !== SQLITE_OK) {
+            throw new RuntimeException("Failed to set account token");
+        }
+        
+        return $this;
     }
 
     public function exec(string $sql): int {
