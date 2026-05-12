@@ -1,6 +1,6 @@
 {
   "name": "arkilian",
-  "version": "1.0.4",
+  "version": "1.0.5",
   "description": "Arkilian - SQLite wrapper with automated cloud backup for Node.js/Bun",
   "main": "index.js",
   "type": "module",
