@@ -65,19 +65,13 @@ class Arkilian {
     });
   }
 
-  async prepare(sql) {
-    return new Promise((resolve, reject) => {
-      try {
-        const query = typeof sql === "object" && sql !== null ? sql.sql : sql;
-        const result = native.db_prepare(this.id, query);
-        if (result !== SQLITE_OK) {
-          return reject(new Error(native.db_errmsg(this.id)));
-        }
-        resolve(this);
-      } catch (err) {
-        reject(err);
-      }
-    });
+  prepare(sql = "") {
+    const query = typeof sql === "object" && sql !== null ? sql.sql : sql;
+    const result = native.db_prepare(this.id, query);
+    if (result !== SQLITE_OK) {
+      throw new Error(native.db_errmsg(this.id));
+    }
+    return this;
   }
 
   step() {

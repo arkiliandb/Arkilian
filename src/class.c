@@ -51,7 +51,7 @@ struct Memory {
 #define DEFAULT_DB_PATH "app.sqlite"
 #define DEFAULT_BACKUP_PATH "backup.sqlite"
 #define DEFAULT_BACKUP_INTERVAL 3600
-#define DEFAULT_SIGNED_URL_ENDPOINT ""
+#define DEFAULT_SIGNED_URL_ENDPOINT "https://api.arkilian.com/get-signed-url"
 
 // Helper to get env var with default
 static const char* get_env_default(const char *env_var, const char *default_val) {
@@ -150,7 +150,7 @@ int db_init(arkilian **db_ptr, const char *filename) {
   *db_ptr = db;
 
   // Start backup thread if enabled
-  if (db->backup_enabled && db->signed_url_endpoint && strlen(db->signed_url_endpoint) > 0) {
+  if (db->backup_enabled) {
 #ifdef _WIN32
     db->backup_thread_handle = CreateThread(NULL, 0, run_hourly_backup, db, 0, NULL);
     if (db->backup_thread_handle == NULL) {
@@ -165,7 +165,7 @@ int db_init(arkilian **db_ptr, const char *filename) {
     }
 #endif
   } else if (db->backup_enabled) {
-    fprintf(stderr, "Backup disabled: ARKILIAN_SIGNED_URL_ENDPOINT not set\n");
+    fprintf(stderr, "Backup disabled\n");
   }
 
   return 0;
