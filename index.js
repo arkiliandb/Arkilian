@@ -7,54 +7,96 @@ const SQLITE_ROW = 100;
 const SQLITE_DONE = 101;
 
 class Arkilian {
-  constructor(dbPath = 'app.sqlite') {
+  constructor(dbPath = "app.sqlite") {
     this.id = native.db_init(dbPath);
     if (!this.id) {
-      throw new Error('Failed to initialize database');
+      throw new Error("Failed to initialize database");
     }
   }
 
-  close() {
-    if (this.id) {
-      native.db_close(this.id);
-      this.id = null;
-    }
+  static async open(dbPath = "app.sqlite") {
+    return new Promise((resolve, reject) => {
+      try {
+        const db = new Arkilian(dbPath);
+        resolve(db);
+      } catch (err) {
+        reject(err);
+      }
+    });
   }
 
-  exec(sql) {
-    const result = native.db_exec(this.id, sql);
-    if (result !== SQLITE_OK && result !== SQLITE_DONE) {
-      throw new Error(native.db_errmsg(this.id));
-    }
-    return result;
+  async close() {
+    return new Promise((resolve, reject) => {
+      try {
+        if (this.id) {
+          native.db_close(this.id);
+          this.id = null;
+        }
+        resolve();
+      } catch (err) {
+        reject(err);
+      }
+    });
   }
 
-  prepare(sql) {
-    const result = native.db_prepare(this.id, sql);
-    if (result !== SQLITE_OK) {
-      throw new Error(native.db_errmsg(this.id));
-    }
-    return this;
+  async exec(sql) {
+    return new Promise((resolve, reject) => {
+      try {
+        const result = native.db_exec(this.id, sql);
+        if (result !== SQLITE_OK && result !== SQLITE_DONE) {
+          return reject(new Error(native.db_errmsg(this.id)));
+        }
+        resolve(result);
+      } catch (err) {
+        reject(err);
+      }
+    });
+  }
+
+  async prepare(sql) {
+    return new Promise((resolve, reject) => {
+      try {
+        const result = native.db_prepare(this.id, sql);
+        if (result !== SQLITE_OK) {
+          return reject(new Error(native.db_errmsg(this.id)));
+        }
+        resolve(this);
+      } catch (err) {
+        reject(err);
+      }
+    });
   }
 
   step() {
     return native.db_step(this.id);
   }
 
-  finalize() {
-    const result = native.db_finalize(this.id);
-    if (result !== SQLITE_OK) {
-      throw new Error(native.db_errmsg(this.id));
-    }
-    return this;
+  async finalize() {
+    return new Promise((resolve, reject) => {
+      try {
+        const result = native.db_finalize(this.id);
+        if (result !== SQLITE_OK) {
+          return reject(new Error(native.db_errmsg(this.id)));
+        }
+        resolve(this);
+      } catch (err) {
+        reject(err);
+      }
+    });
   }
 
-  reset() {
-    const result = native.db_reset(this.id);
-    if (result !== SQLITE_OK) {
-      throw new Error(native.db_errmsg(this.id));
-    }
-    return this;
+  async reset() {
+    return new Promise((resolve, reject) => {
+      try {
+        const result = native.db_reset(this.id);
+        if (result !== SQLITE_OK) {
+          return reject(new Error(native.db_errmsg(this.id)));
+        }
+        resolve(this);
+      } catch (err) {
+        reject(err);
+      }
+    });
   }
 
   getColumns() {
@@ -102,11 +144,11 @@ class Arkilian {
     return this;
   }
 
-  run(sql, params = []) {
-    this.prepare(sql);
+  async run(sql, params = []) {
+    await this.prepare(sql);
     for (let i = 0; i < params.length; i++) {
       const p = params[i];
-      if (typeof p === 'string') {
+      if (typeof p === "string") {
         this.bindText(i + 1, p);
       } else if (Number.isInteger(p)) {
         this.bindInt(i + 1, p);
@@ -115,16 +157,16 @@ class Arkilian {
       }
     }
     this.step();
-    this.finalize();
+    await this.finalize();
     return this;
   }
 
-  all(sql, params = []) {
+  async all(sql, params = []) {
     const results = [];
-    this.prepare(sql);
+    await this.prepare(sql);
     for (let i = 0; i < params.length; i++) {
       const p = params[i];
-      if (typeof p === 'string') {
+      if (typeof p === "string") {
         this.bindText(i + 1, p);
       } else if (Number.isInteger(p)) {
         this.bindInt(i + 1, p);
@@ -140,7 +182,7 @@ class Arkilian {
       }
       results.push(row);
     }
-    this.finalize();
+    await this.finalize();
     return results;
   }
 
@@ -148,9 +190,15 @@ class Arkilian {
     return native.db_errmsg(this.id);
   }
 
-  static get SQLITE_OK() { return SQLITE_OK; }
-  static get SQLITE_ROW() { return SQLITE_ROW; }
-  static get SQLITE_DONE() { return SQLITE_DONE; }
+  static get SQLITE_OK() {
+    return SQLITE_OK;
+  }
+  static get SQLITE_ROW() {
+    return SQLITE_ROW;
+  }
+  static get SQLITE_DONE() {
+    return SQLITE_DONE;
+  }
 }
 
 module.exports = Arkilian;
