@@ -43,7 +43,7 @@ class Arkilian {
           native.db_close(this.id);
           this.id = null;
         }
-        resolve();
+        resolve(this);
       } catch (err) {
         reject(err);
       }
@@ -53,7 +53,8 @@ class Arkilian {
   async exec(sql) {
     return new Promise((resolve, reject) => {
       try {
-        const result = native.db_exec(this.id, sql);
+        const query = typeof sql === "object" && sql !== null ? sql.sql : sql;
+        const result = native.db_exec(this.id, query);
         if (result !== SQLITE_OK && result !== SQLITE_DONE) {
           return reject(new Error(native.db_errmsg(this.id)));
         }
@@ -67,7 +68,8 @@ class Arkilian {
   async prepare(sql) {
     return new Promise((resolve, reject) => {
       try {
-        const result = native.db_prepare(this.id, sql);
+        const query = typeof sql === "object" && sql !== null ? sql.sql : sql;
+        const result = native.db_prepare(this.id, query);
         if (result !== SQLITE_OK) {
           return reject(new Error(native.db_errmsg(this.id)));
         }
@@ -156,9 +158,12 @@ class Arkilian {
   }
 
   async run(sql, params = []) {
-    await this.prepare(sql);
-    for (let i = 0; i < params.length; i++) {
-      const p = params[i];
+    const query = typeof sql === "object" && sql !== null ? sql.sql : sql;
+    const bindParams =
+      typeof sql === "object" && sql !== null ? sql.params || params : params;
+    await this.prepare(query);
+    for (let i = 0; i < bindParams.length; i++) {
+      const p = bindParams[i];
       if (typeof p === "string") {
         this.bindText(i + 1, p);
       } else if (Number.isInteger(p)) {
@@ -174,9 +179,12 @@ class Arkilian {
 
   async all(sql, params = []) {
     const results = [];
-    await this.prepare(sql);
-    for (let i = 0; i < params.length; i++) {
-      const p = params[i];
+    const query = typeof sql === "object" && sql !== null ? sql.sql : sql;
+    const bindParams =
+      typeof sql === "object" && sql !== null ? sql.params || params : params;
+    await this.prepare(query);
+    for (let i = 0; i < bindParams.length; i++) {
+      const p = bindParams[i];
       if (typeof p === "string") {
         this.bindText(i + 1, p);
       } else if (Number.isInteger(p)) {
