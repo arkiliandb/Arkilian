@@ -17,10 +17,10 @@ class Arkilian {
     }
   }
 
-  static async open(dbPath = "app.sqlite") {
+  static async open(token, dbPath = "app.sqlite") {
     return new Promise((resolve, reject) => {
       try {
-        const db = new Arkilian(dbPath);
+        const db = new Arkilian(token, dbPath);
         resolve(db);
       } catch (err) {
         reject(err);

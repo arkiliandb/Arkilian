@@ -10,12 +10,11 @@ const __dirname = join(__filename, "..");
 console.log("Testing Arkilian Node.js bindings...\n");
 
 const dbPath = join(__dirname, "test.db");
-const db = new Arkilian(dbPath);
+const db = new Arkilian("dummy-test-token-00000000-0000-0000-0000-000000000000", dbPath);
 
-console.log("1. Create table...");
-const a = await db.exec(
-  "CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, name TEXT, email TEXT)",
-);
+console.log("1. Drop old table if exists and recreate...");
+await db.exec("DROP TABLE IF EXISTS users");
+await db.exec("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, email TEXT)");
 console.log("   OK");
 
 console.log("2. Insert data with run()...");
