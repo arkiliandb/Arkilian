@@ -8,7 +8,7 @@
         "src/arkilian.cc"
       ],
       "include_dirs": [
-        "node_modules/node-addon-api",
+        "<!@(node -p \"require('node-addon-api').include\")",
         "src",
         "src/deps/sqlite"
       ],
