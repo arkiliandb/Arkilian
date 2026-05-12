@@ -167,7 +167,8 @@ class Arkilian {
       }
     }
     this.step();
-    await this.finalize();
+    const ok = await this.finalize();
+    console.log({ ok }, "--->");
     return this;
   }
 
@@ -176,7 +177,7 @@ class Arkilian {
     const query = typeof sql === "object" && sql !== null ? sql.sql : sql;
     const bindParams =
       typeof sql === "object" && sql !== null ? sql.params || params : params;
-    await this.prepare(query);
+     await this.prepare(query);
     for (let i = 0; i < bindParams.length; i++) {
       const p = bindParams[i];
       if (typeof p === "string") {
