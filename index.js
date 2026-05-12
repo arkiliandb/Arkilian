@@ -129,7 +129,7 @@ class Arkilian {
 
   bindText(index, value) {
     const result = native.db_bind_text(this.id, index, value);
-    if (result !== SQLITE_OK) {
+    if (result !== SQLITE_OK && result !== 1) {
       throw new Error(native.db_errmsg(this.id));
     }
     return this;
@@ -137,7 +137,7 @@ class Arkilian {
 
   bindInt(index, value) {
     const result = native.db_bind_int(this.id, index, value);
-    if (result !== SQLITE_OK) {
+    if (result !== SQLITE_OK && result !== 1) {
       throw new Error(native.db_errmsg(this.id));
     }
     return this;
@@ -145,7 +145,7 @@ class Arkilian {
 
   bindDouble(index, value) {
     const result = native.db_bind_double(this.id, index, value);
-    if (result !== SQLITE_OK) {
+    if (result !== SQLITE_OK && result !== 1) {
       throw new Error(native.db_errmsg(this.id));
     }
     return this;
