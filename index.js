@@ -9,7 +9,7 @@ const SQLITE_DONE = 101;
 
 class Arkilian {
   constructor(token, dbPath = "app.sqlite") {
-    if (!token) throw new Error("Your data token is required");
+    if (!token) throw new Error("Your database token is required");
     this.id = native.db_init(dbPath);
     this.setToken(token);
     if (!this.id) {
