@@ -34,16 +34,15 @@
   "gypfile": true,
   "files": [
     "index.js",
-    "test.js",
     "binding.gyp",
-    "package.json",
     "LICENSE",
     "README.md",
+    "src/class.c",
     "src/class.h",
     "src/arkilian.cc",
+    "src/deps/sqlite/sqlite3.c",
     "src/deps/sqlite/sqlite3.h",
-    "src/deps/sqlite/sqlite3ext.h",
-    "build/Release/arkilian.node"
+    "src/deps/sqlite/sqlite3ext.h"
   ],
   "binary": {
     "module_name": "arkilian",

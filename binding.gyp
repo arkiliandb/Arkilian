@@ -21,10 +21,24 @@
             "GCC_ENABLE_CPP_EXCEPTIONS": "YES",
             "CLANG_CXX_LIBRARY": "libc++",
             "MACOSX_DEPLOYMENT_TARGET": "10.15"
-          }
+          },
+          "libraries": ["-lcurl"]
         }],
         ["OS=='linux'", {
-          "cflags_cc": ["-fPIC"]
+          "cflags_cc": ["-fPIC"],
+          "libraries": ["-lcurl"]
+        }],
+        ["OS=='win'", {
+          "defines": ["_CRT_SECURE_NO_WARNINGS"],
+          "libraries": ["-lwinhttp", "-lws2_32", "-lcrypt32"],
+          "msvs_settings": {
+            "VCCLCompilerTool": {
+              "ExceptionHandling": 1
+            }
+          },
+          "include_dirs": [
+            "deps/curl/include"
+          ]
         }]
       ]
     }
