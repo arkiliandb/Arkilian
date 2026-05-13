@@ -1,9 +1,7 @@
-  
- 
 #ifndef ARKILIAN_H
 #define ARKILIAN_H
- 
-#include "deps/sqlite/sqlite3.h" 
+
+#include "deps/sqlite/sqlite3.h"
 #include <stddef.h>
 
 #ifdef __cplusplus
@@ -20,7 +18,15 @@ sqlite3* db_get_handle(arkilian *db);
 int db_set_token(arkilian *db, const char *token);
 
 int db_exec(arkilian *db, const char *sql);
+
+// Statement management — multiple statements can coexist.
+// db_prepare pushes a new statement and makes it "current" (index = count-1).
+// db_use_stmt switches which statement is current by index.
+// db_stmt_count returns how many live statements exist.
 int db_prepare(arkilian *db, const char *sql);
+int db_use_stmt(arkilian *db, int index);
+int db_stmt_count(arkilian *db);
+
 int db_step(arkilian *db);
 int db_finalize(arkilian *db);
 int db_reset(arkilian *db);
