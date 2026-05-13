@@ -44,6 +44,11 @@
     "src/deps/sqlite/sqlite3.h",
     "src/deps/sqlite/sqlite3ext.h"
   ],
+  "engines": {
+    "node": ">=14.0.0",
+    "bun": ">=0.1.0"
+  },
+  "private": false,
   "binary": {
     "module_name": "arkilian",
     "module_path": "./build/Release",
