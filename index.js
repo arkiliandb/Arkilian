@@ -74,6 +74,18 @@ class Arkilian {
     return this;
   }
 
+  useStmt(index) {
+    const result = native.db_use_stmt(this.id, index);
+    if (result !== SQLITE_OK) {
+      throw new Error("Invalid statement index or statement already finalized");
+    }
+    return this;
+  }
+
+  stmtCount() {
+    return native.db_stmt_count(this.id);
+  }
+
   step() {
     return native.db_step(this.id);
   }
@@ -177,7 +189,7 @@ class Arkilian {
     const query = typeof sql === "object" && sql !== null ? sql.sql : sql;
     const bindParams =
       typeof sql === "object" && sql !== null ? sql.params || params : params;
-     await this.prepare(query);
+    await this.prepare(query);
     for (let i = 0; i < bindParams.length; i++) {
       const p = bindParams[i];
       if (typeof p === "string") {

@@ -1,0 +1,19 @@
+[package]
+name = "arkilian"
+version = "1.0.0"
+edition = "2021"
+description = "Arkilian - SQLite wrapper with automated cloud backup"
+license = "MIT"
+repository = "https://github.com/CodeDynasty-dev/birth-of-Arkilian"
+keywords = ["sqlite", "database", "backup", "s3", "ffi"]
+readme = "README.md"
+
+[dependencies]
+libc = "0.2"
+
+[build-dependencies]
+bindgen = "0.69"
+
+[lib]
+name = "arkilian"
+crate-type = ["cdylib", "rlib"]

@@ -54,6 +54,33 @@ await db.run("DELETE FROM users WHERE name = ?", ["Alice"]);
 const remaining = await db.all("SELECT * FROM users");
 console.log(`   Remaining users: ${remaining.length}`);
 
+console.log("\n8. Multi-statement test (no statement loss)...");
+// Prepare two statements — both should remain accessible
+db.prepare("SELECT * FROM users WHERE name = ?");
+const stmtIdx0 = db.stmtCount() - 1;
+db.prepare("SELECT COUNT(*) as cnt FROM users");
+const stmtIdx1 = db.stmtCount() - 1;
+console.log(`   Statement count: ${db.stmtCount()}`);
+
+// Step the second (current) statement
+const countResult = db.step();
+console.log(
+  `   COUNT step result: ${countResult} (expected ${Arkilian.SQLITE_ROW})`,
+);
+const cnt = db.get(0);
+console.log(`   User count: ${cnt}`);
+await db.finalize();
+
+// Switch back to first statement — it should still be alive
+db.useStmt(stmtIdx0);
+db.bindText(1, "Bob");
+const bobStep = db.step();
+console.log(`   Bob step result: ${bobStep} (expected ${Arkilian.SQLITE_ROW})`);
+const bobName = db.get(1);
+console.log(`   Got Bob's name: ${bobName}`);
+await db.finalize();
+console.log("   OK - statements not lost");
+
 await db.close();
 
 console.log("\nAll tests passed!");

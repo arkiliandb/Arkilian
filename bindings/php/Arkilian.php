@@ -49,6 +49,8 @@ class Arkilian {
             
             int db_exec(arkilian *db, const char *sql);
             int db_prepare(arkilian *db, const char *sql);
+            int db_use_stmt(arkilian *db, int index);
+            int db_stmt_count(arkilian *db);
             int db_step(arkilian *db);
             int db_finalize(arkilian *db);
             int db_reset(arkilian *db);
@@ -120,6 +122,20 @@ class Arkilian {
         }
         
         return $this;
+    }
+
+    public function useStmt(int $index): self {
+        $result = $this->ffi->db_use_stmt($this->db, $index);
+        
+        if ($result !== SQLITE_OK) {
+            throw new RuntimeException("Invalid statement index or statement already finalized");
+        }
+        
+        return $this;
+    }
+
+    public function stmtCount(): int {
+        return $this->ffi->db_stmt_count($this->db);
     }
 
     public function step(): int {

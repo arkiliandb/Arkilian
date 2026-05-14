@@ -10,8 +10,7 @@ build/
 cmake-build-*/
 *.o
 *.obj
-*.exe
-arkilian
+*.exe 
 arkilian_example
 
 # macOS
@@ -48,5 +47,9 @@ serve.js
 Arkilian-web
 node_modules
 bindings/python/dist
-*.whl
 bindings/python/arkilian.egg-info
+src/arkilian
+*.whl 
+bindings/rust/arkilian/target
+*.typed
+*.pyc
