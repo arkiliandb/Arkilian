@@ -389,21 +389,15 @@ static void test_prepare_select_does_not_log(void) {
 
 static void test_exec_failed_write_rolls_back_no_log(void) {
   arkilian *db = open_test_db();
-  db_exec(db, "CREATE TABLE t1 (id INTEGER PRIMARY KEY)");
+  db_exec(db, "CREATE TABLE t1 (id INTEGER PRIMARY KEY, val INT NOT NULL)");
 
   int before = count_log_rows(db);
 
-  // This will fail (duplicate PK or constraint violation)
-  int rc = db_exec(db,
-    "INSERT INTO t1 (id) VALUES (1); INSERT INTO t1 (id) VALUES (1)");
-  // Either it fails entirely, or the first INSERT inside multi-statement
-  // may succeed — but SQLite processes statements sequentially in exec.
-  // The first INSERT succeeds, the second fails.
-  // Our wrapper does BEGIN/COMMIT around the whole thing, so both roll back.
+  // Inserting NULL into a NOT NULL column — single statement, must fail
+  int rc = db_exec(db, "INSERT INTO t1 (val) VALUES (NULL)");
   assert(rc != SQLITE_DONE);
 
   int after = count_log_rows(db);
-  // No new log entry because the transaction rolled back
   assert(after == before);
 
   // Verify no data was committed
@@ -419,35 +413,19 @@ static void test_exec_failed_write_rolls_back_no_log(void) {
 static void test_prepare_step_failed_write_rolls_back(void) {
   arkilian *db = open_test_db();
   db_exec(db, "CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT NOT NULL)");
+  db_exec(db, "INSERT INTO t1 (id, val) VALUES (1, 'ok')");
 
   int before = count_log_rows(db);
 
-  // This will fail because val is NOT NULL
-  int rc = db_prepare(db, "INSERT INTO t1 (val) VALUES (?)");
+  // Attempt PK conflict via prepare/bind/step/finalize
+  int rc = db_prepare(db, "INSERT INTO t1 (id, val) VALUES (1, 'dup')");
   assert(rc == SQLITE_OK);
-  db_bind_text(db, 1, NULL); // bind NULL to NOT NULL column
-  // The bind_null will succeed (SQLite allows binding NULL)
-  // but sqlite3_bind_text with NULL val returns SQLITE_ERROR in our wrapper
-  // Actually db_bind_text checks !val and returns SQLITE_ERROR.
-  // So the bind fails before step, transaction must roll back.
-  // Let's do a different failure: valid bind, but constraint violation
-  db_finalize(db); // finalize the failed attempt — it will rollback
-
-  // Actually our bind_text returns error for NULL, so let's fix the test
-  // approach: use a valid bind but cause a constraint failure at step time
-  db_prepare(db, "INSERT INTO t1 (id, val) VALUES (1, 'ok')");
-  db_step(db); db_finalize(db); // first row ok
-
-  int before2 = count_log_rows(db);
-
-  db_prepare(db, "INSERT INTO t1 (id, val) VALUES (1, 'dup')"); // PK conflict
   rc = db_step(db);
-  // step should return SQLITE_CONSTRAINT or similar
   assert(rc != SQLITE_DONE && rc != SQLITE_ROW);
-  db_finalize(db); // finalize should rollback
+  db_finalize(db);
 
-  int after2 = count_log_rows(db);
-  assert(after2 == before2); // no new log entry for the failed write
+  int after = count_log_rows(db);
+  assert(after == before);
 
   db_close(db);
   cleanup_files();
@@ -729,13 +707,14 @@ static void test_reads_during_write_transaction_see_snapshot(void) {
   // Prepare a write but don't finalize (transaction in progress)
   db_prepare(db, "INSERT INTO t1 (val) VALUES (999)");
 
-  // A read via exec should see the pre-transaction state (no 999)
+  // A read should see the pre-transaction state (no 999)
   db_prepare(db, "SELECT COUNT(*) FROM t1");
   db_step(db);
   assert(db_column_int(db, 0) == 0);
   db_finalize(db);
 
-  // Commit the write
+  // Commit the write (stmt index 0 is the INSERT, index 1 was the SELECT)
+  db_use_stmt(db, 0);
   db_step(db);
   db_finalize(db);
 
@@ -857,25 +836,56 @@ static void test_perf_select_1000_reads(void) {
 // ---------------------------------------------------------------------------
 
 static void test_write_atomicity_all_or_nothing(void) {
-  // Test that if a multi-statement SQL fails partway, the entire
-  // transaction rolls back (no partial writes, no partial log).
+  // Test that a failed write with side-effects (via trigger) fully
+  // rolls back — nothing is committed, nothing is logged.
   arkilian *db = open_test_db();
-  db_exec(db, "CREATE TABLE atomic (id INTEGER PRIMARY KEY, val INT)");
+  db_exec(db, "CREATE TABLE atomic_a (id INTEGER PRIMARY KEY, val INT)");
+  db_exec(db, "CREATE TABLE atomic_b (id INTEGER PRIMARY KEY, val INT)");
+
+  // Trigger that writes to B whenever A is written to
+  db_exec(db,
+    "CREATE TRIGGER atomic_side_effect AFTER INSERT ON atomic_a "
+    "BEGIN "
+    "  INSERT INTO atomic_b (val) VALUES (NEW.val); "
+    "END;");
 
   int log_before = count_log_rows(db);
 
-  // This SQL has two statements: first valid, second invalid
-  // SQLite's sqlite3_exec processes statements sequentially.
-  // Our wrapper wraps the whole call in BEGIN/COMMIT.
-  int rc = db_exec(db,
-    "INSERT INTO atomic (val) VALUES (1);"
-    "INSERT INTO nonexistent_table VALUES (2)");
+  // This INSERT succeeds — both A and B get the row
+  int rc = db_exec(db, "INSERT INTO atomic_a (val) VALUES (42)");
+  assert(rc == SQLITE_DONE);
+  int log_after_ok = count_log_rows(db);
+  assert(log_after_ok == log_before + 1);
+
+  // Insert that triggers a side-effect which fails
+  // B.id is INTEGER PRIMARY KEY — inserting NULL auto-assigns, so
+  // we use a different approach: make the trigger fail by referencing
+  // a non-existent table case
+  db_exec(db, "DROP TRIGGER atomic_side_effect");
+  db_exec(db,
+    "CREATE TRIGGER atomic_side_effect AFTER INSERT ON atomic_a "
+    "BEGIN "
+    "  INSERT INTO atomic_b (val) VALUES (NEW.val); "
+    "  INSERT INTO no_such_table_xyz VALUES (999); "
+    "END;");
+
+  int log_before2 = count_log_rows(db);
+
+  // This INSERT will succeed on A, but the trigger will fail on the
+  // non-existent table reference, causing the entire transaction to roll back
+  rc = db_exec(db, "INSERT INTO atomic_a (val) VALUES (99)");
   assert(rc != SQLITE_DONE);
 
-  int log_after = count_log_rows(db);
-  assert(log_after == log_before);
+  int log_after2 = count_log_rows(db);
+  assert(log_after2 == log_before2);
 
-  db_prepare(db, "SELECT COUNT(*) FROM atomic");
+  // Verify neither A nor B has the new row
+  db_prepare(db, "SELECT COUNT(*) FROM atomic_a WHERE val = 99");
+  db_step(db);
+  assert(db_column_int(db, 0) == 0);
+  db_finalize(db);
+
+  db_prepare(db, "SELECT COUNT(*) FROM atomic_b WHERE val = 99");
   db_step(db);
   assert(db_column_int(db, 0) == 0);
   db_finalize(db);
