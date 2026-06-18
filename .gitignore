@@ -53,3 +53,5 @@ src/arkilian
 bindings/rust/arkilian/target
 *.typed
 *.pyc
+*.db-shm
+*.db-wal
