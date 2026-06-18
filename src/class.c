@@ -16,6 +16,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 // deps
 #include "deps/sqlite/sqlite3.h"
 
@@ -43,6 +44,16 @@ struct arkilian {
   pthread_t backup_thread_id;
   int backup_thread_running;
 #endif
+  // Write interception
+#ifndef _WIN32
+  pthread_mutex_t write_mutex;
+#else
+  HANDLE write_mutex;
+#endif
+  int in_write_txn;
+  int write_stmt_index;
+  char current_write_sql[1024];
+  int last_step_rc;
 };
 
 struct Memory {
@@ -150,6 +161,17 @@ int db_init(arkilian **db_ptr, const char *filename) {
       get_env_int_default("ARKILIAN_BACKUP_INTERVAL", DEFAULT_BACKUP_INTERVAL);
   db->backup_enabled = get_env_int_default("ARKILIAN_ENABLE_BACKUP", 1);
 
+  // Initialize write mutex and interception state
+#ifndef _WIN32
+  pthread_mutex_init(&db->write_mutex, NULL);
+#else
+  db->write_mutex = CreateMutex(NULL, FALSE, NULL);
+#endif
+  db->in_write_txn = 0;
+  db->write_stmt_index = -1;
+  db->current_write_sql[0] = '\0';
+  db->last_step_rc = 0;
+
   int rc = sqlite3_open_v2(
       db_path, &db->handle,
       SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX, NULL);
@@ -239,6 +261,17 @@ void db_close(arkilian *db) {
   db->stmt_current = -1;
 
   if (db->is_open && db->handle) {
+    // Rollback any open write transaction and release mutex
+    if (db->in_write_txn) {
+      sqlite3_exec(db->handle, "ROLLBACK;", NULL, NULL, NULL);
+      db->in_write_txn = 0;
+      db->write_stmt_index = -1;
+#ifndef _WIN32
+      pthread_mutex_unlock(&db->write_mutex);
+#else
+      ReleaseMutex(db->write_mutex);
+#endif
+    }
     sqlite3_close(db->handle);
     db->handle = NULL;
     db->is_open = 0;
@@ -249,6 +282,14 @@ void db_close(arkilian *db) {
     free(db->signed_url_endpoint);
   if (db->database_token)
     free(db->database_token);
+
+  // Destroy write mutex
+#ifndef _WIN32
+  pthread_mutex_destroy(&db->write_mutex);
+#else
+  if (db->write_mutex) CloseHandle(db->write_mutex);
+#endif
+
   free(db);
 }
 
@@ -477,6 +518,7 @@ int upload_to_s3(const char *signed_url, const char *file_path,
 int db_exec(arkilian *db, const char *sql) {
   if (!db || !db->handle || !sql)
     return SQLITE_ERROR;
+
   sqlite3_stmt *stmt = NULL;
   int rc = sqlite3_prepare_v2(db->handle, sql, -1, &stmt, NULL);
   if (rc != SQLITE_OK) {
@@ -484,9 +526,92 @@ int db_exec(arkilian *db, const char *sql) {
              sqlite3_errmsg(db->handle));
     return rc;
   }
+
+  // Read-only statements execute without the write mutex
+  if (sqlite3_stmt_readonly(stmt)) {
+    rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return rc;
+  }
+
+  // Write path: acquire mutex, BEGIN → execute → log → COMMIT
+#ifndef _WIN32
+  pthread_mutex_lock(&db->write_mutex);
+#else
+  WaitForSingleObject(db->write_mutex, INFINITE);
+#endif
+
+  char *errmsg = NULL;
+  rc = sqlite3_exec(db->handle, "BEGIN;", NULL, NULL, &errmsg);
+  if (rc != SQLITE_OK) {
+    snprintf(db->last_error_msg, sizeof(db->last_error_msg), "%s",
+             errmsg ? errmsg : "BEGIN failed");
+    if (errmsg) sqlite3_free(errmsg);
+    sqlite3_finalize(stmt);
+#ifndef _WIN32
+    pthread_mutex_unlock(&db->write_mutex);
+#else
+    ReleaseMutex(db->write_mutex);
+#endif
+    return rc;
+  }
+
   rc = sqlite3_step(stmt);
   sqlite3_finalize(stmt);
-  return rc;
+
+  if (rc != SQLITE_OK && rc != SQLITE_DONE) {
+    snprintf(db->last_error_msg, sizeof(db->last_error_msg), "%s",
+             sqlite3_errmsg(db->handle));
+    sqlite3_exec(db->handle, "ROLLBACK;", NULL, NULL, NULL);
+#ifndef _WIN32
+    pthread_mutex_unlock(&db->write_mutex);
+#else
+    ReleaseMutex(db->write_mutex);
+#endif
+    return rc;
+  }
+
+  // Insert oplog entry
+  char *log_sql = sqlite3_mprintf(
+    "INSERT INTO _arkilian_log (ts, sql, params) VALUES (%lld, %Q, NULL);",
+    (long long)time(NULL), sql);
+  rc = sqlite3_exec(db->handle, log_sql, NULL, NULL, &errmsg);
+  sqlite3_free(log_sql);
+  if (rc != SQLITE_OK) {
+    snprintf(db->last_error_msg, sizeof(db->last_error_msg), "%s",
+             errmsg ? errmsg : "log insert failed");
+    if (errmsg) sqlite3_free(errmsg);
+    sqlite3_exec(db->handle, "ROLLBACK;", NULL, NULL, NULL);
+#ifndef _WIN32
+    pthread_mutex_unlock(&db->write_mutex);
+#else
+    ReleaseMutex(db->write_mutex);
+#endif
+    return rc;
+  }
+
+  rc = sqlite3_exec(db->handle, "COMMIT;", NULL, NULL, &errmsg);
+  if (rc != SQLITE_OK) {
+    snprintf(db->last_error_msg, sizeof(db->last_error_msg), "%s",
+             errmsg ? errmsg : "COMMIT failed");
+    if (errmsg) sqlite3_free(errmsg);
+#ifndef _WIN32
+    pthread_mutex_unlock(&db->write_mutex);
+#else
+    ReleaseMutex(db->write_mutex);
+#endif
+    return rc;
+  }
+
+  db->has_new_writes = 1;
+
+#ifndef _WIN32
+  pthread_mutex_unlock(&db->write_mutex);
+#else
+  ReleaseMutex(db->write_mutex);
+#endif
+
+  return SQLITE_DONE;
 }
 
 int db_prepare(arkilian *db, const char *sql) {
@@ -510,6 +635,41 @@ int db_prepare(arkilian *db, const char *sql) {
              sqlite3_errmsg(db->handle));
     return rc;
   }
+
+  // If this is a write statement, acquire mutex and begin transaction
+  if (!sqlite3_stmt_readonly(stmt)) {
+    // Only one write transaction at a time
+    if (db->in_write_txn) {
+      sqlite3_finalize(stmt);
+      snprintf(db->last_error_msg, sizeof(db->last_error_msg),
+               "Only one write transaction allowed at a time");
+      return SQLITE_BUSY;
+    }
+#ifndef _WIN32
+    pthread_mutex_lock(&db->write_mutex);
+#else
+    WaitForSingleObject(db->write_mutex, INFINITE);
+#endif
+    char *errmsg = NULL;
+    rc = sqlite3_exec(db->handle, "BEGIN;", NULL, NULL, &errmsg);
+    if (rc != SQLITE_OK) {
+      snprintf(db->last_error_msg, sizeof(db->last_error_msg), "%s",
+               errmsg ? errmsg : "BEGIN failed");
+      if (errmsg) sqlite3_free(errmsg);
+      sqlite3_finalize(stmt);
+#ifndef _WIN32
+      pthread_mutex_unlock(&db->write_mutex);
+#else
+      ReleaseMutex(db->write_mutex);
+#endif
+      return rc;
+    }
+    db->in_write_txn = 1;
+    db->write_stmt_index = db->stmt_count;
+    strncpy(db->current_write_sql, sql, sizeof(db->current_write_sql) - 1);
+    db->current_write_sql[sizeof(db->current_write_sql) - 1] = '\0';
+  }
+
   db->stmts[db->stmt_count] = stmt;
   db->stmt_current = db->stmt_count;
   db->stmt_count++;
@@ -541,7 +701,9 @@ int db_step(arkilian *db) {
   sqlite3_stmt *stmt = get_current_stmt(db);
   if (!stmt)
     return SQLITE_ERROR;
-  return sqlite3_step(stmt);
+  int rc = sqlite3_step(stmt);
+  db->last_step_rc = rc;
+  return rc;
 }
 
 int db_finalize(arkilian *db) {
@@ -549,8 +711,46 @@ int db_finalize(arkilian *db) {
     return SQLITE_ERROR;
   sqlite3_stmt *stmt = get_current_stmt(db);
   if (stmt) {
+    int is_write = db->in_write_txn;
     sqlite3_finalize(stmt);
     db->stmts[db->stmt_current] = NULL;
+
+    if (is_write && db->stmt_current == db->write_stmt_index) {
+      int step_ok = (db->last_step_rc == SQLITE_DONE ||
+                     db->last_step_rc == SQLITE_ROW ||
+                     db->last_step_rc == SQLITE_OK);
+      if (step_ok) {
+        // Insert oplog entry
+        char *log_sql = sqlite3_mprintf(
+          "INSERT INTO _arkilian_log (ts, sql, params) VALUES (%lld, %Q, NULL);",
+          (long long)time(NULL), db->current_write_sql);
+        char *log_err = NULL;
+        int log_rc = sqlite3_exec(db->handle, log_sql, NULL, NULL, &log_err);
+        sqlite3_free(log_sql);
+        if (log_rc == SQLITE_OK) {
+          sqlite3_exec(db->handle, "COMMIT;", NULL, NULL, NULL);
+          db->has_new_writes = 1;
+        } else {
+          snprintf(db->last_error_msg, sizeof(db->last_error_msg), "%s",
+                   log_err ? log_err : "log insert failed");
+          if (log_err) sqlite3_free(log_err);
+          sqlite3_exec(db->handle, "ROLLBACK;", NULL, NULL, NULL);
+        }
+      } else {
+        snprintf(db->last_error_msg, sizeof(db->last_error_msg), "%s",
+                 sqlite3_errmsg(db->handle));
+        sqlite3_exec(db->handle, "ROLLBACK;", NULL, NULL, NULL);
+      }
+
+      db->in_write_txn = 0;
+      db->write_stmt_index = -1;
+      db->current_write_sql[0] = '\0';
+#ifndef _WIN32
+      pthread_mutex_unlock(&db->write_mutex);
+#else
+      ReleaseMutex(db->write_mutex);
+#endif
+    }
   }
   return SQLITE_OK;
 }
