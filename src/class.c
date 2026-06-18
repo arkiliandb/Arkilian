@@ -231,15 +231,18 @@ void *run_wal_flush(void *arg) {
   const char *token    = db->database_token;
 
   while (1) {
-    // Sleep between drain cycles
+    // Sleep between drain cycles (interruptible via not_full signal)
     {
-      int ms = db->flush_interval_ms;
-      if (ms > 0) {
+      pthread_mutex_lock(&db->log_queue.lock);
+      if (!db->log_queue.shutdown) {
         struct timespec ts;
-        ts.tv_sec  = ms / 1000;
-        ts.tv_nsec = (ms % 1000) * 1000000L;
-        nanosleep(&ts, NULL);
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_sec  += db->flush_interval_ms / 1000;
+        ts.tv_nsec += (db->flush_interval_ms % 1000) * 1000000L;
+        if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+        pthread_cond_timedwait(&db->log_queue.not_full, &db->log_queue.lock, &ts);
       }
+      pthread_mutex_unlock(&db->log_queue.lock);
     }
     if (db->log_queue.shutdown) break;
 
@@ -395,20 +398,14 @@ int db_init(arkilian **db_ptr, const char *filename) {
   db->shutdown_requested = 0;
   *db_ptr = db;
 
-  // Start flush thread (only if a push URL is configured)
+  // Start flush thread (always running; fast-free if no URL configured)
   {
-    const char *url = getenv("ARKILIAN_WAL_PUSH_URL");
-    if (url && strlen(url) > 0) {
 #ifndef _WIN32
-      db->flush_thread_running = 0;
-      if (pthread_create(&db->flush_thread_id, NULL, run_wal_flush, db) == 0)
-        db->flush_thread_running = 1;
+    db->flush_thread_running = 0;
+    if (pthread_create(&db->flush_thread_id, NULL, run_wal_flush, db) == 0)
+      db->flush_thread_running = 1;
 #else
-      db->flush_thread_handle = CreateThread(NULL, 0, run_wal_flush, db, 0, NULL);
-#endif
-    }
-#ifndef _WIN32
-    else { db->flush_thread_running = 0; }
+    db->flush_thread_handle = CreateThread(NULL, 0, run_wal_flush, db, 0, NULL);
 #endif
   }
 
@@ -435,6 +432,7 @@ void db_close(arkilian *db) {
   // Signal queue shutdown
   db->log_queue.shutdown = 1;
   pthread_cond_signal(&db->log_queue.not_empty);
+  pthread_cond_signal(&db->log_queue.not_full);
 
   // Wait for flush thread (if running)
 #ifndef _WIN32
