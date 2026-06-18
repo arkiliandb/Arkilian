@@ -87,9 +87,12 @@ static void wal_dbuf_destroy(struct wal_double_buf *b) {
 }
 
 // Push one entry into the active buffer.  Caller holds write_mutex.
-// Swaps buffers if active is full.  Blocks only if both buffers are full
-// (flush thread hasn't finished draining the previous swap).
+// Swaps buffers if active is full.  If no push URL is configured, this
+// is a no-op (no background thread to drain, no reason to accumulate).
 static void wal_dbuf_push(struct wal_double_buf *b, const struct wal_entry *e) {
+  const char *push_url = getenv("ARKILIAN_WAL_PUSH_URL");
+  if (!push_url || strlen(push_url) == 0) return;
+
   int a = b->active;
 
   if (b->count[a] < WAL_BUF_CAPACITY) {

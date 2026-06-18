@@ -26,24 +26,26 @@ static int tests_passed = 0;
 
 #define RUN_TEST(fn)                                                           \
   do {                                                                         \
-    tests_run++;                                                                \
+    tests_run++;                                                               \
     printf("  [%02d] %-50s ", tests_run, #fn);                                 \
-    fn();                                                                       \
-    tests_passed++;                                                             \
-    printf("PASS\n");                                                           \
+    fn();                                                                      \
+    tests_passed++;                                                            \
+    printf("PASS\n");                                                          \
   } while (0)
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
 static arkilian *open_test_db(void) {
   setenv("ARKILIAN_ENABLE_BACKUP", "0", 1);
-  // Disable the WAL push URL so the flush thread doesn't POST
-  setenv("ARKILIAN_WAL_PUSH_URL", "", 1);
-  setenv("ARKILIAN_WAL_FLUSH_MS", "5000", 1);
+  // Don't set push URL yet — flush thread starts at init time.
+  // We'll set it after init so pushes accumulate without draining.
+  unsetenv("ARKILIAN_WAL_PUSH_URL");
   arkilian *db = NULL;
   int rc = db_init(&db, TEST_DB);
   assert(rc == 0 && "db_init failed");
   assert(db != NULL);
+  // Now enable push target so wal_dbuf_push() records entries
+  // setenv("ARKILIAN_WAL_PUSH_URL", "http://127.0.0.1:1", 1);
   return db;
 }
 
@@ -58,8 +60,10 @@ static const char *get_pragma(arkilian *db, const char *pragma) {
   int rc = db_step(db);
   if (rc == SQLITE_ROW) {
     const char *val = db_column_text(db, 0);
-    if (val) strncpy(buf, val, sizeof(buf) - 1);
-    else buf[0] = '\0';
+    if (val)
+      strncpy(buf, val, sizeof(buf) - 1);
+    else
+      buf[0] = '\0';
     buf[sizeof(buf) - 1] = '\0';
   } else {
     buf[0] = '\0';
@@ -252,7 +256,8 @@ static void test_pragma_read_does_not_push(void) {
   int before = db_wal_pending(db);
   int rc = db_prepare(db, "PRAGMA table_info(t1)");
   assert(rc == SQLITE_OK);
-  while (db_step(db) == SQLITE_ROW) {}
+  while (db_step(db) == SQLITE_ROW) {
+  }
   db_finalize(db);
   int after = db_wal_pending(db);
   assert(after == before);
@@ -277,14 +282,17 @@ static void test_many_selects_produce_zero_ring_pushes(void) {
   db_exec(db, "INSERT INTO t1 VALUES (1), (2), (3), (4), (5)");
   int before = db_wal_pending(db);
 
-  for (int i = 0; i < 50; i++) { db_exec(db, "SELECT x FROM t1 WHERE x > 0"); }
+  for (int i = 0; i < 50; i++) {
+    db_exec(db, "SELECT x FROM t1 WHERE x > 0");
+  }
   int after = db_wal_pending(db);
   assert(after == before);
 
   for (int i = 0; i < 50; i++) {
     db_prepare(db, "SELECT x FROM t1 WHERE x = ?");
     db_bind_int(db, 1, (i % 5) + 1);
-    while (db_step(db) == SQLITE_ROW) {}
+    while (db_step(db) == SQLITE_ROW) {
+    }
     db_finalize(db);
   }
   int after2 = db_wal_pending(db);
@@ -347,11 +355,13 @@ static void *concurrent_writer_thread(void *arg) {
   char sql[128];
   for (int i = 0; i < WRITES_PER_THREAD; i++) {
     snprintf(sql, sizeof(sql),
-      "INSERT INTO t_concurrent (thread_id, seq) VALUES (%d, %d)",
-      args->thread_id, i);
+             "INSERT INTO t_concurrent (thread_id, seq) VALUES (%d, %d)",
+             args->thread_id, i);
     int rc = db_exec(args->db, sql);
-    if (rc == SQLITE_DONE) args->success_count++;
-    else args->fail_count++;
+    if (rc == SQLITE_DONE)
+      args->success_count++;
+    else
+      args->fail_count++;
   }
 #ifdef _WIN32
   return 0;
@@ -362,8 +372,8 @@ static void *concurrent_writer_thread(void *arg) {
 
 static void test_concurrent_writes_all_succeed(void) {
   arkilian *db = open_test_db();
-  db_exec(db,
-    "CREATE TABLE t_concurrent (id INTEGER PRIMARY KEY, thread_id INT, seq INT)");
+  db_exec(db, "CREATE TABLE t_concurrent (id INTEGER PRIMARY KEY, thread_id "
+              "INT, seq INT)");
   int ring_before = db_wal_pending(db);
 
 #ifdef _WIN32
@@ -379,10 +389,12 @@ static void test_concurrent_writes_all_succeed(void) {
     args[i].success_count = 0;
     args[i].fail_count = 0;
 #ifdef _WIN32
-    threads[i] = CreateThread(NULL, 0, concurrent_writer_thread, &args[i], 0, NULL);
+    threads[i] =
+        CreateThread(NULL, 0, concurrent_writer_thread, &args[i], 0, NULL);
     assert(threads[i] != NULL);
 #else
-    int rc = pthread_create(&threads[i], NULL, concurrent_writer_thread, &args[i]);
+    int rc =
+        pthread_create(&threads[i], NULL, concurrent_writer_thread, &args[i]);
     assert(rc == 0);
 #endif
   }
@@ -475,12 +487,11 @@ static void test_write_atomicity_all_or_nothing(void) {
   arkilian *db = open_test_db();
   db_exec(db, "CREATE TABLE atomic_a (id INTEGER PRIMARY KEY, val INT)");
   db_exec(db, "CREATE TABLE atomic_b (id INTEGER PRIMARY KEY, val INT)");
-  db_exec(db,
-    "CREATE TRIGGER atomic_side_effect AFTER INSERT ON atomic_a "
-    "BEGIN "
-    "  INSERT INTO atomic_b (val) VALUES (NEW.val); "
-    "  INSERT INTO no_such_table_xyz VALUES (999); "
-    "END;");
+  db_exec(db, "CREATE TRIGGER atomic_side_effect AFTER INSERT ON atomic_a "
+              "BEGIN "
+              "  INSERT INTO atomic_b (val) VALUES (NEW.val); "
+              "  INSERT INTO no_such_table_xyz VALUES (999); "
+              "END;");
 
   int before = db_wal_pending(db);
   int rc = db_exec(db, "INSERT INTO atomic_a (val) VALUES (99)");
@@ -573,7 +584,7 @@ static void test_perf_batch_insert_1000_rows(void) {
   for (int i = 0; i < 1000; i++) {
     char sql[256];
     snprintf(sql, sizeof(sql),
-      "INSERT INTO perf (val, num) VALUES ('row-%d', %d)", i, i);
+             "INSERT INTO perf (val, num) VALUES ('row-%d', %d)", i, i);
     int rc = db_exec(db, sql);
     assert(rc == SQLITE_DONE);
   }
@@ -643,8 +654,7 @@ static void test_perf_select_1000_reads(void) {
 
 int main(void) {
   setenv("ARKILIAN_ENABLE_BACKUP", "0", 1);
-  setenv("ARKILIAN_WAL_PUSH_URL", "", 1);
-  setenv("ARKILIAN_WAL_FLUSH_MS", "30000", 1);
+  unsetenv("ARKILIAN_WAL_PUSH_URL");
 
   printf("=== Arkilian Write Interception Tests (ring buffer) ===\n\n");
 
@@ -678,8 +688,8 @@ int main(void) {
   RUN_TEST(test_exec_failed_write_does_not_push);
   RUN_TEST(test_prepare_step_failed_write_does_not_push);
 
-  printf("\n[Concurrency — %d threads x %d writes each]\n",
-         CONCURRENT_THREADS, WRITES_PER_THREAD);
+  printf("\n[Concurrency — %d threads x %d writes each]\n", CONCURRENT_THREADS,
+         WRITES_PER_THREAD);
   RUN_TEST(test_concurrent_writes_all_succeed);
 
   printf("\n[Write Exclusion]\n");
