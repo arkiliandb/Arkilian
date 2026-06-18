@@ -54,6 +54,11 @@ struct arkilian {
   int write_stmt_index;
   char current_write_sql[1024];
   int last_step_rc;
+  // Cached statements for write interception (avoid re-prepare overhead)
+  sqlite3_stmt *log_insert_stmt;
+  sqlite3_stmt *begin_stmt;
+  sqlite3_stmt *commit_stmt;
+  sqlite3_stmt *rollback_stmt;
 };
 
 struct Memory {
@@ -200,6 +205,14 @@ int db_init(arkilian **db_ptr, const char *filename) {
     "CREATE TABLE IF NOT EXISTS _arkilian_log (lsn INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, sql TEXT, params TEXT);",
     NULL, NULL, NULL);
 
+  // Prepare cached statements for write interception (avoid per-write compile)
+  sqlite3_prepare_v2(db->handle,
+    "INSERT INTO _arkilian_log (ts, sql, params) VALUES (?1, ?2, NULL);",
+    -1, &db->log_insert_stmt, NULL);
+  sqlite3_prepare_v2(db->handle, "BEGIN;", -1, &db->begin_stmt, NULL);
+  sqlite3_prepare_v2(db->handle, "COMMIT;", -1, &db->commit_stmt, NULL);
+  sqlite3_prepare_v2(db->handle, "ROLLBACK;", -1, &db->rollback_stmt, NULL);
+
   db->is_open = 1;
   db->shutdown_requested = 0;
   *db_ptr = db;
@@ -263,7 +276,8 @@ void db_close(arkilian *db) {
   if (db->is_open && db->handle) {
     // Rollback any open write transaction and release mutex
     if (db->in_write_txn) {
-      sqlite3_exec(db->handle, "ROLLBACK;", NULL, NULL, NULL);
+      sqlite3_step(db->rollback_stmt);
+      sqlite3_reset(db->rollback_stmt);
       db->in_write_txn = 0;
       db->write_stmt_index = -1;
 #ifndef _WIN32
@@ -272,6 +286,13 @@ void db_close(arkilian *db) {
       ReleaseMutex(db->write_mutex);
 #endif
     }
+
+    // Finalize cached interception statements
+    if (db->log_insert_stmt) { sqlite3_finalize(db->log_insert_stmt); db->log_insert_stmt = NULL; }
+    if (db->begin_stmt)      { sqlite3_finalize(db->begin_stmt);      db->begin_stmt = NULL; }
+    if (db->commit_stmt)     { sqlite3_finalize(db->commit_stmt);     db->commit_stmt = NULL; }
+    if (db->rollback_stmt)   { sqlite3_finalize(db->rollback_stmt);   db->rollback_stmt = NULL; }
+
     sqlite3_close(db->handle);
     db->handle = NULL;
     db->is_open = 0;
@@ -541,12 +562,11 @@ int db_exec(arkilian *db, const char *sql) {
   WaitForSingleObject(db->write_mutex, INFINITE);
 #endif
 
-  char *errmsg = NULL;
-  rc = sqlite3_exec(db->handle, "BEGIN;", NULL, NULL, &errmsg);
-  if (rc != SQLITE_OK) {
+  rc = sqlite3_step(db->begin_stmt);
+  sqlite3_reset(db->begin_stmt);
+  if (rc != SQLITE_DONE) {
     snprintf(db->last_error_msg, sizeof(db->last_error_msg), "%s",
-             errmsg ? errmsg : "BEGIN failed");
-    if (errmsg) sqlite3_free(errmsg);
+             sqlite3_errmsg(db->handle));
     sqlite3_finalize(stmt);
 #ifndef _WIN32
     pthread_mutex_unlock(&db->write_mutex);
@@ -562,7 +582,8 @@ int db_exec(arkilian *db, const char *sql) {
   if (rc != SQLITE_OK && rc != SQLITE_DONE) {
     snprintf(db->last_error_msg, sizeof(db->last_error_msg), "%s",
              sqlite3_errmsg(db->handle));
-    sqlite3_exec(db->handle, "ROLLBACK;", NULL, NULL, NULL);
+    sqlite3_step(db->rollback_stmt);
+    sqlite3_reset(db->rollback_stmt);
 #ifndef _WIN32
     pthread_mutex_unlock(&db->write_mutex);
 #else
@@ -571,17 +592,16 @@ int db_exec(arkilian *db, const char *sql) {
     return rc;
   }
 
-  // Insert oplog entry
-  char *log_sql = sqlite3_mprintf(
-    "INSERT INTO _arkilian_log (ts, sql, params) VALUES (%lld, %Q, NULL);",
-    (long long)time(NULL), sql);
-  rc = sqlite3_exec(db->handle, log_sql, NULL, NULL, &errmsg);
-  sqlite3_free(log_sql);
-  if (rc != SQLITE_OK) {
+  // Insert oplog entry via cached statement
+  sqlite3_bind_int64(db->log_insert_stmt, 1, (sqlite3_int64)time(NULL));
+  sqlite3_bind_text(db->log_insert_stmt, 2, sql, -1, SQLITE_TRANSIENT);
+  rc = sqlite3_step(db->log_insert_stmt);
+  sqlite3_reset(db->log_insert_stmt);
+  if (rc != SQLITE_DONE) {
     snprintf(db->last_error_msg, sizeof(db->last_error_msg), "%s",
-             errmsg ? errmsg : "log insert failed");
-    if (errmsg) sqlite3_free(errmsg);
-    sqlite3_exec(db->handle, "ROLLBACK;", NULL, NULL, NULL);
+             sqlite3_errmsg(db->handle));
+    sqlite3_step(db->rollback_stmt);
+    sqlite3_reset(db->rollback_stmt);
 #ifndef _WIN32
     pthread_mutex_unlock(&db->write_mutex);
 #else
@@ -590,11 +610,11 @@ int db_exec(arkilian *db, const char *sql) {
     return rc;
   }
 
-  rc = sqlite3_exec(db->handle, "COMMIT;", NULL, NULL, &errmsg);
-  if (rc != SQLITE_OK) {
+  rc = sqlite3_step(db->commit_stmt);
+  sqlite3_reset(db->commit_stmt);
+  if (rc != SQLITE_DONE) {
     snprintf(db->last_error_msg, sizeof(db->last_error_msg), "%s",
-             errmsg ? errmsg : "COMMIT failed");
-    if (errmsg) sqlite3_free(errmsg);
+             sqlite3_errmsg(db->handle));
 #ifndef _WIN32
     pthread_mutex_unlock(&db->write_mutex);
 #else
@@ -650,19 +670,18 @@ int db_prepare(arkilian *db, const char *sql) {
 #else
     WaitForSingleObject(db->write_mutex, INFINITE);
 #endif
-    char *errmsg = NULL;
-    rc = sqlite3_exec(db->handle, "BEGIN;", NULL, NULL, &errmsg);
-    if (rc != SQLITE_OK) {
+    int begin_rc = sqlite3_step(db->begin_stmt);
+    sqlite3_reset(db->begin_stmt);
+    if (begin_rc != SQLITE_DONE) {
       snprintf(db->last_error_msg, sizeof(db->last_error_msg), "%s",
-               errmsg ? errmsg : "BEGIN failed");
-      if (errmsg) sqlite3_free(errmsg);
+               sqlite3_errmsg(db->handle));
       sqlite3_finalize(stmt);
 #ifndef _WIN32
       pthread_mutex_unlock(&db->write_mutex);
 #else
       ReleaseMutex(db->write_mutex);
 #endif
-      return rc;
+      return begin_rc;
     }
     db->in_write_txn = 1;
     db->write_stmt_index = db->stmt_count;
@@ -720,26 +739,27 @@ int db_finalize(arkilian *db) {
                      db->last_step_rc == SQLITE_ROW ||
                      db->last_step_rc == SQLITE_OK);
       if (step_ok) {
-        // Insert oplog entry
-        char *log_sql = sqlite3_mprintf(
-          "INSERT INTO _arkilian_log (ts, sql, params) VALUES (%lld, %Q, NULL);",
-          (long long)time(NULL), db->current_write_sql);
-        char *log_err = NULL;
-        int log_rc = sqlite3_exec(db->handle, log_sql, NULL, NULL, &log_err);
-        sqlite3_free(log_sql);
-        if (log_rc == SQLITE_OK) {
-          sqlite3_exec(db->handle, "COMMIT;", NULL, NULL, NULL);
+        // Insert oplog entry via cached statement
+        sqlite3_bind_int64(db->log_insert_stmt, 1, (sqlite3_int64)time(NULL));
+        sqlite3_bind_text(db->log_insert_stmt, 2, db->current_write_sql,
+                          -1, SQLITE_TRANSIENT);
+        int log_rc = sqlite3_step(db->log_insert_stmt);
+        sqlite3_reset(db->log_insert_stmt);
+        if (log_rc == SQLITE_DONE) {
+          sqlite3_step(db->commit_stmt);
+          sqlite3_reset(db->commit_stmt);
           db->has_new_writes = 1;
         } else {
           snprintf(db->last_error_msg, sizeof(db->last_error_msg), "%s",
-                   log_err ? log_err : "log insert failed");
-          if (log_err) sqlite3_free(log_err);
-          sqlite3_exec(db->handle, "ROLLBACK;", NULL, NULL, NULL);
+                   sqlite3_errmsg(db->handle));
+          sqlite3_step(db->rollback_stmt);
+          sqlite3_reset(db->rollback_stmt);
         }
       } else {
         snprintf(db->last_error_msg, sizeof(db->last_error_msg), "%s",
                  sqlite3_errmsg(db->handle));
-        sqlite3_exec(db->handle, "ROLLBACK;", NULL, NULL, NULL);
+        sqlite3_step(db->rollback_stmt);
+        sqlite3_reset(db->rollback_stmt);
       }
 
       db->in_write_txn = 0;
