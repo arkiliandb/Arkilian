@@ -54,6 +54,7 @@ static void cleanup_files(void) { remove(TEST_DB); }
 
 // Count rows in _arkilian_log
 static int count_log_rows(arkilian *db) {
+  db_flush_log(db);
   int rc = db_prepare(db, "SELECT COUNT(*) FROM _arkilian_log");
   assert(rc == SQLITE_OK);
   rc = db_step(db);
@@ -65,6 +66,7 @@ static int count_log_rows(arkilian *db) {
 
 // Get the latest LSN from _arkilian_log
 static int get_max_lsn(arkilian *db) {
+  db_flush_log(db);
   int rc = db_prepare(db, "SELECT COALESCE(MAX(lsn), 0) FROM _arkilian_log");
   assert(rc == SQLITE_OK);
   rc = db_step(db);
@@ -76,6 +78,7 @@ static int get_max_lsn(arkilian *db) {
 
 // Get the latest SQL text from _arkilian_log
 static void get_last_log_sql(arkilian *db, char *buf, size_t bufsz) {
+  db_flush_log(db);
   int rc = db_prepare(db,
     "SELECT sql FROM _arkilian_log ORDER BY lsn DESC LIMIT 1");
   assert(rc == SQLITE_OK);
