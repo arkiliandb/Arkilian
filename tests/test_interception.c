@@ -162,7 +162,7 @@ static void test_meta_table_exists(void) {
 
 static void test_log_table_exists(void) {
   arkilian *db = open_test_db();
-  int rc = db_prepare(db, "SELECT lsn, ts, sql, params FROM _arkilian_log");
+  int rc = db_prepare(db, "SELECT lsn, ts, op, tbl, sql FROM _arkilian_log");
   assert(rc == SQLITE_OK);
   db_finalize(db);
   db_close(db);
