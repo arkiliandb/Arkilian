@@ -9,8 +9,10 @@
 #include <curl/curl.h>
 #ifdef _WIN32
 #include <windows.h>
+#define strncasecmp _strnicmp
 #else
 #include <pthread.h>
+#include <strings.h>
 #include <unistd.h>
 #endif
 #include <stdio.h>
@@ -59,6 +61,16 @@ struct arkilian {
   sqlite3_stmt *begin_stmt;
   sqlite3_stmt *commit_stmt;
   sqlite3_stmt *rollback_stmt;
+  // Log buffer for batched writes (amortizes log INSERT overhead)
+  #define LOG_BUFFER_CAPACITY 128
+  struct log_entry {
+    sqlite3_int64 ts;
+    int op;        // 0=INSERT, 1=UPDATE, 2=DELETE, 3=DDL
+    char tbl[128];
+    char sql[1024];
+  };
+  struct log_entry *log_buffer;
+  int log_buffer_count;
 };
 
 struct Memory {
@@ -202,16 +214,20 @@ int db_init(arkilian **db_ptr, const char *filename) {
     "CREATE TABLE IF NOT EXISTS _arkilian_meta (k TEXT PRIMARY KEY, v TEXT);",
     NULL, NULL, NULL);
   sqlite3_exec(db->handle,
-    "CREATE TABLE IF NOT EXISTS _arkilian_log (lsn INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, sql TEXT, params TEXT);",
+    "CREATE TABLE IF NOT EXISTS _arkilian_log (lsn INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, op INTEGER, tbl TEXT, sql TEXT);",
     NULL, NULL, NULL);
 
   // Prepare cached statements for write interception (avoid per-write compile)
   sqlite3_prepare_v2(db->handle,
-    "INSERT INTO _arkilian_log (ts, sql, params) VALUES (?1, ?2, NULL);",
+    "INSERT INTO _arkilian_log (ts, op, tbl, sql) VALUES (?1, ?2, ?3, ?4);",
     -1, &db->log_insert_stmt, NULL);
   sqlite3_prepare_v2(db->handle, "BEGIN;", -1, &db->begin_stmt, NULL);
   sqlite3_prepare_v2(db->handle, "COMMIT;", -1, &db->commit_stmt, NULL);
   sqlite3_prepare_v2(db->handle, "ROLLBACK;", -1, &db->rollback_stmt, NULL);
+
+  // Allocate log buffer for batched writes
+  db->log_buffer = malloc(sizeof(*db->log_buffer) * LOG_BUFFER_CAPACITY);
+  db->log_buffer_count = 0;
 
   db->is_open = 1;
   db->shutdown_requested = 0;
@@ -287,6 +303,25 @@ void db_close(arkilian *db) {
 #endif
     }
 
+    // Flush any remaining log entries
+    if (db->log_buffer_count > 0) {
+      sqlite3_step(db->begin_stmt);
+      sqlite3_reset(db->begin_stmt);
+      for (int i = 0; i < db->log_buffer_count; i++) {
+        sqlite3_bind_int64(db->log_insert_stmt, 1, db->log_buffer[i].ts);
+        sqlite3_bind_int(db->log_insert_stmt, 2, db->log_buffer[i].op);
+        sqlite3_bind_text(db->log_insert_stmt, 3, db->log_buffer[i].tbl,
+                          -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(db->log_insert_stmt, 4, db->log_buffer[i].sql,
+                          -1, SQLITE_TRANSIENT);
+        sqlite3_step(db->log_insert_stmt);
+        sqlite3_reset(db->log_insert_stmt);
+      }
+      sqlite3_step(db->commit_stmt);
+      sqlite3_reset(db->commit_stmt);
+      db->log_buffer_count = 0;
+    }
+
     // Finalize cached interception statements
     if (db->log_insert_stmt) { sqlite3_finalize(db->log_insert_stmt); db->log_insert_stmt = NULL; }
     if (db->begin_stmt)      { sqlite3_finalize(db->begin_stmt);      db->begin_stmt = NULL; }
@@ -297,6 +332,8 @@ void db_close(arkilian *db) {
     db->handle = NULL;
     db->is_open = 0;
   }
+  if (db->log_buffer)
+    free(db->log_buffer);
   if (db->backup_path)
     free(db->backup_path);
   if (db->signed_url_endpoint)
@@ -536,6 +573,119 @@ int upload_to_s3(const char *signed_url, const char *file_path,
   return (res == CURLE_OK) ? 0 : 1;
 }
 
+// Parse SQL to extract operation type and table name.
+// op: 0=INSERT, 1=UPDATE, 2=DELETE, 3=DDL
+static void parse_sql_op_tbl(const char *sql, int *op, char *tbl, size_t tblsz) {
+  *op = 3; // default DDL
+  tbl[0] = '\0';
+
+  // Skip leading whitespace and comments
+  while (*sql == ' ' || *sql == '\t' || *sql == '\n' || *sql == '\r') sql++;
+  if (*sql == '-' && *(sql+1) == '-') return; // comment
+  if (*sql == '/' && *(sql+1) == '*') return; // block comment
+
+  // Match first keyword (case-insensitive prefix match)
+  #define MATCH(s, literal) (strncasecmp(s, literal, strlen(literal)) == 0)
+
+  if (MATCH(sql, "INSERT")) {
+    *op = 0;
+    sql += 6; while (*sql == ' ') sql++;
+    if (MATCH(sql, "INTO")) { sql += 4; while (*sql == ' ') sql++; }
+    if (MATCH(sql, "OR")) { sql += 2; while (*sql == ' ') sql++;
+      if (MATCH(sql, "REPLACE") || MATCH(sql, "ROLLBACK") ||
+          MATCH(sql, "ABORT") || MATCH(sql, "FAIL") || MATCH(sql, "IGNORE"))
+        { while (*sql && *sql != ' ') sql++; while (*sql == ' ') sql++; }
+    }
+  } else if (MATCH(sql, "UPDATE")) {
+    *op = 1;
+    sql += 6; while (*sql == ' ') sql++;
+    if (MATCH(sql, "OR")) { sql += 2; while (*sql == ' ') sql++;
+      while (*sql && *sql != ' ') sql++; while (*sql == ' ') sql++; }
+  } else if (MATCH(sql, "DELETE")) {
+    *op = 2;
+    sql += 6; while (*sql == ' ') sql++;
+    if (MATCH(sql, "FROM")) { sql += 4; while (*sql == ' ') sql++; }
+  } else if (MATCH(sql, "REPLACE")) {
+    *op = 0; // treat REPLACE as INSERT
+    sql += 7; while (*sql == ' ') sql++;
+    if (MATCH(sql, "INTO")) { sql += 4; while (*sql == ' ') sql++; }
+  } else {
+    // DDL: CREATE, ALTER, DROP, etc.
+    *op = 3;
+    if (MATCH(sql, "CREATE")) { sql += 6; while (*sql == ' ') sql++;
+      if (MATCH(sql, "TABLE") || MATCH(sql, "INDEX") ||
+          MATCH(sql, "VIEW") || MATCH(sql, "TRIGGER")) {
+        while (*sql && *sql != ' ') sql++; while (*sql == ' ') sql++;
+      }
+    } else if (MATCH(sql, "DROP")) { sql += 4; while (*sql == ' ') sql++;
+      if (MATCH(sql, "TABLE") || MATCH(sql, "INDEX") ||
+          MATCH(sql, "VIEW") || MATCH(sql, "TRIGGER")) {
+        while (*sql && *sql != ' ') sql++; while (*sql == ' ') sql++;
+      }
+      if (MATCH(sql, "IF")) {
+        while (*sql && *sql != ' ') sql++; while (*sql == ' ') sql++;
+        while (*sql && *sql != ' ') sql++; while (*sql == ' ') sql++;
+      }
+    } else if (MATCH(sql, "ALTER")) { sql += 5; while (*sql == ' ') sql++;
+      if (MATCH(sql, "TABLE")) { sql += 5; while (*sql == ' ') sql++; }
+    }
+  }
+  #undef MATCH
+
+  // Extract table name (stop at space, paren, semicolon, or end)
+  if (*sql == '`' || *sql == '"' || *sql == '[') {
+    char quote = (*sql == '[') ? ']' : *sql;
+    sql++; // skip opening quote
+    size_t i = 0;
+    while (*sql && *sql != quote && i < tblsz - 1)
+      tbl[i++] = *sql++;
+    tbl[i] = '\0';
+  } else {
+    size_t i = 0;
+    while (*sql && *sql != ' ' && *sql != '\t' && *sql != '\n' &&
+           *sql != '(' && *sql != ';' && *sql != '\0' && i < tblsz - 1)
+      tbl[i++] = *sql++;
+    tbl[i] = '\0';
+  }
+}
+
+// Flush buffered log entries to disk in a single transaction
+static void log_buffer_flush(arkilian *db) {
+  if (db->log_buffer_count == 0) return;
+
+  sqlite3_step(db->begin_stmt);
+  sqlite3_reset(db->begin_stmt);
+
+  for (int i = 0; i < db->log_buffer_count; i++) {
+    sqlite3_bind_int64(db->log_insert_stmt, 1, db->log_buffer[i].ts);
+    sqlite3_bind_int(db->log_insert_stmt, 2, db->log_buffer[i].op);
+    sqlite3_bind_text(db->log_insert_stmt, 3, db->log_buffer[i].tbl,
+                      -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(db->log_insert_stmt, 4, db->log_buffer[i].sql,
+                      -1, SQLITE_TRANSIENT);
+    sqlite3_step(db->log_insert_stmt);
+    sqlite3_reset(db->log_insert_stmt);
+  }
+
+  sqlite3_step(db->commit_stmt);
+  sqlite3_reset(db->commit_stmt);
+
+  db->log_buffer_count = 0;
+}
+
+// Append a log entry to the in-memory buffer. Flushes if buffer is full.
+static void log_buffer_append(arkilian *db, const char *sql) {
+  if (db->log_buffer_count >= LOG_BUFFER_CAPACITY) {
+    log_buffer_flush(db);
+  }
+
+  struct log_entry *e = &db->log_buffer[db->log_buffer_count++];
+  e->ts = (sqlite3_int64)time(NULL);
+  parse_sql_op_tbl(sql, &e->op, e->tbl, sizeof(e->tbl));
+  strncpy(e->sql, sql, sizeof(e->sql) - 1);
+  e->sql[sizeof(e->sql) - 1] = '\0';
+}
+
 int db_exec(arkilian *db, const char *sql) {
   if (!db || !db->handle || !sql)
     return SQLITE_ERROR;
@@ -592,24 +742,6 @@ int db_exec(arkilian *db, const char *sql) {
     return rc;
   }
 
-  // Insert oplog entry via cached statement
-  sqlite3_bind_int64(db->log_insert_stmt, 1, (sqlite3_int64)time(NULL));
-  sqlite3_bind_text(db->log_insert_stmt, 2, sql, -1, SQLITE_TRANSIENT);
-  rc = sqlite3_step(db->log_insert_stmt);
-  sqlite3_reset(db->log_insert_stmt);
-  if (rc != SQLITE_DONE) {
-    snprintf(db->last_error_msg, sizeof(db->last_error_msg), "%s",
-             sqlite3_errmsg(db->handle));
-    sqlite3_step(db->rollback_stmt);
-    sqlite3_reset(db->rollback_stmt);
-#ifndef _WIN32
-    pthread_mutex_unlock(&db->write_mutex);
-#else
-    ReleaseMutex(db->write_mutex);
-#endif
-    return rc;
-  }
-
   rc = sqlite3_step(db->commit_stmt);
   sqlite3_reset(db->commit_stmt);
   if (rc != SQLITE_DONE) {
@@ -624,6 +756,9 @@ int db_exec(arkilian *db, const char *sql) {
   }
 
   db->has_new_writes = 1;
+
+  // Append oplog entry to in-memory buffer (flushed independently)
+  log_buffer_append(db, sql);
 
 #ifndef _WIN32
   pthread_mutex_unlock(&db->write_mutex);
@@ -739,22 +874,12 @@ int db_finalize(arkilian *db) {
                      db->last_step_rc == SQLITE_ROW ||
                      db->last_step_rc == SQLITE_OK);
       if (step_ok) {
-        // Insert oplog entry via cached statement
-        sqlite3_bind_int64(db->log_insert_stmt, 1, (sqlite3_int64)time(NULL));
-        sqlite3_bind_text(db->log_insert_stmt, 2, db->current_write_sql,
-                          -1, SQLITE_TRANSIENT);
-        int log_rc = sqlite3_step(db->log_insert_stmt);
-        sqlite3_reset(db->log_insert_stmt);
-        if (log_rc == SQLITE_DONE) {
-          sqlite3_step(db->commit_stmt);
-          sqlite3_reset(db->commit_stmt);
-          db->has_new_writes = 1;
-        } else {
-          snprintf(db->last_error_msg, sizeof(db->last_error_msg), "%s",
-                   sqlite3_errmsg(db->handle));
-          sqlite3_step(db->rollback_stmt);
-          sqlite3_reset(db->rollback_stmt);
-        }
+        sqlite3_step(db->commit_stmt);
+        sqlite3_reset(db->commit_stmt);
+        db->has_new_writes = 1;
+
+        // Append oplog entry to in-memory buffer (flushed independently)
+        log_buffer_append(db, db->current_write_sql);
       } else {
         snprintf(db->last_error_msg, sizeof(db->last_error_msg), "%s",
                  sqlite3_errmsg(db->handle));
