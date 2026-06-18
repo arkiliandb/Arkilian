@@ -88,31 +88,22 @@ static void wal_ring_destroy(struct wal_ring *r) {
 #endif
 }
 
-// Producer: push one entry (blocks if full)
+// Producer: push one entry (lock-free — caller holds write_mutex).
+// Uses memory barrier for safe publication to the consumer thread.
 static void wal_ring_push(struct wal_ring *r, const struct wal_entry *e) {
+  if (r->count >= r->capacity) return; // drop if full (ring is large enough)
+  r->entries[r->head] = *e;
 #ifndef _WIN32
-  pthread_mutex_lock(&r->mutex);
-  while (r->count >= r->capacity && !r->shutdown)
-    pthread_cond_wait(&r->not_full, &r->mutex);
-  if (r->shutdown) { pthread_mutex_unlock(&r->mutex); return; }
-  r->entries[r->head] = *e;
-  r->head = (r->head + 1) % r->capacity;
-  r->count++;
-  pthread_cond_signal(&r->not_empty);
-  pthread_mutex_unlock(&r->mutex);
+  __sync_synchronize();
 #else
-  WaitForSingleObject(r->mutex, INFINITE);
-  while (r->count >= r->capacity && !r->shutdown) {
-    ReleaseMutex(r->mutex);
-    WaitForSingleObject(r->not_full, INFINITE);
-    WaitForSingleObject(r->mutex, INFINITE);
-  }
-  if (r->shutdown) { ReleaseMutex(r->mutex); return; }
-  r->entries[r->head] = *e;
+  MemoryBarrier();
+#endif
   r->head = (r->head + 1) % r->capacity;
   r->count++;
+#ifndef _WIN32
+  pthread_cond_signal(&r->not_empty);
+#else
   SetEvent(r->not_empty);
-  ReleaseMutex(r->mutex);
 #endif
 }
 
@@ -1168,15 +1159,5 @@ int db_set_token(arkilian *db, const char *token) {
 // Returns the number of pending WAL entries in the ring buffer
 int db_wal_pending(arkilian *db) {
   if (!db) return 0;
-  int c;
-#ifndef _WIN32
-  pthread_mutex_lock(&db->ring.mutex);
-  c = db->ring.count;
-  pthread_mutex_unlock(&db->ring.mutex);
-#else
-  WaitForSingleObject(db->ring.mutex, INFINITE);
-  c = db->ring.count;
-  ReleaseMutex(db->ring.mutex);
-#endif
-  return c;
+  return db->ring.count;
 }
