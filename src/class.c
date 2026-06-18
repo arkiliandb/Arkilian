@@ -63,6 +63,7 @@ struct arkilian {
 #endif
   int in_write_txn;
   int write_stmt_index;
+  int in_batch_txn;         // set by db_begin / db_commit
   char current_write_sql[1024];
   int last_step_rc;
   // Cached statements for write interception (avoid re-prepare overhead)
@@ -188,6 +189,7 @@ int db_init(arkilian **db_ptr, const char *filename) {
 #endif
   db->in_write_txn = 0;
   db->write_stmt_index = -1;
+  db->in_batch_txn = 0;
   db->current_write_sql[0] = '\0';
   db->last_step_rc = 0;
 
@@ -297,11 +299,19 @@ void db_close(arkilian *db) {
 
   if (db->is_open && db->handle) {
     // Rollback any open write transaction and release mutex
-    if (db->in_write_txn) {
-      sqlite3_step(db->rollback_stmt);
-      sqlite3_reset(db->rollback_stmt);
-      db->in_write_txn = 0;
-      db->write_stmt_index = -1;
+    if (db->in_write_txn || db->in_batch_txn) {
+      if (db->in_write_txn) {
+        sqlite3_step(db->rollback_stmt);
+        sqlite3_reset(db->rollback_stmt);
+        db->in_write_txn = 0;
+        db->write_stmt_index = -1;
+      }
+      if (db->in_batch_txn) {
+        sqlite3_step(db->rollback_stmt);
+        sqlite3_reset(db->rollback_stmt);
+        db->in_batch_txn = 0;
+        db->log_buffer_count = 0;
+      }
 #ifndef _WIN32
       pthread_mutex_unlock(&db->write_mutex);
 #else
@@ -784,6 +794,65 @@ void db_flush_log(arkilian *db) {
 #endif
 }
 
+// Begin a batch transaction.  All subsequent db_exec calls will skip their
+// own BEGIN/COMMIT and share this one.  Call db_commit or db_rollback to end.
+int db_begin(arkilian *db) {
+  if (!db || !db->handle) return SQLITE_ERROR;
+  if (db->in_batch_txn || db->in_write_txn) return SQLITE_BUSY;
+#ifndef _WIN32
+  pthread_mutex_lock(&db->write_mutex);
+#else
+  WaitForSingleObject(db->write_mutex, INFINITE);
+#endif
+  int rc = sqlite3_step(db->begin_stmt);
+  sqlite3_reset(db->begin_stmt);
+  if (rc != SQLITE_DONE) {
+    snprintf(db->last_error_msg, sizeof(db->last_error_msg), "%s",
+             sqlite3_errmsg(db->handle));
+#ifndef _WIN32
+    pthread_mutex_unlock(&db->write_mutex);
+#else
+    ReleaseMutex(db->write_mutex);
+#endif
+    return rc;
+  }
+  db->in_batch_txn = 1;
+  return SQLITE_OK;
+}
+
+// Commit the batch transaction and flush the log buffer.
+int db_commit(arkilian *db) {
+  if (!db || !db->handle) return SQLITE_ERROR;
+  if (!db->in_batch_txn) return SQLITE_ERROR;
+  int rc = sqlite3_step(db->commit_stmt);
+  sqlite3_reset(db->commit_stmt);
+  db->in_batch_txn = 0;
+  db->has_new_writes = 1;
+  log_buffer_flush(db);
+#ifndef _WIN32
+  pthread_mutex_unlock(&db->write_mutex);
+#else
+  ReleaseMutex(db->write_mutex);
+#endif
+  return (rc == SQLITE_DONE) ? SQLITE_OK : rc;
+}
+
+// Rollback the batch transaction without flushing the log buffer.
+int db_rollback(arkilian *db) {
+  if (!db || !db->handle) return SQLITE_ERROR;
+  if (!db->in_batch_txn) return SQLITE_ERROR;
+  sqlite3_step(db->rollback_stmt);
+  sqlite3_reset(db->rollback_stmt);
+  db->in_batch_txn = 0;
+  db->log_buffer_count = 0;
+#ifndef _WIN32
+  pthread_mutex_unlock(&db->write_mutex);
+#else
+  ReleaseMutex(db->write_mutex);
+#endif
+  return SQLITE_OK;
+}
+
 int db_exec(arkilian *db, const char *sql) {
   if (!db || !db->handle || !sql)
     return SQLITE_ERROR;
@@ -803,25 +872,29 @@ int db_exec(arkilian *db, const char *sql) {
     return rc;
   }
 
-  // Write path: acquire mutex, BEGIN → execute → log → COMMIT
+  // Write path: if inside a batch txn, skip per-write BEGIN/COMMIT
+  int in_batch = db->in_batch_txn;
+
+  if (!in_batch) {
 #ifndef _WIN32
-  pthread_mutex_lock(&db->write_mutex);
+    pthread_mutex_lock(&db->write_mutex);
 #else
-  WaitForSingleObject(db->write_mutex, INFINITE);
+    WaitForSingleObject(db->write_mutex, INFINITE);
 #endif
 
-  rc = sqlite3_step(db->begin_stmt);
-  sqlite3_reset(db->begin_stmt);
-  if (rc != SQLITE_DONE) {
-    snprintf(db->last_error_msg, sizeof(db->last_error_msg), "%s",
-             sqlite3_errmsg(db->handle));
-    sqlite3_finalize(stmt);
+    rc = sqlite3_step(db->begin_stmt);
+    sqlite3_reset(db->begin_stmt);
+    if (rc != SQLITE_DONE) {
+      snprintf(db->last_error_msg, sizeof(db->last_error_msg), "%s",
+               sqlite3_errmsg(db->handle));
+      sqlite3_finalize(stmt);
 #ifndef _WIN32
-    pthread_mutex_unlock(&db->write_mutex);
+      pthread_mutex_unlock(&db->write_mutex);
 #else
-    ReleaseMutex(db->write_mutex);
+      ReleaseMutex(db->write_mutex);
 #endif
-    return rc;
+      return rc;
+    }
   }
 
   rc = sqlite3_step(stmt);
@@ -830,6 +903,10 @@ int db_exec(arkilian *db, const char *sql) {
   if (rc != SQLITE_OK && rc != SQLITE_DONE) {
     snprintf(db->last_error_msg, sizeof(db->last_error_msg), "%s",
              sqlite3_errmsg(db->handle));
+    if (in_batch) {
+      // Batch error — caller should rollback the whole batch
+      return rc;
+    }
     sqlite3_step(db->rollback_stmt);
     sqlite3_reset(db->rollback_stmt);
 #ifndef _WIN32
@@ -840,29 +917,33 @@ int db_exec(arkilian *db, const char *sql) {
     return rc;
   }
 
-  rc = sqlite3_step(db->commit_stmt);
-  sqlite3_reset(db->commit_stmt);
-  if (rc != SQLITE_DONE) {
-    snprintf(db->last_error_msg, sizeof(db->last_error_msg), "%s",
-             sqlite3_errmsg(db->handle));
+  if (!in_batch) {
+    rc = sqlite3_step(db->commit_stmt);
+    sqlite3_reset(db->commit_stmt);
+    if (rc != SQLITE_DONE) {
+      snprintf(db->last_error_msg, sizeof(db->last_error_msg), "%s",
+               sqlite3_errmsg(db->handle));
+#ifndef _WIN32
+      pthread_mutex_unlock(&db->write_mutex);
+#else
+      ReleaseMutex(db->write_mutex);
+#endif
+      return rc;
+    }
+  }
+
+  db->has_new_writes = 1;
+
+  // Append oplog entry to in-memory buffer (flushed independently or at batch commit)
+  log_buffer_append(db, sql);
+
+  if (!in_batch) {
 #ifndef _WIN32
     pthread_mutex_unlock(&db->write_mutex);
 #else
     ReleaseMutex(db->write_mutex);
 #endif
-    return rc;
   }
-
-  db->has_new_writes = 1;
-
-  // Append oplog entry to in-memory buffer (flushed independently)
-  log_buffer_append(db, sql);
-
-#ifndef _WIN32
-  pthread_mutex_unlock(&db->write_mutex);
-#else
-  ReleaseMutex(db->write_mutex);
-#endif
 
   return SQLITE_DONE;
 }

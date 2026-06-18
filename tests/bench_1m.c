@@ -234,6 +234,47 @@ static int bench_arkilian_prepared(arkilian *db, int total, double *out_ms) {
 }
 
 // ---------------------------------------------------------------------------
+// Benchmark: Arkilian batched (db_begin → N × db_exec → db_commit)
+// ---------------------------------------------------------------------------
+
+static int bench_arkilian_batched(arkilian *db, int total, int batch_size,
+                                   double *out_ms) {
+  char sql[512];
+  int inserts = 0, updates = 0, deletes = 0;
+
+  double t0 = now_ns();
+  int in_batch = 0;
+
+  for (int i = 0; i < total; i++) {
+    if (!in_batch) {
+      db_begin(db);
+      in_batch = 1;
+    }
+
+    int op = gen_write_sql(sql, sizeof(sql));
+    if (op == 0) inserts++;
+    else if (op == 1) updates++;
+    else deletes++;
+
+    db_exec(db, sql);
+
+    if ((i + 1) % batch_size == 0 || i == total - 1) {
+      db_commit(db);
+      in_batch = 0;
+    }
+
+    if (i > 0 && i % PROGRESS_EVERY == 0) {
+      progress("ark-batch", i, total);
+    }
+  }
+  double elapsed = now_ns() - t0;
+  *out_ms = ns_to_ms(elapsed);
+  progress("ark-batch", total, total);
+
+  return inserts + updates + deletes;
+}
+
+// ---------------------------------------------------------------------------
 // Benchmark: Raw SQLite batched (one transaction per BATCH_SIZE writes)
 // ---------------------------------------------------------------------------
 
@@ -309,7 +350,7 @@ int main(void) {
   printf("  Batch size   : %d (for batched bench)\n", BATCH_SIZE);
   printf("  PRAGMAs      : journal_mode=WAL, synchronous=NORMAL,\n");
   printf("                 busy_timeout=5000, foreign_keys=ON\n");
-  printf("  Arkilian log : _arkilian_log (ts, sql, params)\n");
+  printf("  Arkilian log : _arkilian_log (lsn, ts, op, tbl, sql)\n");
   printf("\n");
 
   // ── Phase 0: Setup ──────────────────────────────────────────────
@@ -343,16 +384,20 @@ int main(void) {
   double t_raw_txn_ms      = 0;
   double t_ark_exec_ms     = 0;
   double t_ark_prep_ms     = 0;
+  double t_ark_batch100_ms = 0;
+  double t_ark_batch1k_ms  = 0;
   double t_raw_batch_ms    = 0;
 
-  int rows_raw_txn   = 0;
-  int rows_ark_exec  = 0;
-  int rows_ark_prep  = 0;
-  int rows_raw_batch = 0;
+  int rows_raw_txn    = 0;
+  int rows_ark_exec   = 0;
+  int rows_ark_prep   = 0;
+  int rows_ark_b100   = 0;
+  int rows_ark_b1k    = 0;
+  int rows_raw_batch  = 0;
 
   // Run 1: Raw SQLite (txn per write)
   {
-    printf("  [1/4] Raw SQLite  (explicit BEGIN/COMMIT per write)\n");
+    printf("  [1/6] Raw SQLite  (explicit BEGIN/COMMIT per write)\n");
     sqlite3_exec(raw_handle, "DELETE FROM bench_data", NULL, NULL, NULL);
     g_seed = 42; g_max_id = 0;
     rows_raw_txn = bench_raw_txn_per_write(raw_handle, TOTAL_WRITES, &t_raw_txn_ms);
@@ -364,7 +409,7 @@ int main(void) {
 
   // Run 2: Arkilian db_exec()
   {
-    printf("\n  [2/4] Arkilian     (db_exec: mutex + BEGIN/COMMIT + log)\n");
+    printf("\n  [2/6] Arkilian     (db_exec: mutex + BEGIN/COMMIT + log)\n");
     sqlite3_exec(raw_handle, "DELETE FROM bench_data", NULL, NULL, NULL);
 
     // Count log rows before
@@ -384,7 +429,7 @@ int main(void) {
 
   // Run 3: Arkilian prepare/bind/step/finalize
   {
-    printf("\n  [3/4] Arkilian     (prepare/step/finalize per write)\n");
+    printf("\n  [3/6] Arkilian     (prepare/step/finalize per write)\n");
     sqlite3_exec(raw_handle, "DELETE FROM bench_data", NULL, NULL, NULL);
 
     int log_before = count_rows(raw_handle, "_arkilian_log");
@@ -401,9 +446,47 @@ int main(void) {
            (double)TOTAL_WRITES / (t_ark_prep_ms / 1000.0));
   }
 
-  // Run 4: Raw SQLite batched
+  // Run 4: Arkilian batched 100
   {
-    printf("\n  [4/4] Raw SQLite  (batched: 1 txn per %d writes)\n", BATCH_SIZE);
+    printf("\n  [4/6] Arkilian     (batched: db_begin → 100 × db_exec → db_commit)\n");
+    sqlite3_exec(raw_handle, "DELETE FROM bench_data", NULL, NULL, NULL);
+
+    int log_before = count_rows(raw_handle, "_arkilian_log");
+
+    g_seed = 42; g_max_id = 0;
+    rows_ark_b100 = bench_arkilian_batched(db, TOTAL_WRITES, 100, &t_ark_batch100_ms);
+
+    int final_rows = count_rows(raw_handle, "bench_data");
+    int log_after = count_rows(raw_handle, "_arkilian_log");
+    int log_added = log_after - log_before;
+
+    printf("  Result: %d rows, %d log entries, %.0f ms, %.0f writes/sec\n",
+           final_rows, log_added, t_ark_batch100_ms,
+           (double)TOTAL_WRITES / (t_ark_batch100_ms / 1000.0));
+  }
+
+  // Run 5: Arkilian batched 1000
+  {
+    printf("\n  [5/6] Arkilian     (batched: db_begin → 1000 × db_exec → db_commit)\n");
+    sqlite3_exec(raw_handle, "DELETE FROM bench_data", NULL, NULL, NULL);
+
+    int log_before = count_rows(raw_handle, "_arkilian_log");
+
+    g_seed = 42; g_max_id = 0;
+    rows_ark_b1k = bench_arkilian_batched(db, TOTAL_WRITES, 1000, &t_ark_batch1k_ms);
+
+    int final_rows = count_rows(raw_handle, "bench_data");
+    int log_after = count_rows(raw_handle, "_arkilian_log");
+    int log_added = log_after - log_before;
+
+    printf("  Result: %d rows, %d log entries, %.0f ms, %.0f writes/sec\n",
+           final_rows, log_added, t_ark_batch1k_ms,
+           (double)TOTAL_WRITES / (t_ark_batch1k_ms / 1000.0));
+  }
+
+  // Run 6: Raw SQLite batched
+  {
+    printf("\n  [6/6] Raw SQLite  (batched: 1 txn per %d writes)\n", BATCH_SIZE);
     sqlite3_exec(raw_handle, "DELETE FROM bench_data", NULL, NULL, NULL);
 
     g_seed = 42; g_max_id = 0;
@@ -418,26 +501,34 @@ int main(void) {
   // ── Phase 3: Comparison ─────────────────────────────────────────
   printf("\n── Phase 3: Comparison ────────────────────────────────────\n\n");
 
-  double rps_raw_txn   = (double)TOTAL_WRITES / (t_raw_txn_ms / 1000.0);
-  double rps_ark_exec  = (double)TOTAL_WRITES / (t_ark_exec_ms / 1000.0);
-  double rps_ark_prep  = (double)TOTAL_WRITES / (t_ark_prep_ms / 1000.0);
-  double rps_raw_batch = (double)TOTAL_WRITES / (t_raw_batch_ms / 1000.0);
+  double rps_raw_txn    = (double)TOTAL_WRITES / (t_raw_txn_ms / 1000.0);
+  double rps_ark_exec   = (double)TOTAL_WRITES / (t_ark_exec_ms / 1000.0);
+  double rps_ark_prep   = (double)TOTAL_WRITES / (t_ark_prep_ms / 1000.0);
+  double rps_ark_b100   = (double)TOTAL_WRITES / (t_ark_batch100_ms / 1000.0);
+  double rps_ark_b1k    = (double)TOTAL_WRITES / (t_ark_batch1k_ms / 1000.0);
+  double rps_raw_batch  = (double)TOTAL_WRITES / (t_raw_batch_ms / 1000.0);
 
-  double overhead_exec  = ((t_ark_exec_ms - t_raw_txn_ms) / t_raw_txn_ms) * 100.0;
-  double overhead_prep  = ((t_ark_prep_ms - t_raw_txn_ms) / t_raw_txn_ms) * 100.0;
+  double overhead_exec   = ((t_ark_exec_ms - t_raw_txn_ms) / t_raw_txn_ms) * 100.0;
+  double overhead_prep   = ((t_ark_prep_ms - t_raw_txn_ms) / t_raw_txn_ms) * 100.0;
+  double overhead_b100   = ((t_ark_batch100_ms - t_raw_batch_ms) / t_raw_batch_ms) * 100.0;
+  double overhead_b1k    = ((t_ark_batch1k_ms - t_raw_batch_ms) / t_raw_batch_ms) * 100.0;
 
-  printf("  ┌─────────────────────┬──────────┬─────────────┬──────────┐\n");
-  printf("  │ Runner              │ Time (ms)│ Writes/sec  │ Overhead │\n");
-  printf("  ├─────────────────────┼──────────┼─────────────┼──────────┤\n");
-  printf("  │ Raw (txn/write)     │ %8.0f │ %10.0f │    —     │\n",
+  printf("  ┌──────────────────────────┬──────────┬─────────────┬──────────┐\n");
+  printf("  │ Runner                   │ Time (ms)│ Writes/sec  │ Overhead │\n");
+  printf("  ├──────────────────────────┼──────────┼─────────────┼──────────┤\n");
+  printf("  │ Raw (txn/write)          │ %8.0f │ %10.0f │    —     │\n",
          t_raw_txn_ms, rps_raw_txn);
-  printf("  │ Arkilian db_exec    │ %8.0f │ %10.0f │ %+7.1f%% │\n",
+  printf("  │ Arkilian db_exec         │ %8.0f │ %10.0f │ %+7.1f%% │\n",
          t_ark_exec_ms, rps_ark_exec, overhead_exec);
-  printf("  │ Arkilian prepare    │ %8.0f │ %10.0f │ %+7.1f%% │\n",
+  printf("  │ Arkilian prepare         │ %8.0f │ %10.0f │ %+7.1f%% │\n",
          t_ark_prep_ms, rps_ark_prep, overhead_prep);
-  printf("  │ Raw (batched %4d)  │ %8.0f │ %10.0f │    —     │\n",
+  printf("  │ Arkilian batch 100       │ %8.0f │ %10.0f │ %+7.1f%% │\n",
+         t_ark_batch100_ms, rps_ark_b100, overhead_b100);
+  printf("  │ Arkilian batch 1000      │ %8.0f │ %10.0f │ %+7.1f%% │\n",
+         t_ark_batch1k_ms, rps_ark_b1k, overhead_b1k);
+  printf("  │ Raw (batched %4d)       │ %8.0f │ %10.0f │    —     │\n",
          BATCH_SIZE, t_raw_batch_ms, rps_raw_batch);
-  printf("  └─────────────────────┴──────────┴─────────────┴──────────┘\n");
+  printf("  └──────────────────────────┴──────────┴─────────────┴──────────┘\n");
 
   // Log growth
   {
