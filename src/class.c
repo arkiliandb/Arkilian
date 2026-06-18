@@ -159,6 +159,14 @@ int db_init(arkilian **db_ptr, const char *filename) {
   sqlite3_exec(db->handle, "PRAGMA busy_timeout=5000;", NULL, NULL, NULL);
   sqlite3_exec(db->handle, "PRAGMA foreign_keys=ON;", NULL, NULL, NULL);
 
+  // Ensure internal tables exist
+  sqlite3_exec(db->handle,
+    "CREATE TABLE IF NOT EXISTS _arkilian_meta (k TEXT PRIMARY KEY, v TEXT);",
+    NULL, NULL, NULL);
+  sqlite3_exec(db->handle,
+    "CREATE TABLE IF NOT EXISTS _arkilian_log (lsn INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, sql TEXT, params TEXT);",
+    NULL, NULL, NULL);
+
   db->is_open = 1;
   db->shutdown_requested = 0;
   *db_ptr = db;
