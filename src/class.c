@@ -58,7 +58,8 @@ struct Memory {
 #define DEFAULT_SIGNED_URL_ENDPOINT "https://api.arkilian.com/get-signed-url"
 
 // Helper to get env var with default
-static const char* get_env_default(const char *env_var, const char *default_val) {
+static const char *get_env_default(const char *env_var,
+                                   const char *default_val) {
   const char *val = getenv(env_var);
   // printf("%s = %s;\n", env_var, val);
   return (val && strlen(val) > 0) ? val : default_val;
@@ -77,7 +78,8 @@ static int get_env_int_default(const char *env_var, int default_val) {
 void load_env(void) {
   const char *file = ".env";
   FILE *fp = fopen(file, "r");
-  if (!fp) return;
+  if (!fp)
+    return;
 
   char line[256];
   while (fgets(line, sizeof(line), fp)) {
@@ -101,8 +103,10 @@ DWORD WINAPI run_hourly_backup(LPVOID arg);
 #else
 void *run_hourly_backup(void *arg);
 #endif
-char *get_signed_url(const char *api_endpoint, const char *token, int *shutdown_flag);
-int upload_to_s3(const char *signed_url, const char *file_path, const char *token);
+char *get_signed_url(const char *api_endpoint, const char *token,
+                     int *shutdown_flag);
+int upload_to_s3(const char *signed_url, const char *file_path,
+                 const char *token);
 
 int db_init(arkilian **db_ptr, const char *filename) {
   if (!db_ptr)
@@ -119,24 +123,31 @@ int db_init(arkilian **db_ptr, const char *filename) {
   db->stmt_current = -1;
   load_env();
   // Get configuration from environment
-  const char *db_path = (filename != NULL) ? filename :
-                        get_env_default("ARKILIAN_DB_PATH", DEFAULT_DB_PATH);
+  const char *db_path =
+      (filename != NULL) ? filename
+                         : get_env_default("ARKILIAN_DB_PATH", DEFAULT_DB_PATH);
 
   // Backup configuration (using portable string copy instead of strdup)
-  const char *backup_path_tmp = get_env_default("ARKILIAN_BACKUP_PATH", DEFAULT_BACKUP_PATH);
+  const char *backup_path_tmp =
+      get_env_default("ARKILIAN_BACKUP_PATH", DEFAULT_BACKUP_PATH);
   db->backup_path = malloc(strlen(backup_path_tmp) + 1);
-  if (db->backup_path) strcpy(db->backup_path, backup_path_tmp);
-  
-  const char *signed_url_tmp = get_env_default("ARKILIAN_SIGNED_URL_ENDPOINT", DEFAULT_SIGNED_URL_ENDPOINT);
-  
+  if (db->backup_path)
+    strcpy(db->backup_path, backup_path_tmp);
+
+  const char *signed_url_tmp = get_env_default("ARKILIAN_SIGNED_URL_ENDPOINT",
+                                               DEFAULT_SIGNED_URL_ENDPOINT);
+
   db->signed_url_endpoint = malloc(strlen(signed_url_tmp) + 1);
-  if (db->signed_url_endpoint) strcpy(db->signed_url_endpoint, signed_url_tmp);
+  if (db->signed_url_endpoint)
+    strcpy(db->signed_url_endpoint, signed_url_tmp);
 
   const char *token_tmp = get_env_default("ARKILIAN_DATABASE_TOKEN", "");
   db->database_token = malloc(strlen(token_tmp) + 1);
-  if (db->database_token) strcpy(db->database_token, token_tmp);
-  
-  db->backup_interval = get_env_int_default("ARKILIAN_BACKUP_INTERVAL", DEFAULT_BACKUP_INTERVAL);
+  if (db->database_token)
+    strcpy(db->database_token, token_tmp);
+
+  db->backup_interval =
+      get_env_int_default("ARKILIAN_BACKUP_INTERVAL", DEFAULT_BACKUP_INTERVAL);
   db->backup_enabled = get_env_int_default("ARKILIAN_ENABLE_BACKUP", 1);
 
   int rc = sqlite3_open_v2(
@@ -153,7 +164,7 @@ int db_init(arkilian **db_ptr, const char *filename) {
     return 1;
   }
 
-  // Appling performance and safety pragmas
+  // Apply performance and safety pragmas
   sqlite3_exec(db->handle, "PRAGMA journal_mode=WAL;", NULL, NULL, NULL);
   sqlite3_exec(db->handle, "PRAGMA synchronous=NORMAL;", NULL, NULL, NULL);
   sqlite3_exec(db->handle, "PRAGMA busy_timeout=5000;", NULL, NULL, NULL);
@@ -174,13 +185,15 @@ int db_init(arkilian **db_ptr, const char *filename) {
   // Start backup thread if enabled
   if (db->backup_enabled) {
 #ifdef _WIN32
-    db->backup_thread_handle = CreateThread(NULL, 0, run_hourly_backup, db, 0, NULL);
+    db->backup_thread_handle =
+        CreateThread(NULL, 0, run_hourly_backup, db, 0, NULL);
     if (db->backup_thread_handle == NULL) {
       fprintf(stderr, "Failed to create backup thread\n");
     }
 #else
     db->backup_thread_running = 0;
-    if (pthread_create(&db->backup_thread_id, NULL, run_hourly_backup, db) != 0) {
+    if (pthread_create(&db->backup_thread_id, NULL, run_hourly_backup, db) !=
+        0) {
       fprintf(stderr, "Failed to create backup thread\n");
     } else {
       db->backup_thread_running = 1;
@@ -214,7 +227,6 @@ void db_close(arkilian *db) {
   }
 #endif
 
-
   for (int i = 0; i < db->stmt_count; i++) {
     if (db->stmts[i]) {
       sqlite3_finalize(db->stmts[i]);
@@ -231,9 +243,12 @@ void db_close(arkilian *db) {
     db->handle = NULL;
     db->is_open = 0;
   }
-  if (db->backup_path) free(db->backup_path);
-  if (db->signed_url_endpoint) free(db->signed_url_endpoint);
-  if (db->database_token) free(db->database_token);
+  if (db->backup_path)
+    free(db->backup_path);
+  if (db->signed_url_endpoint)
+    free(db->signed_url_endpoint);
+  if (db->database_token)
+    free(db->database_token);
   free(db);
 }
 
@@ -254,7 +269,8 @@ int backup_database(sqlite3 *pSource, const char *zFilename) {
   sqlite3 *pDest = NULL;
   sqlite3_backup *pBackup = NULL;
 
-  const char *actualPath = (zFilename != NULL) ? zFilename : DEFAULT_BACKUP_PATH;
+  const char *actualPath =
+      (zFilename != NULL) ? zFilename : DEFAULT_BACKUP_PATH;
   rc = sqlite3_open_v2(actualPath, &pDest,
                        SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, NULL);
 
@@ -330,10 +346,12 @@ void *run_hourly_backup(void *arg) {
     int status = backup_database(db->handle, db->backup_path);
     if (status == SQLITE_OK) {
       printf("Backup file made\n");
-      char *signed_url = get_signed_url(db->signed_url_endpoint, db->database_token, &db->shutdown_requested);
+      char *signed_url = get_signed_url(
+          db->signed_url_endpoint, db->database_token, &db->shutdown_requested);
       printf("----> %s", signed_url);
       if (signed_url && signed_url != NULL && strlen(signed_url) > 5) {
-        int upload_status = upload_to_s3(signed_url, db->backup_path, db->database_token);
+        int upload_status =
+            upload_to_s3(signed_url, db->backup_path, db->database_token);
         if (upload_status == 0) {
           printf("S3 Upload Successful!\n");
         } else {
@@ -373,7 +391,8 @@ static size_t write_cb(void *data, size_t size, size_t nmemb, void *userp) {
   return realsize;
 }
 
-char *get_signed_url(const char *api_endpoint, const char *token, int *shutdown_flag) {
+char *get_signed_url(const char *api_endpoint, const char *token,
+                     int *shutdown_flag) {
   CURL *curl = curl_easy_init();
   struct Memory chunk;
   chunk.response = malloc(1);
@@ -386,19 +405,22 @@ char *get_signed_url(const char *api_endpoint, const char *token, int *shutdown_
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)&chunk);
     // Timeout settings - fail fast if endpoint is unresponsive
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L); // 10 second total timeout
-    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5L); // 5 second connection timeout
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT,
+                     5L); // 5 second connection timeout
 
     // Set Bearer token authorization header
     struct curl_slist *headers = NULL;
     if (token && strlen(token) > 0) {
       char auth_header[512];
-      snprintf(auth_header, sizeof(auth_header), "Authorization: Bearer %s", token);
+      snprintf(auth_header, sizeof(auth_header), "Authorization: Bearer %s",
+               token);
       headers = curl_slist_append(headers, auth_header);
       curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
     }
 
     CURLcode res = curl_easy_perform(curl);
-    if (headers) curl_slist_free_all(headers);
+    if (headers)
+      curl_slist_free_all(headers);
     curl_easy_cleanup(curl);
 
     if (res == CURLE_OK)
@@ -408,7 +430,8 @@ char *get_signed_url(const char *api_endpoint, const char *token, int *shutdown_
   return NULL;
 }
 
-int upload_to_s3(const char *signed_url, const char *file_path, const char *token) {
+int upload_to_s3(const char *signed_url, const char *file_path,
+                 const char *token) {
   CURL *curl = curl_easy_init();
   if (!curl)
     return 1;
@@ -432,7 +455,8 @@ int upload_to_s3(const char *signed_url, const char *file_path, const char *toke
   headers = curl_slist_append(headers, "Content-Type: application/x-sqlite3");
   if (token && strlen(token) > 0) {
     char auth_header[512];
-    snprintf(auth_header, sizeof(auth_header), "Authorization: Bearer %s", token);
+    snprintf(auth_header, sizeof(auth_header), "Authorization: Bearer %s",
+             token);
     headers = curl_slist_append(headers, auth_header);
   }
   curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
@@ -456,7 +480,8 @@ int db_exec(arkilian *db, const char *sql) {
   sqlite3_stmt *stmt = NULL;
   int rc = sqlite3_prepare_v2(db->handle, sql, -1, &stmt, NULL);
   if (rc != SQLITE_OK) {
-    snprintf(db->last_error_msg, sizeof(db->last_error_msg), "%s", sqlite3_errmsg(db->handle));
+    snprintf(db->last_error_msg, sizeof(db->last_error_msg), "%s",
+             sqlite3_errmsg(db->handle));
     return rc;
   }
   rc = sqlite3_step(stmt);
@@ -470,7 +495,8 @@ int db_prepare(arkilian *db, const char *sql) {
 
   if (db->stmt_count >= db->stmt_capacity) {
     int new_cap = (db->stmt_capacity == 0) ? 4 : db->stmt_capacity * 2;
-    sqlite3_stmt **new_arr = realloc(db->stmts, (size_t)new_cap * sizeof(sqlite3_stmt *));
+    sqlite3_stmt **new_arr =
+        realloc(db->stmts, (size_t)new_cap * sizeof(sqlite3_stmt *));
     if (!new_arr)
       return SQLITE_NOMEM;
     db->stmts = new_arr;
@@ -480,7 +506,8 @@ int db_prepare(arkilian *db, const char *sql) {
   sqlite3_stmt *stmt = NULL;
   int rc = sqlite3_prepare_v2(db->handle, sql, -1, &stmt, NULL);
   if (rc != SQLITE_OK) {
-    snprintf(db->last_error_msg, sizeof(db->last_error_msg), "%s", sqlite3_errmsg(db->handle));
+    snprintf(db->last_error_msg, sizeof(db->last_error_msg), "%s",
+             sqlite3_errmsg(db->handle));
     return rc;
   }
   db->stmts[db->stmt_count] = stmt;
@@ -503,7 +530,7 @@ int db_stmt_count(arkilian *db) {
     return 0;
   return db->stmt_count;
 }
- 
+
 static sqlite3_stmt *get_current_stmt(arkilian *db) {
   if (!db || db->stmt_current < 0 || db->stmt_current >= db->stmt_count)
     return NULL;
@@ -542,18 +569,18 @@ int db_column_count(arkilian *db) {
   return sqlite3_column_count(stmt);
 }
 
-const char* db_column_name(arkilian *db, int col) {
+const char *db_column_name(arkilian *db, int col) {
   sqlite3_stmt *stmt = get_current_stmt(db);
   if (!stmt)
     return NULL;
-  return (const char*)sqlite3_column_name(stmt, col);
+  return (const char *)sqlite3_column_name(stmt, col);
 }
 
-const char* db_column_text(arkilian *db, int col) {
+const char *db_column_text(arkilian *db, int col) {
   sqlite3_stmt *stmt = get_current_stmt(db);
   if (!stmt)
     return NULL;
-  return (const char*)sqlite3_column_text(stmt, col);
+  return (const char *)sqlite3_column_text(stmt, col);
 }
 
 int db_column_int(arkilian *db, int col) {
@@ -594,11 +621,11 @@ int db_bind_double(arkilian *db, int idx, double val) {
 int db_set_token(arkilian *db, const char *token) {
   if (!db || !token)
     return 1;
-  if (db->database_token) free(db->database_token);
+  if (db->database_token)
+    free(db->database_token);
   db->database_token = malloc(strlen(token) + 1);
-  if (!db->database_token) return 1;
+  if (!db->database_token)
+    return 1;
   strcpy(db->database_token, token);
   return 0;
 }
-
-
