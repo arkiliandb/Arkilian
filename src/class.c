@@ -153,6 +153,12 @@ int db_init(arkilian **db_ptr, const char *filename) {
     return 1;
   }
 
+  // Appling performance and safety pragmas
+  sqlite3_exec(db->handle, "PRAGMA journal_mode=WAL;", NULL, NULL, NULL);
+  sqlite3_exec(db->handle, "PRAGMA synchronous=NORMAL;", NULL, NULL, NULL);
+  sqlite3_exec(db->handle, "PRAGMA busy_timeout=5000;", NULL, NULL, NULL);
+  sqlite3_exec(db->handle, "PRAGMA foreign_keys=ON;", NULL, NULL, NULL);
+
   db->is_open = 1;
   db->shutdown_requested = 0;
   *db_ptr = db;
