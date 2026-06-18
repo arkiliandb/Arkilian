@@ -446,6 +446,7 @@ static void test_lsn_is_monotonic(void) {
   db_exec(db, "INSERT INTO t1 (name) VALUES ('third')");
 
   // Query all LSNs ordered by rowid (which equals LSN for AUTOINCREMENT)
+  db_flush_log(db);
   db_prepare(db, "SELECT lsn FROM _arkilian_log ORDER BY lsn");
   int prev = 0;
   int count = 0;
