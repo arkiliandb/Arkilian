@@ -88,15 +88,23 @@ static void get_last_log_sql(arkilian *db, char *buf, size_t bufsz) {
   db_finalize(db);
 }
 
-// Verify PRAGMA value via query
+// Verify PRAGMA value via query (returns static buffer)
 static const char *get_pragma(arkilian *db, const char *pragma) {
+  static char buf[64];
   char query[128];
   snprintf(query, sizeof(query), "PRAGMA %s;", pragma);
   db_prepare(db, query);
   int rc = db_step(db);
-  const char *val = (rc == SQLITE_ROW) ? db_column_text(db, 0) : NULL;
+  if (rc == SQLITE_ROW) {
+    const char *val = db_column_text(db, 0);
+    if (val) strncpy(buf, val, sizeof(buf) - 1);
+    else buf[0] = '\0';
+    buf[sizeof(buf) - 1] = '\0';
+  } else {
+    buf[0] = '\0';
+  }
   db_finalize(db);
-  return val;
+  return buf;
 }
 
 // ---------------------------------------------------------------------------

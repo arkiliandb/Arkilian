@@ -55,3 +55,4 @@ bindings/rust/arkilian/target
 *.pyc
 *.db-shm
 *.db-wal
+test_interception
