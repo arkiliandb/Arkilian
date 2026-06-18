@@ -26,9 +26,12 @@
 #define strncasecmp _strnicmp
 #endif
 
-// ── Ring buffer for out-of-band WAL shipping ────────────────────────
+// ── Double-buffer for out-of-band WAL shipping ────────────────────
+// Active buffer: writers push here lock-free (serialized by write_mutex).
+// Flush buffer: background thread drains, POSTs, then clears.
+// Swap happens only when active buffer fills up (every 100k writes).
 
-#define RING_CAPACITY 4096
+#define WAL_BUF_CAPACITY 100000
 
 struct wal_entry {
   uint64_t ts;
@@ -38,116 +41,148 @@ struct wal_entry {
   char     sql[1024];
 };
 
-struct wal_ring {
-  struct wal_entry *entries;
-  int head;            // producer insert index
-  int tail;            // consumer read index
-  int count;           // number of live entries
-  int capacity;
+struct wal_double_buf {
+  struct wal_entry *entries[2];  // [0] = active, [1] = flushing (or vice versa)
+  int count[2];                  // entries in each buffer
+  int active;                    // index of the currently-active buffer
   int shutdown;
 #ifndef _WIN32
-  pthread_mutex_t mutex;
-  pthread_cond_t  not_empty;
-  pthread_cond_t  not_full;
+  pthread_mutex_t swap_mutex;
+  pthread_cond_t  flush_cond;
+  int             is_flushing;   // 1 when flush buffer has work
 #else
-  HANDLE mutex;
-  HANDLE not_empty;   // auto-reset event
-  HANDLE not_full;    // auto-reset event
+  HANDLE swap_mutex;
+  HANDLE flush_event;
+  LONG   is_flushing;            // Interlocked
 #endif
 };
 
-static void wal_ring_init(struct wal_ring *r, int cap) {
-  r->entries = malloc((size_t)cap * sizeof(struct wal_entry));
-  r->head = 0;
-  r->tail = 0;
-  r->count = 0;
-  r->capacity = cap;
-  r->shutdown = 0;
+static void wal_dbuf_init(struct wal_double_buf *b) {
+  b->entries[0] = malloc((size_t)WAL_BUF_CAPACITY * sizeof(struct wal_entry));
+  b->entries[1] = malloc((size_t)WAL_BUF_CAPACITY * sizeof(struct wal_entry));
+  b->count[0]  = 0;
+  b->count[1]  = 0;
+  b->active    = 0;
+  b->shutdown  = 0;
+  b->is_flushing = 0;
 #ifndef _WIN32
-  pthread_mutex_init(&r->mutex, NULL);
-  pthread_cond_init(&r->not_empty, NULL);
-  pthread_cond_init(&r->not_full, NULL);
+  pthread_mutex_init(&b->swap_mutex, NULL);
+  pthread_cond_init(&b->flush_cond, NULL);
 #else
-  r->mutex = CreateMutex(NULL, FALSE, NULL);
-  r->not_empty = CreateEvent(NULL, FALSE, FALSE, NULL);
-  r->not_full = CreateEvent(NULL, FALSE, FALSE, NULL);
+  b->swap_mutex  = CreateMutex(NULL, FALSE, NULL);
+  b->flush_event = CreateEvent(NULL, FALSE, FALSE, NULL);
 #endif
 }
 
-static void wal_ring_destroy(struct wal_ring *r) {
-  free(r->entries);
-  r->entries = NULL;
+static void wal_dbuf_destroy(struct wal_double_buf *b) {
+  free(b->entries[0]);
+  free(b->entries[1]);
 #ifndef _WIN32
-  pthread_mutex_destroy(&r->mutex);
-  pthread_cond_destroy(&r->not_empty);
-  pthread_cond_destroy(&r->not_full);
+  pthread_mutex_destroy(&b->swap_mutex);
+  pthread_cond_destroy(&b->flush_cond);
 #else
-  CloseHandle(r->mutex);
-  CloseHandle(r->not_empty);
-  CloseHandle(r->not_full);
+  CloseHandle(b->swap_mutex);
+  CloseHandle(b->flush_event);
 #endif
 }
 
-// Producer: push one entry (lock-free — caller holds write_mutex).
-// Uses memory barrier for safe publication to the consumer thread.
-static void wal_ring_push(struct wal_ring *r, const struct wal_entry *e) {
-  if (r->count >= r->capacity) return; // drop if full (ring is large enough)
-  r->entries[r->head] = *e;
+// Push one entry into the active buffer.  Caller holds write_mutex.
+// Swaps buffers if active is full.  Blocks only if both buffers are full
+// (flush thread hasn't finished draining the previous swap).
+static void wal_dbuf_push(struct wal_double_buf *b, const struct wal_entry *e) {
+  int a = b->active;
+
+  if (b->count[a] < WAL_BUF_CAPACITY) {
+    b->entries[a][b->count[a]++] = *e;
+    return;
+  }
+
+  // Active buffer full — try to swap
 #ifndef _WIN32
-  __sync_synchronize();
+  pthread_mutex_lock(&b->swap_mutex);
+  while (b->is_flushing && !b->shutdown) {
+    pthread_mutex_unlock(&b->swap_mutex);
+    usleep(100); // brief backoff
+    pthread_mutex_lock(&b->swap_mutex);
+  }
+  if (b->shutdown) { pthread_mutex_unlock(&b->swap_mutex); return; }
+
+  // Swap: old active becomes flushing, old flushing becomes active
+  b->active = 1 - a;
+  b->is_flushing = 1;
+  pthread_cond_signal(&b->flush_cond);
+  pthread_mutex_unlock(&b->swap_mutex);
 #else
-  MemoryBarrier();
+  WaitForSingleObject(b->swap_mutex, INFINITE);
+  while (b->is_flushing && !b->shutdown) {
+    ReleaseMutex(b->swap_mutex);
+    Sleep(1);
+    WaitForSingleObject(b->swap_mutex, INFINITE);
+  }
+  if (b->shutdown) { ReleaseMutex(b->swap_mutex); return; }
+  b->active = 1 - a;
+  b->is_flushing = 1;
+  SetEvent(b->flush_event);
+  ReleaseMutex(b->swap_mutex);
 #endif
-  r->head = (r->head + 1) % r->capacity;
-  r->count++;
+
+  // Push to the newly-active buffer
+  int na = b->active;
+  b->entries[na][b->count[na]++] = *e;
+}
+
+// Called by the flush thread.  Blocks until a buffer is ready to flush
+// or shutdown is requested.  Returns the number of entries to flush.
+// The caller MUST call wal_dbuf_flush_done after POST.
+static int wal_dbuf_acquire_flush(struct wal_double_buf *b,
+                                   struct wal_entry **out_entries) {
 #ifndef _WIN32
-  pthread_cond_signal(&r->not_empty);
+  pthread_mutex_lock(&b->swap_mutex);
+  while (!b->is_flushing && !b->shutdown)
+    pthread_cond_wait(&b->flush_cond, &b->swap_mutex);
+  if (b->shutdown && !b->is_flushing) {
+    pthread_mutex_unlock(&b->swap_mutex);
+    return 0;
+  }
+  int flush_idx = 1 - b->active;
+  *out_entries = b->entries[flush_idx];
+  int n = b->count[flush_idx];
+  pthread_mutex_unlock(&b->swap_mutex);
+  return n;
 #else
-  SetEvent(r->not_empty);
+  WaitForSingleObject(b->swap_mutex, INFINITE);
+  while (!b->is_flushing && !b->shutdown) {
+    ReleaseMutex(b->swap_mutex);
+    WaitForSingleObject(b->flush_event, INFINITE);
+    WaitForSingleObject(b->swap_mutex, INFINITE);
+  }
+  if (b->shutdown && !b->is_flushing) {
+    ReleaseMutex(b->swap_mutex);
+    return 0;
+  }
+  int flush_idx = 1 - b->active;
+  *out_entries = b->entries[flush_idx];
+  int n = b->count[flush_idx];
+  ReleaseMutex(b->swap_mutex);
+  return n;
 #endif
 }
 
-// Consumer: drain up to max entries. Returns number drained.
-// Caller provides a pre-allocated buffer.
-static int wal_ring_drain(struct wal_ring *r, struct wal_entry *dst, int max,
-                           int block_ms) {
-  int drained = 0;
+// Called by the flush thread after POST completes.
+static void wal_dbuf_flush_done(struct wal_double_buf *b) {
 #ifndef _WIN32
-  pthread_mutex_lock(&r->mutex);
-  // Wait with timeout for entries or shutdown
-  if (r->count == 0 && !r->shutdown && block_ms > 0) {
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    ts.tv_sec  += block_ms / 1000;
-    ts.tv_nsec += (block_ms % 1000) * 1000000L;
-    if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
-    pthread_cond_timedwait(&r->not_empty, &r->mutex, &ts);
-  }
-  while (r->count > 0 && drained < max) {
-    dst[drained++] = r->entries[r->tail];
-    r->tail = (r->tail + 1) % r->capacity;
-    r->count--;
-  }
-  if (drained > 0)
-    pthread_cond_signal(&r->not_full);
-  pthread_mutex_unlock(&r->mutex);
+  pthread_mutex_lock(&b->swap_mutex);
+  int flush_idx = 1 - b->active;
+  b->count[flush_idx] = 0;
+  b->is_flushing = 0;
+  pthread_mutex_unlock(&b->swap_mutex);
 #else
-  WaitForSingleObject(r->mutex, INFINITE);
-  if (r->count == 0 && !r->shutdown && block_ms > 0) {
-    ReleaseMutex(r->mutex);
-    WaitForSingleObject(r->not_empty, (DWORD)block_ms);
-    WaitForSingleObject(r->mutex, INFINITE);
-  }
-  while (r->count > 0 && drained < max) {
-    dst[drained++] = r->entries[r->tail];
-    r->tail = (r->tail + 1) % r->capacity;
-    r->count--;
-  }
-  if (drained > 0)
-    SetEvent(r->not_full);
-  ReleaseMutex(r->mutex);
+  WaitForSingleObject(b->swap_mutex, INFINITE);
+  int flush_idx = 1 - b->active;
+  b->count[flush_idx] = 0;
+  b->is_flushing = 0;
+  ReleaseMutex(b->swap_mutex);
 #endif
-  return drained;
 }
 
 // ── SQL helpers ─────────────────────────────────────────────────────
@@ -303,10 +338,9 @@ struct arkilian {
   sqlite3_stmt *begin_stmt;
   sqlite3_stmt *commit_stmt;
   sqlite3_stmt *rollback_stmt;
-  // Ring buffer for out-of-band WAL shipping
-  struct wal_ring ring;
+  // Double-buffer for out-of-band WAL shipping
+  struct wal_double_buf wal;
   // Flush thread
-  int flush_interval_ms;
 #ifndef _WIN32
   pthread_t flush_thread_id;
   int flush_thread_running;
@@ -327,7 +361,6 @@ struct Memory {
 #define DEFAULT_BACKUP_PATH "backup.sqlite"
 #define DEFAULT_BACKUP_INTERVAL 3600
 #define DEFAULT_SIGNED_URL_ENDPOINT "https://api.arkilian.com/get-signed-url"
-#define DEFAULT_FLUSH_INTERVAL_MS 1000
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
@@ -389,13 +422,11 @@ void *run_wal_flush(void *arg) {
   const char *token    = db->database_token;
 
   while (1) {
-    // Drain up to 256 entries, wait up to flush_interval_ms
-    struct wal_entry batch[256];
-    int n = wal_ring_drain(&db->ring, batch, 256, db->flush_interval_ms);
+    struct wal_entry *batch;
+    int n = wal_dbuf_acquire_flush(&db->wal, &batch);
+    if (n == 0) break;
 
-    if (db->ring.shutdown && n == 0) break;
-
-    if (n > 0 && push_url && strlen(push_url) > 0) {
+    if (push_url && strlen(push_url) > 0) {
       // Build JSON payload
       size_t json_cap = (size_t)n * 512 + 64;
       char *json = malloc(json_cap);
@@ -442,7 +473,7 @@ void *run_wal_flush(void *arg) {
       }
     }
 
-    if (db->ring.shutdown) break;
+    wal_dbuf_flush_done(&db->wal);
   }
 
 #ifdef _WIN32
@@ -529,12 +560,8 @@ int db_init(arkilian **db_ptr, const char *filename) {
   sqlite3_prepare_v2(db->handle, "COMMIT;", -1, &db->commit_stmt, NULL);
   sqlite3_prepare_v2(db->handle, "ROLLBACK;", -1, &db->rollback_stmt, NULL);
 
-  // Ring buffer for WAL shipping
-  wal_ring_init(&db->ring, RING_CAPACITY);
-
-  // Flush interval
-  db->flush_interval_ms =
-    get_env_int_default("ARKILIAN_WAL_FLUSH_MS", DEFAULT_FLUSH_INTERVAL_MS);
+  // Double-buffer for WAL shipping
+  wal_dbuf_init(&db->wal);
 
   db->is_open = 1;
   db->shutdown_requested = 0;
@@ -577,24 +604,22 @@ void db_close(arkilian *db) {
 
   db->shutdown_requested = 1;
 
-  // Signal ring buffer shutdown
-  db->ring.shutdown = 1;
+  // Signal double-buffer shutdown to wake flush thread
+  db->wal.shutdown = 1;
 #ifndef _WIN32
-  pthread_cond_signal(&db->ring.not_empty);
+  pthread_cond_signal(&db->wal.flush_cond);
 #else
-  SetEvent(db->ring.not_empty);
+  SetEvent(db->wal.flush_event);
 #endif
 
   // Wait for flush thread (if running)
 #ifndef _WIN32
   if (db->flush_thread_running) {
-    pthread_cond_signal(&db->ring.not_empty);
     pthread_join(db->flush_thread_id, NULL);
     db->flush_thread_running = 0;
   }
 #else
   if (db->flush_thread_handle != NULL) {
-    SetEvent(db->ring.not_empty);
     WaitForSingleObject(db->flush_thread_handle, INFINITE);
     CloseHandle(db->flush_thread_handle);
     db->flush_thread_handle = NULL;
@@ -660,7 +685,7 @@ void db_close(arkilian *db) {
   if (db->signed_url_endpoint) free(db->signed_url_endpoint);
   if (db->database_token)      free(db->database_token);
 
-  wal_ring_destroy(&db->ring);
+  wal_dbuf_destroy(&db->wal);
 
 #ifndef _WIN32
   pthread_mutex_destroy(&db->write_mutex);
@@ -902,7 +927,7 @@ int db_exec(arkilian *db, const char *sql) {
     // Push to ring buffer for async streaming
     struct wal_entry entry;
     build_wal_entry(&entry, sql);
-    wal_ring_push(&db->ring, &entry);
+    wal_dbuf_push(&db->wal, &entry);
   } else {
     snprintf(db->last_error_msg, sizeof(db->last_error_msg), "%s",
              sqlite3_errmsg(db->handle));
@@ -1017,7 +1042,7 @@ int db_finalize(arkilian *db) {
         db->has_new_writes = 1;
         struct wal_entry entry;
         build_wal_entry(&entry, db->current_write_sql);
-        wal_ring_push(&db->ring, &entry);
+        wal_dbuf_push(&db->wal, &entry);
       }
       db->in_write_txn = 0;
       db->write_stmt_index = -1;
@@ -1159,5 +1184,5 @@ int db_set_token(arkilian *db, const char *token) {
 // Returns the number of pending WAL entries in the ring buffer
 int db_wal_pending(arkilian *db) {
   if (!db) return 0;
-  return db->ring.count;
+  return db->wal.count[0] + db->wal.count[1];
 }
