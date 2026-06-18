@@ -37,15 +37,13 @@ static int tests_passed = 0;
 
 static arkilian *open_test_db(void) {
   setenv("ARKILIAN_ENABLE_BACKUP", "0", 1);
-  // Don't set push URL yet — flush thread starts at init time.
-  // We'll set it after init so pushes accumulate without draining.
-  unsetenv("ARKILIAN_WAL_PUSH_URL");
+  // Set a dummy push URL so the double-buffer accumulates entries.
+  // The flush thread will start but fail-fast on this non-routable address.
+  setenv("ARKILIAN_WAL_PUSH_URL", "http://127.0.0.1:1", 1);
   arkilian *db = NULL;
   int rc = db_init(&db, TEST_DB);
   assert(rc == 0 && "db_init failed");
   assert(db != NULL);
-  // Now enable push target so wal_dbuf_push() records entries
-  // setenv("ARKILIAN_WAL_PUSH_URL", "http://127.0.0.1:1", 1);
   return db;
 }
 
@@ -654,7 +652,7 @@ static void test_perf_select_1000_reads(void) {
 
 int main(void) {
   setenv("ARKILIAN_ENABLE_BACKUP", "0", 1);
-  unsetenv("ARKILIAN_WAL_PUSH_URL");
+  setenv("ARKILIAN_WAL_PUSH_URL", "http://127.0.0.1:1", 1);
 
   printf("=== Arkilian Write Interception Tests (ring buffer) ===\n\n");
 
