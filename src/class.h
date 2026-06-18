@@ -18,10 +18,10 @@ sqlite3* db_get_handle(arkilian *db);
 int db_set_token(arkilian *db, const char *token);
 
 int db_exec(arkilian *db, const char *sql);
-void db_flush_log(arkilian *db);
 int db_begin(arkilian *db);
 int db_commit(arkilian *db);
 int db_rollback(arkilian *db);
+int db_wal_pending(arkilian *db);
 
 // Statement management — multiple statements can coexist.
 // db_prepare pushes a new statement and makes it "current" (index = count-1).

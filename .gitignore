@@ -57,3 +57,4 @@ bindings/rust/arkilian/target
 *.db-wal
 test_interception
 bench_1m
+test_basic
