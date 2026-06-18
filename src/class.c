@@ -231,59 +231,73 @@ void *run_wal_flush(void *arg) {
   const char *token    = db->database_token;
 
   while (1) {
-    // Drain up to 256 entries, wait up to flush_interval_ms
+    // Sleep between drain cycles
+    {
+      int ms = db->flush_interval_ms;
+      if (ms > 0) {
+        struct timespec ts;
+        ts.tv_sec  = ms / 1000;
+        ts.tv_nsec = (ms % 1000) * 1000000L;
+        nanosleep(&ts, NULL);
+      }
+    }
+    if (db->log_queue.shutdown) break;
+
+    // Drain everything currently in the queue (non-blocking)
     char *batch[256];
-    int n = queue_drain(&db->log_queue, batch, 256, db->flush_interval_ms);
-
-    if (db->log_queue.shutdown && n == 0) break;
-
-    if (n > 0 && push_url && strlen(push_url) > 0) {
-      // Build JSON payload
-      size_t json_cap = (size_t)n * 512 + 64;
-      char *json = malloc(json_cap);
-      if (json) {
-        int off = snprintf(json, 64, "[");
-        for (int i = 0; i < n; i++) {
-          char *sql = batch[i];
-          off += snprintf(json + off, json_cap - (size_t)off,
-            "{\"sql\":\"");
-          for (char *s = sql; *s && off < (int)json_cap - 32; s++) {
-            if (*s == '"' || *s == '\\') json[off++] = '\\';
-            json[off++] = *s;
+    int n;
+    while ((n = queue_drain(&db->log_queue, batch, 256, 0)) > 0) {
+      if (push_url && strlen(push_url) > 0) {
+        // Build JSON payload and POST
+        size_t json_cap = (size_t)n * 512 + 64;
+        char *json = malloc(json_cap);
+        if (json) {
+          int off = snprintf(json, 64, "[");
+          for (int i = 0; i < n; i++) {
+            char *sql = batch[i];
+            off += snprintf(json + off, json_cap - (size_t)off,
+              "{\"sql\":\"");
+            for (char *s = sql; *s && off < (int)json_cap - 32; s++) {
+              if (*s == '"' || *s == '\\') json[off++] = '\\';
+              json[off++] = *s;
+            }
+            off += snprintf(json + off, 16, "\"}%s", (i < n - 1) ? "," : "");
+            free(sql);
           }
-          off += snprintf(json + off, 16, "\"}%s", (i < n - 1) ? "," : "");
-          free(sql); // free the strdup'd copy
-        }
-        off += snprintf(json + off, 8, "]");
+          off += snprintf(json + off, 8, "]");
 
-        CURL *curl = curl_easy_init();
-        if (curl) {
-          curl_easy_setopt(curl, CURLOPT_URL, push_url);
-          curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json);
-          curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
-          curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5L);
+          CURL *curl = curl_easy_init();
+          if (curl) {
+            curl_easy_setopt(curl, CURLOPT_URL, push_url);
+            curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json);
+            curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
+            curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5L);
 
-          struct curl_slist *headers = NULL;
-          headers = curl_slist_append(headers, "Content-Type: application/json");
-          if (token && strlen(token) > 0) {
-            char auth[512];
-            snprintf(auth, sizeof(auth), "Authorization: Bearer %s", token);
-            headers = curl_slist_append(headers, auth);
+            struct curl_slist *headers = NULL;
+            headers = curl_slist_append(headers, "Content-Type: application/json");
+            if (token && strlen(token) > 0) {
+              char auth[512];
+              snprintf(auth, sizeof(auth), "Authorization: Bearer %s", token);
+              headers = curl_slist_append(headers, auth);
+            }
+            curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+
+            CURLcode res = curl_easy_perform(curl);
+            if (res != CURLE_OK)
+              fprintf(stderr, "WAL push: %s\n", curl_easy_strerror(res));
+
+            curl_slist_free_all(headers);
+            curl_easy_cleanup(curl);
           }
-          curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-
-          CURLcode res = curl_easy_perform(curl);
-          if (res != CURLE_OK)
-            fprintf(stderr, "WAL push: %s\n", curl_easy_strerror(res));
-
-          curl_slist_free_all(headers);
-          curl_easy_cleanup(curl);
+          free(json);
         }
-        free(json);
+      } else {
+        // No URL configured — drain to /dev/null (just free the entries)
+        for (int i = 0; i < n; i++) free(batch[i]);
       }
     }
 
-    if (db->log_queue.shutdown) break;
+    if (db->log_queue.shutdown && db->log_queue.count == 0) break;
   }
 
 #ifdef _WIN32

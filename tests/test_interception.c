@@ -39,7 +39,7 @@ static arkilian *open_test_db(void) {
   setenv("ARKILIAN_ENABLE_BACKUP", "0", 1);
   // Disable the WAL push URL so the flush thread doesn't POST
   setenv("ARKILIAN_WAL_PUSH_URL", "", 1);
-  setenv("ARKILIAN_WAL_FLUSH_MS", "5000", 1);
+  setenv("ARKILIAN_WAL_FLUSH_MS", "30000", 1);
   arkilian *db = NULL;
   int rc = db_init(&db, TEST_DB);
   assert(rc == 0 && "db_init failed");
