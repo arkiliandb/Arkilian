@@ -52,10 +52,10 @@ static arkilian *open_test_db(void) {
 
 static void cleanup_files(void) { remove(TEST_DB); }
 
-// Count rows in _arkilian_log
+// Count rows in _arkilian_log_v2
 static int count_log_rows(arkilian *db) {
   db_flush_log(db);
-  int rc = db_prepare(db, "SELECT COUNT(*) FROM _arkilian_log");
+  int rc = db_prepare(db, "SELECT COUNT(*) FROM _arkilian_log_v2");
   assert(rc == SQLITE_OK);
   rc = db_step(db);
   assert(rc == SQLITE_ROW);
@@ -64,10 +64,10 @@ static int count_log_rows(arkilian *db) {
   return count;
 }
 
-// Get the latest LSN from _arkilian_log
+// Get the latest LSN from _arkilian_log_v2
 static int get_max_lsn(arkilian *db) {
   db_flush_log(db);
-  int rc = db_prepare(db, "SELECT COALESCE(MAX(lsn), 0) FROM _arkilian_log");
+  int rc = db_prepare(db, "SELECT COALESCE(MAX(lsn), 0) FROM _arkilian_log_v2");
   assert(rc == SQLITE_OK);
   rc = db_step(db);
   assert(rc == SQLITE_ROW);
@@ -76,11 +76,11 @@ static int get_max_lsn(arkilian *db) {
   return max_lsn;
 }
 
-// Get the latest SQL text from _arkilian_log
+// Get the latest SQL text from _arkilian_log_v2
 static void get_last_log_sql(arkilian *db, char *buf, size_t bufsz) {
   db_flush_log(db);
   int rc = db_prepare(db,
-    "SELECT sql FROM _arkilian_log ORDER BY lsn DESC LIMIT 1");
+    "SELECT sql FROM _arkilian_log_v2 ORDER BY lsn DESC LIMIT 1");
   assert(rc == SQLITE_OK);
   rc = db_step(db);
   assert(rc == SQLITE_ROW);
@@ -165,7 +165,7 @@ static void test_meta_table_exists(void) {
 
 static void test_log_table_exists(void) {
   arkilian *db = open_test_db();
-  int rc = db_prepare(db, "SELECT lsn, ts, op, tbl, sql FROM _arkilian_log");
+  int rc = db_prepare(db, "SELECT lsn, ts, op, table_id, pk, sql FROM _arkilian_log_v2");
   assert(rc == SQLITE_OK);
   db_finalize(db);
   db_close(db);
@@ -447,7 +447,7 @@ static void test_lsn_is_monotonic(void) {
 
   // Query all LSNs ordered by rowid (which equals LSN for AUTOINCREMENT)
   db_flush_log(db);
-  db_prepare(db, "SELECT lsn FROM _arkilian_log ORDER BY lsn");
+  db_prepare(db, "SELECT lsn FROM _arkilian_log_v2 ORDER BY lsn");
   int prev = 0;
   int count = 0;
   while (db_step(db) == SQLITE_ROW) {
@@ -484,7 +484,7 @@ static void test_log_escapes_sql_special_chars(void) {
 
   // Verify the logged SQL is safe (can be replayed)
   db_prepare(db,
-    "SELECT sql FROM _arkilian_log ORDER BY lsn DESC LIMIT 1");
+    "SELECT sql FROM _arkilian_log_v2 ORDER BY lsn DESC LIMIT 1");
   db_step(db);
   const char *logged = db_column_text(db, 0);
   assert(logged != NULL);

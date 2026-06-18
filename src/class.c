@@ -18,6 +18,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 #include <time.h>
 // deps
 #include "deps/sqlite/sqlite3.h"
@@ -25,10 +26,12 @@
 #define LOG_BUFFER_CAPACITY 128
 
 struct log_entry {
-  sqlite3_int64 ts;
-  int op; // 0=INSERT, 1=UPDATE, 2=DELETE, 3=DDL
-  char tbl[128];
-  char sql[1024];
+  uint64_t lsn;        // assigned at flush time
+  uint64_t ts;         // unix timestamp (seconds)
+  uint8_t  op;         // 1=INSERT, 2=UPDATE, 3=DELETE, 0=DDL
+  uint16_t table_id;   // djb2 hash of table name
+  uint64_t pk;         // primary key / rowid
+  char     sql[1024];  // original SQL (for replay / debugging)
 };
 
 struct arkilian {
@@ -223,11 +226,23 @@ int db_init(arkilian **db_ptr, const char *filename) {
       "CREATE TABLE IF NOT EXISTS _arkilian_log (lsn INTEGER PRIMARY KEY "
       "AUTOINCREMENT, ts INTEGER, op INTEGER, tbl TEXT, sql TEXT);",
       NULL, NULL, NULL);
+  sqlite3_exec(
+      db->handle,
+      "CREATE TABLE IF NOT EXISTS _arkilian_log_v2 ("
+      "  lsn       INTEGER PRIMARY KEY AUTOINCREMENT,"
+      "  ts        INTEGER NOT NULL,"
+      "  op        INTEGER NOT NULL,"
+      "  table_id  INTEGER NOT NULL,"
+      "  pk        INTEGER NOT NULL,"
+      "  sql       TEXT"
+      ");",
+      NULL, NULL, NULL);
 
   // Prepare cached statements for write interception (avoid per-write compile)
   sqlite3_prepare_v2(
       db->handle,
-      "INSERT INTO _arkilian_log (ts, op, tbl, sql) VALUES (?1, ?2, ?3, ?4);",
+      "INSERT INTO _arkilian_log_v2 (ts, op, table_id, pk, sql) "
+      "VALUES (?1, ?2, ?3, ?4, ?5);",
       -1, &db->log_insert_stmt, NULL);
   sqlite3_prepare_v2(db->handle, "BEGIN;", -1, &db->begin_stmt, NULL);
   sqlite3_prepare_v2(db->handle, "COMMIT;", -1, &db->commit_stmt, NULL);
@@ -324,12 +339,12 @@ void db_close(arkilian *db) {
       sqlite3_step(db->begin_stmt);
       sqlite3_reset(db->begin_stmt);
       for (int i = 0; i < db->log_buffer_count; i++) {
-        sqlite3_bind_int64(db->log_insert_stmt, 1, db->log_buffer[i].ts);
-        sqlite3_bind_int(db->log_insert_stmt, 2, db->log_buffer[i].op);
-        sqlite3_bind_text(db->log_insert_stmt, 3, db->log_buffer[i].tbl, -1,
-                          SQLITE_TRANSIENT);
-        sqlite3_bind_text(db->log_insert_stmt, 4, db->log_buffer[i].sql, -1,
-                          SQLITE_TRANSIENT);
+        struct log_entry *e = &db->log_buffer[i];
+        sqlite3_bind_int64(db->log_insert_stmt, 1, (sqlite3_int64)e->ts);
+        sqlite3_bind_int(db->log_insert_stmt, 2, e->op);
+        sqlite3_bind_int(db->log_insert_stmt, 3, e->table_id);
+        sqlite3_bind_int64(db->log_insert_stmt, 4, (sqlite3_int64)e->pk);
+        sqlite3_bind_text(db->log_insert_stmt, 5, e->sql, -1, SQLITE_TRANSIENT);
         sqlite3_step(db->log_insert_stmt);
         sqlite3_reset(db->log_insert_stmt);
       }
@@ -602,11 +617,52 @@ int upload_to_s3(const char *signed_url, const char *file_path,
   return (res == CURLE_OK) ? 0 : 1;
 }
 
-// Parse SQL to extract operation type and table name.
-// op: 0=INSERT, 1=UPDATE, 2=DELETE, 3=DDL
-static void parse_sql_op_tbl(const char *sql, int *op, char *tbl,
-                             size_t tblsz) {
-  *op = 3; // default DDL
+// djb2 hash (portable, fast) for table name → table_id mapping
+static uint16_t table_name_hash(const char *s) {
+  unsigned long hash = 5381;
+  int c;
+  while ((c = (unsigned char)*s++))
+    hash = ((hash << 5) + hash) + c;
+  return (uint16_t)(hash & 0xFFFF);
+}
+
+// Try to extract a trailing integer pk from SQL (e.g. WHERE id = 123).
+// Returns 1 and sets *pk on success, 0 if not found.
+static int extract_pk_from_sql(const char *sql, uint64_t *pk) {
+  // Search backwards for "= " followed by digits, optionally near the end
+  const char *eq = sql;
+  while ((eq = strstr(eq, "= ")) != NULL) {
+    eq += 2;
+    if (*eq >= '0' && *eq <= '9') {
+      char *end;
+      unsigned long long v = strtoull(eq, &end, 10);
+      if (v > 0 && (end == eq || *end == ';' || *end == '\0')) {
+        *pk = (uint64_t)v;
+        return 1;
+      }
+    }
+  }
+  // Try "="  without space
+  eq = sql;
+  while ((eq = strchr(eq, '=')) != NULL) {
+    eq++;
+    if (*eq >= '0' && *eq <= '9') {
+      char *end;
+      unsigned long long v = strtoull(eq, &end, 10);
+      if (v > 0 && (end == eq || *end == ' ' || *end == ';' || *end == '\0')) {
+        *pk = (uint64_t)v;
+        return 1;
+      }
+    }
+  }
+  return 0;
+}
+
+// Parse SQL to extract operation type, table name, hash, and primary key.
+// op: 0=DDL, 1=INSERT, 2=UPDATE, 3=DELETE
+static void parse_sql_op_tbl(const char *sql, uint8_t *op, char *tbl, size_t tblsz,
+                             uint16_t *table_id, uint64_t *pk) {
+  *op = 0; // default DDL
   tbl[0] = '\0';
 
   // Skip leading whitespace and comments
@@ -621,7 +677,7 @@ static void parse_sql_op_tbl(const char *sql, int *op, char *tbl,
 #define MATCH(s, literal) (strncasecmp(s, literal, strlen(literal)) == 0)
 
   if (MATCH(sql, "INSERT")) {
-    *op = 0;
+    *op = 1;
     sql += 6;
     while (*sql == ' ')
       sql++;
@@ -643,7 +699,7 @@ static void parse_sql_op_tbl(const char *sql, int *op, char *tbl,
       }
     }
   } else if (MATCH(sql, "UPDATE")) {
-    *op = 1;
+    *op = 2;
     sql += 6;
     while (*sql == ' ')
       sql++;
@@ -657,7 +713,7 @@ static void parse_sql_op_tbl(const char *sql, int *op, char *tbl,
         sql++;
     }
   } else if (MATCH(sql, "DELETE")) {
-    *op = 2;
+    *op = 3;
     sql += 6;
     while (*sql == ' ')
       sql++;
@@ -667,7 +723,7 @@ static void parse_sql_op_tbl(const char *sql, int *op, char *tbl,
         sql++;
     }
   } else if (MATCH(sql, "REPLACE")) {
-    *op = 0; // treat REPLACE as INSERT
+    *op = 1; // treat REPLACE as INSERT
     sql += 7;
     while (*sql == ' ')
       sql++;
@@ -678,7 +734,7 @@ static void parse_sql_op_tbl(const char *sql, int *op, char *tbl,
     }
   } else {
     // DDL: CREATE, ALTER, DROP, etc.
-    *op = 3;
+    *op = 0;
     if (MATCH(sql, "CREATE")) {
       sql += 6;
       while (*sql == ' ')
@@ -739,23 +795,29 @@ static void parse_sql_op_tbl(const char *sql, int *op, char *tbl,
       tbl[i++] = *sql++;
     tbl[i] = '\0';
   }
+
+  *table_id = table_name_hash(tbl);
+  if (!extract_pk_from_sql(sql, pk))
+    *pk = 0;
 }
 
-// Flush buffered log entries to disk in a single transaction
+// Flush buffered log entries to _arkilian_log_v2 in a single transaction.
+// Then POST to the network push URL if configured.
 static void log_buffer_flush(arkilian *db) {
-  if (db->log_buffer_count == 0)
-    return;
+  if (db->log_buffer_count == 0) return;
 
+  // ── Local flush to SQLite ──
   sqlite3_step(db->begin_stmt);
   sqlite3_reset(db->begin_stmt);
 
   for (int i = 0; i < db->log_buffer_count; i++) {
-    sqlite3_bind_int64(db->log_insert_stmt, 1, db->log_buffer[i].ts);
-    sqlite3_bind_int(db->log_insert_stmt, 2, db->log_buffer[i].op);
-    sqlite3_bind_text(db->log_insert_stmt, 3, db->log_buffer[i].tbl, -1,
-                      SQLITE_TRANSIENT);
-    sqlite3_bind_text(db->log_insert_stmt, 4, db->log_buffer[i].sql, -1,
-                      SQLITE_TRANSIENT);
+    struct log_entry *e = &db->log_buffer[i];
+    e->lsn = 0; // assigned by AUTOINCREMENT; read back from sqlite3_last_insert_rowid
+    sqlite3_bind_int64(db->log_insert_stmt, 1, (sqlite3_int64)e->ts);
+    sqlite3_bind_int(db->log_insert_stmt, 2, e->op);
+    sqlite3_bind_int(db->log_insert_stmt, 3, e->table_id);
+    sqlite3_bind_int64(db->log_insert_stmt, 4, (sqlite3_int64)e->pk);
+    sqlite3_bind_text(db->log_insert_stmt, 5, e->sql, -1, SQLITE_TRANSIENT);
     sqlite3_step(db->log_insert_stmt);
     sqlite3_reset(db->log_insert_stmt);
   }
@@ -763,7 +825,65 @@ static void log_buffer_flush(arkilian *db) {
   sqlite3_step(db->commit_stmt);
   sqlite3_reset(db->commit_stmt);
 
+  int flushed = db->log_buffer_count;
   db->log_buffer_count = 0;
+
+  // ── Network push ──
+  const char *push_url = getenv("ARKILIAN_WAL_PUSH_URL");
+  if (push_url && strlen(push_url) > 0) {
+    // Build JSON payload: [{"ts":...,"op":...,"table_id":...,"pk":...,"sql":"..."},...]
+    char *json = malloc(flushed * 512 + 64);
+    if (json) {
+      int off = snprintf(json, 64, "[");
+      for (int i = 0; i < flushed; i++) {
+        struct log_entry *e = &db->log_buffer[i];
+        off += snprintf(json + off, 512,
+          "{\"ts\":%llu,\"op\":%u,\"table_id\":%u,\"pk\":%llu,\"sql\":\"",
+          (unsigned long long)e->ts, e->op, e->table_id, (unsigned long long)e->pk);
+        // Escape SQL for JSON
+        for (char *s = e->sql; *s && off < (flushed * 512 + 32); s++) {
+          if (*s == '"' || *s == '\\') json[off++] = '\\';
+          json[off++] = *s;
+        }
+        off += snprintf(json + off, 16, "\"}%s", (i < flushed - 1) ? "," : "");
+      }
+      off += snprintf(json + off, 8, "]");
+
+      CURL *curl = curl_easy_init();
+      if (curl) {
+        curl_easy_setopt(curl, CURLOPT_URL, push_url);
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json);
+        curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
+        curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5L);
+
+        struct curl_slist *headers = NULL;
+        headers = curl_slist_append(headers, "Content-Type: application/json");
+        if (db->database_token && strlen(db->database_token) > 0) {
+          char auth[512];
+          snprintf(auth, sizeof(auth), "Authorization: Bearer %s",
+                   db->database_token);
+          headers = curl_slist_append(headers, auth);
+        }
+        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+
+        CURLcode res = curl_easy_perform(curl);
+        if (res == CURLE_OK) {
+          long http_code = 0;
+          curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+          if (http_code != 200) {
+            fprintf(stderr, "WAL push returned HTTP %ld\n", http_code);
+          }
+          // On non-200, entries are already cleared from buffer (best-effort).
+          // Future: retry logic would keep them.
+        } else {
+          fprintf(stderr, "WAL push failed: %s\n", curl_easy_strerror(res));
+        }
+        curl_slist_free_all(headers);
+        curl_easy_cleanup(curl);
+      }
+      free(json);
+    }
+  }
 }
 
 // Append a log entry to the in-memory buffer. Flushes if buffer is full.
@@ -773,8 +893,9 @@ static void log_buffer_append(arkilian *db, const char *sql) {
   }
 
   struct log_entry *e = &db->log_buffer[db->log_buffer_count++];
-  e->ts = (sqlite3_int64)time(NULL);
-  parse_sql_op_tbl(sql, &e->op, e->tbl, sizeof(e->tbl));
+  e->ts = (uint64_t)time(NULL);
+  char tbl_buf[128];
+  parse_sql_op_tbl(sql, &e->op, tbl_buf, sizeof(tbl_buf), &e->table_id, &e->pk);
   strncpy(e->sql, sql, sizeof(e->sql) - 1);
   e->sql[sizeof(e->sql) - 1] = '\0';
 }

@@ -350,7 +350,7 @@ int main(void) {
   printf("  Batch size   : %d (for batched bench)\n", BATCH_SIZE);
   printf("  PRAGMAs      : journal_mode=WAL, synchronous=NORMAL,\n");
   printf("                 busy_timeout=5000, foreign_keys=ON\n");
-  printf("  Arkilian log : _arkilian_log (lsn, ts, op, tbl, sql)\n");
+  printf("  Arkilian log : _arkilian_log_v2 (lsn, ts, op, table_id, pk, sql)\n");
   printf("\n");
 
   // ── Phase 0: Setup ──────────────────────────────────────────────
@@ -413,13 +413,13 @@ int main(void) {
     sqlite3_exec(raw_handle, "DELETE FROM bench_data", NULL, NULL, NULL);
 
     // Count log rows before
-    int log_before = count_rows(raw_handle, "_arkilian_log");
+    int log_before = count_rows(raw_handle, "_arkilian_log_v2");
 
     g_seed = 42; g_max_id = 0;
     rows_ark_exec = bench_arkilian_exec(db, TOTAL_WRITES, &t_ark_exec_ms);
 
     int final_rows = count_rows(raw_handle, "bench_data");
-    int log_after = count_rows(raw_handle, "_arkilian_log");
+    int log_after = count_rows(raw_handle, "_arkilian_log_v2");
     int log_added = log_after - log_before;
 
     printf("  Result: %d rows, %d log entries, %.0f ms, %.0f writes/sec\n",
@@ -432,13 +432,13 @@ int main(void) {
     printf("\n  [3/6] Arkilian     (prepare/step/finalize per write)\n");
     sqlite3_exec(raw_handle, "DELETE FROM bench_data", NULL, NULL, NULL);
 
-    int log_before = count_rows(raw_handle, "_arkilian_log");
+    int log_before = count_rows(raw_handle, "_arkilian_log_v2");
 
     g_seed = 42; g_max_id = 0;
     rows_ark_prep = bench_arkilian_prepared(db, TOTAL_WRITES, &t_ark_prep_ms);
 
     int final_rows = count_rows(raw_handle, "bench_data");
-    int log_after = count_rows(raw_handle, "_arkilian_log");
+    int log_after = count_rows(raw_handle, "_arkilian_log_v2");
     int log_added = log_after - log_before;
 
     printf("  Result: %d rows, %d log entries, %.0f ms, %.0f writes/sec\n",
@@ -451,13 +451,13 @@ int main(void) {
     printf("\n  [4/6] Arkilian     (batched: db_begin → 100 × db_exec → db_commit)\n");
     sqlite3_exec(raw_handle, "DELETE FROM bench_data", NULL, NULL, NULL);
 
-    int log_before = count_rows(raw_handle, "_arkilian_log");
+    int log_before = count_rows(raw_handle, "_arkilian_log_v2");
 
     g_seed = 42; g_max_id = 0;
     rows_ark_b100 = bench_arkilian_batched(db, TOTAL_WRITES, 100, &t_ark_batch100_ms);
 
     int final_rows = count_rows(raw_handle, "bench_data");
-    int log_after = count_rows(raw_handle, "_arkilian_log");
+    int log_after = count_rows(raw_handle, "_arkilian_log_v2");
     int log_added = log_after - log_before;
 
     printf("  Result: %d rows, %d log entries, %.0f ms, %.0f writes/sec\n",
@@ -470,13 +470,13 @@ int main(void) {
     printf("\n  [5/6] Arkilian     (batched: db_begin → 1000 × db_exec → db_commit)\n");
     sqlite3_exec(raw_handle, "DELETE FROM bench_data", NULL, NULL, NULL);
 
-    int log_before = count_rows(raw_handle, "_arkilian_log");
+    int log_before = count_rows(raw_handle, "_arkilian_log_v2");
 
     g_seed = 42; g_max_id = 0;
     rows_ark_b1k = bench_arkilian_batched(db, TOTAL_WRITES, 1000, &t_ark_batch1k_ms);
 
     int final_rows = count_rows(raw_handle, "bench_data");
-    int log_after = count_rows(raw_handle, "_arkilian_log");
+    int log_after = count_rows(raw_handle, "_arkilian_log_v2");
     int log_added = log_after - log_before;
 
     printf("  Result: %d rows, %d log entries, %.0f ms, %.0f writes/sec\n",
@@ -532,15 +532,15 @@ int main(void) {
 
   // Log growth
   {
-    int total_log = count_rows(raw_handle, "_arkilian_log");
+    int total_log = count_rows(raw_handle, "_arkilian_log_v2");
     double log_mb = (double)total_log * 256.0 / (1024.0 * 1024.0); // rough estimate
-    printf("\n  _arkilian_log rows: %d (~%.1f MB estimated)\n",
+    printf("\n  _arkilian_log_v2 rows: %d (~%.1f MB estimated)\n",
            total_log, log_mb);
   }
 
   printf("\n  NOTE: Overhead = (Arkilian_time - Raw_time) / Raw_time\n");
   printf("        This measures the cost of: mutex, BEGIN/COMMIT,\n");
-  printf("        and INSERT into _arkilian_log per write.\n");
+  printf("        and INSERT into _arkilian_log_v2 per write.\n");
   printf("        The batched run shows the theoretical ceiling with\n");
   printf("        transaction batching (no log overhead).\n\n");
 
