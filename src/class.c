@@ -22,6 +22,15 @@
 // deps
 #include "deps/sqlite/sqlite3.h"
 
+#define LOG_BUFFER_CAPACITY 128
+
+struct log_entry {
+  sqlite3_int64 ts;
+  int op;        // 0=INSERT, 1=UPDATE, 2=DELETE, 3=DDL
+  char tbl[128];
+  char sql[1024];
+};
+
 struct arkilian {
   sqlite3 *handle;
   int last_error_code;
@@ -62,13 +71,6 @@ struct arkilian {
   sqlite3_stmt *commit_stmt;
   sqlite3_stmt *rollback_stmt;
   // Log buffer for batched writes (amortizes log INSERT overhead)
-  #define LOG_BUFFER_CAPACITY 128
-  struct log_entry {
-    sqlite3_int64 ts;
-    int op;        // 0=INSERT, 1=UPDATE, 2=DELETE, 3=DDL
-    char tbl[128];
-    char sql[1024];
-  };
   struct log_entry *log_buffer;
   int log_buffer_count;
 };
