@@ -26,240 +26,82 @@
 #define strncasecmp _strnicmp
 #endif
 
-// ── Ring buffer for out-of-band WAL shipping ────────────────────────
+// ── Fixed-Size Bounded Queue for out-of-band WAL shipping ──────────
 
-#define RING_CAPACITY 4096
+#define MAX_QUEUE_SIZE 2048
 
-struct wal_entry {
-  uint64_t ts;
-  uint8_t  op;         // 1=INSERT, 2=UPDATE, 3=DELETE, 0=DDL
-  uint16_t table_id;
-  uint64_t pk;
-  char     sql[1024];
-};
-
-struct wal_ring {
-  struct wal_entry *entries;
-  int head;            // producer insert index
-  int tail;            // consumer read index
-  int count;           // number of live entries
-  int capacity;
+typedef struct {
+  char *sql_queries[MAX_QUEUE_SIZE];
+  int head;             // consumer read index
+  int tail;             // producer insert index
+  int count;            // number of live entries
   int shutdown;
-#ifndef _WIN32
-  pthread_mutex_t mutex;
-  pthread_cond_t  not_empty;
+  pthread_mutex_t lock;
   pthread_cond_t  not_full;
-#else
-  HANDLE mutex;
-  HANDLE not_empty;   // auto-reset event
-  HANDLE not_full;    // auto-reset event
-#endif
-};
+  pthread_cond_t  not_empty;
+} BoundedLogQueue;
 
-static void wal_ring_init(struct wal_ring *r, int cap) {
-  r->entries = malloc((size_t)cap * sizeof(struct wal_entry));
-  r->head = 0;
-  r->tail = 0;
-  r->count = 0;
-  r->capacity = cap;
-  r->shutdown = 0;
-#ifndef _WIN32
-  pthread_mutex_init(&r->mutex, NULL);
-  pthread_cond_init(&r->not_empty, NULL);
-  pthread_cond_init(&r->not_full, NULL);
-#else
-  r->mutex = CreateMutex(NULL, FALSE, NULL);
-  r->not_empty = CreateEvent(NULL, FALSE, FALSE, NULL);
-  r->not_full = CreateEvent(NULL, FALSE, FALSE, NULL);
-#endif
+static void queue_init(BoundedLogQueue *q) {
+  memset(q->sql_queries, 0, sizeof(q->sql_queries));
+  q->head = 0;
+  q->tail = 0;
+  q->count = 0;
+  q->shutdown = 0;
+  pthread_mutex_init(&q->lock, NULL);
+  pthread_cond_init(&q->not_full, NULL);
+  pthread_cond_init(&q->not_empty, NULL);
 }
 
-static void wal_ring_destroy(struct wal_ring *r) {
-  free(r->entries);
-  r->entries = NULL;
-#ifndef _WIN32
-  pthread_mutex_destroy(&r->mutex);
-  pthread_cond_destroy(&r->not_empty);
-  pthread_cond_destroy(&r->not_full);
-#else
-  CloseHandle(r->mutex);
-  CloseHandle(r->not_empty);
-  CloseHandle(r->not_full);
-#endif
+static void queue_destroy(BoundedLogQueue *q) {
+  // Free any remaining entries
+  for (int i = 0; i < MAX_QUEUE_SIZE; i++) {
+    if (q->sql_queries[i]) { free(q->sql_queries[i]); q->sql_queries[i] = NULL; }
+  }
+  pthread_mutex_destroy(&q->lock);
+  pthread_cond_destroy(&q->not_full);
+  pthread_cond_destroy(&q->not_empty);
 }
 
-// Producer: push one entry (lock-free — caller holds write_mutex).
-// Uses memory barrier for safe publication to the consumer thread.
-static void wal_ring_push(struct wal_ring *r, const struct wal_entry *e) {
-  if (r->count >= r->capacity) return; // drop if full (ring is large enough)
-  r->entries[r->head] = *e;
-#ifndef _WIN32
-  __sync_synchronize();
-#else
-  MemoryBarrier();
-#endif
-  r->head = (r->head + 1) % r->capacity;
-  r->count++;
-#ifndef _WIN32
-  pthread_cond_signal(&r->not_empty);
-#else
-  SetEvent(r->not_empty);
-#endif
+// Producer: push one SQL string. Blocks with backpressure if queue is full.
+static void queue_push(BoundedLogQueue *q, const char *sql) {
+  pthread_mutex_lock(&q->lock);
+  while (q->count == MAX_QUEUE_SIZE && !q->shutdown)
+    pthread_cond_wait(&q->not_full, &q->lock);
+  if (q->shutdown) { pthread_mutex_unlock(&q->lock); return; }
+  q->sql_queries[q->tail] = strdup(sql);
+  q->tail = (q->tail + 1) % MAX_QUEUE_SIZE;
+  q->count++;
+  pthread_cond_signal(&q->not_empty);
+  pthread_mutex_unlock(&q->lock);
 }
 
 // Consumer: drain up to max entries. Returns number drained.
-// Caller provides a pre-allocated buffer.
-static int wal_ring_drain(struct wal_ring *r, struct wal_entry *dst, int max,
-                           int block_ms) {
+// dst[] must have space for max char* pointers.
+static int queue_drain(BoundedLogQueue *q, char **dst, int max, int block_ms) {
   int drained = 0;
-#ifndef _WIN32
-  pthread_mutex_lock(&r->mutex);
-  // Wait with timeout for entries or shutdown
-  if (r->count == 0 && !r->shutdown && block_ms > 0) {
+  pthread_mutex_lock(&q->lock);
+
+  if (q->count == 0 && !q->shutdown && block_ms > 0) {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     ts.tv_sec  += block_ms / 1000;
     ts.tv_nsec += (block_ms % 1000) * 1000000L;
     if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
-    pthread_cond_timedwait(&r->not_empty, &r->mutex, &ts);
+    pthread_cond_timedwait(&q->not_empty, &q->lock, &ts);
   }
-  while (r->count > 0 && drained < max) {
-    dst[drained++] = r->entries[r->tail];
-    r->tail = (r->tail + 1) % r->capacity;
-    r->count--;
+
+  while (q->count > 0 && drained < max) {
+    dst[drained] = q->sql_queries[q->head];
+    q->sql_queries[q->head] = NULL;
+    q->head = (q->head + 1) % MAX_QUEUE_SIZE;
+    q->count--;
+    drained++;
   }
+
   if (drained > 0)
-    pthread_cond_signal(&r->not_full);
-  pthread_mutex_unlock(&r->mutex);
-#else
-  WaitForSingleObject(r->mutex, INFINITE);
-  if (r->count == 0 && !r->shutdown && block_ms > 0) {
-    ReleaseMutex(r->mutex);
-    WaitForSingleObject(r->not_empty, (DWORD)block_ms);
-    WaitForSingleObject(r->mutex, INFINITE);
-  }
-  while (r->count > 0 && drained < max) {
-    dst[drained++] = r->entries[r->tail];
-    r->tail = (r->tail + 1) % r->capacity;
-    r->count--;
-  }
-  if (drained > 0)
-    SetEvent(r->not_full);
-  ReleaseMutex(r->mutex);
-#endif
+    pthread_cond_signal(&q->not_full);
+  pthread_mutex_unlock(&q->lock);
   return drained;
-}
-
-// ── SQL helpers ─────────────────────────────────────────────────────
-
-static uint16_t table_name_hash(const char *s) {
-  unsigned long hash = 5381;
-  int c;
-  while ((c = (unsigned char)*s++))
-    hash = ((hash << 5) + hash) + c;
-  return (uint16_t)(hash & 0xFFFF);
-}
-
-static int extract_pk_from_sql(const char *sql, uint64_t *pk) {
-  const char *eq = sql;
-  while ((eq = strstr(eq, "= ")) != NULL) {
-    eq += 2;
-    if (*eq >= '0' && *eq <= '9') {
-      char *end;
-      unsigned long long v = strtoull(eq, &end, 10);
-      if (v > 0 && (end == eq || *end == ';' || *end == '\0')) {
-        *pk = (uint64_t)v; return 1;
-      }
-    }
-  }
-  eq = sql;
-  while ((eq = strchr(eq, '=')) != NULL) {
-    eq++;
-    if (*eq >= '0' && *eq <= '9') {
-      char *end;
-      unsigned long long v = strtoull(eq, &end, 10);
-      if (v > 0 && (end == eq || *end == ' ' || *end == ';' || *end == '\0')) {
-        *pk = (uint64_t)v; return 1;
-      }
-    }
-  }
-  return 0;
-}
-
-static void parse_sql_meta(const char *sql, uint8_t *op_out, char *tbl, size_t tblsz,
-                            uint16_t *tid_out, uint64_t *pk_out) {
-  uint8_t op = 0; // DDL
-  tbl[0] = '\0';
-
-  // Skip whitespace
-  while (*sql == ' ' || *sql == '\t' || *sql == '\n' || *sql == '\r') sql++;
-  if ((*sql == '-' && *(sql+1) == '-') || (*sql == '/' && *(sql+1) == '*')) {
-    *op_out = op; *tid_out = 0; *pk_out = 0; return;
-  }
-
-#define MATCH(s, literal) (strncasecmp(s, literal, strlen(literal)) == 0)
-
-  if (MATCH(sql, "INSERT")) {
-    op = 1; sql += 6; while (*sql == ' ') sql++;
-    if (MATCH(sql, "INTO")) { sql += 4; while (*sql == ' ') sql++; }
-    if (MATCH(sql, "OR")) { sql += 2; while (*sql == ' ') sql++;
-      if (MATCH(sql,"REPLACE")||MATCH(sql,"ROLLBACK")||MATCH(sql,"ABORT")||MATCH(sql,"FAIL")||MATCH(sql,"IGNORE"))
-        { while (*sql && *sql!=' ') sql++; while (*sql==' ') sql++; }
-    }
-  } else if (MATCH(sql, "UPDATE")) {
-    op = 2; sql += 6; while (*sql == ' ') sql++;
-    if (MATCH(sql, "OR")) { sql += 2; while (*sql == ' ') sql++;
-      while (*sql && *sql!=' ') sql++; while (*sql==' ') sql++; }
-  } else if (MATCH(sql, "DELETE")) {
-    op = 3; sql += 6; while (*sql == ' ') sql++;
-    if (MATCH(sql, "FROM")) { sql += 4; while (*sql == ' ') sql++; }
-  } else if (MATCH(sql, "REPLACE")) {
-    op = 1; sql += 7; while (*sql == ' ') sql++;
-    if (MATCH(sql, "INTO")) { sql += 4; while (*sql == ' ') sql++; }
-  } else {
-    op = 0;
-    if (MATCH(sql,"CREATE")) { sql+=6; while (*sql==' ') sql++;
-      if (MATCH(sql,"TABLE")||MATCH(sql,"INDEX")||MATCH(sql,"VIEW")||MATCH(sql,"TRIGGER"))
-        { while (*sql&&*sql!=' ') sql++; while (*sql==' ') sql++; }
-    } else if (MATCH(sql,"DROP")) { sql+=4; while (*sql==' ') sql++;
-      if (MATCH(sql,"TABLE")||MATCH(sql,"INDEX")||MATCH(sql,"VIEW")||MATCH(sql,"TRIGGER"))
-        { while (*sql&&*sql!=' ') sql++; while (*sql==' ') sql++; }
-      if (MATCH(sql,"IF")) {
-        while (*sql&&*sql!=' ') sql++; while (*sql==' ') sql++;
-        while (*sql&&*sql!=' ') sql++; while (*sql==' ') sql++;
-      }
-    } else if (MATCH(sql,"ALTER")) { sql+=5; while (*sql==' ') sql++;
-      if (MATCH(sql,"TABLE")) { sql+=5; while (*sql==' ') sql++; }
-    }
-  }
-#undef MATCH
-
-  // Extract table name
-  if (*sql == '`' || *sql == '"' || *sql == '[') {
-    char quote = (*sql == '[') ? ']' : *sql;
-    sql++;
-    size_t i = 0;
-    while (*sql && *sql != quote && i < tblsz - 1) tbl[i++] = *sql++;
-    tbl[i] = '\0';
-  } else {
-    size_t i = 0;
-    while (*sql && *sql != ' ' && *sql != '\t' && *sql != '\n' &&
-           *sql != '(' && *sql != ';' && i < tblsz - 1) tbl[i++] = *sql++;
-    tbl[i] = '\0';
-  }
-
-  *op_out  = op;
-  *tid_out = table_name_hash(tbl);
-  if (!extract_pk_from_sql(sql, pk_out)) *pk_out = 0;
-}
-
-// Build a wal_entry from the SQL string
-static void build_wal_entry(struct wal_entry *e, const char *sql) {
-  char tbl[128];
-  e->ts = (uint64_t)time(NULL);
-  parse_sql_meta(sql, &e->op, tbl, sizeof(tbl), &e->table_id, &e->pk);
-  strncpy(e->sql, sql, sizeof(e->sql) - 1);
-  e->sql[sizeof(e->sql) - 1] = '\0';
 }
 
 // ── Arkilian struct ─────────────────────────────────────────────────
@@ -303,8 +145,8 @@ struct arkilian {
   sqlite3_stmt *begin_stmt;
   sqlite3_stmt *commit_stmt;
   sqlite3_stmt *rollback_stmt;
-  // Ring buffer for out-of-band WAL shipping
-  struct wal_ring ring;
+  // Bounded queue for out-of-band WAL shipping
+  BoundedLogQueue log_queue;
   // Flush thread
   int flush_interval_ms;
 #ifndef _WIN32
@@ -390,10 +232,10 @@ void *run_wal_flush(void *arg) {
 
   while (1) {
     // Drain up to 256 entries, wait up to flush_interval_ms
-    struct wal_entry batch[256];
-    int n = wal_ring_drain(&db->ring, batch, 256, db->flush_interval_ms);
+    char *batch[256];
+    int n = queue_drain(&db->log_queue, batch, 256, db->flush_interval_ms);
 
-    if (db->ring.shutdown && n == 0) break;
+    if (db->log_queue.shutdown && n == 0) break;
 
     if (n > 0 && push_url && strlen(push_url) > 0) {
       // Build JSON payload
@@ -402,16 +244,15 @@ void *run_wal_flush(void *arg) {
       if (json) {
         int off = snprintf(json, 64, "[");
         for (int i = 0; i < n; i++) {
-          struct wal_entry *e = &batch[i];
+          char *sql = batch[i];
           off += snprintf(json + off, json_cap - (size_t)off,
-            "{\"ts\":%llu,\"op\":%u,\"table_id\":%u,\"pk\":%llu,\"sql\":\"",
-            (unsigned long long)e->ts, e->op, e->table_id,
-            (unsigned long long)e->pk);
-          for (char *s = e->sql; *s && off < (int)json_cap - 32; s++) {
+            "{\"sql\":\"");
+          for (char *s = sql; *s && off < (int)json_cap - 32; s++) {
             if (*s == '"' || *s == '\\') json[off++] = '\\';
             json[off++] = *s;
           }
           off += snprintf(json + off, 16, "\"}%s", (i < n - 1) ? "," : "");
+          free(sql); // free the strdup'd copy
         }
         off += snprintf(json + off, 8, "]");
 
@@ -442,7 +283,7 @@ void *run_wal_flush(void *arg) {
       }
     }
 
-    if (db->ring.shutdown) break;
+    if (db->log_queue.shutdown) break;
   }
 
 #ifdef _WIN32
@@ -529,8 +370,8 @@ int db_init(arkilian **db_ptr, const char *filename) {
   sqlite3_prepare_v2(db->handle, "COMMIT;", -1, &db->commit_stmt, NULL);
   sqlite3_prepare_v2(db->handle, "ROLLBACK;", -1, &db->rollback_stmt, NULL);
 
-  // Ring buffer for WAL shipping
-  wal_ring_init(&db->ring, RING_CAPACITY);
+  // Bounded queue for WAL shipping
+  queue_init(&db->log_queue);
 
   // Flush interval
   db->flush_interval_ms =
@@ -577,28 +418,19 @@ void db_close(arkilian *db) {
 
   db->shutdown_requested = 1;
 
-  // Signal ring buffer shutdown
-  db->ring.shutdown = 1;
-#ifndef _WIN32
-  pthread_cond_signal(&db->ring.not_empty);
-#else
-  SetEvent(db->ring.not_empty);
-#endif
+  // Signal queue shutdown
+  db->log_queue.shutdown = 1;
+  pthread_cond_signal(&db->log_queue.not_empty);
 
   // Wait for flush thread (if running)
 #ifndef _WIN32
   if (db->flush_thread_running) {
-    pthread_cond_signal(&db->ring.not_empty);
+    pthread_cond_signal(&db->log_queue.not_empty);
     pthread_join(db->flush_thread_id, NULL);
     db->flush_thread_running = 0;
   }
 #else
-  if (db->flush_thread_handle != NULL) {
-    SetEvent(db->ring.not_empty);
-    WaitForSingleObject(db->flush_thread_handle, INFINITE);
-    CloseHandle(db->flush_thread_handle);
-    db->flush_thread_handle = NULL;
-  }
+  // Windows: queue is pthread-based; flush thread not supported yet
 #endif
 
   // Wait for backup thread
@@ -660,7 +492,7 @@ void db_close(arkilian *db) {
   if (db->signed_url_endpoint) free(db->signed_url_endpoint);
   if (db->database_token)      free(db->database_token);
 
-  wal_ring_destroy(&db->ring);
+  queue_destroy(&db->log_queue);
 
 #ifndef _WIN32
   pthread_mutex_destroy(&db->write_mutex);
@@ -898,11 +730,7 @@ int db_exec(arkilian *db, const char *sql) {
 
   if (rc == SQLITE_DONE || rc == SQLITE_OK || rc == SQLITE_ROW) {
     db->has_new_writes = 1;
-
-    // Push to ring buffer for async streaming
-    struct wal_entry entry;
-    build_wal_entry(&entry, sql);
-    wal_ring_push(&db->ring, &entry);
+    queue_push(&db->log_queue, sql);
   } else {
     snprintf(db->last_error_msg, sizeof(db->last_error_msg), "%s",
              sqlite3_errmsg(db->handle));
@@ -1015,9 +843,7 @@ int db_finalize(arkilian *db) {
                 db->last_step_rc == SQLITE_OK);
       if (ok) {
         db->has_new_writes = 1;
-        struct wal_entry entry;
-        build_wal_entry(&entry, db->current_write_sql);
-        wal_ring_push(&db->ring, &entry);
+        queue_push(&db->log_queue, db->current_write_sql);
       }
       db->in_write_txn = 0;
       db->write_stmt_index = -1;
@@ -1159,5 +985,5 @@ int db_set_token(arkilian *db, const char *token) {
 // Returns the number of pending WAL entries in the ring buffer
 int db_wal_pending(arkilian *db) {
   if (!db) return 0;
-  return db->ring.count;
+  return db->log_queue.count;
 }
