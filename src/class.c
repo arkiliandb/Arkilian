@@ -549,14 +549,22 @@ int db_init(arkilian **db_ptr, const char *filename) {
   db->shutdown_requested = 0;
   *db_ptr = db;
 
-  // Start flush thread
+  // Start flush thread (only if a push URL is configured)
+  {
+    const char *url = getenv("ARKILIAN_WAL_PUSH_URL");
+    if (url && strlen(url) > 0) {
 #ifndef _WIN32
-  db->flush_thread_running = 0;
-  if (pthread_create(&db->flush_thread_id, NULL, run_wal_flush, db) == 0)
-    db->flush_thread_running = 1;
+      db->flush_thread_running = 0;
+      if (pthread_create(&db->flush_thread_id, NULL, run_wal_flush, db) == 0)
+        db->flush_thread_running = 1;
 #else
-  db->flush_thread_handle = CreateThread(NULL, 0, run_wal_flush, db, 0, NULL);
+      db->flush_thread_handle = CreateThread(NULL, 0, run_wal_flush, db, 0, NULL);
 #endif
+    }
+#ifndef _WIN32
+    else { db->flush_thread_running = 0; }
+#endif
+  }
 
   // Start backup thread if enabled
   if (db->backup_enabled) {
@@ -586,14 +594,16 @@ void db_close(arkilian *db) {
   SetEvent(db->ring.not_empty);
 #endif
 
-  // Wait for flush thread
+  // Wait for flush thread (if running)
 #ifndef _WIN32
   if (db->flush_thread_running) {
+    pthread_cond_signal(&db->ring.not_empty);
     pthread_join(db->flush_thread_id, NULL);
     db->flush_thread_running = 0;
   }
 #else
   if (db->flush_thread_handle != NULL) {
+    SetEvent(db->ring.not_empty);
     WaitForSingleObject(db->flush_thread_handle, INFINITE);
     CloseHandle(db->flush_thread_handle);
     db->flush_thread_handle = NULL;
