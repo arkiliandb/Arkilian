@@ -41,7 +41,15 @@ int db_column_int(arkilian *db, int col);
 double db_column_double(arkilian *db, int col);
 int db_bind_text(arkilian *db, int idx, const char *val);
 int db_bind_int(arkilian *db, int idx, int val);
+int db_bind_int64(arkilian *db, int idx, sqlite3_int64 val);
 int db_bind_double(arkilian *db, int idx, double val);
+int db_bind_null(arkilian *db, int idx);
+
+int db_column_type(arkilian *db, int col);
+sqlite3_int64 db_column_int64(arkilian *db, int col);
+
+int db_changes(arkilian *db);
+sqlite3_int64 db_last_insert_rowid(arkilian *db);
 
 #ifdef __cplusplus
 }

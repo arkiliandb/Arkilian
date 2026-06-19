@@ -60,6 +60,12 @@ struct wal_double_buf {
 static void wal_dbuf_init(struct wal_double_buf *b) {
   b->entries[0] = malloc((size_t)WAL_BUF_CAPACITY * sizeof(struct wal_entry));
   b->entries[1] = malloc((size_t)WAL_BUF_CAPACITY * sizeof(struct wal_entry));
+  if (!b->entries[0] || !b->entries[1]) {
+    free(b->entries[0]);
+    free(b->entries[1]);
+    b->entries[0] = NULL;
+    b->entries[1] = NULL;
+  }
   b->count[0]  = 0;
   b->count[1]  = 0;
   b->active    = 0;
@@ -436,20 +442,26 @@ void *run_wal_flush(void *arg) {
       size_t json_cap = (size_t)n * 512 + 64;
       char *json = malloc(json_cap);
       if (json) {
-        int off = snprintf(json, 64, "[");
+        int off = 0;
+        off += snprintf(json + off, json_cap - (size_t)off, "[");
         for (int i = 0; i < n; i++) {
           struct wal_entry *e = &batch[i];
-          off += snprintf(json + off, json_cap - (size_t)off,
+          int remain = (int)(json_cap - (size_t)off);
+          if (remain <= 32) break; // safety: stop if near buffer end
+          off += snprintf(json + off, (size_t)remain,
             "{\"ts\":%llu,\"op\":%u,\"table_id\":%u,\"pk\":%llu,\"sql\":\"",
             (unsigned long long)e->ts, e->op, e->table_id,
             (unsigned long long)e->pk);
           for (char *s = e->sql; *s && off < (int)json_cap - 32; s++) {
-            if (*s == '"' || *s == '\\') json[off++] = '\\';
-            json[off++] = *s;
+            if (*s == '"' || *s == '\\') { if (off + 1 < (int)json_cap) json[off++] = '\\'; }
+            if (off < (int)json_cap) json[off++] = *s;
           }
-          off += snprintf(json + off, 16, "\"}%s", (i < n - 1) ? "," : "");
+          remain = (int)(json_cap - (size_t)off);
+          if (remain > 16)
+            off += snprintf(json + off, (size_t)remain, "\"}%s", (i < n - 1) ? "," : "");
         }
-        off += snprintf(json + off, 8, "]");
+        if ((int)json_cap - off > 8)
+          off += snprintf(json + off, json_cap - (size_t)off, "]");
 
         CURL *curl = curl_easy_init();
         if (curl) {
@@ -587,9 +599,12 @@ int db_init(arkilian **db_ptr, const char *filename) {
     NULL, NULL, NULL);
 
   // Cached transaction statements
-  sqlite3_prepare_v2(db->handle, "BEGIN;", -1, &db->begin_stmt, NULL);
-  sqlite3_prepare_v2(db->handle, "COMMIT;", -1, &db->commit_stmt, NULL);
-  sqlite3_prepare_v2(db->handle, "ROLLBACK;", -1, &db->rollback_stmt, NULL);
+  if (sqlite3_prepare_v2(db->handle, "BEGIN;", -1, &db->begin_stmt, NULL) != SQLITE_OK)
+    db->begin_stmt = NULL;
+  if (sqlite3_prepare_v2(db->handle, "COMMIT;", -1, &db->commit_stmt, NULL) != SQLITE_OK)
+    db->commit_stmt = NULL;
+  if (sqlite3_prepare_v2(db->handle, "ROLLBACK;", -1, &db->rollback_stmt, NULL) != SQLITE_OK)
+    db->rollback_stmt = NULL;
 
   // Double-buffer for WAL shipping
   wal_dbuf_init(&db->wal);
@@ -937,9 +952,10 @@ int db_exec(arkilian *db, const char *sql) {
   }
 
   // Write path
-  int in_batch = db->in_batch_txn;
+  // Mutex may already be held by db_prepare (in_write_txn) or db_begin (in_batch_txn)
+  int mutex_held = db->in_write_txn || db->in_batch_txn;
 
-  if (!in_batch) {
+  if (!mutex_held) {
 #ifndef _WIN32
     pthread_mutex_lock(&db->write_mutex);
 #else
@@ -962,7 +978,7 @@ int db_exec(arkilian *db, const char *sql) {
   } else {
     snprintf(db->last_error_msg, sizeof(db->last_error_msg), "%s",
              sqlite3_errmsg(db->handle));
-    if (in_batch) {
+    if (db->in_batch_txn) {
 #ifndef _WIN32
       pthread_mutex_unlock(&db->write_mutex);
 #else
@@ -972,7 +988,7 @@ int db_exec(arkilian *db, const char *sql) {
     }
   }
 
-  if (!in_batch) {
+  if (!mutex_held) {
 #ifndef _WIN32
     pthread_mutex_unlock(&db->write_mutex);
 #else
@@ -1201,7 +1217,39 @@ int db_rollback(arkilian *db) {
   return SQLITE_OK;
 }
 
-// ── Token management ────────────────────────────────────────────────
+int db_bind_null(arkilian *db, int idx) {
+  sqlite3_stmt *stmt = get_current_stmt(db);
+  if (!stmt) return SQLITE_ERROR;
+  return sqlite3_bind_null(stmt, idx);
+}
+
+int db_bind_int64(arkilian *db, int idx, sqlite3_int64 val) {
+  sqlite3_stmt *stmt = get_current_stmt(db);
+  if (!stmt) return SQLITE_ERROR;
+  return sqlite3_bind_int64(stmt, idx, val);
+}
+
+sqlite3_int64 db_column_int64(arkilian *db, int col) {
+  sqlite3_stmt *stmt = get_current_stmt(db);
+  if (!stmt) return 0;
+  return sqlite3_column_int64(stmt, col);
+}
+
+int db_column_type(arkilian *db, int col) {
+  sqlite3_stmt *stmt = get_current_stmt(db);
+  if (!stmt) return SQLITE_NULL;
+  return sqlite3_column_type(stmt, col);
+}
+
+int db_changes(arkilian *db) {
+  if (!db || !db->handle) return 0;
+  return sqlite3_changes(db->handle);
+}
+
+sqlite3_int64 db_last_insert_rowid(arkilian *db) {
+  if (!db || !db->handle) return 0;
+  return sqlite3_last_insert_rowid(db->handle);
+}
 
 int db_set_token(arkilian *db, const char *token) {
   if (!db || !token) return 1;
