@@ -56,9 +56,12 @@ func TestSimulation(t *testing.T) {
 	defer os.Remove(serverBin)
 
 	os.Setenv("ARKILIAN_DEBUG", "true")
-	os.Setenv("ARKILIAN_ENABLE_BACKUP", "0")
+	os.Setenv("ARKILIAN_ENABLE_BACKUP", "1")
+	os.Setenv("ARKILIAN_BACKUP_INTERVAL", "5") // backup every 5 seconds
+	os.Setenv("ARKILIAN_BACKUP_PATH", "/tmp/arkilian_sim_backup.sqlite")
 	os.Setenv("JWT_SECRET", "simulation-secret")
 	os.Remove("/tmp/arkilian_sim_server.db")
+	os.Remove("/tmp/arkilian_sim_backup.sqlite")
 
 	server := exec.Command(serverBin)
 	server.Env = append(os.Environ(),
@@ -260,6 +263,21 @@ loop:
 		}
 	}
 
+	// ── Backup verification ───────────────────────────────────────
+	t.Log("\n── Backup Verification ──")
+	backupPath := "/tmp/arkilian_sim_backup.sqlite"
+	if info, err := os.Stat(backupPath); err == nil {
+		t.Logf("  Backup file:  %s  (%d bytes)", backupPath, info.Size())
+	} else {
+		t.Logf("  Backup file:  not yet created (backup runs every %ss)",
+			os.Getenv("ARKILIAN_BACKUP_INTERVAL"))
+	}
+	// Check for backup-wal too
+	walPath := backupPath + "-wal"
+	if info, err := os.Stat(walPath); err == nil {
+		t.Logf("  Backup WAL:   %s  (%d bytes)", walPath, info.Size())
+	}
+
 	// ── Summary ───────────────────────────────────────────────────
 	totalTime := time.Since(startTime).Round(time.Second)
 	rate := float64(grandTotal) / totalTime.Seconds()
@@ -282,15 +300,20 @@ loop:
 	t.Logf("  ║  Isolation:     per-api-key   ✓      ║")
 	t.Logf("  ║  Cold-start:    %-12s   ✓      ║", src.Name)
 	t.Logf("  ╚══════════════════════════════════════╝")
+	t.Logf("\n  Inspect data:")
+	t.Logf("    Server DB:   /tmp/arkilian_sim_server.db")
+	t.Logf("    Backup DB:   /tmp/arkilian_sim_backup.sqlite")
+	for _, tn := range tenants {
+		t.Logf("    Client %-12s: %s", tn.Name+":", tn.DBPath)
+	}
 
 	if grandErrors > 0 || dataLoss > 0 {
 		t.Errorf("errors=%d data_loss=%d", grandErrors, dataLoss)
 	}
 
-	for _, tn := range tenants {
-		os.Remove(tn.DBPath)
-	}
-	os.Remove("/tmp/arkilian_sim_server.db")
+	// NOTE: DB files are intentionally NOT removed so you can inspect them.
+	// Remove them manually:
+	//   rm -f /tmp/arkilian_sim_*.db /tmp/arkilian_sim_*.sqlite /tmp/sim_*.sqlite
 }
 
 // ── Continuous writer ──────────────────────────────────────────────
