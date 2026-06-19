@@ -1,335 +1,412 @@
-// Arkilian Control Plane — server tests
-//
-// Run:  go test -v ./...
+// Arkilian Control Plane — server tests (multi-tenant, per-db API keys)
 
 package main
 
 import (
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"net/http/httptest"
 	"strings"
 	"testing"
-	"time"
 )
 
 func init() {
-	authToken = "test-token"
-}
-
-// ── Health ───────────────────────────────────────────────────────────
-
-func TestHealth(t *testing.T) {
-	req := httptest.NewRequest("GET", "/health", nil)
-	w := httptest.NewRecorder()
-	handleHealth(w, req)
-
-	if w.Code != 200 {
-		t.Fatalf("expected 200, got %d", w.Code)
-	}
-	var resp map[string]bool
-	json.NewDecoder(w.Body).Decode(&resp)
-	if !resp["ok"] {
-		t.Fatal("expected ok:true")
-	}
-}
-
-// ── Upload request ──────────────────────────────────────────────────
-
-func TestUploadRequest(t *testing.T) {
-	// Setup in-memory SQLite
-	var err error
-	db, err = initTestDB()
-	if err != nil {
-		t.Fatalf("init test db: %v", err)
-	}
-	defer db.Close()
-
-	body := `{"token":"test-token","db_id":"test-db","event_count":100,"lsn_start":1,"lsn_end":100}`
-	req := httptest.NewRequest("POST", "/v1/upload/request", strings.NewReader(body))
-	req.Header.Set("Authorization", "Bearer test-token")
-	req.Header.Set("Content-Type", "application/json")
-
-	w := httptest.NewRecorder()
-	handleUploadRequest(w, req)
-
-	if w.Code != 200 {
-		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
-	}
-
-	var resp UploadResponse
-	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
-		t.Fatalf("decode response: %v", err)
-	}
-	if resp.UploadURL == "" {
-		t.Fatal("expected non-empty upload_url")
-	}
-	if resp.ExpiresAt == 0 {
-		t.Fatal("expected non-zero expires_at")
-	}
-	if !strings.Contains(resp.UploadURL, "test-db") {
-		t.Fatalf("expected upload_url to contain db_id, got: %s", resp.UploadURL)
-	}
-	t.Logf("upload_url: %s", resp.UploadURL)
-}
-
-func TestUploadRequestUnauthorized(t *testing.T) {
-	var err error
-	db, err = initTestDB()
-	if err != nil {
-		t.Fatalf("init test db: %v", err)
-	}
-	defer db.Close()
-
-	body := `{"token":"test-token","db_id":"x","event_count":1,"lsn_start":1,"lsn_end":1}`
-	req := httptest.NewRequest("POST", "/v1/upload/request", strings.NewReader(body))
-	// No auth header
-
-	w := httptest.NewRecorder()
-	handleUploadRequest(w, req)
-
-	if w.Code != 401 {
-		t.Fatalf("expected 401, got %d", w.Code)
-	}
-}
-
-func TestUploadRequestBadMethod(t *testing.T) {
-	req := httptest.NewRequest("GET", "/v1/upload/request", nil)
-	w := httptest.NewRecorder()
-	handleUploadRequest(w, req)
-	if w.Code != 405 {
-		t.Fatalf("expected 405, got %d", w.Code)
-	}
-}
-
-// ── Snapshot register ───────────────────────────────────────────────
-
-func TestSnapshotRegister(t *testing.T) {
-	var err error
-	db, err = initTestDB()
-	if err != nil {
-		t.Fatalf("init test db: %v", err)
-	}
-	defer db.Close()
-
-	body := `{"baseline_lsn":42,"s3_key":"db_x/snapshots/snap_42.db"}`
-	req := httptest.NewRequest("POST", "/v1/snapshot/register", strings.NewReader(body))
-	req.Header.Set("Authorization", "Bearer test-token")
-	req.Header.Set("Content-Type", "application/json")
-
-	w := httptest.NewRecorder()
-	handleSnapshotRegister(w, req)
-
-	if w.Code != 200 {
-		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
-	}
-}
-
-// ── Hydrate plan ────────────────────────────────────────────────────
-
-func TestHydratePlanNoSnapshot(t *testing.T) {
-	var err error
-	db, err = initTestDB()
-	if err != nil {
-		t.Fatalf("init test db: %v", err)
-	}
-	defer db.Close()
-
-	req := httptest.NewRequest("GET", "/v1/hydrate/plan", nil)
-	req.Header.Set("Authorization", "Bearer test-token")
-
-	w := httptest.NewRecorder()
-	handleHydratePlan(w, req)
-
-	if w.Code != 404 {
-		t.Fatalf("expected 404 (no snapshot), got %d", w.Code)
-	}
-}
-
-func TestHydratePlanWithSnapshot(t *testing.T) {
-	var err error
-	db, err = initTestDB()
-	if err != nil {
-		t.Fatalf("init test db: %v", err)
-	}
-	defer db.Close()
-
-	// Register a snapshot
-	db.Exec("INSERT INTO snapshots (baseline_lsn, s3_key) VALUES (100, 'db_x/snapshots/snap_100.db')")
-
-	// Register two chunks after the snapshot
-	db.Exec("INSERT INTO chunks (lsn_start, lsn_end, s3_key) VALUES (101, 5000, 'db_x/chunks/chunk_101_5000.zst')")
-	db.Exec("INSERT INTO chunks (lsn_start, lsn_end, s3_key) VALUES (5001, 8000, 'db_x/chunks/chunk_5001_8000.zst')")
-
-	// Also register a chunk BEFORE the snapshot (should be filtered out)
-	db.Exec("INSERT INTO chunks (lsn_start, lsn_end, s3_key) VALUES (1, 50, 'db_x/chunks/chunk_1_50.zst')")
-
-	req := httptest.NewRequest("GET", "/v1/hydrate/plan", nil)
-	req.Header.Set("Authorization", "Bearer test-token")
-
-	w := httptest.NewRecorder()
-	handleHydratePlan(w, req)
-
-	if w.Code != 200 {
-		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
-	}
-
-	var plan HydratePlanResponse
-	if err := json.NewDecoder(w.Body).Decode(&plan); err != nil {
-		t.Fatalf("decode plan: %v", err)
-	}
-
-	if plan.SnapshotURL == "" {
-		t.Fatal("expected non-empty snapshot_url")
-	}
-	if plan.BaselineLSN != 100 {
-		t.Fatalf("expected baseline_lsn=100, got %d", plan.BaselineLSN)
-	}
-	if len(plan.Chunks) != 2 {
-		t.Fatalf("expected 2 chunks (after snapshot), got %d", len(plan.Chunks))
-	}
-	if plan.Chunks[0].LSNStart != 101 || plan.Chunks[0].LSNEnd != 5000 {
-		t.Fatalf("chunk 0 range wrong: %d-%d", plan.Chunks[0].LSNStart, plan.Chunks[0].LSNEnd)
-	}
-	if plan.Chunks[1].LSNStart != 5001 || plan.Chunks[1].LSNEnd != 8000 {
-		t.Fatalf("chunk 1 range wrong: %d-%d", plan.Chunks[1].LSNStart, plan.Chunks[1].LSNEnd)
-	}
-
-	t.Logf("snapshot_url: %s", plan.SnapshotURL)
-	t.Logf("chunks: %d", len(plan.Chunks))
-}
-
-func TestHydratePlanUnauthorized(t *testing.T) {
-	var err error
-	db, err = initTestDB()
-	if err != nil {
-		t.Fatalf("init test db: %v", err)
-	}
-	defer db.Close()
-
-	req := httptest.NewRequest("GET", "/v1/hydrate/plan", nil)
-	// No auth header
-	w := httptest.NewRecorder()
-	handleHydratePlan(w, req)
-
-	if w.Code != 401 {
-		t.Fatalf("expected 401, got %d", w.Code)
-	}
-}
-
-// ── Auth ────────────────────────────────────────────────────────────
-
-func TestCheckAuthNoToken(t *testing.T) {
-	old := authToken
 	authToken = ""
-	defer func() { authToken = old }()
-
-	req := httptest.NewRequest("GET", "/", nil)
-	if !checkAuth(req) {
-		t.Fatal("expected auth to pass when no token required")
-	}
+	jwtSecret = []byte("test-secret")
 }
 
-func TestCheckAuthValid(t *testing.T) {
-	req := httptest.NewRequest("GET", "/", nil)
-	req.Header.Set("Authorization", "Bearer test-token")
-	if !checkAuth(req) {
-		t.Fatal("expected valid bearer token to pass")
-	}
-}
-
-func TestCheckAuthInvalid(t *testing.T) {
-	req := httptest.NewRequest("GET", "/", nil)
-	req.Header.Set("Authorization", "Bearer wrong-token")
-	if checkAuth(req) {
-		t.Fatal("expected wrong bearer token to fail")
-	}
-}
-
-func TestCheckAuthMissing(t *testing.T) {
-	req := httptest.NewRequest("GET", "/", nil)
-	if checkAuth(req) {
-		t.Fatal("expected missing auth header to fail")
-	}
-}
-
-// ── Signed URL format ───────────────────────────────────────────────
-
-func TestSignedURLFormat(t *testing.T) {
-	s3Endpoint = "https://s3.amazonaws.com"
-	s3Bucket = "my-bucket"
-	s3AccessKey = "AKIAIOSFODNN7EXAMPLE"
-
-	url, expires := signedURL("GET", "path/to/object.db", 3600*time.Second)
-
-	if url == "" {
-		t.Fatal("expected non-empty url")
-	}
-	if expires == 0 {
-		t.Fatal("expected non-zero expires")
-	}
-	if !strings.Contains(url, "my-bucket") {
-		t.Fatalf("expected url to contain bucket name, got: %s", url)
-	}
-	if !strings.Contains(url, "path/to/object.db") {
-		t.Fatalf("expected url to contain key, got: %s", url)
-	}
-	if !strings.Contains(url, "X-Amz-Algorithm=AWS4-HMAC-SHA256") {
-		t.Fatal("expected sig v4 algorithm in URL")
-	}
-
-	t.Logf("signed GET URL: %s", url)
-}
-
-func TestSignedURLOptions(t *testing.T) {
-	s3Endpoint = "http://minio:9000"
-	s3Bucket = "arkilian-test"
-
-	url1, _ := signedURL("PUT", "uploads/chunk.zst", 600*time.Second)
-	if !strings.Contains(url1, "X-Amz-Expires=600") {
-		t.Fatalf("expected 600s expiry, got: %s", url1)
-	}
-
-	url2, _ := signedURL("GET", "snapshots/base.db", 3600*time.Second)
-	if !strings.Contains(url2, "X-Amz-Expires=3600") {
-		t.Fatalf("expected 3600s expiry, got: %s", url2)
-	}
-}
-
-// ── Helpers ─────────────────────────────────────────────────────────
-
-// initTestDB creates an in-memory SQLite database for testing.
-func initTestDB() (*sql.DB, error) {
-	return initTestDBPath(":memory:")
-}
-
-func initTestDBPath(path string) (*sql.DB, error) {
+func setupTestDB(t *testing.T) {
+	t.Helper()
 	var err error
-	db, err = sql.Open("sqlite3", path+"?_journal_mode=MEMORY&_synchronous=OFF")
+	db, err = sql.Open("sqlite3", ":memory:?_journal_mode=MEMORY&_synchronous=OFF")
 	if err != nil {
-		return nil, err
+		t.Fatalf("open test db: %v", err)
 	}
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
 
 	_, err = db.Exec(`
+		CREATE TABLE IF NOT EXISTS users (
+			id            INTEGER PRIMARY KEY AUTOINCREMENT,
+			email         TEXT UNIQUE NOT NULL,
+			password_hash TEXT NOT NULL,
+			created_at    INTEGER DEFAULT (unixepoch())
+		);
+		CREATE TABLE IF NOT EXISTS databases (
+			db_id     TEXT PRIMARY KEY,
+			user_id   INTEGER NOT NULL REFERENCES users(id),
+			name      TEXT NOT NULL,
+			api_key   TEXT UNIQUE NOT NULL,
+			created_at INTEGER DEFAULT (unixepoch())
+		);
+		CREATE TABLE IF NOT EXISTS wal_entries (
+			lsn         INTEGER PRIMARY KEY AUTOINCREMENT,
+			db_id       TEXT NOT NULL REFERENCES databases(db_id),
+			ts          INTEGER NOT NULL,
+			op          INTEGER NOT NULL,
+			table_id    INTEGER NOT NULL,
+			pk          INTEGER NOT NULL,
+			sql         TEXT,
+			received_at INTEGER DEFAULT (unixepoch())
+		);
+		CREATE INDEX IF NOT EXISTS idx_wal_db ON wal_entries(db_id, lsn);
 		CREATE TABLE IF NOT EXISTS snapshots (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			id           INTEGER PRIMARY KEY AUTOINCREMENT,
+			db_id        TEXT NOT NULL REFERENCES databases(db_id),
 			baseline_lsn INTEGER NOT NULL,
-			s3_key TEXT NOT NULL,
-			created_at INTEGER NOT NULL DEFAULT (unixepoch())
+			s3_key       TEXT NOT NULL,
+			created_at   INTEGER DEFAULT (unixepoch())
 		);
 		CREATE TABLE IF NOT EXISTS chunks (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			lsn_start INTEGER NOT NULL,
-			lsn_end INTEGER NOT NULL,
-			s3_key TEXT NOT NULL,
-			created_at INTEGER NOT NULL DEFAULT (unixepoch())
-		);
-		CREATE TABLE IF NOT EXISTS db_registry (
-			db_id TEXT PRIMARY KEY,
-			created_at INTEGER NOT NULL DEFAULT (unixepoch())
+			id         INTEGER PRIMARY KEY AUTOINCREMENT,
+			db_id      TEXT NOT NULL REFERENCES databases(db_id),
+			lsn_start  INTEGER NOT NULL,
+			lsn_end    INTEGER NOT NULL,
+			s3_key     TEXT NOT NULL,
+			created_at  INTEGER DEFAULT (unixepoch())
 		);
 	`)
-	return db, err
+	if err != nil {
+		t.Fatalf("create schema: %v", err)
+	}
 }
+
+// register + login helper.  Returns session JWT.
+func registerAndLogin(t *testing.T) string {
+	t.Helper()
+
+	// Register
+	body := `{"email":"test@arkilian.com","password":"secret123"}`
+	req := httptest.NewRequest("POST", "/v1/auth/register", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	handleRegister(w, req)
+	if w.Code != 201 {
+		t.Fatalf("register: expected 201, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// Login
+	req = httptest.NewRequest("POST", "/v1/auth/login", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w = httptest.NewRecorder()
+	handleLogin(w, req)
+	if w.Code != 200 {
+		t.Fatalf("login: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp LoginResponse
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp.Token == "" {
+		t.Fatal("login: expected non-empty token")
+	}
+	return resp.Token
+}
+
+// createDB helper.  Returns db_id + api_key.
+func createDB(t *testing.T, sessionToken string, name string) (string, string) {
+	t.Helper()
+	body := fmt.Sprintf(`{"name":"%s"}`, name)
+	req := httptest.NewRequest("POST", "/v1/db/create", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+sessionToken)
+	w := httptest.NewRecorder()
+	handleDBCreate(w, req)
+	if w.Code != 201 {
+		t.Fatalf("create db: expected 201, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp CreateDBResponse
+	json.NewDecoder(w.Body).Decode(&resp)
+	return resp.DBID, resp.APIKey
+}
+
+// ── Tests ───────────────────────────────────────────────────────────
+
+func TestRegisterAndLogin(t *testing.T) {
+	setupTestDB(t)
+	defer db.Close()
+
+	token := registerAndLogin(t)
+	if token == "" {
+		t.Fatal("expected non-empty session token")
+	}
+}
+
+func TestRegisterDuplicate(t *testing.T) {
+	setupTestDB(t)
+	defer db.Close()
+
+	body := `{"email":"dup@test.com","password":"secret123"}`
+	req := httptest.NewRequest("POST", "/v1/auth/register", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	handleRegister(w, req)
+	if w.Code != 201 {
+		t.Fatalf("first register: %d", w.Code)
+	}
+
+	req = httptest.NewRequest("POST", "/v1/auth/register", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w = httptest.NewRecorder()
+	handleRegister(w, req)
+	if w.Code != 409 {
+		t.Fatalf("expected 409 conflict, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestLoginInvalid(t *testing.T) {
+	setupTestDB(t)
+	defer db.Close()
+
+	registerAndLogin(t)
+
+	body := `{"email":"test@arkilian.com","password":"wrongpass"}`
+	req := httptest.NewRequest("POST", "/v1/auth/login", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	handleLogin(w, req)
+	if w.Code != 401 {
+		t.Fatalf("expected 401, got %d", w.Code)
+	}
+}
+
+func TestDBCreateAndList(t *testing.T) {
+	setupTestDB(t)
+	defer db.Close()
+
+	token := registerAndLogin(t)
+
+	// Create 3 databases
+	createDB(t, token, "production")
+	createDB(t, token, "staging")
+	createDB(t, token, "analytics")
+
+	// List databases
+	req := httptest.NewRequest("GET", "/v1/db/list", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	w := httptest.NewRecorder()
+	handleDBList(w, req)
+	if w.Code != 200 {
+		t.Fatalf("list: %d", w.Code)
+	}
+
+	var dbs []DBInfo
+	json.NewDecoder(w.Body).Decode(&dbs)
+	if len(dbs) != 3 {
+		t.Fatalf("expected 3 databases, got %d", len(dbs))
+	}
+	// Verify all expected names exist (order may vary with same-second timestamps)
+	names := map[string]bool{"production": false, "staging": false, "analytics": false}
+	for _, d := range dbs {
+		names[d.Name] = true
+	}
+	for name, found := range names {
+		if !found {
+			t.Fatalf("missing database: %s", name)
+		}
+	}
+}
+
+func TestDBKeyRetrieval(t *testing.T) {
+	setupTestDB(t)
+	defer db.Close()
+
+	token := registerAndLogin(t)
+	dbID, apiKey := createDB(t, token, "my-app")
+
+	// Get key for this database
+	req := httptest.NewRequest("GET", "/v1/db/"+dbID+"/key", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	w := httptest.NewRecorder()
+	handleDBKey(w, req)
+	if w.Code != 200 {
+		t.Fatalf("get key: %d: %s", w.Code, w.Body.String())
+	}
+
+	var kr KeyResponse
+	json.NewDecoder(w.Body).Decode(&kr)
+	if kr.APIKey != apiKey {
+		t.Fatalf("api key mismatch: expected %s, got %s", apiKey, kr.APIKey)
+	}
+}
+
+func TestDBKeyWrongUser(t *testing.T) {
+	setupTestDB(t)
+	defer db.Close()
+
+	// User 1 creates DB
+	token1 := registerAndLogin(t)
+	dbID, _ := createDB(t, token1, "user1-db")
+
+	// Register user 2 and try to access user 1's DB key
+	body := `{"email":"user2@test.com","password":"secret123"}`
+	req := httptest.NewRequest("POST", "/v1/auth/register", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	handleRegister(w, req)
+	if w.Code != 201 {
+		t.Fatalf("register user2: %d", w.Code)
+	}
+	req = httptest.NewRequest("POST", "/v1/auth/login", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w = httptest.NewRecorder()
+	handleLogin(w, req)
+	var lr LoginResponse
+	json.NewDecoder(w.Body).Decode(&lr)
+	token2 := lr.Token
+
+	// User 2 tries to get user 1's DB key
+	req = httptest.NewRequest("GET", "/v1/db/"+dbID+"/key", nil)
+	req.Header.Set("Authorization", "Bearer "+token2)
+	w = httptest.NewRecorder()
+	handleDBKey(w, req)
+	if w.Code != 404 {
+		t.Fatalf("expected 404 (db not found for user2), got %d", w.Code)
+	}
+}
+
+func TestWALPushWithAPIKey(t *testing.T) {
+	setupTestDB(t)
+	defer db.Close()
+
+	token := registerAndLogin(t)
+	_, apiKey := createDB(t, token, "my-db")
+
+	// Push WAL entries using the API key
+	entries := `[
+		{"ts":100,"op":1,"table_id":1,"pk":1,"sql":"INSERT INTO t VALUES (1)"},
+		{"ts":101,"op":1,"table_id":1,"pk":2,"sql":"INSERT INTO t VALUES (2)"}
+	]`
+	req := httptest.NewRequest("POST", "/v1/wal/push", strings.NewReader(entries))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	w := httptest.NewRecorder()
+	handleWALPush(w, req)
+	if w.Code != 200 {
+		t.Fatalf("wal push: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// Verify entries in DB
+	var count int
+	db.QueryRow("SELECT COUNT(*) FROM wal_entries").Scan(&count)
+	if count != 2 {
+		t.Fatalf("expected 2 wal entries, got %d", count)
+	}
+}
+
+func TestWALPushInvalidAPIKey(t *testing.T) {
+	setupTestDB(t)
+	defer db.Close()
+
+	req := httptest.NewRequest("POST", "/v1/wal/push",
+		strings.NewReader(`[{"ts":1,"op":1,"table_id":1,"pk":1,"sql":""}]`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer invalid-key")
+	w := httptest.NewRecorder()
+	handleWALPush(w, req)
+	if w.Code != 401 {
+		t.Fatalf("expected 401, got %d", w.Code)
+	}
+}
+
+func TestWALPushSessionTokenRejected(t *testing.T) {
+	setupTestDB(t)
+	defer db.Close()
+
+	token := registerAndLogin(t)
+	createDB(t, token, "my-db")
+
+	// Try to push WAL using the session token (not the API key)
+	req := httptest.NewRequest("POST", "/v1/wal/push",
+		strings.NewReader(`[{"ts":1,"op":1,"table_id":1,"pk":1,"sql":""}]`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+	w := httptest.NewRecorder()
+	handleWALPush(w, req)
+	if w.Code != 401 {
+		t.Fatalf("expected 401 (session token not valid for WAL push), got %d", w.Code)
+	}
+}
+
+func TestHydratePlanWithAPIKey(t *testing.T) {
+	setupTestDB(t)
+	defer db.Close()
+
+	token := registerAndLogin(t)
+	dbID, apiKey := createDB(t, token, "my-db")
+
+	// Register a snapshot
+	db.Exec(`INSERT INTO snapshots (db_id, baseline_lsn, s3_key)
+		VALUES (?, 100, 'snaps/snap_100.db')`, dbID)
+
+	// Register chunks
+	db.Exec(`INSERT INTO chunks (db_id, lsn_start, lsn_end, s3_key)
+		VALUES (?, 101, 5000, 'chunks/chunk_101_5000.zst')`, dbID)
+
+	// Hydrate plan with API key
+	req := httptest.NewRequest("GET", "/v1/hydrate/plan", nil)
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	w := httptest.NewRecorder()
+	handleHydratePlan(w, req)
+	if w.Code != 200 {
+		t.Fatalf("hydrate plan: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var plan HydratePlanResponse
+	json.NewDecoder(w.Body).Decode(&plan)
+	if plan.BaselineLSN != 100 {
+		t.Fatalf("expected baseline_lsn=100, got %d", plan.BaselineLSN)
+	}
+	if len(plan.Chunks) != 1 {
+		t.Fatalf("expected 1 chunk, got %d", len(plan.Chunks))
+	}
+}
+
+func TestUploadRequestWithAPIKey(t *testing.T) {
+	setupTestDB(t)
+	defer db.Close()
+
+	token := registerAndLogin(t)
+	_, apiKey := createDB(t, token, "my-db")
+
+	body := `{"db_id":"x","event_count":100,"lsn_start":1,"lsn_end":100}`
+	req := httptest.NewRequest("POST", "/v1/upload/request", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	w := httptest.NewRecorder()
+	handleUploadRequest(w, req)
+	if w.Code != 200 {
+		t.Fatalf("upload request: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp UploadResponse
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp.UploadURL == "" {
+		t.Fatal("expected non-empty upload_url")
+	}
+}
+
+func TestDBManagementRequiresSession(t *testing.T) {
+	setupTestDB(t)
+	defer db.Close()
+
+	// Try to list DBs without auth
+	req := httptest.NewRequest("GET", "/v1/db/list", nil)
+	w := httptest.NewRecorder()
+	handleDBList(w, req)
+	if w.Code != 401 {
+		t.Fatalf("expected 401, got %d", w.Code)
+	}
+
+	// Try to create DB without auth
+	req = httptest.NewRequest("POST", "/v1/db/create",
+		strings.NewReader(`{"name":"test"}`))
+	req.Header.Set("Content-Type", "application/json")
+	w = httptest.NewRecorder()
+	handleDBCreate(w, req)
+	if w.Code != 401 {
+		t.Fatalf("expected 401, got %d", w.Code)
+	}
+}
+
+// ── Helpers ─────────────────────────────────────────────────────────

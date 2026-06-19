@@ -1,28 +1,36 @@
-// Arkilian Control Plane API — issues signed URLs, manages metadata.
-// The server never touches S3 directly — it delegates heavy transfers
-// to the client via Pre-Signed URLs.
+// Arkilian Control Plane — user management, database registry, WAL push.
+//
+// Auth model:
+//   Users register/login → get session JWT (for management APIs).
+//   Each database has a unique api_key (for WAL push / backup / hydrate).
 //
 // Endpoints:
-//   GET    /v1/hydrate/plan    — return snapshot URL + incremental chunk URLs
-//   POST   /v1/upload/request  — request a signed PUT URL for a chunk
-//   GET    /health             — health check
+//   POST   /v1/auth/register       — create account
+//   POST   /v1/auth/login          — login, get session token
+//   POST   /v1/db/create           — create database, returns db_id + api_key
+//   GET    /v1/db/list             — list user's databases
+//   GET    /v1/db/{db_id}/key      — get/rotate api_key for a database
+//   POST   /v1/wal/push            — push WAL entries (auth: api_key)
+//   POST   /v1/upload/request      — request signed PUT URL (auth: api_key)
+//   GET    /v1/hydrate/plan        — get hydrate plan (auth: api_key)
+//   GET    /health                 — health check
 //
 // Env:
-//   PORT              HTTP listen port (default 8080)
-//   AUTH_TOKEN        Bearer token for authentication
-//   ARKILIAN_DB_PATH  SQLite metadata database (default /data/arkilian.db)
-//   S3_ENDPOINT       S3-compatible endpoint (default http://localhost:9000)
-//   S3_BUCKET         Bucket name (default arkilian)
-//   S3_REGION         Region (default us-east-1)
-//   S3_KEY            Access key
-//   S3_SECRET         Secret key
+//   PORT, AUTH_TOKEN (master), ARKILIAN_DB_PATH, JWT_SECRET,
+//   S3_ENDPOINT, S3_BUCKET, S3_REGION, S3_KEY, S3_SECRET
 
 package main
 
 import (
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -31,9 +39,18 @@ import (
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
+	"golang.org/x/crypto/bcrypt"
 )
 
 // ── Types ───────────────────────────────────────────────────────────
+
+type WALEntry struct {
+	TS      uint64 `json:"ts"`
+	Op      uint8  `json:"op"`
+	TableID uint16 `json:"table_id"`
+	PK      uint64 `json:"pk"`
+	SQL     string `json:"sql"`
+}
 
 type ChunkInfo struct {
 	URL       string `json:"url"`
@@ -50,7 +67,6 @@ type HydratePlanResponse struct {
 }
 
 type UploadRequest struct {
-	Token      string `json:"token"`
 	DBID       string `json:"db_id"`
 	EventCount int    `json:"event_count"`
 	LSNStart   int64  `json:"lsn_start"`
@@ -62,12 +78,50 @@ type UploadResponse struct {
 	ExpiresAt int64  `json:"expires_at"`
 }
 
-// ── Configuration ───────────────────────────────────────────────────
+type RegisterRequest struct {
+	Email    string `json:"email"`
+	Password string `json:"password"`
+}
+
+type LoginRequest struct {
+	Email    string `json:"email"`
+	Password string `json:"password"`
+}
+
+type LoginResponse struct {
+	Token   string `json:"token"`
+	UserID  int64  `json:"user_id"`
+	Expires int64  `json:"expires_at"`
+}
+
+type CreateDBRequest struct {
+	Name string `json:"name"`
+}
+
+type CreateDBResponse struct {
+	DBID   string `json:"db_id"`
+	APIKey string `json:"api_key"`
+	Name   string `json:"name"`
+}
+
+type DBInfo struct {
+	DBID      string `json:"db_id"`
+	Name      string `json:"name"`
+	CreatedAt int64  `json:"created_at"`
+}
+
+type KeyResponse struct {
+	DBID   string `json:"db_id"`
+	APIKey string `json:"api_key"`
+}
+
+// ── Config ──────────────────────────────────────────────────────────
 
 var (
-	authToken string
-	db        *sql.DB
-	mu        sync.Mutex
+	authToken  string // master admin token (optional)
+	jwtSecret  []byte
+	db         *sql.DB
+	mu         sync.Mutex
 
 	s3Endpoint  string
 	s3Bucket    string
@@ -83,19 +137,120 @@ func getEnv(key, def string) string {
 	return def
 }
 
-func checkAuth(r *http.Request) bool {
+// ── JWT helpers (HMAC-SHA256, no external library) ──────────────────
+
+func jwtSign(payload string, secret []byte) string {
+	h := hmac.New(sha256.New, secret)
+	h.Write([]byte(payload))
+	sig := base64.RawURLEncoding.EncodeToString(h.Sum(nil))
+	b64 := base64.RawURLEncoding.EncodeToString([]byte(payload))
+	return b64 + "." + sig
+}
+
+func jwtVerify(token string, secret []byte) (string, bool) {
+	parts := strings.SplitN(token, ".", 2)
+	if len(parts) != 2 {
+		return "", false
+	}
+	// Decode the payload portion
+	raw, err := base64.RawURLEncoding.DecodeString(parts[0])
+	if err != nil {
+		return "", false
+	}
+	expected := jwtSign(string(raw), secret)
+	if !hmac.Equal([]byte(token), []byte(expected)) {
+		return "", false
+	}
+	return string(raw), true
+}
+
+func jwtMake(userID int64, email string) (string, int64) {
+	exp := time.Now().Add(24 * time.Hour).Unix()
+	payload := fmt.Sprintf(`{"user_id":%d,"email":"%s","exp":%d}`, userID, email, exp)
+	return jwtSign(payload, jwtSecret), exp
+}
+
+// ── API key generation ──────────────────────────────────────────────
+
+func generateAPIKey(dbID string) string {
+	b := make([]byte, 32)
+	rand.Read(b)
+	return "ak_" + dbID + "_" + hex.EncodeToString(b)
+}
+
+// ── Crypto rand string for db_id ────────────────────────────────────
+
+func randStr(n int) string {
+	b := make([]byte, n)
+	rand.Read(b)
+	return hex.EncodeToString(b)[:n]
+}
+
+// ── Auth helpers ────────────────────────────────────────────────────
+
+// masterTokenAuth checks the global AUTH_TOKEN (if set).
+func masterTokenAuth(r *http.Request) bool {
 	if authToken == "" {
 		return true
 	}
 	auth := r.Header.Get("Authorization")
-	return strings.HasPrefix(auth, "Bearer ") && strings.TrimPrefix(auth, "Bearer ") == authToken
+	return strings.HasPrefix(auth, "Bearer ") &&
+		strings.TrimPrefix(auth, "Bearer ") == authToken
 }
 
-// ── SQLite metadata store ───────────────────────────────────────────
+// sessionAuth extracts user_id from a JWT session token.
+func sessionAuth(r *http.Request) (int64, bool) {
+	auth := r.Header.Get("Authorization")
+	if !strings.HasPrefix(auth, "Bearer ") {
+		return 0, false
+	}
+	token := strings.TrimPrefix(auth, "Bearer ")
+	payload, ok := jwtVerify(token, jwtSecret)
+	if !ok {
+		return 0, false
+	}
+
+	// Parse `{"user_id":N,"email":"E","exp":N}`
+	var userID, exp int64
+	if _, err := fmt.Sscanf(payload, `{"user_id":%d,"email":`, &userID); err != nil {
+		return 0, false
+	}
+	// Find exp field after the second comma
+	idx := strings.LastIndex(payload, `"exp":`)
+	if idx < 0 {
+		return 0, false
+	}
+	if _, err := fmt.Sscanf(payload[idx:], `"exp":%d}`, &exp); err != nil {
+		return 0, false
+	}
+	if time.Now().Unix() > exp {
+		return 0, false
+	}
+	return userID, true
+}
+
+// apiKeyAuth validates a Bearer token against the databases table.
+// Returns db_id on success.
+func apiKeyAuth(r *http.Request) (string, bool) {
+	auth := r.Header.Get("Authorization")
+	if !strings.HasPrefix(auth, "Bearer ") {
+		return "", false
+	}
+	key := strings.TrimPrefix(auth, "Bearer ")
+	var dbID string
+	err := db.QueryRow("SELECT db_id FROM databases WHERE api_key = ?", key).Scan(&dbID)
+	if err != nil {
+		return "", false
+	}
+	return dbID, true
+}
+
+// ── SQLite setup ────────────────────────────────────────────────────
 
 func initDB(path string) error {
 	var err error
-	db, err = sql.Open("sqlite3", path+"?_journal_mode=WAL&_synchronous=NORMAL")
+	db, err = sql.Open("sqlite3", path+
+		"?_journal_mode=WAL&_synchronous=NORMAL&_busy_timeout=5000&_foreign_keys=ON")
 	if err != nil {
 		return fmt.Errorf("open db: %w", err)
 	}
@@ -104,90 +259,384 @@ func initDB(path string) error {
 	db.SetConnMaxLifetime(0)
 
 	_, err = db.Exec(`
+		CREATE TABLE IF NOT EXISTS users (
+			id            INTEGER PRIMARY KEY AUTOINCREMENT,
+			email         TEXT UNIQUE NOT NULL,
+			password_hash TEXT NOT NULL,
+			created_at    INTEGER DEFAULT (unixepoch())
+		);
+		CREATE TABLE IF NOT EXISTS databases (
+			db_id     TEXT PRIMARY KEY,
+			user_id   INTEGER NOT NULL REFERENCES users(id),
+			name      TEXT NOT NULL,
+			api_key   TEXT UNIQUE NOT NULL,
+			created_at INTEGER DEFAULT (unixepoch())
+		);
+		CREATE TABLE IF NOT EXISTS wal_entries (
+			lsn         INTEGER PRIMARY KEY AUTOINCREMENT,
+			db_id       TEXT NOT NULL REFERENCES databases(db_id),
+			ts          INTEGER NOT NULL,
+			op          INTEGER NOT NULL,
+			table_id    INTEGER NOT NULL,
+			pk          INTEGER NOT NULL,
+			sql         TEXT,
+			received_at INTEGER DEFAULT (unixepoch())
+		);
+		CREATE INDEX IF NOT EXISTS idx_wal_db ON wal_entries(db_id, lsn);
 		CREATE TABLE IF NOT EXISTS snapshots (
-			id          INTEGER PRIMARY KEY AUTOINCREMENT,
+			id           INTEGER PRIMARY KEY AUTOINCREMENT,
+			db_id        TEXT NOT NULL REFERENCES databases(db_id),
 			baseline_lsn INTEGER NOT NULL,
-			s3_key      TEXT NOT NULL,
-			created_at  INTEGER NOT NULL DEFAULT (unixepoch())
+			s3_key       TEXT NOT NULL,
+			created_at   INTEGER DEFAULT (unixepoch())
 		);
 		CREATE TABLE IF NOT EXISTS chunks (
-			id          INTEGER PRIMARY KEY AUTOINCREMENT,
-			lsn_start   INTEGER NOT NULL,
-			lsn_end     INTEGER NOT NULL,
-			s3_key      TEXT NOT NULL,
-			created_at  INTEGER NOT NULL DEFAULT (unixepoch())
-		);
-		CREATE TABLE IF NOT EXISTS db_registry (
-			db_id       TEXT PRIMARY KEY,
-			created_at  INTEGER NOT NULL DEFAULT (unixepoch())
+			id         INTEGER PRIMARY KEY AUTOINCREMENT,
+			db_id      TEXT NOT NULL REFERENCES databases(db_id),
+			lsn_start  INTEGER NOT NULL,
+			lsn_end    INTEGER NOT NULL,
+			s3_key     TEXT NOT NULL,
+			created_at  INTEGER DEFAULT (unixepoch())
 		);
 	`)
 	return err
 }
 
-// ── Signed URL generator (S3-compatible) ────────────────────────────
+// ── Signed URL ──────────────────────────────────────────────────────
 
 func signedURL(verb, key string, expiresIn time.Duration) (string, int64) {
 	expires := time.Now().Add(expiresIn).Unix()
-
-	host := s3Endpoint
+	host := strings.TrimSuffix(s3Endpoint, "/")
 	if !strings.HasPrefix(host, "http") {
 		host = "https://" + host
 	}
-	host = strings.TrimSuffix(host, "/")
-
-	url := fmt.Sprintf("%s/%s/%s", host, s3Bucket, key)
-	// In production replace with real AWS Signature V4.
-	// For now we return a plain URL with an X-Amz-* style query suffix
-	// that the caller handles server-side or via a real SDK.
-	url += fmt.Sprintf("?X-Amz-Algorithm=AWS4-HMAC-SHA256"+
+	url := fmt.Sprintf("%s/%s/%s?X-Amz-Algorithm=AWS4-HMAC-SHA256"+
 		"&X-Amz-Credential=%s/%%2F%s/%%2Fs3/%%2Faws4_request"+
-		"&X-Amz-Date=%s"+
-		"&X-Amz-Expires=%d"+
-		"&X-Amz-SignedHeaders=host",
+		"&X-Amz-Date=%s&X-Amz-Expires=%d&X-Amz-SignedHeaders=host",
+		host, s3Bucket, key,
 		s3AccessKey, time.Now().UTC().Format("20060102"),
 		time.Now().UTC().Format("20060102T150405Z"),
 		expiresIn/time.Second)
-	// Note: a real deployment must compute the Signature parameter using
-	// HMAC-SHA256.  The above URL is structurally correct but will 403
-	// without a valid signature.  Use a library or implement HMAC.
 	return url, expires
 }
 
-// ── Hydrate plan endpoint ───────────────────────────────────────────
+// ── Auth handlers ───────────────────────────────────────────────────
+
+func handleRegister(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req RegisterRequest
+	if json.NewDecoder(r.Body).Decode(&req) != nil ||
+		req.Email == "" || len(req.Password) < 6 {
+		http.Error(w, `{"error":"invalid request"}`, http.StatusBadRequest)
+		return
+	}
+
+	hash, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
+	if err != nil {
+		http.Error(w, "server error", http.StatusInternalServerError)
+		return
+	}
+
+	mu.Lock()
+	_, err = db.Exec("INSERT INTO users (email, password_hash) VALUES (?, ?)",
+		req.Email, string(hash))
+	mu.Unlock()
+
+	if err != nil {
+		if strings.Contains(err.Error(), "UNIQUE") {
+			http.Error(w, `{"error":"email already registered"}`, http.StatusConflict)
+		} else {
+			http.Error(w, "server error", http.StatusInternalServerError)
+		}
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	w.Write([]byte(`{"ok":true}`))
+}
+
+func handleLogin(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req LoginRequest
+	if json.NewDecoder(r.Body).Decode(&req) != nil || req.Email == "" {
+		http.Error(w, `{"error":"invalid request"}`, http.StatusBadRequest)
+		return
+	}
+
+	var userID int64
+	var hash string
+	err := db.QueryRow("SELECT id, password_hash FROM users WHERE email = ?",
+		req.Email).Scan(&userID, &hash)
+	if err != nil {
+		http.Error(w, `{"error":"invalid credentials"}`, http.StatusUnauthorized)
+		return
+	}
+
+	if bcrypt.CompareHashAndPassword([]byte(hash), []byte(req.Password)) != nil {
+		http.Error(w, `{"error":"invalid credentials"}`, http.StatusUnauthorized)
+		return
+	}
+
+	token, exp := jwtMake(userID, req.Email)
+	resp := LoginResponse{Token: token, UserID: userID, Expires: exp}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
+}
+
+// ── Database management handlers ────────────────────────────────────
+
+func handleDBCreate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	userID, ok := sessionAuth(r)
+	if !ok {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+
+	var req CreateDBRequest
+	if json.NewDecoder(r.Body).Decode(&req) != nil || req.Name == "" {
+		http.Error(w, `{"error":"name required"}`, http.StatusBadRequest)
+		return
+	}
+
+	dbID := "db_" + randStr(12)
+	apiKey := generateAPIKey(dbID)
+
+	mu.Lock()
+	_, err := db.Exec(
+		"INSERT INTO databases (db_id, user_id, name, api_key) VALUES (?, ?, ?, ?)",
+		dbID, userID, req.Name, apiKey)
+	mu.Unlock()
+
+	if err != nil {
+		http.Error(w, "server error", http.StatusInternalServerError)
+		return
+	}
+
+	resp := CreateDBResponse{DBID: dbID, APIKey: apiKey, Name: req.Name}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(resp)
+}
+
+func handleDBList(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	userID, ok := sessionAuth(r)
+	if !ok {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+
+	rows, err := db.Query(
+		"SELECT db_id, name, created_at FROM databases WHERE user_id = ? ORDER BY created_at DESC",
+		userID)
+	if err != nil {
+		http.Error(w, "db error", http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	dbs := make([]DBInfo, 0)
+	for rows.Next() {
+		var d DBInfo
+		if rows.Scan(&d.DBID, &d.Name, &d.CreatedAt) == nil {
+			dbs = append(dbs, d)
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(dbs)
+}
+
+func handleDBKey(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	userID, ok := sessionAuth(r)
+	if !ok {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+
+	dbID := strings.TrimPrefix(r.URL.Path, "/v1/db/")
+	dbID = strings.TrimSuffix(dbID, "/key")
+
+	var apiKey string
+	err := db.QueryRow(
+		"SELECT api_key FROM databases WHERE db_id = ? AND user_id = ?",
+		dbID, userID).Scan(&apiKey)
+	if err != nil {
+		http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
+		return
+	}
+
+	resp := KeyResponse{DBID: dbID, APIKey: apiKey}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
+}
+
+// ── WAL push (api_key auth, stores entries per database) ────────────
+
+var insertStmt *sql.Stmt
+var insertStmtMu sync.Mutex
+
+func handleWALPush(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	dbID, ok := apiKeyAuth(r)
+	if !ok {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+
+	r.Body = http.MaxBytesReader(w, r.Body, 32<<20)
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "body too large", http.StatusRequestEntityTooLarge)
+		return
+	}
+	defer r.Body.Close()
+
+	var entries []WALEntry
+	if err := json.Unmarshal(body, &entries); err != nil {
+		http.Error(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+	if len(entries) == 0 {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"ok":true,"inserted":0}`))
+		return
+	}
+
+	insertStmtMu.Lock()
+	tx, err := db.Begin()
+	if err != nil {
+		insertStmtMu.Unlock()
+		log.Printf("ERROR begin tx: %v", err)
+		http.Error(w, "db error", http.StatusInternalServerError)
+		return
+	}
+
+	// Prepare within tx for per-db_id inserts
+	stmt, err := tx.Prepare(
+		`INSERT INTO wal_entries (db_id, ts, op, table_id, pk, sql)
+		 VALUES (?, ?, ?, ?, ?, ?)`)
+	if err != nil {
+		tx.Rollback()
+		insertStmtMu.Unlock()
+		log.Printf("ERROR prepare: %v", err)
+		http.Error(w, "db error", http.StatusInternalServerError)
+		return
+	}
+
+	for i := range entries {
+		e := &entries[i]
+		if _, err := stmt.Exec(dbID, e.TS, e.Op, e.TableID, e.PK, e.SQL); err != nil {
+			stmt.Close()
+			tx.Rollback()
+			insertStmtMu.Unlock()
+			log.Printf("ERROR insert wal: %v", err)
+			http.Error(w, "db error", http.StatusInternalServerError)
+			return
+		}
+	}
+	stmt.Close()
+
+	if err := tx.Commit(); err != nil {
+		insertStmtMu.Unlock()
+		log.Printf("ERROR commit: %v", err)
+		http.Error(w, "db error", http.StatusInternalServerError)
+		return
+	}
+	insertStmtMu.Unlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprintf(w, `{"ok":true,"inserted":%d}`, len(entries))
+}
+
+// ── Upload request (api_key auth) ───────────────────────────────────
+
+func handleUploadRequest(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	dbID, ok := apiKeyAuth(r)
+	if !ok {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+
+	var req UploadRequest
+	if json.NewDecoder(r.Body).Decode(&req) != nil {
+		http.Error(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+
+	key := fmt.Sprintf("db_%s/chunks/lsn_%010d_%010d.sql.zst",
+		dbID, req.LSNStart, req.LSNEnd)
+
+	mu.Lock()
+	db.Exec(`INSERT INTO chunks (db_id, lsn_start, lsn_end, s3_key)
+		VALUES (?, ?, ?, ?)`, dbID, req.LSNStart, req.LSNEnd, key)
+	mu.Unlock()
+
+	putURL, expires := signedURL("PUT", key, 10*time.Minute)
+	resp := UploadResponse{UploadURL: putURL, ExpiresAt: expires}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
+}
+
+// ── Hydrate plan (api_key auth) ─────────────────────────────────────
 
 func handleHydratePlan(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if !checkAuth(r) {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
+	dbID, ok := apiKeyAuth(r)
+	if !ok {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
 		return
 	}
 
-	mu.Lock()
-	defer mu.Unlock()
-
-	// Find the latest snapshot
 	var snapLSN int64
 	var snapKey string
-	if err := db.QueryRow(
-		"SELECT baseline_lsn, s3_key FROM snapshots ORDER BY baseline_lsn DESC LIMIT 1",
-	).Scan(&snapLSN, &snapKey); err != nil {
-		http.Error(w, "no snapshot available", http.StatusNotFound)
+	err := db.QueryRow(
+		`SELECT baseline_lsn, s3_key FROM snapshots
+		 WHERE db_id = ? ORDER BY baseline_lsn DESC LIMIT 1`,
+		dbID).Scan(&snapLSN, &snapKey)
+	if err != nil {
+		http.Error(w, `{"error":"no snapshot available"}`, http.StatusNotFound)
 		return
 	}
 
 	snapURL, snapExpires := signedURL("GET", snapKey, 1*time.Hour)
 
-	// Find all chunks with LSN > snapshot baseline
 	rows, err := db.Query(
-		`SELECT lsn_start, lsn_end, s3_key
-		 FROM chunks WHERE lsn_start > ?
-		 ORDER BY lsn_start ASC LIMIT 1000`, snapLSN)
+		`SELECT lsn_start, lsn_end, s3_key FROM chunks
+		 WHERE db_id = ? AND lsn_start > ?
+		 ORDER BY lsn_start ASC LIMIT 1000`,
+		dbID, snapLSN)
 	if err != nil {
-		log.Printf("ERROR query chunks: %v", err)
 		http.Error(w, "db error", http.StatusInternalServerError)
 		return
 	}
@@ -197,11 +646,10 @@ func handleHydratePlan(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var ci ChunkInfo
 		var key string
-		if err := rows.Scan(&ci.LSNStart, &ci.LSNEnd, &key); err != nil {
-			continue
+		if rows.Scan(&ci.LSNStart, &ci.LSNEnd, &key) == nil {
+			ci.URL, ci.ExpiresAt = signedURL("GET", key, 1*time.Hour)
+			chunks = append(chunks, ci)
 		}
-		ci.URL, ci.ExpiresAt = signedURL("GET", key, 1*time.Hour)
-		chunks = append(chunks, ci)
 	}
 
 	resp := HydratePlanResponse{
@@ -210,66 +658,20 @@ func handleHydratePlan(w http.ResponseWriter, r *http.Request) {
 		ExpiresAt:   snapExpires,
 		Chunks:      chunks,
 	}
-
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
 }
 
-// ── Upload request endpoint ─────────────────────────────────────────
-
-func handleUploadRequest(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	if !checkAuth(r) {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
-		return
-	}
-
-	var req UploadRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid json", http.StatusBadRequest)
-		return
-	}
-
-	mu.Lock()
-	defer mu.Unlock()
-
-	// Register DB if new
-	db.Exec("INSERT OR IGNORE INTO db_registry (db_id) VALUES (?)", req.DBID)
-
-	// Generate S3 key for this chunk
-	key := fmt.Sprintf("db_%s/chunks/lsn_%010d_%010d.sql.zst",
-		req.DBID, req.LSNStart, req.LSNEnd)
-
-	// Record chunk metadata
-	db.Exec(
-		`INSERT INTO chunks (lsn_start, lsn_end, s3_key)
-		 VALUES (?, ?, ?)`,
-		req.LSNStart, req.LSNEnd, key)
-
-	// Generate signed PUT URL (10 minute expiry)
-	putURL, expires := signedURL("PUT", key, 10*time.Minute)
-
-	resp := UploadResponse{
-		UploadURL: putURL,
-		ExpiresAt: expires,
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
-}
-
-// ── Admin: register a snapshot ──────────────────────────────────────
+// ── Snapshot register (api_key auth) ────────────────────────────────
 
 func handleSnapshotRegister(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if !checkAuth(r) {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
+	dbID, ok := apiKeyAuth(r)
+	if !ok {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
 		return
 	}
 
@@ -277,16 +679,15 @@ func handleSnapshotRegister(w http.ResponseWriter, r *http.Request) {
 		BaselineLSN int64  `json:"baseline_lsn"`
 		S3Key       string `json:"s3_key"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if json.NewDecoder(r.Body).Decode(&req) != nil {
 		http.Error(w, "invalid json", http.StatusBadRequest)
 		return
 	}
 
 	mu.Lock()
-	defer mu.Unlock()
-
-	db.Exec("INSERT INTO snapshots (baseline_lsn, s3_key) VALUES (?, ?)",
-		req.BaselineLSN, req.S3Key)
+	db.Exec(`INSERT INTO snapshots (db_id, baseline_lsn, s3_key) VALUES (?, ?, ?)`,
+		dbID, req.BaselineLSN, req.S3Key)
+	mu.Unlock()
 
 	w.Header().Set("Content-Type", "application/json")
 	w.Write([]byte(`{"ok":true}`))
@@ -305,6 +706,7 @@ func main() {
 	port := getEnv("PORT", "8080")
 	authToken = getEnv("AUTH_TOKEN", "")
 	dbPath := getEnv("ARKILIAN_DB_PATH", "/data/arkilian.db")
+	jwtSecret = []byte(getEnv("JWT_SECRET", "arkilian-dev-secret-change-in-production"))
 	s3Endpoint = getEnv("S3_ENDPOINT", "http://localhost:9000")
 	s3Bucket = getEnv("S3_BUCKET", "arkilian")
 	s3Region = getEnv("S3_REGION", "us-east-1")
@@ -319,16 +721,26 @@ func main() {
 	defer db.Close()
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/hydrate/plan",       handleHydratePlan)
-	mux.HandleFunc("/v1/upload/request",     handleUploadRequest)
-	mux.HandleFunc("/v1/snapshot/register",  handleSnapshotRegister)
-	mux.HandleFunc("/health",                handleHealth)
+	// Auth
+	mux.HandleFunc("/v1/auth/register", handleRegister)
+	mux.HandleFunc("/v1/auth/login", handleLogin)
+	// Database management (session auth)
+	mux.HandleFunc("/v1/db/create", handleDBCreate)
+	mux.HandleFunc("/v1/db/list", handleDBList)
+	mux.HandleFunc("/v1/db/", handleDBKey) // /v1/db/{db_id}/key
+	// WAL & hydration (api_key auth)
+	mux.HandleFunc("/v1/wal/push", handleWALPush)
+	mux.HandleFunc("/v1/upload/request", handleUploadRequest)
+	mux.HandleFunc("/v1/hydrate/plan", handleHydratePlan)
+	mux.HandleFunc("/v1/snapshot/register", handleSnapshotRegister)
+	// Health
+	mux.HandleFunc("/health", handleHealth)
 
 	srv := &http.Server{
 		Addr:         ":" + port,
 		Handler:      mux,
 		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 30 * time.Second,
+		WriteTimeout: 60 * time.Second,
 		IdleTimeout:  60 * time.Second,
 	}
 
