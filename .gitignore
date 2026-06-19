@@ -53,6 +53,7 @@ src/arkilian
 bindings/rust/arkilian/target
 *.typed
 *.pyc
+testdata/
 *.db-shm
 *.db-wal
 test_interception

@@ -58,14 +58,14 @@ func TestSimulation(t *testing.T) {
 	os.Setenv("ARKILIAN_DEBUG", "true")
 	os.Setenv("ARKILIAN_ENABLE_BACKUP", "1")
 	os.Setenv("ARKILIAN_BACKUP_INTERVAL", "5") // backup every 5 seconds
-	os.Setenv("ARKILIAN_BACKUP_PATH", "/tmp/arkilian_sim_backup.sqlite")
-	os.Setenv("JWT_SECRET", "simulation-secret")
-	os.Remove("/tmp/arkilian_sim_server.db")
-	os.Remove("/tmp/arkilian_sim_backup.sqlite")
+	os.Setenv("ARKILIAN_BACKUP_PATH", testdataPath("arkilian_sim_backup.sqlite"))
+	os.Setenv("ARKILIAN_JWT_SECRET", "simulation-secret")
+	os.Remove(testdataPath("arkilian_sim_server.db"))
+	os.Remove(testdataPath("arkilian_sim_backup.sqlite"))
 
 	server := exec.Command(serverBin)
 	server.Env = append(os.Environ(),
-		"ARKILIAN_DB_PATH=/tmp/arkilian_sim_server.db",
+		"ARKILIAN_DB_PATH="+testdataPath("arkilian_sim_server.db"),
 		"PORT=19876",
 		"JWT_SECRET=simulation-secret",
 	)
@@ -98,7 +98,7 @@ func TestSimulation(t *testing.T) {
 		tn.Email = fmt.Sprintf("%s@sim.local", tn.Name)
 		tn.Token = simRegisterLogin(t, baseURL, tn.Email, "sim-pass")
 		tn.DBID, tn.APIKey = simCreateDB(t, baseURL, tn.Token, tn.Name)
-		tn.DBPath = fmt.Sprintf("/tmp/sim_%s.sqlite", tn.DBID)
+		tn.DBPath = testdataPath("sim_" + tn.DBID + ".sqlite")
 		os.Remove(tn.DBPath)
 		tenants[i] = tn
 		t.Logf("Tenant %-12s  db=%s  key=%s...", tn.Name, tn.DBID, tn.APIKey[:28])
@@ -231,7 +231,7 @@ loop:
 	// ── Cold-start hydration ──────────────────────────────────────
 	t.Log("\n── Cold-Start Hydration ──")
 	src := tenants[0]
-	hydratePath := fmt.Sprintf("/tmp/sim_hydrate_%s.sqlite", src.DBID)
+	hydratePath := testdataPath("sim_hydrate_" + src.DBID + ".sqlite")
 	os.Remove(hydratePath)
 	defer os.Remove(hydratePath)
 
@@ -265,14 +265,12 @@ loop:
 
 	// ── Backup verification ───────────────────────────────────────
 	t.Log("\n── Backup Verification ──")
-	backupPath := "/tmp/arkilian_sim_backup.sqlite"
+	backupPath := testdataPath("arkilian_sim_backup.sqlite")
 	if info, err := os.Stat(backupPath); err == nil {
 		t.Logf("  Backup file:  %s  (%d bytes)", backupPath, info.Size())
 	} else {
-		t.Logf("  Backup file:  not yet created (backup runs every %ss)",
-			os.Getenv("ARKILIAN_BACKUP_INTERVAL"))
+		t.Logf("  Backup file:  not yet created")
 	}
-	// Check for backup-wal too
 	walPath := backupPath + "-wal"
 	if info, err := os.Stat(walPath); err == nil {
 		t.Logf("  Backup WAL:   %s  (%d bytes)", walPath, info.Size())
@@ -300,20 +298,19 @@ loop:
 	t.Logf("  ║  Isolation:     per-api-key   ✓      ║")
 	t.Logf("  ║  Cold-start:    %-12s   ✓      ║", src.Name)
 	t.Logf("  ╚══════════════════════════════════════╝")
-	t.Logf("\n  Inspect data:")
-	t.Logf("    Server DB:   /tmp/arkilian_sim_server.db")
-	t.Logf("    Backup DB:   /tmp/arkilian_sim_backup.sqlite")
+	t.Logf("\n  Inspect data (in testdata/):")
+	t.Logf("    Server DB:   testdata/arkilian_sim_server.db")
+	t.Logf("    Backup DB:   testdata/arkilian_sim_backup.sqlite")
 	for _, tn := range tenants {
-		t.Logf("    Client %-12s: %s", tn.Name+":", tn.DBPath)
+		t.Logf("    Client %-12s: testdata/sim_%s.sqlite", tn.Name+":", tn.DBID)
 	}
 
 	if grandErrors > 0 || dataLoss > 0 {
 		t.Errorf("errors=%d data_loss=%d", grandErrors, dataLoss)
 	}
 
-	// NOTE: DB files are intentionally NOT removed so you can inspect them.
-	// Remove them manually:
-	//   rm -f /tmp/arkilian_sim_*.db /tmp/arkilian_sim_*.sqlite /tmp/sim_*.sqlite
+	// DB files preserved in testdata/ for inspection.
+	// Clean up with: rm -f testdata/arkilian_sim_* testdata/sim_*
 }
 
 // ── Continuous writer ──────────────────────────────────────────────
@@ -455,4 +452,12 @@ func tableNames(rows []map[string]interface{}) []string {
 	}
 	sort.Strings(names)
 	return names
+}
+
+// testdataPath returns a path relative to the project root testdata/ directory.
+func testdataPath(name string) string {
+	_, thisFile, _, _ := runtime.Caller(0)
+	root := filepath.Join(filepath.Dir(thisFile), "..", "..", "..", "testdata")
+	os.MkdirAll(root, 0755)
+	return filepath.Join(root, name)
 }
