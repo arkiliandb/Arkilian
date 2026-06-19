@@ -15,9 +15,13 @@
 //   GET    /v1/hydrate/plan        — get hydrate plan (auth: api_key)
 //   GET    /health                 — health check
 //
-// Env:
+// Env (server also reads ./.env at startup):
 //   PORT, AUTH_TOKEN (master), ARKILIAN_DB_PATH, JWT_SECRET,
-//   S3_ENDPOINT, S3_BUCKET, S3_REGION, S3_KEY, S3_SECRET
+//   ARKILIAN_SIGNED_URL_ENDPOINT (or S3_ENDPOINT),
+//   ARKILIAN_AWS_BUCKET (or S3_BUCKET),
+//   ARKILIAN_AWS_ACCESS_KEY_ID (or S3_KEY),
+//   ARKILIAN_AWS_SECRET_ACCESS_KEY (or S3_SECRET),
+//   S3_REGION
 
 package main
 
@@ -135,6 +139,16 @@ func getEnv(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// firstEnv returns the first non-empty env var from the list.
+func firstEnv(keys ...string) string {
+	for _, k := range keys {
+		if v := os.Getenv(k); v != "" {
+			return v
+		}
+	}
+	return "" // caller should handle empty
 }
 
 // ── JWT helpers (HMAC-SHA256, no external library) ──────────────────
@@ -703,15 +717,31 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 // ── Main ────────────────────────────────────────────────────────────
 
 func main() {
+	// Load .env file if present (simple KEY=VALUE format, ignores comments)
+	if data, err := os.ReadFile(".env"); err == nil {
+		for _, line := range strings.Split(string(data), "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" || strings.HasPrefix(line, "#") {
+				continue
+			}
+			parts := strings.SplitN(line, "=", 2)
+			if len(parts) == 2 && os.Getenv(parts[0]) == "" {
+				os.Setenv(parts[0], strings.TrimSpace(parts[1]))
+			}
+		}
+	}
+
 	port := getEnv("PORT", "8080")
 	authToken = getEnv("AUTH_TOKEN", "")
 	dbPath := getEnv("ARKILIAN_DB_PATH", "/data/arkilian.db")
 	jwtSecret = []byte(getEnv("JWT_SECRET", "arkilian-dev-secret-change-in-production"))
-	s3Endpoint = getEnv("S3_ENDPOINT", "http://localhost:9000")
-	s3Bucket = getEnv("S3_BUCKET", "arkilian")
-	s3Region = getEnv("S3_REGION", "us-east-1")
-	s3AccessKey = getEnv("S3_KEY", "minioadmin")
-	s3SecretKey = getEnv("S3_SECRET", "minioadmin")
+
+	// S3-compatible storage (supports both naming conventions)
+	s3Endpoint  = firstEnv("ARKILIAN_SIGNED_URL_ENDPOINT", "S3_ENDPOINT", "http://localhost:9000")
+	s3Bucket    = firstEnv("ARKILIAN_AWS_BUCKET", "S3_BUCKET", "arkilian")
+	s3Region    = getEnv("S3_REGION", "auto") // R2 uses "auto"
+	s3AccessKey = firstEnv("ARKILIAN_AWS_ACCESS_KEY_ID", "S3_KEY", "minioadmin")
+	s3SecretKey = firstEnv("ARKILIAN_AWS_SECRET_ACCESS_KEY", "S3_SECRET", "minioadmin")
 
 	log.Printf("Arkilian Control Plane on :%s", port)
 
