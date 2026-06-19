@@ -194,6 +194,20 @@ static void wal_dbuf_flush_done(struct wal_double_buf *b) {
 #endif
 }
 
+// Called when a push fails — reset is_flushing so writers can swap
+// again, but preserve entries in the flush buffer for retry.
+static void wal_dbuf_push_failed(struct wal_double_buf *b) {
+#ifndef _WIN32
+  pthread_mutex_lock(&b->swap_mutex);
+  b->is_flushing = 0; // unblock writers
+  pthread_mutex_unlock(&b->swap_mutex);
+#else
+  WaitForSingleObject(b->swap_mutex, INFINITE);
+  b->is_flushing = 0;
+  ReleaseMutex(b->swap_mutex);
+#endif
+}
+
 // ── SQL helpers ─────────────────────────────────────────────────────
 
 static uint16_t table_name_hash(const char *s) {
@@ -501,19 +515,12 @@ void *run_wal_flush(void *arg) {
     if (pushed) {
       wal_dbuf_flush_done(&db->wal);
     } else {
-      // Push failed — keep entries in the flush buffer.  The next
-      // acquire_flush will return the same batch again.  Sleep briefly
-      // to avoid a tight spin loop.
+      // Push failed — entries stay in the flush buffer.  is_flushing
+      // is still 1, so the next acquire_flush will return them again.
+      // Brief backoff before retry to avoid tight spin.
 #ifndef _WIN32
-      pthread_mutex_lock(&db->wal.swap_mutex);
-      // Re-mark as flushing so acquire_flush will return it again
-      db->wal.is_flushing = 1;
-      pthread_mutex_unlock(&db->wal.swap_mutex);
-      usleep(500000); // 500ms backoff before retry
+      usleep(500000);
 #else
-      WaitForSingleObject(db->wal.swap_mutex, INFINITE);
-      db->wal.is_flushing = 1;
-      ReleaseMutex(db->wal.swap_mutex);
       Sleep(500);
 #endif
     }
