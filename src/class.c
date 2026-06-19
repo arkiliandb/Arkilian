@@ -429,6 +429,8 @@ void *run_wal_flush(void *arg) {
     int n = wal_dbuf_acquire_flush(&db->wal, &batch);
     if (n == 0) break;
 
+    int pushed = 0;
+
     if (push_url && strlen(push_url) > 0) {
       // Build JSON payload
       size_t json_cap = (size_t)n * 512 + 64;
@@ -466,8 +468,16 @@ void *run_wal_flush(void *arg) {
           curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
 
           CURLcode res = curl_easy_perform(curl);
-          if (res != CURLE_OK)
-            fprintf(stderr, "WAL push: %s\n", curl_easy_strerror(res));
+          long http_code = 0;
+          if (res == CURLE_OK)
+            curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+
+          if (res == CURLE_OK && http_code == 200) {
+            pushed = 1;
+          } else {
+            fprintf(stderr, "WAL push failed (HTTP %ld, %s) — retrying next cycle\n",
+                    http_code, curl_easy_strerror(res));
+          }
 
           curl_slist_free_all(headers);
           curl_easy_cleanup(curl);
@@ -476,7 +486,25 @@ void *run_wal_flush(void *arg) {
       }
     }
 
-    wal_dbuf_flush_done(&db->wal);
+    if (pushed) {
+      wal_dbuf_flush_done(&db->wal);
+    } else {
+      // Push failed — keep entries in the flush buffer.  The next
+      // acquire_flush will return the same batch again.  Sleep briefly
+      // to avoid a tight spin loop.
+#ifndef _WIN32
+      pthread_mutex_lock(&db->wal.swap_mutex);
+      // Re-mark as flushing so acquire_flush will return it again
+      db->wal.is_flushing = 1;
+      pthread_mutex_unlock(&db->wal.swap_mutex);
+      usleep(500000); // 500ms backoff before retry
+#else
+      WaitForSingleObject(db->wal.swap_mutex, INFINITE);
+      db->wal.is_flushing = 1;
+      ReleaseMutex(db->wal.swap_mutex);
+      Sleep(500);
+#endif
+    }
   }
 
 #ifdef _WIN32
