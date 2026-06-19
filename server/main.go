@@ -17,7 +17,7 @@
 //
 // Env (server also reads ./.env at startup):
 //   PORT, AUTH_TOKEN (master), ARKILIAN_DB_PATH, JWT_SECRET,
-//   ARKILIAN_SIGNED_URL_ENDPOINT (or S3_ENDPOINT),
+//   ARKILIAN_AWS_ENDPOINT_URL (or S3_ENDPOINT),
 //   ARKILIAN_AWS_BUCKET (or S3_BUCKET),
 //   ARKILIAN_AWS_ACCESS_KEY_ID (or S3_KEY),
 //   ARKILIAN_AWS_SECRET_ACCESS_KEY (or S3_SECRET),
@@ -198,18 +198,6 @@ func randStr(n int) string {
 	b := make([]byte, n)
 	rand.Read(b)
 	return hex.EncodeToString(b)[:n]
-}
-
-// ── Auth helpers ────────────────────────────────────────────────────
-
-// masterTokenAuth checks the global AUTH_TOKEN (if set).
-func masterTokenAuth(r *http.Request) bool {
-	if authToken == "" {
-		return true
-	}
-	auth := r.Header.Get("Authorization")
-	return strings.HasPrefix(auth, "Bearer ") &&
-		strings.TrimPrefix(auth, "Bearer ") == authToken
 }
 
 // sessionAuth extracts user_id from a JWT session token.
@@ -733,11 +721,11 @@ func main() {
 
 	port := getEnv("PORT", "8080")
 	authToken = getEnv("AUTH_TOKEN", "")
-	dbPath := getEnv("ARKILIAN_DB_PATH", "/data/arkilian.db")
+	dbPath := getEnv("ARKILIAN_DB_PATH", "./data/arkilian.db")
 	jwtSecret = []byte(getEnv("JWT_SECRET", "arkilian-dev-secret-change-in-production"))
 
 	// S3-compatible storage (supports both naming conventions)
-	s3Endpoint  = firstEnv("ARKILIAN_SIGNED_URL_ENDPOINT", "S3_ENDPOINT", "http://localhost:9000")
+	s3Endpoint  = firstEnv("ARKILIAN_AWS_ENDPOINT_URL", "S3_ENDPOINT", "http://localhost:9000")
 	s3Bucket    = firstEnv("ARKILIAN_AWS_BUCKET", "S3_BUCKET", "arkilian")
 	s3Region    = getEnv("S3_REGION", "auto") // R2 uses "auto"
 	s3AccessKey = firstEnv("ARKILIAN_AWS_ACCESS_KEY_ID", "S3_KEY", "minioadmin")
