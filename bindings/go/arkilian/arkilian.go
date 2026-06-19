@@ -328,6 +328,11 @@ func (db *DB) WALPending() int {
 	return int(C.db_wal_pending(db.ptr))
 }
 
+// FlushWAL forces the WAL double-buffer to flush immediately.
+func (db *DB) FlushWAL() {
+	C.db_wal_flush(db.ptr)
+}
+
 // LastInsertRowID returns the rowid of the last inserted row.
 func (db *DB) LastInsertRowID() int64 {
 	return int64(C.db_last_insert_rowid(db.ptr))

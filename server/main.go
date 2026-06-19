@@ -148,7 +148,12 @@ func firstEnv(keys ...string) string {
 			return v
 		}
 	}
-	return "" // caller should handle empty
+	return ""
+}
+
+// cleanEnv strips trailing commas and whitespace from env values.
+func cleanEnv(v string) string {
+	return strings.TrimRight(strings.TrimSpace(v), ",")
 }
 
 // ── JWT helpers (HMAC-SHA256, no external library) ──────────────────
@@ -308,18 +313,67 @@ func initDB(path string) error {
 
 func signedURL(verb, key string, expiresIn time.Duration) (string, int64) {
 	expires := time.Now().Add(expiresIn).Unix()
+
 	host := strings.TrimSuffix(s3Endpoint, "/")
-	if !strings.HasPrefix(host, "http") {
-		host = "https://" + host
-	}
-	url := fmt.Sprintf("%s/%s/%s?X-Amz-Algorithm=AWS4-HMAC-SHA256"+
-		"&X-Amz-Credential=%s/%%2F%s/%%2Fs3/%%2Faws4_request"+
-		"&X-Amz-Date=%s&X-Amz-Expires=%d&X-Amz-SignedHeaders=host",
+	host = strings.TrimPrefix(host, "https://")
+	host = strings.TrimPrefix(host, "http://")
+
+	t := time.Now().UTC()
+	dateStamp := t.Format("20060102")
+	amzDate := t.Format("20060102T150405Z")
+	credential := s3AccessKey + "/" + dateStamp + "/" + s3Region + "/s3/aws4_request"
+
+	canonicalRequest := verb + "\n/" + s3Bucket + "/" + key + "\n" +
+		"X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=" + urlEncode(credential) +
+		"&X-Amz-Date=" + amzDate + "&X-Amz-Expires=" + fmt.Sprintf("%d", expiresIn/time.Second) +
+		"&X-Amz-SignedHeaders=host\n" +
+		"host:" + host + "\n\n" +
+		"host\n" +
+		"UNSIGNED-PAYLOAD"
+
+	stringToSign := "AWS4-HMAC-SHA256\n" + amzDate + "\n" +
+		dateStamp + "/" + s3Region + "/s3/aws4_request\n" +
+		sha256Hex(canonicalRequest)
+
+	signingKey := hmacSHA256([]byte("aws4_request"),
+		hmacSHA256([]byte("s3"),
+			hmacSHA256([]byte(s3Region),
+				hmacSHA256([]byte(dateStamp),
+					[]byte("AWS4"+s3SecretKey)))))
+
+	signature := hex.EncodeToString(hmacSHA256(signingKey, []byte(stringToSign)))
+
+	url := fmt.Sprintf("http://%s/%s/%s?X-Amz-Algorithm=AWS4-HMAC-SHA256"+
+		"&X-Amz-Credential=%s&X-Amz-Date=%s&X-Amz-Expires=%d"+
+		"&X-Amz-SignedHeaders=host&X-Amz-Signature=%s",
 		host, s3Bucket, key,
-		s3AccessKey, time.Now().UTC().Format("20060102"),
-		time.Now().UTC().Format("20060102T150405Z"),
-		expiresIn/time.Second)
+		urlEncode(credential), amzDate, expiresIn/time.Second, signature)
+
 	return url, expires
+}
+
+func urlEncode(s string) string {
+	result := ""
+	for _, c := range s {
+		if (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+			c == '-' || c == '_' || c == '.' || c == '~' {
+			result += string(c)
+		} else {
+			result += fmt.Sprintf("%%%02X", c)
+		}
+	}
+	return result
+}
+
+func sha256Hex(s string) string {
+	h := sha256.Sum256([]byte(s))
+	return hex.EncodeToString(h[:])
+}
+
+func hmacSHA256(key, data []byte) []byte {
+	h := hmac.New(sha256.New, key)
+	h.Write(data)
+	return h.Sum(nil)
 }
 
 // ── Auth handlers ───────────────────────────────────────────────────
@@ -695,6 +749,24 @@ func handleSnapshotRegister(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(`{"ok":true}`))
 }
 
+// ── WAL count (api_key auth) ───────────────────────────────────────
+
+func handleWALCount(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	dbID, ok := apiKeyAuth(r)
+	if !ok {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+	var count int
+	db.QueryRow("SELECT COUNT(*) FROM wal_entries WHERE db_id = ?", dbID).Scan(&count)
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprintf(w, `{"count":%d}`, count)
+}
+
 // ── Health ──────────────────────────────────────────────────────────
 
 func handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -724,12 +796,19 @@ func main() {
 	dbPath := getEnv("ARKILIAN_DB_PATH", "./data/arkilian.db")
 	jwtSecret = []byte(getEnv("JWT_SECRET", "arkilian-dev-secret-change-in-production"))
 
-	// S3-compatible storage (supports both naming conventions)
-	s3Endpoint  = firstEnv("ARKILIAN_AWS_ENDPOINT_URL", "S3_ENDPOINT", "http://localhost:9000")
-	s3Bucket    = firstEnv("ARKILIAN_AWS_BUCKET", "S3_BUCKET", "arkilian")
-	s3Region    = getEnv("S3_REGION", "auto") // R2 uses "auto"
-	s3AccessKey = firstEnv("ARKILIAN_AWS_ACCESS_KEY_ID", "S3_KEY", "minioadmin")
-	s3SecretKey = firstEnv("ARKILIAN_AWS_SECRET_ACCESS_KEY", "S3_SECRET", "minioadmin")
+	// S3-compatible storage (supports multiple naming conventions)
+	s3Endpoint  = cleanEnv(firstEnv(
+		"ARKILIAN_AWS_ENDPOINT_URL",
+		"ARKILIAN_SIGNED_URL_ENDPOINT",
+		"S3_ENDPOINT", "http://localhost:9000"))
+	s3Bucket = cleanEnv(firstEnv(
+		"ARKILIAN_AWS_BUCKET", "S3_BUCKET", "arkilian"))
+	s3Region = cleanEnv(firstEnv(
+		"REGION", "S3_REGION", "us-east-1"))
+	s3AccessKey = cleanEnv(firstEnv(
+		"ARKILIAN_AWS_ACCESS_KEY_ID", "S3_KEY", "minioadmin"))
+	s3SecretKey = cleanEnv(firstEnv(
+		"ARKILIAN_AWS_SECRET_ACCESS_KEY", "S3_SECRET", "minioadmin"))
 
 	log.Printf("Arkilian Control Plane on :%s", port)
 
@@ -748,6 +827,7 @@ func main() {
 	mux.HandleFunc("/v1/db/", handleDBKey) // /v1/db/{db_id}/key
 	// WAL & hydration (api_key auth)
 	mux.HandleFunc("/v1/wal/push", handleWALPush)
+	mux.HandleFunc("/v1/wal/count", handleWALCount)
 	mux.HandleFunc("/v1/upload/request", handleUploadRequest)
 	mux.HandleFunc("/v1/hydrate/plan", handleHydratePlan)
 	mux.HandleFunc("/v1/snapshot/register", handleSnapshotRegister)

@@ -1265,3 +1265,45 @@ int db_wal_pending(arkilian *db) {
   if (!db) return 0;
   return db->wal.count[0] + db->wal.count[1];
 }
+
+// Force a flush of the WAL double-buffer.  Must be called while the
+// write_mutex is NOT held (the flush thread uses swap_mutex).
+void db_wal_flush(arkilian *db) {
+  if (!db || !db->handle) return;
+  // Signal the flush thread to drain now
+  int had_entries = (db->wal.count[db->wal.active] > 0);
+  if (!had_entries) return;
+
+  // Trigger a swap by marking the active buffer as "full"
+#ifndef _WIN32
+  pthread_mutex_lock(&db->wal.swap_mutex);
+  if (db->wal.is_flushing) {
+    // Already flushing — wait for it to finish, then swap
+    pthread_mutex_unlock(&db->wal.swap_mutex);
+    // Wait briefly for the flush thread
+    usleep(200000);
+    pthread_mutex_lock(&db->wal.swap_mutex);
+  }
+  if (!db->wal.is_flushing && db->wal.count[db->wal.active] > 0) {
+    int a = db->wal.active;
+    db->wal.active = 1 - a;
+    db->wal.is_flushing = 1;
+    pthread_cond_signal(&db->wal.flush_cond);
+  }
+  pthread_mutex_unlock(&db->wal.swap_mutex);
+#else
+  WaitForSingleObject(db->wal.swap_mutex, INFINITE);
+  if (db->wal.is_flushing) {
+    ReleaseMutex(db->wal.swap_mutex);
+    Sleep(200);
+    WaitForSingleObject(db->wal.swap_mutex, INFINITE);
+  }
+  if (!db->wal.is_flushing && db->wal.count[db->wal.active] > 0) {
+    int a = db->wal.active;
+    db->wal.active = 1 - a;
+    db->wal.is_flushing = 1;
+    SetEvent(db->wal.flush_event);
+  }
+  ReleaseMutex(db->wal.swap_mutex);
+#endif
+}
