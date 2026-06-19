@@ -1,4 +1,8 @@
-// Arkilian Hydration Engine — implementation
+// Arkilian Hydration Engine v2 — implementation
+//
+// Logical replay: downloads snapshot binary + incremental SQL chunks
+// via Pre-Signed URLs, plays them back with sqlite3_exec() inside
+// explicit transactions.  No binary WAL frame manipulation needed.
 
 #include "hydration.h"
 #include <curl/curl.h>
@@ -17,281 +21,298 @@ struct curl_buf {
 static size_t curl_write_cb(void *ptr, size_t sz, size_t nmemb, void *user) {
   struct curl_buf *buf = (struct curl_buf *)user;
   size_t total = sz * nmemb;
-  if (buf->len + total > buf->cap) {
+  size_t needed = buf->len + total;
+  if (needed > buf->cap) {
     size_t new_cap = buf->cap ? buf->cap * 2 : (total > 65536 ? total : 65536);
-    if (new_cap < buf->len + total) new_cap = buf->len + total;
+    if (new_cap < needed) new_cap = needed;
     uint8_t *p = realloc(buf->data, new_cap);
     if (!p) return 0;
     buf->data = p;
     buf->cap  = new_cap;
   }
   memcpy(buf->data + buf->len, ptr, total);
-  buf->len += total;
+  buf->len = needed;
   return total;
 }
 
 // ── HTTP helpers ────────────────────────────────────────────────────
 
-static CURL *make_curl(const char *url, const char *token,
-                        struct curl_slist **headers_out) {
-  CURL *c = curl_easy_init();
-  if (!c) return NULL;
-  curl_easy_setopt(c, CURLOPT_URL, url);
-  curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, curl_write_cb);
-  curl_easy_setopt(c, CURLOPT_TIMEOUT, 120L);
-  curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT, 15L);
-  curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
+typedef struct {
+  CURL           *handle;
+  struct curl_slist *headers;
+} HttpReq;
 
-  struct curl_slist *h = NULL;
+static int http_init(HttpReq *r, const char *url, const char *token) {
+  r->handle = curl_easy_init();
+  if (!r->handle) return -1;
+  curl_easy_setopt(r->handle, CURLOPT_URL, url);
+  curl_easy_setopt(r->handle, CURLOPT_WRITEFUNCTION, curl_write_cb);
+  curl_easy_setopt(r->handle, CURLOPT_TIMEOUT, 120L);
+  curl_easy_setopt(r->handle, CURLOPT_CONNECTTIMEOUT, 15L);
+  curl_easy_setopt(r->handle, CURLOPT_FOLLOWLOCATION, 1L);
+  r->headers = NULL;
   if (token && strlen(token) > 0) {
     char auth[512];
     snprintf(auth, sizeof(auth), "Authorization: Bearer %s", token);
-    h = curl_slist_append(h, auth);
+    r->headers = curl_slist_append(r->headers, auth);
+    curl_easy_setopt(r->handle, CURLOPT_HTTPHEADER, r->headers);
   }
-  curl_easy_setopt(c, CURLOPT_HTTPHEADER, h);
-  *headers_out = h;
-  return c;
+  return 0;
 }
 
-// Download a file from URL into a malloc'd buffer.  Returns malloc'd
-// data (caller frees), sets *out_len on success, or returns NULL.
-static uint8_t *http_download(const char *url, const char *token,
-                               size_t *out_len, int *err) {
+static void http_free(HttpReq *r) {
+  if (r->headers) curl_slist_free_all(r->headers);
+  if (r->handle)  curl_easy_cleanup(r->handle);
+}
+
+// GET a URL into a malloc'd string.  Returns NULL on failure.
+static char *http_get_string(const char *url, const char *token, int *err_out) {
+  HttpReq r;
+  if (http_init(&r, url, token) != 0) { *err_out = HYDRATION_ERR_NET; return NULL; }
+
   struct curl_buf buf = {NULL, 0, 0};
-  struct curl_slist *headers = NULL;
-  CURL *c = make_curl(url, token, &headers);
-  if (!c) { *err = HYDRATION_ERR_NET; return NULL; }
+  curl_easy_setopt(r.handle, CURLOPT_WRITEDATA, &buf);
 
-  curl_easy_setopt(c, CURLOPT_WRITEDATA, &buf);
-  CURLcode rc = curl_easy_perform(c);
+  CURLcode rc = curl_easy_perform(r.handle);
   long http_code = 0;
-  if (rc == CURLE_OK) curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &http_code);
-
-  curl_slist_free_all(headers);
-  curl_easy_cleanup(c);
+  if (rc == CURLE_OK) curl_easy_getinfo(r.handle, CURLINFO_RESPONSE_CODE, &http_code);
+  http_free(&r);
 
   if (rc != CURLE_OK || http_code != 200) {
     free(buf.data);
-    *err = HYDRATION_ERR_NET;
+    if (http_code == 401 || http_code == 403) *err_out = HYDRATION_ERR_PROTO;
+    else *err_out = HYDRATION_ERR_NET;
     return NULL;
   }
-  *out_len = buf.len;
-  return buf.data;
+
+  // Null-terminate
+  uint8_t *term = realloc(buf.data, buf.len + 1);
+  if (!term) { free(buf.data); *err_out = HYDRATION_ERR_MEM; return NULL; }
+  term[buf.len] = '\0';
+  *err_out = 0;
+  return (char *)term;
 }
 
-// ── WAL checksum (SQLite cumulative algorithm) ──────────────────────
+// Download a binary file from a URL to a local path.
+static int http_download_file(const char *url, const char *token,
+                               const char *local_path, int *err_out) {
+  HttpReq r;
+  if (http_init(&r, url, token) != 0) { *err_out = HYDRATION_ERR_NET; return -1; }
 
-void wal_checksum_step(uint32_t *s1, uint32_t *s2,
-                       const uint32_t *data, size_t words) {
-  for (size_t i = 0; i < words; i += 2) {
-    *s1 += data[i] + *s2;
-    *s2 += data[i + 1] + *s1;
+  FILE *f = fopen(local_path, "wb");
+  if (!f) { http_free(&r); *err_out = HYDRATION_ERR_DISK; return -1; }
+
+  struct curl_buf buf = {NULL, 0, 0};
+  curl_easy_setopt(r.handle, CURLOPT_WRITEDATA, &buf);
+
+  CURLcode rc = curl_easy_perform(r.handle);
+  long http_code = 0;
+  if (rc == CURLE_OK) curl_easy_getinfo(r.handle, CURLINFO_RESPONSE_CODE, &http_code);
+  http_free(&r);
+
+  if (rc != CURLE_OK || http_code != 200) {
+    fclose(f); free(buf.data); remove(local_path);
+    *err_out = HYDRATION_ERR_NET; return -1;
   }
+
+  size_t written = fwrite(buf.data, 1, buf.len, f);
+  fclose(f);
+  free(buf.data);
+  *err_out = 0;
+  return (written == buf.len) ? 0 : -1;
 }
 
-// ── WAL file writer ─────────────────────────────────────────────────
+// ── Minimal JSON helpers (no external library) ──────────────────────
 
-int wal_file_write(const char *wal_path, const WalHeader *hdr,
-                   const WalFrame *frames, int frame_count) {
-  FILE *f = fopen(wal_path, "wb");
-  if (!f) return HYDRATION_ERR_DISK;
+// Find a string value for a key in a flat JSON object: {"key":"value",...}
+// Returns malloc'd string or NULL.
+char *json_get_string(const char *json, const char *key) {
+  char search[128];
+  snprintf(search, sizeof(search), "\"%s\":\"", key);
+  const char *pos = strstr(json, search);
+  if (!pos) return NULL;
+  pos += strlen(search);
+  const char *end = strchr(pos, '"');
+  if (!end) return NULL;
+  size_t len = (size_t)(end - pos);
+  char *val = malloc(len + 1);
+  if (!val) return NULL;
+  memcpy(val, pos, len);
+  val[len] = '\0';
+  return val;
+}
 
-  // Write WAL header
-  if (fwrite(hdr, sizeof(WalHeader), 1, f) != 1) {
-    fclose(f); return HYDRATION_ERR_DISK;
+int64_t json_get_int64(const char *json, const char *key) {
+  char search[128];
+  snprintf(search, sizeof(search), "\"%s\":", key);
+  const char *pos = strstr(json, search);
+  if (!pos) return 0;
+  pos += strlen(search);
+  return (int64_t)strtoll(pos, NULL, 10);
+}
+
+// Count elements in a JSON array at the given key: {"key":[{...},{...}]}
+int json_array_count(const char *json, const char *key) {
+  char search[128];
+  snprintf(search, sizeof(search), "\"%s\":[", key);
+  const char *pos = strstr(json, search);
+  if (!pos) return 0;
+  pos += strlen(search);
+  int count = 0;
+  int depth = 0;
+  for (const char *p = pos; *p; p++) {
+    if (*p == '{') depth++;
+    if (*p == '}' && depth == 1) count++;
+    if (*p == '}') depth--;
   }
+  return count;
+}
 
-  // Write each frame: header + page data
-  for (int i = 0; i < frame_count; i++) {
-    if (fwrite(&frames[i].hdr, sizeof(WalFrameHeader), 1, f) != 1 ||
-        fwrite(frames[i].page_data, frames[i].page_size, 1, f) != 1) {
-      fclose(f); return HYDRATION_ERR_DISK;
+// Parse the i-th object from a JSON array at key: {"key":[{...},{...}]}
+// Returns malloc'd copy of the i-th element (including braces).
+char *json_array_get(const char *json, const char *key, int index) {
+  char search[128];
+  snprintf(search, sizeof(search), "\"%s\":[", key);
+  const char *pos = strstr(json, search);
+  if (!pos) return NULL;
+  pos += strlen(search);
+
+  int cur = 0;
+  for (const char *p = pos; *p; p++) {
+    if (*p == '{' && cur == index) {
+      const char *start = p;
+      int depth = 0;
+      while (*p) {
+        if (*p == '{') depth++;
+        if (*p == '}') { depth--; if (depth == 0) break; }
+        p++;
+      }
+      size_t len = (size_t)(p - start + 1);
+      char *copy = malloc(len + 1);
+      if (!copy) return NULL;
+      memcpy(copy, start, len);
+      copy[len] = '\0';
+      return copy;
+    }
+    if (*p == '{') cur++;
+  }
+  return NULL;
+}
+
+// ── Control Plane: request hydration plan ───────────────────────────
+
+static int request_hydrate_plan(const char *server_url, const char *token,
+                                 HydratePlan *plan) {
+  char url[1024];
+  snprintf(url, sizeof(url), "%s/hydrate/plan", server_url);
+
+  int err = 0;
+  char *json = http_get_string(url, token, &err);
+  if (!json) return err;
+
+  // Parse plan
+  memset(plan, 0, sizeof(*plan));
+  plan->snapshot_url  = json_get_string(json, "snapshot_url");
+  plan->baseline_lsn  = json_get_int64(json, "baseline_lsn");
+  plan->expires_at    = json_get_int64(json, "expires_at");
+  plan->chunk_count   = json_array_count(json, "chunks");
+
+  if (plan->chunk_count > 0) {
+    plan->chunks = malloc((size_t)plan->chunk_count * sizeof(HydrateChunk));
+    if (!plan->chunks) { free(json); return HYDRATION_ERR_MEM; }
+
+    for (int i = 0; i < plan->chunk_count; i++) {
+      char *elem = json_array_get(json, "chunks", i);
+      if (elem) {
+        plan->chunks[i].url        = json_get_string(elem, "url");
+        plan->chunks[i].lsn_start  = json_get_int64(elem, "lsn_start");
+        plan->chunks[i].lsn_end    = json_get_int64(elem, "lsn_end");
+        plan->chunks[i].expires_at = json_get_int64(elem, "expires_at");
+        free(elem);
+      }
     }
   }
 
-  fclose(f);
+  free(json);
+
+  if (!plan->snapshot_url) return HYDRATION_ERR_PROTO;
   return 0;
 }
 
-// ── Frame validation ────────────────────────────────────────────────
-
-// Validate a single WAL frame: salts must match the header, checksums
-// must be correct for the given page data.  Returns 0 on success.
-int validate_frame(const WalHeader *hdr, WalFrame *frame,
-                          uint32_t *running_s1, uint32_t *running_s2) {
-  if (frame->hdr.salt_1 != hdr->salt_1 ||
-      frame->hdr.salt_2 != hdr->salt_2)
-    return HYDRATION_ERR_CHECK;
-
-  // Recompute checksum over frame header (first 8 bytes: page_no + size_after)
-  uint32_t s1 = *running_s1, s2 = *running_s2;
-  uint32_t hdr_words[2];
-  hdr_words[0] = frame->hdr.page_no;
-  hdr_words[1] = frame->hdr.size_after;
-  wal_checksum_step(&s1, &s2, hdr_words, 2);
-
-  // Continue over page data
-  wal_checksum_step(&s1, &s2, (const uint32_t *)frame->page_data,
-                    frame->page_size / 4);
-
-  if (s1 != frame->hdr.checksum_1 || s2 != frame->hdr.checksum_2)
-    return HYDRATION_ERR_CHECK;
-
-  *running_s1 = s1;
-  *running_s2 = s2;
-  return 0;
+void hydrate_plan_free(HydratePlan *plan) {
+  if (!plan) return;
+  free(plan->snapshot_url);
+  for (int i = 0; i < plan->chunk_count; i++)
+    free(plan->chunks[i].url);
+  free(plan->chunks);
+  memset(plan, 0, sizeof(*plan));
 }
 
-// ── Phase 1: Download latest snapshot ───────────────────────────────
+// ── Step 1: Download & decompress snapshot ──────────────────────────
 
-static int download_snapshot(const char *server_url, const char *token,
+static int download_snapshot(const char *snapshot_url, const char *token,
                               const char *db_path,
-                              uint32_t *out_lsn,
                               hydration_progress_cb progress, void *user) {
-  char url[1024];
-  snprintf(url, sizeof(url), "%s/snapshot/latest", server_url);
+  if (progress) progress(1, 0, 1, user);
 
-  if (progress) progress(1, 0, user);
-
-  size_t len = 0;
   int err = 0;
-  uint8_t *data = http_download(url, token, &len, &err);
-  if (!data) return err;
+  int rc = http_download_file(snapshot_url, token, db_path, &err);
+  if (rc != 0) return err;
 
-  if (progress) progress(1, 50, user);
-
-  // The first 4 bytes of the response are the snapshot LSN (uint32 LE).
-  // The rest is the raw SQLite database file.
-  uint32_t snapshot_lsn = 0;
-  if (len >= 4) {
-    snapshot_lsn = (uint32_t)data[0] |
-                   ((uint32_t)data[1] << 8) |
-                   ((uint32_t)data[2] << 16) |
-                   ((uint32_t)data[3] << 24);
-  }
-
-  // Write the .db file (skip the 4-byte LSN prefix)
-  FILE *f = fopen(db_path, "wb");
-  if (!f) { free(data); return HYDRATION_ERR_DISK; }
-
-  size_t written = 0;
-  if (len > 4) written = fwrite(data + 4, 1, len - 4, f);
-  fclose(f);
-  free(data);
-
-  if (written != (len > 4 ? len - 4 : 0)) return HYDRATION_ERR_DISK;
-
-  if (out_lsn) *out_lsn = snapshot_lsn;
-
-  if (progress) progress(1, 100, user);
+  if (progress) progress(1, 1, 1, user);
   return 0;
 }
 
-// ── Phase 2: Download and reconstruct WAL ───────────────────────────
+// ── Step 2: Read local last_applied_lsn ─────────────────────────────
 
-static int download_wal_frames(const char *server_url, const char *token,
-                                const char *db_path, uint32_t after_lsn,
-                                hydration_progress_cb progress, void *user) {
-  char url[1024];
-  snprintf(url, sizeof(url), "%s/wal/frames?after=%u", server_url, after_lsn);
+static int64_t read_last_applied_lsn(sqlite3 *db) {
+  sqlite3_stmt *stmt = NULL;
+  int rc = sqlite3_prepare_v2(db,
+    "SELECT v FROM _arkilian_meta WHERE k = 'last_applied_lsn'",
+    -1, &stmt, NULL);
+  if (rc != SQLITE_OK) return 0;
 
-  if (progress) progress(2, 0, user);
+  int64_t lsn = 0;
+  if (sqlite3_step(stmt) == SQLITE_ROW)
+    lsn = sqlite3_column_int64(stmt, 0);
+  sqlite3_finalize(stmt);
+  return lsn;
+}
 
-  size_t len = 0;
-  int err = 0;
-  uint8_t *data = http_download(url, token, &len, &err);
-  if (!data) return err;
+// ── Step 3: Replay a single chunk ───────────────────────────────────
 
-  if (progress) progress(2, 30, user);
+int hydrate_replay_chunk(sqlite3 *db, const char *raw_sql, int64_t chunk_lsn) {
+  char *err_msg = NULL;
 
-  // Response format: binary stream of frames.
-  // Each frame: [4B page_no LE][4B size_after LE][4B salt_1 LE][4B salt_2 LE]
-  //             [4B checksum_1 LE][4B checksum_2 LE][4B page_size LE]
-  //             [page_size bytes of page data]
-  //
-  // First 32 bytes: WalHeader (magic, format, page_size, checkpoint_seq,
-  //                             salt_1, salt_2, checksum_1, checksum_2)
-
-  if (len < 32) { free(data); return HYDRATION_ERR_CHECK; }
-
-  size_t off = 0;
-
-  // Read WalHeader from the first 32 bytes
-  WalHeader hdr;
-  memcpy(&hdr, data + off, sizeof(WalHeader));
-  off += sizeof(WalHeader);
-
-  // Parse frames
-  int frame_cap = 256;
-  int frame_cnt = 0;
-  WalFrame *frames = malloc((size_t)frame_cap * sizeof(WalFrame));
-  if (!frames) { free(data); return HYDRATION_ERR_MEM; }
-
-  uint32_t running_s1 = hdr.checksum_1;
-  uint32_t running_s2 = hdr.checksum_2;
-  int salt_mismatch = 0;
-
-  while (off + 28 <= len) {
-    // Read frame header fields (6 x uint32 LE)
-    uint32_t page_no    = *(uint32_t *)(data + off);      off += 4;
-    uint32_t size_after = *(uint32_t *)(data + off);      off += 4;
-    uint32_t salt_1     = *(uint32_t *)(data + off);      off += 4;
-    uint32_t salt_2     = *(uint32_t *)(data + off);      off += 4;
-    uint32_t cksum1_in  = *(uint32_t *)(data + off);      off += 4;
-    uint32_t cksum2_in  = *(uint32_t *)(data + off);      off += 4;
-    uint32_t page_size  = *(uint32_t *)(data + off);      off += 4;
-
-    if (page_size == 0 || off + page_size > len) break;
-
-    // Salt mismatch check — discard this and all subsequent frames
-    if (salt_1 != hdr.salt_1 || salt_2 != hdr.salt_2) {
-      salt_mismatch = 1;
-      break;
-    }
-
-    // Grow frame array if needed
-    if (frame_cnt >= frame_cap) {
-      frame_cap *= 2;
-      WalFrame *p = realloc(frames, (size_t)frame_cap * sizeof(WalFrame));
-      if (!p) { free(frames); free(data); return HYDRATION_ERR_MEM; }
-      frames = p;
-    }
-
-    WalFrame *f = &frames[frame_cnt];
-    f->hdr.page_no    = page_no;
-    f->hdr.size_after = size_after;
-    f->hdr.salt_1     = salt_1;
-    f->hdr.salt_2     = salt_2;
-    f->hdr.checksum_1 = cksum1_in;
-    f->hdr.checksum_2 = cksum2_in;
-    f->page_size      = page_size;
-    f->page_data      = data + off;
-    off += page_size;
-
-    // Validate checksum
-    if (validate_frame(&hdr, f, &running_s1, &running_s2) != 0) {
-      // Checksum mismatch — discard this frame (keep previous valid ones)
-      break;
-    }
-
-    frame_cnt++;
-    if (progress && frame_cnt % 100 == 0)
-      progress(2, 30 + (int)((float)off / (float)len * 60.0f), user);
+  // 1. Begin explicit transaction for throughput
+  int rc = sqlite3_exec(db, "BEGIN TRANSACTION;", NULL, NULL, &err_msg);
+  if (rc != SQLITE_OK) {
+    if (err_msg) { fprintf(stderr, "Hydration BEGIN error: %s\n", err_msg); sqlite3_free(err_msg); }
+    return HYDRATION_ERR_SQL;
   }
 
-  if (progress) progress(2, 90, user);
+  // 2. Replay the raw multi-statement SQL text
+  rc = sqlite3_exec(db, raw_sql, NULL, NULL, &err_msg);
+  if (rc != SQLITE_OK) {
+    fprintf(stderr, "Hydration replay error: %s\n", err_msg);
+    sqlite3_free(err_msg);
+    sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
+    return HYDRATION_ERR_SQL;
+  }
 
-  // Write the .db-wal file
-  char wal_path[1024];
-  snprintf(wal_path, sizeof(wal_path), "%s-wal", db_path);
-  int wrc = wal_file_write(wal_path, &hdr, frames, frame_cnt);
-  free(frames);
-  free(data);
+  // 3. Update metadata tracking
+  char meta_sql[256];
+  snprintf(meta_sql, sizeof(meta_sql),
+    "INSERT OR REPLACE INTO _arkilian_meta (k, v) VALUES ('last_applied_lsn', '%lld');",
+    (long long)chunk_lsn);
+  rc = sqlite3_exec(db, meta_sql, NULL, NULL, NULL);
+  if (rc != SQLITE_OK) {
+    sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
+    return HYDRATION_ERR_SQL;
+  }
 
-  if (wrc != 0) return wrc;
-
-  if (progress) progress(2, 100, user);
-  return salt_mismatch ? HYDRATION_ERR_CHECK : 0;
+  rc = sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
+  return (rc == SQLITE_OK) ? 0 : HYDRATION_ERR_SQL;
 }
 
 // ── Public API ──────────────────────────────────────────────────────
@@ -303,18 +324,65 @@ int arkilian_hydrate(const char *db_path,
                      void *user_data) {
   if (!db_path || !server_url) return HYDRATION_ERR_NET;
 
-  // Phase 1: download base snapshot
-  uint32_t snapshot_lsn = 0;
-  int rc = download_snapshot(server_url, auth_token, db_path,
-                              &snapshot_lsn, progress, user_data);
+  // ── Phase 0: Request hydration plan ──
+  HydratePlan plan;
+  int rc = request_hydrate_plan(server_url, auth_token, &plan);
   if (rc != 0) return rc;
 
-  // Phase 2: download and reconstruct WAL frames
-  rc = download_wal_frames(server_url, auth_token, db_path,
-                            snapshot_lsn, progress, user_data);
-  // Even if there are no WAL frames (HYDRATION_ERR_NET because 404),
-  // the database from Phase 1 is still valid.
-  if (rc == HYDRATION_ERR_NET) rc = 0;
+  // ── Phase 1: Download baseline snapshot ──
+  rc = download_snapshot(plan.snapshot_url, auth_token, db_path,
+                          progress, user_data);
+  if (rc != 0) { hydrate_plan_free(&plan); return rc; }
 
-  return rc;
+  // ── Phase 2: Open database, check LSN, replay chunks ──
+  sqlite3 *db = NULL;
+  rc = sqlite3_open_v2(db_path, &db,
+    SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX, NULL);
+  if (rc != SQLITE_OK) { hydrate_plan_free(&plan); return HYDRATION_ERR_SQL; }
+
+  // Apply PRAGMAs for speed during hydration
+  sqlite3_exec(db, "PRAGMA journal_mode=WAL;", NULL, NULL, NULL);
+  sqlite3_exec(db, "PRAGMA synchronous=OFF;", NULL, NULL, NULL); // speed over safety during bulk load
+  sqlite3_exec(db, "PRAGMA foreign_keys=OFF;", NULL, NULL, NULL);
+
+  int64_t local_lsn = read_last_applied_lsn(db);
+  if (local_lsn < plan.baseline_lsn)
+    local_lsn = plan.baseline_lsn;
+
+  int chunk_total = 0;
+  for (int i = 0; i < plan.chunk_count; i++) {
+    HydrateChunk *ch = &plan.chunks[i];
+
+    // Skip chunks already applied
+    if (ch->lsn_end <= local_lsn) continue;
+
+    // Check URL expiry
+    if (ch->expires_at > 0 && (int64_t)time(NULL) > ch->expires_at) {
+      sqlite3_close(db);
+      hydrate_plan_free(&plan);
+      return HYDRATION_ERR_EXPIRED;
+    }
+
+    // Download chunk
+    int err = 0;
+    char *sql_text = http_get_string(ch->url, auth_token, &err);
+    if (!sql_text) { sqlite3_close(db); hydrate_plan_free(&plan); return err; }
+
+    // Replay
+    rc = hydrate_replay_chunk(db, sql_text, ch->lsn_end);
+    free(sql_text);
+
+    if (rc != 0) { sqlite3_close(db); hydrate_plan_free(&plan); return rc; }
+
+    chunk_total++;
+    if (progress) progress(2, chunk_total, plan.chunk_count, user_data);
+  }
+
+  // Restore safe PRAGMAs
+  sqlite3_exec(db, "PRAGMA synchronous=NORMAL;", NULL, NULL, NULL);
+  sqlite3_exec(db, "PRAGMA foreign_keys=ON;", NULL, NULL, NULL);
+
+  sqlite3_close(db);
+  hydrate_plan_free(&plan);
+  return 0;
 }

@@ -1,80 +1,78 @@
-// Arkilian Hydration Engine — Point-in-Time Recovery / Cold Start
+// Arkilian Hydration Engine v2 — Logical, Client-Driven Cloud Model
 //
-// Phase 1: Download the latest base snapshot (.db) from remote storage.
-// Phase 2: Download missing WAL frames, reconstruct local .db-wal file
-//          with valid SQLite binary headers and checksums.
-// Phase 3: Open with sqlite3_open_v2 — SQLite auto-recovers from .db-wal.
+// Cold-start recovery via signed-URL snapshot + incremental log chunk replay.
+// The client never touches the server's bandwidth — all heavy transfers go
+// directly through Pre-Signed S3 URLs issued by the Control Plane API.
 //
-// Usage:
-//   arkilian_hydrate("mydb.db", "https://server/v1", "token", NULL);
-
+// Phases:
+//   1. Request hydrate plan from Control Plane → signed URLs + baseline LSN
+//   2. Download .snapshot via signed GET → decompress → save as local .db
+//   3. Open DB, query _arkilian_meta for last_applied_lsn
+//   4. Iterate incremental log chunks via signed GET → decompress → replay SQL
+//
+//   arkilian_hydrate("mydb.db", "https://control-plane/v1", "token");
+//
 #ifndef ARKILIAN_HYDRATION_H
 #define ARKILIAN_HYDRATION_H
 
 #include <stdint.h>
 #include <stddef.h>
+#include "deps/sqlite/sqlite3.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-// ── WAL binary structures (packed, matching SQLite on-disk layout) ──
+// ── Error codes ─────────────────────────────────────────────────────
 
-#pragma pack(push, 1)
+#define HYDRATION_OK             0
+#define HYDRATION_ERR_NET       -1   // HTTP / network failure
+#define HYDRATION_ERR_DISK      -2   // local file I/O failure
+#define HYDRATION_ERR_MEM       -3   // out of memory
+#define HYDRATION_ERR_PROTO     -4   // control plane returned unexpected response
+#define HYDRATION_ERR_SQL       -5   // SQL replay failed
+#define HYDRATION_ERR_DECOMP    -6   // decompression failure
+#define HYDRATION_ERR_EXPIRED   -7   // signed URL expired, caller should retry
 
+// ── Types ───────────────────────────────────────────────────────────
+
+// A single signed URL with its LSN range.
 typedef struct {
-  uint32_t magic_no;       // 0x377f0682 LE or 0x377f0683 BE
-  uint32_t file_format;    // 3007000
-  uint32_t page_size;      // e.g. 4096
-  uint32_t checkpoint_seq; // incremental checkpoint counter
-  uint32_t salt_1;         // random salt, must match in all frames
-  uint32_t salt_2;         // random salt, must match in all frames
-  uint32_t checksum_1;     // cumulative frame-0 checksum seed (normally 0)
-  uint32_t checksum_2;     // cumulative frame-0 checksum seed (normally 0)
-} WalHeader;
+  char   *url;          // Pre-Signed GET URL (caller frees)
+  int64_t lsn_start;    // first LSN in this chunk (inclusive)
+  int64_t lsn_end;      // last  LSN in this chunk (inclusive)
+  int64_t expires_at;   // unix timestamp when URL expires (0 = no expiry)
+} HydrateChunk;
 
+// The complete hydration plan returned by the Control Plane.
 typedef struct {
-  uint32_t page_no;        // target B-Tree page number
-  uint32_t size_after;     // DB size in pages (0 = non-commit frame, >0 = commit)
-  uint32_t salt_1;         // must match WalHeader.salt_1
-  uint32_t salt_2;         // must match WalHeader.salt_2
-  uint32_t checksum_1;     // cumulative frame checksum
-  uint32_t checksum_2;     // cumulative frame checksum
-} WalFrameHeader;
+  char   *snapshot_url;   // Pre-Signed GET URL for the baseline .snapshot
+  int64_t baseline_lsn;   // LSN embedded in the snapshot
+  int64_t expires_at;     // when snapshot URL expires (0 = no expiry)
 
-#pragma pack(pop)
+  HydrateChunk *chunks;   // ordered list of incremental chunks (caller frees)
+  int           chunk_count;
+} HydratePlan;
 
-// A single WAL frame ready to be written to disk.
-typedef struct {
-  WalFrameHeader hdr;
-  uint8_t       *page_data;   // hdr.page_size bytes (caller owns)
-  size_t         page_size;
-} WalFrame;
+// Progress callback.
+//   phase:   1 = downloading snapshot, 2 = replaying log chunks
+//   current: number of chunks processed (phase 1) or SQL statements played (phase 2)
+//   total:   total expected (0 if unknown)
+typedef void (*hydration_progress_cb)(int phase, int current, int total,
+                                       void *user_data);
 
-// ── Progress callback ──────────────────────────────────────────────
-// Called after each major phase completes.  phase: 1 = snapshot, 2 = WAL.
-// percent: 0-100.  user_data: opaque pointer passed to arkilian_hydrate.
-typedef void (*hydration_progress_cb)(int phase, int percent, void *user_data);
+// ── Minimal JSON helpers (exposed for testing) ──────────────────────
 
-// ── Hydration result ───────────────────────────────────────────────
+char   *json_get_string(const char *json, const char *key);
+int64_t json_get_int64(const char *json, const char *key);
+int     json_array_count(const char *json, const char *key);
+char   *json_array_get(const char *json, const char *key, int index);
 
-#define HYDRATION_OK          0
-#define HYDRATION_ERR_NET    -1   // network / HTTP error
-#define HYDRATION_ERR_DISK   -2   // local file I/O error
-#define HYDRATION_ERR_CHECK  -3   // WAL frame checksum / salt mismatch
-#define HYDRATION_ERR_MEM    -4   // out of memory
-
-// ── Public API ─────────────────────────────────────────────────────
-
-// Run the full two-phase hydration protocol.  Downloads the latest
-// base snapshot, then downloads any WAL frames newer than the snapshot,
-// reconstructs the local .db-wal file, and opens the database via
-// SQLite's normal crash-recovery path.
-//
-//   db_path        Local path for the restored database (e.g. "mydb.db")
-//   server_url     Base URL of the Arkilian server (e.g. "https://fly.io/v1")
-//   auth_token     Bearer token for server authentication (may be NULL)
-//   progress       Optional progress callback (may be NULL)
+// Run the full two-phase hydration protocol.
+//   db_path      Local target database path (e.g. "mydb.db")
+//   server_url   Control Plane base URL (e.g. "https://api.arkilian.com/v1")
+//   auth_token   Bearer token for authentication (may be NULL)
+//   progress     Optional progress callback (may be NULL)
 //
 // Returns HYDRATION_OK on success, or a negative error code.
 int arkilian_hydrate(const char *db_path,
@@ -83,25 +81,14 @@ int arkilian_hydrate(const char *db_path,
                      hydration_progress_cb progress,
                      void *user_data);
 
-// ── WAL checksum helpers (exposed for testing) ─────────────────────
-
-// Cumulative WAL checksum step.  Processes pairs of uint32 words.
-// s1 and s2 are in/out running checksum seeds.
-void wal_checksum_step(uint32_t *s1, uint32_t *s2,
-                       const uint32_t *data, size_t words);
-
-// Validate a single WAL frame: salts must match header, checksum must
-// match the page data.  Updates running_s1/s2 on success.
-// Returns 0 on success, HYDRATION_ERR_CHECK on mismatch.
-int validate_frame(const WalHeader *hdr, WalFrame *frame,
-                   uint32_t *running_s1, uint32_t *running_s2);
-
-// Write a complete WAL file from scratch given an array of frames.
+// Download a single plaintext SQL log chunk and replay it against an
+// open database.  The chunk is wrapped in an explicit transaction.
+// Updates _arkilian_meta.last_applied_lsn on success.
 // Returns 0 on success, negative on error.
-int wal_file_write(const char        *wal_path,
-                   const WalHeader   *hdr,
-                   const WalFrame    *frames,
-                   int                frame_count);
+int hydrate_replay_chunk(sqlite3 *db, const char *raw_sql, int64_t chunk_lsn);
+
+// Free all memory associated with a HydratePlan.
+void hydrate_plan_free(HydratePlan *plan);
 
 #ifdef __cplusplus
 }
