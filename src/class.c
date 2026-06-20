@@ -532,21 +532,20 @@ void *run_wal_flush(void *arg) {
     if (push_url && strlen(push_url) > 0) {
       // Build JSON payload
       size_t json_cap = 64;
-      for (int i = 0; i < n; i++) json_cap += strlen(batch[i].sql) * 2 + 96;
+      for (int i = 0; i < n; i++) json_cap += strlen(batch[i].sql) * 6 + 96;
       char *json = malloc(json_cap);
       if (json) {
-        int off = 0;
-        off += snprintf(json + off, json_cap - (size_t)off, "[");
+        size_t off = 0;
+        off += (size_t)snprintf(json + off, json_cap - off, "[");
         for (int i = 0; i < n; i++) {
           struct wal_entry *e = &batch[i];
-          int remain = (int)(json_cap - (size_t)off);
-          if (remain <= 32) break; // safety: stop if near buffer end
-          off += snprintf(json + off, (size_t)remain,
+          if (off + 32 >= json_cap) break;
+          off += (size_t)snprintf(json + off, json_cap - off,
             "{\"ts\":%llu,\"op\":%u,\"table_id\":%u,\"pk\":%llu,\"rk\":%u,\"sql\":\"",
             (unsigned long long)e->ts, e->op, e->table_id,
             (unsigned long long)e->pk, e->rk);
           for (char *s = e->sql ? e->sql : ""; *s; s++) {
-            if ((size_t)off + 8 >= json_cap) break;
+            if (off + 8 >= json_cap) break;
             switch (*s) {
             case '"':  json[off++] = '\\'; json[off++] = '"';  break;
             case '\\': json[off++] = '\\'; json[off++] = '\\'; break;
@@ -565,12 +564,12 @@ void *run_wal_flush(void *arg) {
               break;
             }
           }
-          remain = (int)(json_cap - (size_t)off);
-          if (remain > 16)
-            off += snprintf(json + off, (size_t)remain, "\"}%s", (i < n - 1) ? "," : "");
+          if (off + 16 >= json_cap) break;
+          off += (size_t)snprintf(json + off, json_cap - off,
+            "\"}%s", (i < n - 1) ? "," : "");
         }
-        if ((int)json_cap - off > 8)
-          off += snprintf(json + off, json_cap - (size_t)off, "]");
+        if (off + 4 < json_cap)
+          off += (size_t)snprintf(json + off, json_cap - off, "]");
 
         CURL *curl = curl_easy_init();
         if (curl) {
