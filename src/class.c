@@ -773,6 +773,8 @@ void db_close(arkilian *db) {
 #else
       Sleep(100);
 #endif
+      if (db->wal.count[db->wal.active] > 0)
+        db_wal_flush(db);
       waited++;
     }
   }
@@ -1421,39 +1423,41 @@ int db_wal_pending(arkilian *db) {
 void db_wal_flush(arkilian *db) {
   if (!db || !db->handle) return;
   if (!db->wal.allocated) return;
-  int had_entries = (db->wal.count[db->wal.active] > 0);
-  if (!had_entries) return;
 
-  // Trigger a swap by marking the active buffer as "full"
+  // Keep at it until we hand off the active buffer, or there's nothing
+  // left to hand off.  A single retry isn't enough — the flush thread
+  // could be mid-POST and take longer than our 200ms window.
+  for (int retry = 0; retry < 50; retry++) {
+    if (db->wal.count[db->wal.active] == 0) return;
+
 #ifndef _WIN32
-  pthread_mutex_lock(&db->wal.swap_mutex);
-  if (db->wal.is_flushing) {
-    // Already flushing — wait for it to finish, then swap
-    pthread_mutex_unlock(&db->wal.swap_mutex);
-    // Wait briefly for the flush thread
-    usleep(200000);
     pthread_mutex_lock(&db->wal.swap_mutex);
-  }
-  if (!db->wal.is_flushing && db->wal.count[db->wal.active] > 0) {
-    int a = db->wal.active;
-    db->wal.active = 1 - a;
-    db->wal.is_flushing = 1;
-    pthread_cond_signal(&db->wal.flush_cond);
-  }
-  pthread_mutex_unlock(&db->wal.swap_mutex);
+    if (db->wal.is_flushing) {
+      pthread_mutex_unlock(&db->wal.swap_mutex);
+      usleep(200000);
+      continue;
+    }
+    if (db->wal.count[db->wal.active] > 0) {
+      int a = db->wal.active;
+      db->wal.active = 1 - a;
+      db->wal.is_flushing = 1;
+      pthread_cond_signal(&db->wal.flush_cond);
+    }
+    pthread_mutex_unlock(&db->wal.swap_mutex);
 #else
-  WaitForSingleObject(db->wal.swap_mutex, INFINITE);
-  if (db->wal.is_flushing) {
-    ReleaseMutex(db->wal.swap_mutex);
-    Sleep(200);
     WaitForSingleObject(db->wal.swap_mutex, INFINITE);
-  }
-  if (!db->wal.is_flushing && db->wal.count[db->wal.active] > 0) {
-    int a = db->wal.active;
-    db->wal.active = 1 - a;
-    db->wal.is_flushing = 1;
-    SetEvent(db->wal.flush_event);
-  }
-  ReleaseMutex(db->wal.swap_mutex);
+    if (db->wal.is_flushing) {
+      ReleaseMutex(db->wal.swap_mutex);
+      Sleep(200);
+      continue;
+    }
+    if (db->wal.count[db->wal.active] > 0) {
+      int a = db->wal.active;
+      db->wal.active = 1 - a;
+      db->wal.is_flushing = 1;
+      SetEvent(db->wal.flush_event);
+    }
+    ReleaseMutex(db->wal.swap_mutex);
 #endif
+  }
 }
