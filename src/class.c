@@ -38,7 +38,8 @@ struct wal_entry {
   uint8_t  op;         // 1=INSERT, 2=UPDATE, 3=DELETE, 0=DDL
   uint16_t table_id;
   uint64_t pk;
-  char     sql[1024];
+  char     *sql;
+  uint32_t rk;
 };
 
 struct wal_double_buf {
@@ -46,6 +47,7 @@ struct wal_double_buf {
   int count[2];                  // entries in each buffer
   int active;                    // index of the currently-active buffer
   int shutdown;
+  int allocated;
 #ifndef _WIN32
   pthread_mutex_t swap_mutex;
   pthread_cond_t  flush_cond;
@@ -58,19 +60,29 @@ struct wal_double_buf {
 };
 
 static void wal_dbuf_init(struct wal_double_buf *b) {
-  b->entries[0] = malloc((size_t)WAL_BUF_CAPACITY * sizeof(struct wal_entry));
-  b->entries[1] = malloc((size_t)WAL_BUF_CAPACITY * sizeof(struct wal_entry));
-  if (!b->entries[0] || !b->entries[1]) {
-    free(b->entries[0]);
-    free(b->entries[1]);
-    b->entries[0] = NULL;
-    b->entries[1] = NULL;
-  }
   b->count[0]  = 0;
   b->count[1]  = 0;
   b->active    = 0;
   b->shutdown  = 0;
   b->is_flushing = 0;
+  b->allocated = 0;
+  b->entries[0] = NULL;
+  b->entries[1] = NULL;
+
+  const char *push_url = getenv("ARKILIAN_WAL_PUSH_URL");
+  if (push_url && strlen(push_url) > 0) {
+    b->entries[0] = malloc((size_t)WAL_BUF_CAPACITY * sizeof(struct wal_entry));
+    b->entries[1] = malloc((size_t)WAL_BUF_CAPACITY * sizeof(struct wal_entry));
+    if (!b->entries[0] || !b->entries[1]) {
+      free(b->entries[0]);
+      free(b->entries[1]);
+      b->entries[0] = NULL;
+      b->entries[1] = NULL;
+    } else {
+      b->allocated = 1;
+    }
+  }
+
 #ifndef _WIN32
   pthread_mutex_init(&b->swap_mutex, NULL);
   pthread_cond_init(&b->flush_cond, NULL);
@@ -80,9 +92,22 @@ static void wal_dbuf_init(struct wal_double_buf *b) {
 #endif
 }
 
+static void wal_entries_free_sql(struct wal_entry *entries, int count) {
+  for (int i = 0; i < count; i++) {
+    free(entries[i].sql);
+    entries[i].sql = NULL;
+  }
+}
+
 static void wal_dbuf_destroy(struct wal_double_buf *b) {
-  free(b->entries[0]);
-  free(b->entries[1]);
+  if (b->allocated) {
+    wal_entries_free_sql(b->entries[0], b->count[0]);
+    wal_entries_free_sql(b->entries[1], b->count[1]);
+    free(b->entries[0]);
+    free(b->entries[1]);
+    b->entries[0] = NULL;
+    b->entries[1] = NULL;
+  }
 #ifndef _WIN32
   pthread_mutex_destroy(&b->swap_mutex);
   pthread_cond_destroy(&b->flush_cond);
@@ -95,9 +120,16 @@ static void wal_dbuf_destroy(struct wal_double_buf *b) {
 // Push one entry into the active buffer.  Caller holds write_mutex.
 // Swaps buffers if active is full.  If no push URL is configured, this
 // is a no-op (no background thread to drain, no reason to accumulate).
-static void wal_dbuf_push(struct wal_double_buf *b, const struct wal_entry *e) {
+static void wal_dbuf_push(struct wal_double_buf *b, struct wal_entry *e) {
   const char *push_url = getenv("ARKILIAN_WAL_PUSH_URL");
-  if (!push_url || strlen(push_url) == 0) return;
+  if (!push_url || strlen(push_url) == 0) {
+    free(e->sql);
+    return;
+  }
+  if (!b->allocated) {
+    free(e->sql);
+    return;
+  }
 
 #ifndef _WIN32
   pthread_mutex_lock(&b->swap_mutex);
@@ -124,7 +156,7 @@ static void wal_dbuf_push(struct wal_double_buf *b, const struct wal_entry *e) {
     usleep(100); // brief backoff
     pthread_mutex_lock(&b->swap_mutex);
   }
-  if (b->shutdown) { pthread_mutex_unlock(&b->swap_mutex); return; }
+  if (b->shutdown) { pthread_mutex_unlock(&b->swap_mutex); free(e->sql); return; }
 
   // Swap: old active becomes flushing, old flushing becomes active
   b->active = 1 - a;
@@ -137,7 +169,7 @@ static void wal_dbuf_push(struct wal_double_buf *b, const struct wal_entry *e) {
     Sleep(1);
     WaitForSingleObject(b->swap_mutex, INFINITE);
   }
-  if (b->shutdown) { ReleaseMutex(b->swap_mutex); return; }
+  if (b->shutdown) { ReleaseMutex(b->swap_mutex); free(e->sql); return; }
   b->active = 1 - a;
   b->is_flushing = 1;
   SetEvent(b->flush_event);
@@ -154,11 +186,12 @@ static void wal_dbuf_push(struct wal_double_buf *b, const struct wal_entry *e) {
 // The caller MUST call wal_dbuf_flush_done after POST.
 static int wal_dbuf_acquire_flush(struct wal_double_buf *b,
                                    struct wal_entry **out_entries) {
+  if (!b->allocated) return 0;
 #ifndef _WIN32
   pthread_mutex_lock(&b->swap_mutex);
   while (!b->is_flushing && !b->shutdown)
     pthread_cond_wait(&b->flush_cond, &b->swap_mutex);
-  if (b->shutdown && !b->is_flushing) {
+  if (b->shutdown) {
     pthread_mutex_unlock(&b->swap_mutex);
     return 0;
   }
@@ -174,7 +207,7 @@ static int wal_dbuf_acquire_flush(struct wal_double_buf *b,
     WaitForSingleObject(b->flush_event, INFINITE);
     WaitForSingleObject(b->swap_mutex, INFINITE);
   }
-  if (b->shutdown && !b->is_flushing) {
+  if (b->shutdown) {
     ReleaseMutex(b->swap_mutex);
     return 0;
   }
@@ -188,15 +221,18 @@ static int wal_dbuf_acquire_flush(struct wal_double_buf *b,
 
 // Called by the flush thread after POST completes.
 static void wal_dbuf_flush_done(struct wal_double_buf *b) {
+  if (!b->allocated) return;
 #ifndef _WIN32
   pthread_mutex_lock(&b->swap_mutex);
   int flush_idx = 1 - b->active;
+  wal_entries_free_sql(b->entries[flush_idx], b->count[flush_idx]);
   b->count[flush_idx] = 0;
   b->is_flushing = 0;
   pthread_mutex_unlock(&b->swap_mutex);
 #else
   WaitForSingleObject(b->swap_mutex, INFINITE);
   int flush_idx = 1 - b->active;
+  wal_entries_free_sql(b->entries[flush_idx], b->count[flush_idx]);
   b->count[flush_idx] = 0;
   b->is_flushing = 0;
   ReleaseMutex(b->swap_mutex);
@@ -214,27 +250,27 @@ static uint16_t table_name_hash(const char *s) {
 }
 
 static int extract_pk_from_sql(const char *sql, uint64_t *pk) {
-  const char *eq = sql;
-  while ((eq = strstr(eq, "= ")) != NULL) {
-    eq += 2;
-    if (*eq >= '0' && *eq <= '9') {
+  // Walk backwards to find the last `= <number>` — this is most likely
+  // the WHERE-clause filter rather than a SET assignment.
+  const char *last = NULL;
+  const char *p = sql;
+  while ((p = strchr(p, '=')) != NULL) {
+    const char *num = p + 1;
+    while (*num == ' ') num++;
+    if (*num >= '0' && *num <= '9') {
       char *end;
-      unsigned long long v = strtoull(eq, &end, 10);
-      if (v > 0 && (end == eq || *end == ';' || *end == '\0')) {
-        *pk = (uint64_t)v; return 1;
-      }
+      unsigned long long v = strtoull(num, &end, 10);
+      if (v > 0 && (*end == ' ' || *end == ';' || *end == '\0' ||
+                    *end == ')' || *end == ','))
+        last = p;
     }
+    p++;
   }
-  eq = sql;
-  while ((eq = strchr(eq, '=')) != NULL) {
-    eq++;
-    if (*eq >= '0' && *eq <= '9') {
-      char *end;
-      unsigned long long v = strtoull(eq, &end, 10);
-      if (v > 0 && (end == eq || *end == ' ' || *end == ';' || *end == '\0')) {
-        *pk = (uint64_t)v; return 1;
-      }
-    }
+  if (last) {
+    const char *num = last + 1;
+    while (*num == ' ') num++;
+    *pk = (uint64_t)strtoull(num, NULL, 10);
+    return 1;
   }
   return 0;
 }
@@ -311,8 +347,7 @@ static void build_wal_entry(struct wal_entry *e, const char *sql) {
   char tbl[128];
   e->ts = (uint64_t)time(NULL);
   parse_sql_meta(sql, &e->op, tbl, sizeof(tbl), &e->table_id, &e->pk);
-  strncpy(e->sql, sql, sizeof(e->sql) - 1);
-  e->sql[sizeof(e->sql) - 1] = '\0';
+  e->sql = strdup(sql ? sql : "");
 }
 
 // ── Arkilian struct ─────────────────────────────────────────────────
@@ -479,7 +514,8 @@ void *run_wal_flush(void *arg) {
 
     if (push_url && strlen(push_url) > 0) {
       // Build JSON payload
-      size_t json_cap = (size_t)n * 512 + 64;
+      size_t json_cap = 64;
+      for (int i = 0; i < n; i++) json_cap += strlen(batch[i].sql) * 2 + 96;
       char *json = malloc(json_cap);
       if (json) {
         int off = 0;
@@ -489,10 +525,10 @@ void *run_wal_flush(void *arg) {
           int remain = (int)(json_cap - (size_t)off);
           if (remain <= 32) break; // safety: stop if near buffer end
           off += snprintf(json + off, (size_t)remain,
-            "{\"ts\":%llu,\"op\":%u,\"table_id\":%u,\"pk\":%llu,\"sql\":\"",
+            "{\"ts\":%llu,\"op\":%u,\"table_id\":%u,\"pk\":%llu,\"rk\":%u,\"sql\":\"",
             (unsigned long long)e->ts, e->op, e->table_id,
-            (unsigned long long)e->pk);
-          for (char *s = e->sql; *s; s++) {
+            (unsigned long long)e->pk, e->rk);
+          for (char *s = e->sql ? e->sql : ""; *s; s++) {
             if ((size_t)off + 4 >= json_cap) break;
             if (*s == '"' || *s == '\\') {
               json[off++] = '\\';
@@ -1035,6 +1071,7 @@ int db_exec(arkilian *db, const char *sql) {
     struct wal_entry entry;
     build_wal_entry(&entry, sql);
     check_update_hook_before_push(db, &entry);
+    entry.rk = (uint32_t)sqlite3_changes(db->handle);
     wal_dbuf_push(&db->wal, &entry);
   } else {
     snprintf(db->last_error_msg, sizeof(db->last_error_msg), "%s",
@@ -1166,6 +1203,7 @@ int db_finalize(arkilian *db) {
           build_wal_entry(&entry, db->current_write_sql);
         }
         check_update_hook_before_push(db, &entry);
+        entry.rk = (uint32_t)sqlite3_changes(db->handle);
         wal_dbuf_push(&db->wal, &entry);
       } else {
         if (expanded) sqlite3_free(expanded);
@@ -1351,7 +1389,7 @@ int db_wal_pending(arkilian *db) {
 // write_mutex is NOT held (the flush thread uses swap_mutex).
 void db_wal_flush(arkilian *db) {
   if (!db || !db->handle) return;
-  // Signal the flush thread to drain now
+  if (!db->wal.allocated) return;
   int had_entries = (db->wal.count[db->wal.active] > 0);
   if (!had_entries) return;
 
