@@ -578,6 +578,34 @@ static int count_rows(sqlite3 *db) {
   return c;
 }
 
+// Re-seed the table with N rows from a deterministic sequence
+static void reseed_table(sqlite3 *db, int n) {
+  sqlite3_exec(db, "DELETE FROM " TBL_NAME, NULL, NULL, NULL);
+  g_seed = 42;
+  g_max_id = 0;
+  sqlite3_exec(db, "BEGIN", NULL, NULL, NULL);
+  sqlite3_stmt *ins = NULL;
+  sqlite3_prepare_v2(db,
+    "INSERT INTO bench_data (id,customer,product,qty,price,total,status,note,created,updated) "
+    "VALUES (?,?,?,?,?,?,?,NULL,?,?)", -1, &ins, NULL);
+  for (int i = 0; i < n; i++) {
+    row_data d = gen_row();
+    sqlite3_bind_int64(ins, 1, d.id);
+    sqlite3_bind_text(ins, 2, d.customer, -1, SQLITE_STATIC);
+    sqlite3_bind_text(ins, 3, d.product,  -1, SQLITE_STATIC);
+    sqlite3_bind_int(ins,   4, d.qty);
+    sqlite3_bind_double(ins, 5, d.price);
+    sqlite3_bind_double(ins, 6, d.total);
+    sqlite3_bind_text(ins, 7, d.status, -1, SQLITE_STATIC);
+    sqlite3_bind_int64(ins, 8, d.now);
+    sqlite3_bind_int64(ins, 9, d.now);
+    sqlite3_step(ins);
+    sqlite3_reset(ins);
+  }
+  sqlite3_finalize(ins);
+  sqlite3_exec(db, "COMMIT", NULL, NULL, NULL);
+}
+
 // =====================================================================
 //  Main
 // =====================================================================
@@ -658,14 +686,14 @@ int main(int argc, char **argv) {
   long mem_after_seed = get_resident_mem_kb();
   printf("  Memory after seed : %'ld KB\n", mem_after_seed);
 
+  // ── Helper: clear table and re-seed N rows for a fresh baseline ──
+  // (the bulk insert pattern matches setup above)
   // ── Warmup ─────────────────────────────────────────────────────────
   printf("\n  ── Warmup (%d operations each) ───────────────────────────────\n",
          WARMUP);
 
-  g_seed = 42;
-  g_max_id = seed_rows;
-  bench_insert_raw(raw, WARMUP, 1);
-  printf("\n");
+  reseed_table(raw, 50000 + WARMUP);
+  printf("  Warmup done: %d rows\n", count_rows(raw));
 
   // ── Store all results for final display ────────────────────────────
   enum { R_INSERT, R_UPDATE, R_SEL_PK, R_SEL_RNG, R_NUM };
@@ -673,6 +701,7 @@ int main(int argc, char **argv) {
   bench_result raw_batch[NUM_BATCH], ark_batch[NUM_BATCH];
   bench_result raw_lat_ins, ark_lat_ins, raw_lat_sel, ark_lat_sel;
 
+  // ── Helper: bulk re-seed N rows with unique ids ────────────────────
   // ── 1. Single-row throughput ───────────────────────────────────────
   printf("\n");
   printf("  "
@@ -686,31 +715,31 @@ int main(int argc, char **argv) {
          "══════════╝\n");
 
   printf("\n  INSERT:\n");
-  g_seed = 42;
-  g_max_id = seed_rows;
+  sqlite3_exec(raw, "DELETE FROM " TBL_NAME, NULL, NULL, NULL);
+  g_seed = 42; g_max_id = 0;
   raw_single[R_INSERT] = bench_insert_raw(raw, OPS, 1);
   printf("\n");
-  g_seed = 42;
-  g_max_id = seed_rows;
+  sqlite3_exec(raw, "DELETE FROM " TBL_NAME, NULL, NULL, NULL);
+  g_seed = 42; g_max_id = 0;
   ark_single[R_INSERT] = bench_insert_arkilian(db, OPS);
   printf("\n");
 
   printf("  UPDATE (by PK):\n");
-  g_seed = 42;
+  reseed_table(raw, 50000);
   raw_single[R_UPDATE] = bench_update_raw(raw, OPS);
   printf("\n");
+  reseed_table(raw, 50000);
   ark_single[R_UPDATE] = bench_update_arkilian(db, OPS);
   printf("\n");
 
   printf("  SELECT (point by PK):\n");
-  g_seed = 42;
+  // table already has 50K rows from the re-seed above — reuse it
   raw_single[R_SEL_PK] = bench_select_point_raw(raw, OPS);
   printf("\n");
   ark_single[R_SEL_PK] = bench_select_point_arkilian(db, OPS);
   printf("\n");
 
   printf("  SELECT (range 100 rows):\n");
-  g_seed = 42;
   raw_single[R_SEL_RNG] = bench_select_range_raw(raw, OPS / 10);
   printf("\n");
   ark_single[R_SEL_RNG] = bench_select_range_arkilian(db, OPS / 10);
@@ -730,12 +759,12 @@ int main(int argc, char **argv) {
   for (int bi = 0; bi < NUM_BATCH; bi++) {
     int bs = BATCH_SIZES[bi];
     printf("\n  Batch size %d:\n", bs);
-    g_seed = 42;
-    g_max_id = seed_rows;
+    sqlite3_exec(raw, "DELETE FROM " TBL_NAME, NULL, NULL, NULL);
+    g_seed = 42; g_max_id = 0;
     raw_batch[bi] = bench_insert_batched_raw(raw, OPS, bs);
     printf("\n");
-    g_seed = 42;
-    g_max_id = seed_rows;
+    sqlite3_exec(raw, "DELETE FROM " TBL_NAME, NULL, NULL, NULL);
+    g_seed = 42; g_max_id = 0;
     ark_batch[bi] = bench_insert_batched_arkilian(db, OPS, bs);
     printf("\n");
   }
@@ -753,17 +782,17 @@ int main(int argc, char **argv) {
          "══════════╝\n");
 
   printf("\n  INSERT:\n");
-  g_seed = 42;
-  g_max_id = seed_rows;
+  sqlite3_exec(raw, "DELETE FROM " TBL_NAME, NULL, NULL, NULL);
+  g_seed = 42; g_max_id = 0;
   raw_lat_ins = bench_insert_raw(raw, LAT_OPS, 1);
   printf("\n");
-  g_seed = 42;
-  g_max_id = seed_rows;
+  sqlite3_exec(raw, "DELETE FROM " TBL_NAME, NULL, NULL, NULL);
+  g_seed = 42; g_max_id = 0;
   ark_lat_ins = bench_insert_arkilian(db, LAT_OPS);
   printf("\n");
 
   printf("  SELECT (point by PK):\n");
-  g_seed = 42;
+  reseed_table(raw, 50000);
   raw_lat_sel = bench_select_point_raw(raw, LAT_OPS);
   printf("\n");
   ark_lat_sel = bench_select_point_arkilian(db, LAT_OPS);
