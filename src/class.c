@@ -935,8 +935,8 @@ void *run_hourly_backup(void *arg) {
             upload_to_s3(signed_url, db->backup_path, db->database_token);
         if (upload_status == 0) printf("S3 Upload Successful!\n");
         else fprintf(stderr, "S3 Upload Failed with status: %d\n", upload_status);
-        free(signed_url);
       }
+      free(signed_url);
     } else {
       fprintf(stderr, "Backup failed with error code: %d\n", status);
     }
