@@ -1064,6 +1064,24 @@ int db_exec(arkilian *db, const char *sql) {
   if (!db || !db->handle || !sql)
     return SQLITE_ERROR;
 
+  // Fast path for reads — skip prepare, mutex, ring buffer, everything.
+  // Just let SQLite handle it directly.
+  const char *p = sql;
+  while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+  if ((p[0] == 'S' || p[0] == 's') &&
+      (p[1] == 'E' || p[1] == 'e') &&
+      (p[2] == 'L' || p[2] == 'l') &&
+      (p[3] == 'E' || p[3] == 'e') &&
+      (p[4] == 'C' || p[4] == 'c') &&
+      (p[5] == 'T' || p[5] == 't') &&
+      (p[6] == ' ' || p[6] == '\t' || p[6] == '\n' || p[6] == '\r' || p[6] == '\0')) {
+    int rc = sqlite3_exec(db->handle, sql, NULL, NULL, NULL);
+    if (rc != SQLITE_OK)
+      snprintf(db->last_error_msg, sizeof(db->last_error_msg), "%s",
+               sqlite3_errmsg(db->handle));
+    return rc;
+  }
+
   sqlite3_stmt *stmt = NULL;
   int rc = sqlite3_prepare_v2(db->handle, sql, -1, &stmt, NULL);
   if (rc != SQLITE_OK) {
