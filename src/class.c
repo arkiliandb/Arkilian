@@ -632,6 +632,7 @@ int db_init(arkilian **db_ptr, const char *filename) {
   if (!db_ptr) return 1;
   arkilian *db = malloc(sizeof(arkilian));
   if (!db) return 1;
+  memset(db, 0, sizeof(arkilian));
   db->is_open = 0;
   db->has_new_writes = 0;
   db->last_error_msg[0] = '\0';
