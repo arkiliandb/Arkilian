@@ -1077,6 +1077,9 @@ int db_exec(arkilian *db, const char *sql) {
     snprintf(db->last_error_msg, sizeof(db->last_error_msg), "%s",
              sqlite3_errmsg(db->handle));
     if (db->in_batch_txn) {
+      sqlite3_step(db->rollback_stmt);
+      sqlite3_reset(db->rollback_stmt);
+      db->in_batch_txn = 0;
 #ifndef _WIN32
       pthread_mutex_unlock(&db->write_mutex);
 #else
