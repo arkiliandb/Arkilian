@@ -99,16 +99,26 @@ static void wal_dbuf_push(struct wal_double_buf *b, const struct wal_entry *e) {
   const char *push_url = getenv("ARKILIAN_WAL_PUSH_URL");
   if (!push_url || strlen(push_url) == 0) return;
 
+#ifndef _WIN32
+  pthread_mutex_lock(&b->swap_mutex);
+#else
+  WaitForSingleObject(b->swap_mutex, INFINITE);
+#endif
+
   int a = b->active;
 
   if (b->count[a] < WAL_BUF_CAPACITY) {
     b->entries[a][b->count[a]++] = *e;
+#ifndef _WIN32
+    pthread_mutex_unlock(&b->swap_mutex);
+#else
+    ReleaseMutex(b->swap_mutex);
+#endif
     return;
   }
 
   // Active buffer full — try to swap
 #ifndef _WIN32
-  pthread_mutex_lock(&b->swap_mutex);
   while (b->is_flushing && !b->shutdown) {
     pthread_mutex_unlock(&b->swap_mutex);
     usleep(100); // brief backoff
@@ -122,7 +132,6 @@ static void wal_dbuf_push(struct wal_double_buf *b, const struct wal_entry *e) {
   pthread_cond_signal(&b->flush_cond);
   pthread_mutex_unlock(&b->swap_mutex);
 #else
-  WaitForSingleObject(b->swap_mutex, INFINITE);
   while (b->is_flushing && !b->shutdown) {
     ReleaseMutex(b->swap_mutex);
     Sleep(1);
@@ -189,20 +198,6 @@ static void wal_dbuf_flush_done(struct wal_double_buf *b) {
   WaitForSingleObject(b->swap_mutex, INFINITE);
   int flush_idx = 1 - b->active;
   b->count[flush_idx] = 0;
-  b->is_flushing = 0;
-  ReleaseMutex(b->swap_mutex);
-#endif
-}
-
-// Called when a push fails — reset is_flushing so writers can swap
-// again, but preserve entries in the flush buffer for retry.
-static void wal_dbuf_push_failed(struct wal_double_buf *b) {
-#ifndef _WIN32
-  pthread_mutex_lock(&b->swap_mutex);
-  b->is_flushing = 0; // unblock writers
-  pthread_mutex_unlock(&b->swap_mutex);
-#else
-  WaitForSingleObject(b->swap_mutex, INFINITE);
   b->is_flushing = 0;
   ReleaseMutex(b->swap_mutex);
 #endif
@@ -356,6 +351,11 @@ struct arkilian {
   int write_stmt_index;
   int in_batch_txn;
   char current_write_sql[1024];
+  // Update hook state
+  uint8_t  update_hook_op;
+  char     update_hook_table[128];
+  uint64_t update_hook_rowid;
+  int      update_hook_fired;
   int last_step_rc;
   // Cached statements
   sqlite3_stmt *begin_stmt;
@@ -371,6 +371,32 @@ struct arkilian {
   HANDLE flush_thread_handle;
 #endif
 };
+
+static void ar_update_hook(void *user_data, int op_type, char const *db_name,
+                           char const *table_name, sqlite3_int64 row_id) {
+  arkilian *db = (arkilian *)user_data;
+  (void)db_name;
+  db->update_hook_fired = 1;
+  db->update_hook_op = (op_type == SQLITE_INSERT) ? 1 :
+                       (op_type == SQLITE_UPDATE) ? 2 :
+                       (op_type == SQLITE_DELETE) ? 3 : 0;
+  if (table_name) {
+    strncpy(db->update_hook_table, table_name, sizeof(db->update_hook_table) - 1);
+    db->update_hook_table[sizeof(db->update_hook_table) - 1] = '\0';
+  } else {
+    db->update_hook_table[0] = '\0';
+  }
+  db->update_hook_rowid = (uint64_t)row_id;
+}
+
+static void check_update_hook_before_push(arkilian *db, struct wal_entry *e) {
+  if (db->update_hook_fired) {
+    e->op = db->update_hook_op;
+    e->table_id = table_name_hash(db->update_hook_table);
+    e->pk = db->update_hook_rowid;
+    db->update_hook_fired = 0;
+  }
+}
 
 struct Memory {
   char *response;
@@ -466,9 +492,12 @@ void *run_wal_flush(void *arg) {
             "{\"ts\":%llu,\"op\":%u,\"table_id\":%u,\"pk\":%llu,\"sql\":\"",
             (unsigned long long)e->ts, e->op, e->table_id,
             (unsigned long long)e->pk);
-          for (char *s = e->sql; *s && off < (int)json_cap - 32; s++) {
-            if (*s == '"' || *s == '\\') { if (off + 1 < (int)json_cap) json[off++] = '\\'; }
-            if (off < (int)json_cap) json[off++] = *s;
+          for (char *s = e->sql; *s; s++) {
+            if ((size_t)off + 4 >= json_cap) break;
+            if (*s == '"' || *s == '\\') {
+              json[off++] = '\\';
+            }
+            json[off++] = *s;
           }
           remain = (int)(json_cap - (size_t)off);
           if (remain > 16)
@@ -599,6 +628,10 @@ int db_init(arkilian **db_ptr, const char *filename) {
   sqlite3_exec(db->handle, "PRAGMA synchronous=NORMAL;", NULL, NULL, NULL);
   sqlite3_exec(db->handle, "PRAGMA busy_timeout=5000;", NULL, NULL, NULL);
   sqlite3_exec(db->handle, "PRAGMA foreign_keys=ON;", NULL, NULL, NULL);
+
+  // Register update hook for robust write metadata capture
+  sqlite3_update_hook(db->handle, ar_update_hook, db);
+  db->update_hook_fired = 0;
 
   // Internal tables
   sqlite3_exec(db->handle,
@@ -981,6 +1014,7 @@ int db_exec(arkilian *db, const char *sql) {
     // Push to ring buffer for async streaming
     struct wal_entry entry;
     build_wal_entry(&entry, sql);
+    check_update_hook_before_push(db, &entry);
     wal_dbuf_push(&db->wal, &entry);
   } else {
     snprintf(db->last_error_msg, sizeof(db->last_error_msg), "%s",
@@ -1085,6 +1119,12 @@ int db_finalize(arkilian *db) {
   if (stmt) {
     int is_write = db->in_write_txn;
     int is_this_write = (db->stmt_current == db->write_stmt_index);
+
+    char *expanded = NULL;
+    if (is_write && is_this_write) {
+      expanded = sqlite3_expanded_sql(stmt);
+    }
+
     sqlite3_finalize(stmt);
     db->stmts[db->stmt_current] = NULL;
 
@@ -1095,8 +1135,16 @@ int db_finalize(arkilian *db) {
       if (ok) {
         db->has_new_writes = 1;
         struct wal_entry entry;
-        build_wal_entry(&entry, db->current_write_sql);
+        if (expanded) {
+          build_wal_entry(&entry, expanded);
+          sqlite3_free(expanded);
+        } else {
+          build_wal_entry(&entry, db->current_write_sql);
+        }
+        check_update_hook_before_push(db, &entry);
         wal_dbuf_push(&db->wal, &entry);
+      } else {
+        if (expanded) sqlite3_free(expanded);
       }
       db->in_write_txn = 0;
       db->write_stmt_index = -1;
