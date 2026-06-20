@@ -468,9 +468,9 @@ void *run_wal_flush(void *arg) {
 #endif
   arkilian *db = (arkilian *)arg;
   const char *push_url = getenv("ARKILIAN_WAL_PUSH_URL");
-  const char *token    = db->database_token;
 
   while (1) {
+    const char *token = db->database_token;
     struct wal_entry *batch;
     int n = wal_dbuf_acquire_flush(&db->wal, &batch);
     if (n == 0) break;
@@ -689,6 +689,26 @@ void db_close(arkilian *db) {
   if (!db) return;
 
   db->shutdown_requested = 1;
+
+  // Flush any pending WAL entries before joining the flush thread.
+  // If the active buffer has unflushed writes, force a swap so the
+  // flush thread drains them.  Spin-wait until both buffers are empty
+  // or a timeout is reached.
+  {
+    int active = db->wal.active;
+    if (db->wal.count[active] > 0) {
+      db_wal_flush(db);
+    }
+    int waited = 0;
+    while ((db->wal.count[0] > 0 || db->wal.count[1] > 0) && waited < 100) {
+#ifndef _WIN32
+      usleep(100000);
+#else
+      Sleep(100);
+#endif
+      waited++;
+    }
+  }
 
   // Signal double-buffer shutdown to wake flush thread
   db->wal.shutdown = 1;
@@ -1066,6 +1086,7 @@ int db_prepare(arkilian *db, const char *sql) {
 
   // Write statements: acquire mutex (autocommit — each write runs in its own txn)
   if (!sqlite3_stmt_readonly(stmt)) {
+    int was_in_write = db->in_write_txn;
     if (db->in_write_txn || db->in_batch_txn) {
       // Already in a transaction from a previous write prepare or db_begin
     } else {
@@ -1076,9 +1097,12 @@ int db_prepare(arkilian *db, const char *sql) {
 #endif
     }
     db->in_write_txn = 1;
-    db->write_stmt_index = db->stmt_count;
-    strncpy(db->current_write_sql, sql, sizeof(db->current_write_sql) - 1);
-    db->current_write_sql[sizeof(db->current_write_sql) - 1] = '\0';
+    // Only record the first write in a transaction as the tracked statement
+    if (!was_in_write) {
+      db->write_stmt_index = db->stmt_count;
+      strncpy(db->current_write_sql, sql, sizeof(db->current_write_sql) - 1);
+      db->current_write_sql[sizeof(db->current_write_sql) - 1] = '\0';
+    }
   }
 
   db->stmts[db->stmt_count] = stmt;
@@ -1121,14 +1145,14 @@ int db_finalize(arkilian *db) {
     int is_this_write = (db->stmt_current == db->write_stmt_index);
 
     char *expanded = NULL;
-    if (is_write && is_this_write) {
+    if (is_write) {
       expanded = sqlite3_expanded_sql(stmt);
     }
 
     sqlite3_finalize(stmt);
     db->stmts[db->stmt_current] = NULL;
 
-    if (is_write && is_this_write) {
+    if (is_write) {
       int ok = (db->last_step_rc == SQLITE_DONE ||
                 db->last_step_rc == SQLITE_ROW ||
                 db->last_step_rc == SQLITE_OK);
@@ -1146,15 +1170,17 @@ int db_finalize(arkilian *db) {
       } else {
         if (expanded) sqlite3_free(expanded);
       }
-      db->in_write_txn = 0;
-      db->write_stmt_index = -1;
-      db->current_write_sql[0] = '\0';
-      if (!db->in_batch_txn) {
+      if (is_this_write) {
+        db->in_write_txn = 0;
+        db->write_stmt_index = -1;
+        db->current_write_sql[0] = '\0';
+        if (!db->in_batch_txn) {
 #ifndef _WIN32
-        pthread_mutex_unlock(&db->write_mutex);
+          pthread_mutex_unlock(&db->write_mutex);
 #else
-        ReleaseMutex(db->write_mutex);
+          ReleaseMutex(db->write_mutex);
 #endif
+        }
       }
     }
   }
