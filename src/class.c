@@ -280,11 +280,20 @@ static void parse_sql_meta(const char *sql, uint8_t *op_out, char *tbl, size_t t
   uint8_t op = 0; // DDL
   tbl[0] = '\0';
 
-  // Skip whitespace
+  // Skip whitespace and leading comments
   while (*sql == ' ' || *sql == '\t' || *sql == '\n' || *sql == '\r') sql++;
-  if ((*sql == '-' && *(sql+1) == '-') || (*sql == '/' && *(sql+1) == '*')) {
-    *op_out = op; *tid_out = 0; *pk_out = 0; return;
+  while ((*sql == '-' && *(sql+1) == '-') || (*sql == '/' && *(sql+1) == '*')) {
+    if (*sql == '-') {
+      while (*sql && *sql != '\n') sql++;
+      if (*sql == '\n') sql++;
+    } else {
+      sql += 2;
+      while (*sql && !(*sql == '*' && *(sql+1) == '/')) sql++;
+      if (*sql == '*') sql += 2;
+    }
+    while (*sql == ' ' || *sql == '\t' || *sql == '\n' || *sql == '\r') sql++;
   }
+  if (*sql == '\0') { *op_out = 0; *tid_out = 0; *pk_out = 0; return; }
 
 #define MATCH(s, literal) ( \
   strncasecmp(s, literal, strlen(literal)) == 0 && \
@@ -442,7 +451,7 @@ static void check_update_hook_before_push(arkilian *db, struct wal_entry *e) {
 struct Memory {
   char *response;
   size_t size;
-  int shutdown_flag;
+  int *shutdown_flag;
 };
 
 // ── Config defaults ─────────────────────────────────────────────────
@@ -535,11 +544,24 @@ void *run_wal_flush(void *arg) {
             (unsigned long long)e->ts, e->op, e->table_id,
             (unsigned long long)e->pk, e->rk);
           for (char *s = e->sql ? e->sql : ""; *s; s++) {
-            if ((size_t)off + 4 >= json_cap) break;
-            if (*s == '"' || *s == '\\') {
-              json[off++] = '\\';
+            if ((size_t)off + 8 >= json_cap) break;
+            switch (*s) {
+            case '"':  json[off++] = '\\'; json[off++] = '"';  break;
+            case '\\': json[off++] = '\\'; json[off++] = '\\'; break;
+            case '\n': json[off++] = '\\'; json[off++] = 'n';  break;
+            case '\r': json[off++] = '\\'; json[off++] = 'r';  break;
+            case '\t': json[off++] = '\\'; json[off++] = 't';  break;
+            case '\b': json[off++] = '\\'; json[off++] = 'b';  break;
+            case '\f': json[off++] = '\\'; json[off++] = 'f';  break;
+            default:
+              if ((unsigned char)*s < 0x20) {
+                int w = snprintf(json + off, 8, "\\u%04x", (unsigned char)*s);
+                if (w > 0) off += (size_t)w;
+                continue;
+              }
+              json[off++] = *s;
+              break;
             }
-            json[off++] = *s;
           }
           remain = (int)(json_cap - (size_t)off);
           if (remain > 16)
@@ -950,7 +972,7 @@ void *run_hourly_backup(void *arg) {
 
 static size_t write_cb(void *data, size_t size, size_t nmemb, void *userp) {
   struct Memory *mem = (struct Memory *)userp;
-  if (mem->shutdown_flag) return 0;
+  if (mem->shutdown_flag && *(mem->shutdown_flag)) return 0;
   size_t realsize = size * nmemb;
   char *ptr = realloc(mem->response, mem->size + realsize + 1);
   if (!ptr) return 0;
@@ -967,7 +989,7 @@ char *get_signed_url(const char *api_endpoint, const char *token,
   struct Memory chunk;
   chunk.response = malloc(1);
   chunk.size = 0;
-  chunk.shutdown_flag = shutdown_flag ? *shutdown_flag : 0;
+  chunk.shutdown_flag = shutdown_flag;
 
   if (curl) {
     curl_easy_setopt(curl, CURLOPT_URL, api_endpoint);
