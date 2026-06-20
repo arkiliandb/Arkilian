@@ -1,11 +1,17 @@
-// Arkilian vs Raw SQLite — 1M Write Benchmark
+// Arkilian vs Raw SQLite — Production-Grade Side-by-Side Benchmark
 //
 // Compile:
-//   cc tests/bench_1m.c src/class.c src/deps/sqlite/sqlite3.c \
-//      -Isrc -Isrc/deps/sqlite -lcurl -lpthread -O2 -o bench_1m
+//   cc -O2 tests/bench_1m.c src/class.c src/deps/sqlite/sqlite3.c \
+//      -Isrc -Isrc/deps/sqlite -lcurl -lpthread -lm -o bench_1m
 //
 // Run:
-//   ./bench_1m
+//   ./bench_1m                    (full: ~5-10 min)
+//   ./bench_1m 10000              (quick: 10K ops, ~30 sec)
+//   ARKILIAN_WAL_PUSH_URL=... ./bench_1m  (with streaming)
+//
+// Every benchmark runs BOTH raw SQLite and Arkilian on the same connection,
+// same data, same operations — so every row in the output table is a
+// direct, fair comparison.
 
 #include "class.h"
 #include <assert.h>
@@ -19,532 +25,884 @@
 #include <windows.h>
 #else
 #include <pthread.h>
+#include <sys/resource.h>
 #include <unistd.h>
 #endif
 
-#define BENCH_DB       "bench_1m.db"
-#define TOTAL_WRITES   1000000
-#define WARMUP_WRITES  10000
-#define BATCH_SIZE     1000
-#define PROGRESS_EVERY (TOTAL_WRITES / 10)
+#ifdef __APPLE__
+#include <mach/mach.h>
+#endif
 
-// Operation weights for varied workload
-#define INSERT_WEIGHT  60
-#define UPDATE_WEIGHT  30
-#define DELETE_WEIGHT  10
+// ── Config (overridable via argv[1]) ────────────────────────────────────
+static int OPS = 1000000; // per-benchmark operation count
+static int WARMUP = 0;    // set in main from OPS
+static int BATCH_SIZES[] = {1, 10, 100, 1000, 10000, 100000, 1000000};
+static int NUM_BATCH = 7;
 
-// Schema
-#define CREATE_TABLE_SQL                                                      \
-  "CREATE TABLE IF NOT EXISTS bench_data ("                                   \
-  "  id       INTEGER PRIMARY KEY, "                                          \
-  "  name     TEXT    NOT NULL, "                                             \
-  "  value    REAL    NOT NULL, "                                             \
-  "  created  INTEGER NOT NULL, "                                             \
-  "  updated  INTEGER NOT NULL"                                               \
-  ");"
+// ── Schema (production-like: indexed text + numeric columns) ────────────
+#define TBL                                                                    \
+  "CREATE TABLE IF NOT EXISTS bench_data ("                                    \
+  "  id        INTEGER PRIMARY KEY, "                                          \
+  "  customer  TEXT    NOT NULL, "                                             \
+  "  product   TEXT    NOT NULL, "                                             \
+  "  qty       INTEGER NOT NULL, "                                             \
+  "  price     REAL    NOT NULL, "                                             \
+  "  total     REAL    NOT NULL, "                                             \
+  "  status    TEXT    NOT NULL DEFAULT 'pending', "                           \
+  "  note      TEXT, "                                                         \
+  "  created   INTEGER NOT NULL, "                                             \
+  "  updated   INTEGER NOT NULL)"
+#define TBL_NAME "bench_data"
 
-// ---------------------------------------------------------------------------
-// High-precision timer
-// ---------------------------------------------------------------------------
-
+// ── High-precision timer ───────────────────────────────────────────────
 static double now_ns(void) {
   struct timespec ts;
   clock_gettime(CLOCK_MONOTONIC, &ts);
   return (double)ts.tv_sec * 1e9 + (double)ts.tv_nsec;
 }
-
 static double ns_to_ms(double ns) { return ns / 1e6; }
 
-// ---------------------------------------------------------------------------
-// Progress bar
-// ---------------------------------------------------------------------------
-
-static void progress(const char *label, int done, int total) {
-  int pct = (int)((double)done / (double)total * 100.0);
-  fprintf(stderr, "\r  %-8s [", label);
-  int bars = pct / 5;
-  for (int i = 0; i < 20; i++) fputc(i < bars ? '=' : (i == bars ? '>' : ' '), stderr);
-  fprintf(stderr, "] %3d%%  %d/%d", pct, done, total);
-  if (done == total) fputc('\n', stderr);
-}
-
-// ---------------------------------------------------------------------------
-// SQL generation (deterministic pseudo-random for reproducibility)
-// ---------------------------------------------------------------------------
-
+// ── Deterministic RNG for reproducible results ─────────────────────────
 static unsigned int g_seed = 42;
-
 static unsigned int xorshift32(void) {
   g_seed ^= g_seed << 13;
   g_seed ^= g_seed >> 17;
   g_seed ^= g_seed << 5;
   return g_seed;
 }
-
-static int rand_range(int lo, int hi) {
+static int rng_int(int lo, int hi) {
+  if (hi <= lo)
+    return lo;
   return lo + (int)(xorshift32() % (unsigned int)(hi - lo + 1));
 }
-
-static int pick_op(void) {
-  int r = rand_range(1, 100);
-  if (r <= INSERT_WEIGHT)  return 0; // INSERT
-  if (r <= INSERT_WEIGHT + UPDATE_WEIGHT) return 1; // UPDATE
-  return 2; // DELETE
+static double rng_dbl(double lo, double hi) {
+  return lo + (double)xorshift32() / (double)0xFFFFFFFF * (hi - lo);
+}
+static void rng_str(char *buf, int len) {
+  static const char chars[] =
+      "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+  for (int i = 0; i < len - 1; i++)
+    buf[i] = chars[rng_int(0, (int)sizeof(chars) - 2)];
+  buf[len - 1] = '\0';
 }
 
+// ── Data generation ─────────────────────────────────────────────────────
 static int g_max_id = 0;
 
-// Generate a varied INSERT/UPDATE/DELETE SQL into buf. Returns 0=INSERT, 1=UPDATE, 2=DELETE.
-static int gen_write_sql(char *buf, size_t bufsz) {
-  int op = pick_op();
+typedef struct {
+  int id;
+  char customer[16];
+  char product[16];
+  int qty;
+  double price;
+  double total;
+  char status[12];
+  long long now;
+} row_data;
 
-  if (op == 0 || g_max_id == 0) {
-    // INSERT
-    g_max_id++;
-    int  rname = rand_range(0, 999);
-    double rval = (double)rand_range(0, 99999) / 100.0;
-    long long now = (long long)time(NULL);
-    snprintf(buf, bufsz,
-      "INSERT INTO bench_data (id, name, value, created, updated) "
-      "VALUES (%d, 'user_%04d', %.2f, %lld, %lld)",
-      g_max_id, rname, rval, now, now);
-    return 0;
-  } else if (op == 1) {
-    // UPDATE a random existing row
-    int target_id = rand_range(1, g_max_id);
-    double rval = (double)rand_range(0, 99999) / 100.0;
-    long long now = (long long)time(NULL);
-    snprintf(buf, bufsz,
-      "UPDATE bench_data SET value = %.2f, updated = %lld WHERE id = %d",
-      rval, now, target_id);
-    return 1;
-  } else {
-    // DELETE a random existing row (keep at least 1000 rows)
-    if (g_max_id > 1000) {
-      int target_id = rand_range(1, g_max_id - 500);
-      snprintf(buf, bufsz, "DELETE FROM bench_data WHERE id = %d", target_id);
-      return 2;
-    } else {
-      // Fall back to INSERT if not enough rows to safely delete
-      g_max_id++;
-      int  rname = rand_range(0, 999);
-      double rval = (double)rand_range(0, 99999) / 100.0;
-      long long now = (long long)time(NULL);
-      snprintf(buf, bufsz,
-        "INSERT INTO bench_data (id, name, value, created, updated) "
-        "VALUES (%d, 'user_%04d', %.2f, %lld, %lld)",
-        g_max_id, rname, rval, now, now);
-      return 0;
-    }
-  }
+static row_data gen_row(void) {
+  row_data r;
+  r.id = ++g_max_id;
+  rng_str(r.customer, 10);
+  rng_str(r.product, 10);
+  r.qty = rng_int(1, 100);
+  r.price = rng_dbl(1.0, 9999.99);
+  r.total = r.qty * r.price;
+  rng_str(r.status, 8);
+  r.status[0] = 's'; // 'shipped','pending','cancelled'
+  r.now = (long long)time(NULL);
+  return r;
 }
 
-// ---------------------------------------------------------------------------
-// Benchmark: Raw SQLite (explicit BEGIN/COMMIT per write)
-// ---------------------------------------------------------------------------
+// ── Latency histogram (log2 buckets: 0.5us … 2^31 us ≈ 35 min) ────────
+#define LAT_BUCKETS 32
+typedef struct {
+  double buckets[LAT_BUCKETS];
+  int count;
+} lat_hist;
 
-static int bench_raw_txn_per_write(sqlite3 *handle, int total, double *out_ms) {
-  char sql[512];
-  int inserts = 0, updates = 0, deletes = 0;
-
-  double t0 = now_ns();
-  for (int i = 0; i < total; i++) {
-    int op = gen_write_sql(sql, sizeof(sql));
-    if (op == 0) inserts++;
-    else if (op == 1) updates++;
-    else deletes++;
-
-    char *err = NULL;
-    sqlite3_exec(handle, "BEGIN;", NULL, NULL, NULL);
-    int rc = sqlite3_exec(handle, sql, NULL, NULL, &err);
-    if (rc == SQLITE_OK) {
-      sqlite3_exec(handle, "COMMIT;", NULL, NULL, NULL);
-    } else {
-      sqlite3_exec(handle, "ROLLBACK;", NULL, NULL, NULL);
-      if (err) sqlite3_free(err);
-    }
-
-    if (i > 0 && i % PROGRESS_EVERY == 0) {
-      progress("raw-txn", i, total);
-    }
+static void lat_record(lat_hist *h, double nanos) {
+  int b = 0;
+  double v = nanos / 1000.0; // convert to µs
+  while (v >= 1.0 && b < LAT_BUCKETS - 1) {
+    v /= 2.0;
+    b++;
   }
-  double elapsed = now_ns() - t0;
-  *out_ms = ns_to_ms(elapsed);
-  progress("raw-txn", total, total);
-
-  return inserts + updates + deletes;
+  h->buckets[b] += 1.0;
+  h->count++;
 }
 
-// ---------------------------------------------------------------------------
-// Benchmark: Arkilian db_exec() (wrapper: mutex + BEGIN/COMMIT + log)
-// ---------------------------------------------------------------------------
+static double lat_percentile(lat_hist *h, double pct) {
+  double target = h->count * pct / 100.0;
+  double cum = 0;
+  double lo_us = 0.5;
+  for (int i = 0; i < LAT_BUCKETS; i++) {
+    cum += h->buckets[i];
+    if (cum >= target)
+      return lo_us * 2.0;
+    lo_us *= 2.0;
+  }
+  return lo_us;
+}
 
-static int bench_arkilian_exec(arkilian *db, int total, double *out_ms) {
-  char sql[512];
-  int inserts = 0, updates = 0, deletes = 0;
+// ── Progress ───────────────────────────────────────────────────────────
+static void progress(const char *label, int done, int total) {
+  int pct = (int)((double)done / (double)total * 100.0);
+  fprintf(stderr, "\r  %-22s [", label);
+  int bars = pct / 5;
+  for (int i = 0; i < 20; i++)
+    fputc(i < bars ? '=' : (i == bars ? '>' : ' '), stderr);
+  fprintf(stderr, "] %3d%%  %d/%d", pct, done, total);
+  if (done == total)
+    fputc('\n', stderr);
+}
+
+// =====================================================================
+//  BENCHMARK: Single-row INSERT throughput
+// =====================================================================
+typedef struct {
+  double ms;
+  double ops_per_sec;
+  lat_hist lat;
+} bench_result;
+
+static bench_result bench_insert_raw(sqlite3 *db, int n, int use_prepare) {
+  bench_result r = {0};
+  lat_hist lat = {0};
+
+  sqlite3_stmt *ins = NULL;
+  if (use_prepare) {
+    sqlite3_prepare_v2(
+        db,
+        "INSERT INTO bench_data "
+        "(id,customer,product,qty,price,total,status,note,created,updated) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?)",
+        -1, &ins, NULL);
+  }
 
   double t0 = now_ns();
-  for (int i = 0; i < total; i++) {
-    int op = gen_write_sql(sql, sizeof(sql));
-    if (op == 0) inserts++;
-    else if (op == 1) updates++;
-    else deletes++;
+  for (int i = 0; i < n; i++) {
+    row_data d = gen_row();
+    double op_t0 = now_ns();
 
+    if (use_prepare) {
+      sqlite3_bind_int64(ins, 1, d.id);
+      sqlite3_bind_text(ins, 2, d.customer, -1, SQLITE_STATIC);
+      sqlite3_bind_text(ins, 3, d.product, -1, SQLITE_STATIC);
+      sqlite3_bind_int(ins, 4, d.qty);
+      sqlite3_bind_double(ins, 5, d.price);
+      sqlite3_bind_double(ins, 6, d.total);
+      sqlite3_bind_text(ins, 7, d.status, -1, SQLITE_STATIC);
+      sqlite3_bind_null(ins, 8);
+      sqlite3_bind_int64(ins, 9, d.now);
+      sqlite3_bind_int64(ins, 10, d.now);
+      sqlite3_step(ins);
+      sqlite3_reset(ins);
+    } else {
+      char sql[512];
+      snprintf(
+          sql, sizeof(sql),
+          "INSERT INTO bench_data "
+          "(id,customer,product,qty,price,total,status,note,created,updated) "
+          "VALUES (%d,'%s','%s',%d,%.2f,%.2f,'%s',NULL,%lld,%lld)",
+          d.id, d.customer, d.product, d.qty, d.price, d.total, d.status, d.now,
+          d.now);
+      sqlite3_exec(db, sql, NULL, NULL, NULL);
+    }
+
+    lat_record(&lat, now_ns() - op_t0);
+
+    if (i > 0 && i % (n / 10) == 0)
+      progress(use_prepare ? "raw-prep INSERT" : "raw-exec INSERT", i, n);
+  }
+  r.ms = ns_to_ms(now_ns() - t0);
+  r.ops_per_sec = (double)n / (r.ms / 1000.0);
+  r.lat = lat;
+
+  if (ins)
+    sqlite3_finalize(ins);
+  progress(use_prepare ? "raw-prep INSERT" : "raw-exec INSERT", n, n);
+  return r;
+}
+
+static bench_result bench_insert_arkilian(arkilian *db, int n) {
+  bench_result r = {0};
+  lat_hist lat = {0};
+
+  double t0 = now_ns();
+  for (int i = 0; i < n; i++) {
+    row_data d = gen_row();
+    double op_t0 = now_ns();
+
+    char sql[512];
+    snprintf(
+        sql, sizeof(sql),
+        "INSERT INTO bench_data "
+        "(id,customer,product,qty,price,total,status,note,created,updated) "
+        "VALUES (%d,'%s','%s',%d,%.2f,%.2f,'%s',NULL,%lld,%lld)",
+        d.id, d.customer, d.product, d.qty, d.price, d.total, d.status, d.now,
+        d.now);
     db_exec(db, sql);
 
-    if (i > 0 && i % PROGRESS_EVERY == 0) {
-      progress("arkilian", i, total);
-    }
+    lat_record(&lat, now_ns() - op_t0);
+    if (i > 0 && i % (n / 10) == 0)
+      progress("ark INSERT", i, n);
   }
-  double elapsed = now_ns() - t0;
-  *out_ms = ns_to_ms(elapsed);
-  progress("arkilian", total, total);
-
-  return inserts + updates + deletes;
+  r.ms = ns_to_ms(now_ns() - t0);
+  r.ops_per_sec = (double)n / (r.ms / 1000.0);
+  r.lat = lat;
+  progress("ark INSERT", n, n);
+  return r;
 }
 
-// ---------------------------------------------------------------------------
-// Benchmark: Arkilian prepare/bind/step/finalize (per write)
-// ---------------------------------------------------------------------------
+// =====================================================================
+//  BENCHMARK: Single-row UPDATE (by PK)
+// =====================================================================
+static bench_result bench_update_raw(sqlite3 *db, int n) {
+  bench_result r = {0};
+  lat_hist lat = {0};
 
-static int bench_arkilian_prepared(arkilian *db, int total, double *out_ms) {
-  int inserts = 0, updates = 0, deletes = 0;
+  sqlite3_stmt *upd = NULL;
+  sqlite3_prepare_v2(db,
+                     "UPDATE bench_data SET "
+                     "qty=?,price=?,total=?,status=?,updated=? WHERE id=?",
+                     -1, &upd, NULL);
 
   double t0 = now_ns();
-  for (int i = 0; i < total; i++) {
-    char sql[512];
-    int op = gen_write_sql(sql, sizeof(sql));
-    if (op == 0) inserts++;
-    else if (op == 1) updates++;
-    else deletes++;
+  for (int i = 0; i < n; i++) {
+    int target = rng_int(1, g_max_id);
+    int qty = rng_int(1, 100);
+    double pr = rng_dbl(1.0, 9999.99);
+    double op_t0 = now_ns();
 
-    db_prepare(db, sql);
-    db_step(db);
+    sqlite3_bind_int(upd, 1, qty);
+    sqlite3_bind_double(upd, 2, pr);
+    sqlite3_bind_double(upd, 3, qty * pr);
+    sqlite3_bind_text(upd, 4, "shipped", -1, SQLITE_STATIC);
+    sqlite3_bind_int64(upd, 5, (long long)time(NULL));
+    sqlite3_bind_int(upd, 6, target);
+    sqlite3_step(upd);
+    sqlite3_reset(upd);
+
+    lat_record(&lat, now_ns() - op_t0);
+    if (i > 0 && i % (n / 10) == 0)
+      progress("raw UPDATE", i, n);
+  }
+  r.ms = ns_to_ms(now_ns() - t0);
+  r.ops_per_sec = (double)n / (r.ms / 1000.0);
+  r.lat = lat;
+  sqlite3_finalize(upd);
+  progress("raw UPDATE", n, n);
+  return r;
+}
+
+static bench_result bench_update_arkilian(arkilian *db, int n) {
+  bench_result r = {0};
+  lat_hist lat = {0};
+
+  double t0 = now_ns();
+  for (int i = 0; i < n; i++) {
+    int target = rng_int(1, g_max_id);
+    int qty = rng_int(1, 100);
+    double pr = rng_dbl(1.0, 9999.99);
+    double op_t0 = now_ns();
+
+    char sql[256];
+    snprintf(sql, sizeof(sql),
+             "UPDATE bench_data SET "
+             "qty=%d,price=%.2f,total=%.2f,status='shipped',updated=%lld WHERE "
+             "id=%d",
+             qty, pr, qty * pr, (long long)time(NULL), target);
+    db_exec(db, sql);
+
+    lat_record(&lat, now_ns() - op_t0);
+    if (i > 0 && i % (n / 10) == 0)
+      progress("ark UPDATE", i, n);
+  }
+  r.ms = ns_to_ms(now_ns() - t0);
+  r.ops_per_sec = (double)n / (r.ms / 1000.0);
+  r.lat = lat;
+  progress("ark UPDATE", n, n);
+  return r;
+}
+
+// =====================================================================
+//  BENCHMARK: Point SELECT by PK
+// =====================================================================
+static bench_result bench_select_point_raw(sqlite3 *db, int n) {
+  bench_result r = {0};
+  lat_hist lat = {0};
+
+  sqlite3_stmt *sel = NULL;
+  sqlite3_prepare_v2(db, "SELECT * FROM bench_data WHERE id = ?", -1, &sel,
+                     NULL);
+
+  double t0 = now_ns();
+  for (int i = 0; i < n; i++) {
+    int target = rng_int(1, g_max_id);
+    double op_t0 = now_ns();
+
+    sqlite3_bind_int(sel, 1, target);
+    int rc = sqlite3_step(sel);
+    if (rc == SQLITE_ROW) {
+      // consume all columns to simulate real use
+      for (int c = 0; c < sqlite3_column_count(sel); c++)
+        (void)sqlite3_column_text(sel, c);
+    }
+    sqlite3_reset(sel);
+
+    lat_record(&lat, now_ns() - op_t0);
+    if (i > 0 && i % (n / 10) == 0)
+      progress("raw SELECT(PK)", i, n);
+  }
+  r.ms = ns_to_ms(now_ns() - t0);
+  r.ops_per_sec = (double)n / (r.ms / 1000.0);
+  r.lat = lat;
+  sqlite3_finalize(sel);
+  progress("raw SELECT(PK)", n, n);
+  return r;
+}
+
+static bench_result bench_select_point_arkilian(arkilian *db, int n) {
+  bench_result r = {0};
+  lat_hist lat = {0};
+
+  double t0 = now_ns();
+  for (int i = 0; i < n; i++) {
+    int target = rng_int(1, g_max_id);
+    double op_t0 = now_ns();
+
+    db_prepare(db, "SELECT * FROM bench_data WHERE id = ?");
+    db_bind_int(db, 1, target);
+    int rc = db_step(db);
+    if (rc == SQLITE_ROW) {
+      for (int c = 0; c < db_column_count(db); c++)
+        (void)db_column_text(db, c);
+    }
     db_finalize(db);
 
-    if (i > 0 && i % PROGRESS_EVERY == 0) {
-      progress("ark-prep", i, total);
-    }
+    lat_record(&lat, now_ns() - op_t0);
+    if (i > 0 && i % (n / 10) == 0)
+      progress("ark SELECT(PK)", i, n);
   }
-  double elapsed = now_ns() - t0;
-  *out_ms = ns_to_ms(elapsed);
-  progress("ark-prep", total, total);
-
-  return inserts + updates + deletes;
+  r.ms = ns_to_ms(now_ns() - t0);
+  r.ops_per_sec = (double)n / (r.ms / 1000.0);
+  r.lat = lat;
+  progress("ark SELECT(PK)", n, n);
+  return r;
 }
 
-// ---------------------------------------------------------------------------
-// Benchmark: Arkilian batched (db_begin → N × db_exec → db_commit)
-// ---------------------------------------------------------------------------
+// =====================================================================
+//  BENCHMARK: Range SELECT (scan 100 rows, no index on created)
+// =====================================================================
+static bench_result bench_select_range_raw(sqlite3 *db, int n) {
+  bench_result r = {0};
+  lat_hist lat = {0};
 
-static int bench_arkilian_batched(arkilian *db, int total, int batch_size,
-                                   double *out_ms) {
-  char sql[512];
-  int inserts = 0, updates = 0, deletes = 0;
+  sqlite3_stmt *sel = NULL;
+  sqlite3_prepare_v2(
+      db, "SELECT * FROM bench_data WHERE id BETWEEN ? AND ? ORDER BY id", -1,
+      &sel, NULL);
 
   double t0 = now_ns();
-  int in_batch = 0;
-
-  for (int i = 0; i < total; i++) {
-    if (!in_batch) {
-      db_begin(db);
-      in_batch = 1;
+  for (int i = 0; i < n; i++) {
+    int lo = rng_int(1, g_max_id - 100);
+    double op_t0 = now_ns();
+    sqlite3_bind_int(sel, 1, lo);
+    sqlite3_bind_int(sel, 2, lo + 100);
+    while (sqlite3_step(sel) == SQLITE_ROW) {
+      for (int c = 0; c < sqlite3_column_count(sel); c++)
+        (void)sqlite3_column_text(sel, c);
     }
+    sqlite3_reset(sel);
+    lat_record(&lat, now_ns() - op_t0);
+    if (i > 0 && i % (n / 10) == 0)
+      progress("raw SELECT(range)", i, n);
+  }
+  r.ms = ns_to_ms(now_ns() - t0);
+  r.ops_per_sec = (double)n / (r.ms / 1000.0);
+  r.lat = lat;
+  sqlite3_finalize(sel);
+  progress("raw SELECT(range)", n, n);
+  return r;
+}
 
-    int op = gen_write_sql(sql, sizeof(sql));
-    if (op == 0) inserts++;
-    else if (op == 1) updates++;
-    else deletes++;
+static bench_result bench_select_range_arkilian(arkilian *db, int n) {
+  bench_result r = {0};
+  lat_hist lat = {0};
 
+  double t0 = now_ns();
+  for (int i = 0; i < n; i++) {
+    int lo = rng_int(1, g_max_id - 100);
+    double op_t0 = now_ns();
+    db_prepare(db,
+               "SELECT * FROM bench_data WHERE id BETWEEN ? AND ? ORDER BY id");
+    db_bind_int(db, 1, lo);
+    db_bind_int(db, 2, lo + 100);
+    while (db_step(db) == SQLITE_ROW) {
+      for (int c = 0; c < db_column_count(db); c++)
+        (void)db_column_text(db, c);
+    }
+    db_finalize(db);
+    lat_record(&lat, now_ns() - op_t0);
+    if (i > 0 && i % (n / 10) == 0)
+      progress("ark SELECT(range)", i, n);
+  }
+  r.ms = ns_to_ms(now_ns() - t0);
+  r.ops_per_sec = (double)n / (r.ms / 1000.0);
+  r.lat = lat;
+  progress("ark SELECT(range)", n, n);
+  return r;
+}
+
+// =====================================================================
+//  BENCHMARK: Batched INSERT throughput (1 txn per batch)
+// =====================================================================
+static bench_result bench_insert_batched_raw(sqlite3 *db, int n, int batch) {
+  bench_result r = {0};
+  lat_hist lat = {0};
+
+  sqlite3_stmt *ins = NULL;
+  sqlite3_prepare_v2(
+      db,
+      "INSERT INTO bench_data "
+      "(id,customer,product,qty,price,total,status,note,created,updated) "
+      "VALUES (?,?,?,?,?,?,?,?,?,?)",
+      -1, &ins, NULL);
+
+  double t0 = now_ns();
+  for (int i = 0; i < n; i++) {
+    if (i % batch == 0)
+      sqlite3_exec(db, "BEGIN", NULL, NULL, NULL);
+
+    row_data d = gen_row();
+    double op_t0 = now_ns();
+    sqlite3_bind_int64(ins, 1, d.id);
+    sqlite3_bind_text(ins, 2, d.customer, -1, SQLITE_STATIC);
+    sqlite3_bind_text(ins, 3, d.product, -1, SQLITE_STATIC);
+    sqlite3_bind_int(ins, 4, d.qty);
+    sqlite3_bind_double(ins, 5, d.price);
+    sqlite3_bind_double(ins, 6, d.total);
+    sqlite3_bind_text(ins, 7, d.status, -1, SQLITE_STATIC);
+    sqlite3_bind_null(ins, 8);
+    sqlite3_bind_int64(ins, 9, d.now);
+    sqlite3_bind_int64(ins, 10, d.now);
+    sqlite3_step(ins);
+    sqlite3_reset(ins);
+    lat_record(&lat, now_ns() - op_t0);
+
+    if ((i + 1) % batch == 0 || i == n - 1)
+      sqlite3_exec(db, "COMMIT", NULL, NULL, NULL);
+
+    if (i > 0 && i % (n / 10) == 0)
+      progress("raw-batch INSERT", i, n);
+  }
+  r.ms = ns_to_ms(now_ns() - t0);
+  r.ops_per_sec = (double)n / (r.ms / 1000.0);
+  r.lat = lat;
+  sqlite3_finalize(ins);
+  progress("raw-batch INSERT", n, n);
+  return r;
+}
+
+static bench_result bench_insert_batched_arkilian(arkilian *db, int n,
+                                                  int batch) {
+  bench_result r = {0};
+  lat_hist lat = {0};
+
+  double t0 = now_ns();
+  for (int i = 0; i < n; i++) {
+    if (i % batch == 0)
+      db_begin(db);
+
+    row_data d = gen_row();
+    double op_t0 = now_ns();
+    char sql[512];
+    snprintf(
+        sql, sizeof(sql),
+        "INSERT INTO bench_data "
+        "(id,customer,product,qty,price,total,status,note,created,updated) "
+        "VALUES (%d,'%s','%s',%d,%.2f,%.2f,'%s',NULL,%lld,%lld)",
+        d.id, d.customer, d.product, d.qty, d.price, d.total, d.status, d.now,
+        d.now);
     db_exec(db, sql);
 
-    if ((i + 1) % batch_size == 0 || i == total - 1) {
+    lat_record(&lat, now_ns() - op_t0);
+
+    if ((i + 1) % batch == 0 || i == n - 1)
       db_commit(db);
-      in_batch = 0;
-    }
 
-    if (i > 0 && i % PROGRESS_EVERY == 0) {
-      progress("ark-batch", i, total);
-    }
+    if (i > 0 && i % (n / 10) == 0)
+      progress("ark-batch INSERT", i, n);
   }
-  double elapsed = now_ns() - t0;
-  *out_ms = ns_to_ms(elapsed);
-  progress("ark-batch", total, total);
-
-  return inserts + updates + deletes;
+  r.ms = ns_to_ms(now_ns() - t0);
+  r.ops_per_sec = (double)n / (r.ms / 1000.0);
+  r.lat = lat;
+  progress("ark-batch INSERT", n, n);
+  return r;
 }
 
-// ---------------------------------------------------------------------------
-// Benchmark: Raw SQLite batched (one transaction per BATCH_SIZE writes)
-// ---------------------------------------------------------------------------
-
-static int bench_raw_batched(sqlite3 *handle, int total, double *out_ms) {
-  char sql[512];
-  int inserts = 0, updates = 0, deletes = 0;
-
-  double t0 = now_ns();
-  int batch_count = 0;
-  for (int i = 0; i < total; i++) {
-    if (batch_count == 0) {
-      sqlite3_exec(handle, "BEGIN;", NULL, NULL, NULL);
-    }
-
-    int op = gen_write_sql(sql, sizeof(sql));
-    if (op == 0) inserts++;
-    else if (op == 1) updates++;
-    else deletes++;
-
-    char *err = NULL;
-    int rc = sqlite3_exec(handle, sql, NULL, NULL, &err);
-    if (rc != SQLITE_OK && err) sqlite3_free(err);
-
-    batch_count++;
-    if (batch_count >= BATCH_SIZE || i == total - 1) {
-      sqlite3_exec(handle, "COMMIT;", NULL, NULL, NULL);
-      batch_count = 0;
-    }
-
-    if (i > 0 && i % PROGRESS_EVERY == 0) {
-      progress("raw-batch", i, total);
-    }
+// =====================================================================
+//  Memory measurement
+// =====================================================================
+static long get_resident_mem_kb(void) {
+  long kb = 0;
+#ifdef __linux__
+  FILE *f = fopen("/proc/self/status", "r");
+  if (f) {
+    char line[256];
+    while (fgets(line, sizeof(line), f))
+      if (sscanf(line, "VmRSS: %ld kB", &kb) == 1)
+        break;
+    fclose(f);
   }
-  double elapsed = now_ns() - t0;
-  *out_ms = ns_to_ms(elapsed);
-  progress("raw-batch", total, total);
-
-  return inserts + updates + deletes;
+#elif defined(__APPLE__)
+  struct task_basic_info_64 t_info;
+  mach_msg_type_number_t t_info_count = TASK_BASIC_INFO_64_COUNT;
+  if (task_info(mach_task_self(), TASK_BASIC_INFO_64, (task_info_t)&t_info,
+                &t_info_count) == KERN_SUCCESS)
+    kb = (long)(t_info.resident_size / 1024);
+#endif
+  return kb;
 }
 
-// ---------------------------------------------------------------------------
-// Row counting helper
-// ---------------------------------------------------------------------------
-
-static int count_rows(sqlite3 *handle, const char *table) {
-  char sql[256];
-  snprintf(sql, sizeof(sql), "SELECT COUNT(*) FROM %s", table);
-  sqlite3_stmt *stmt = NULL;
-  sqlite3_prepare_v2(handle, sql, -1, &stmt, NULL);
-  sqlite3_step(stmt);
-  int c = sqlite3_column_int(stmt, 0);
-  sqlite3_finalize(stmt);
+// =====================================================================
+//  Helpers
+// =====================================================================
+static int count_rows(sqlite3 *db) {
+  sqlite3_stmt *s = NULL;
+  sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM " TBL_NAME, -1, &s, NULL);
+  sqlite3_step(s);
+  int c = sqlite3_column_int(s, 0);
+  sqlite3_finalize(s);
   return c;
 }
 
-// ---------------------------------------------------------------------------
-// Main
-// ---------------------------------------------------------------------------
+// =====================================================================
+//  Main
+// =====================================================================
+int main(int argc, char **argv) {
+  if (argc > 1) {
+    OPS = atoi(argv[1]);
+    if (OPS < 1000)
+      OPS = 1000;
+  }
 
-int main(void) {
+  WARMUP = OPS < 10000 ? OPS / 2 : 10000;
+  unsetenv("ARKILIAN_WAL_PUSH_URL");
   setenv("ARKILIAN_ENABLE_BACKUP", "0", 1);
-  remove(BENCH_DB);
+  remove("bench_1m.db");
 
-  printf("╔══════════════════════════════════════════════════════════════╗\n");
-  printf("║   Arkilian vs Raw SQLite — 1M Write Benchmark               ║\n");
-  printf("╚══════════════════════════════════════════════════════════════╝\n\n");
+  long mem_before = get_resident_mem_kb();
 
-  printf("Configuration:\n");
-  printf("  Total writes : %d\n", TOTAL_WRITES);
-  printf("  Warmup       : %d writes\n", WARMUP_WRITES);
-  printf("  Mix          : %d%% INSERT / %d%% UPDATE / %d%% DELETE\n",
-         INSERT_WEIGHT, UPDATE_WEIGHT, DELETE_WEIGHT);
-  printf("  Batch size   : %d (for batched bench)\n", BATCH_SIZE);
-  printf("  PRAGMAs      : journal_mode=WAL, synchronous=NORMAL,\n");
-  printf("                 busy_timeout=5000, foreign_keys=ON\n");
-  printf("  Arkilian log : ring buffer → async HTTP POST\n");
+  // ── Header ─────────────────────────────────────────────────────────
   printf("\n");
+  printf("  "
+         "╔════════════════════════════════════════════════════════════════════"
+         "══════════╗\n");
+  printf("  ║               Arkilian vs Raw SQLite — Production Benchmark      "
+         "          ║\n");
+  printf("  "
+         "╚════════════════════════════════════════════════════════════════════"
+         "══════════╝\n\n");
+  printf("  Operations per test : %'d\n", OPS);
+  printf("  Warmup              : %'d\n", WARMUP);
+  printf("  Schema              : 10 columns (INTEGER PK, TEXT×4, REAL×3, "
+         "INTEGER×2)\n");
+  printf("  PRAGMAs             : journal_mode=WAL, synchronous=NORMAL,\n");
+  printf("                        busy_timeout=5000, foreign_keys=ON\n");
+  printf("  Arkilian overhead   : write mutex + per-statement ring-buffer "
+         "capture\n");
 
-  // ── Phase 0: Setup ──────────────────────────────────────────────
-  printf("── Phase 0: Setup ──────────────────────────────────────────\n");
+  // ── Setup ──────────────────────────────────────────────────────────
+  printf("\n  ── Setup "
+         "──────────────────────────────────────────────────────────\n");
 
   arkilian *db = NULL;
-  int rc = db_init(&db, BENCH_DB);
-  assert(rc == 0 && "db_init failed");
-  sqlite3 *raw_handle = db_get_handle(db);
+  int rc = db_init(&db, "bench_1m.db");
+  assert(rc == 0);
+  sqlite3 *raw = db_get_handle(db);
+  sqlite3_exec(raw, TBL, NULL, NULL, NULL);
 
-  sqlite3_exec(raw_handle, CREATE_TABLE_SQL, NULL, NULL, NULL);
-  printf("  Table created.\n");
-
-  // ── Phase 1: Warmup ─────────────────────────────────────────────
-  printf("\n── Phase 1: Warmup (%d writes each runner) ────────────────\n",
-         WARMUP_WRITES);
-
-  // Reset seed for deterministic warmup
+  // Pre-populate 50K rows for UPDATE/SELECT benchmarks
+  printf("  Seeding 50,000 rows for UPDATE/SELECT benchmarks ...\n");
   g_seed = 42;
   g_max_id = 0;
+  sqlite3_exec(raw, "BEGIN", NULL, NULL, NULL);
+  sqlite3_stmt *bulk = NULL;
+  sqlite3_prepare_v2(
+      raw,
+      "INSERT INTO bench_data "
+      "(id,customer,product,qty,price,total,status,note,created,updated) "
+      "VALUES (?,?,?,?,?,?,?,NULL,?,?)",
+      -1, &bulk, NULL);
+  for (int i = 0; i < 50000; i++) {
+    row_data d = gen_row();
+    sqlite3_bind_int64(bulk, 1, d.id);
+    sqlite3_bind_text(bulk, 2, d.customer, -1, SQLITE_STATIC);
+    sqlite3_bind_text(bulk, 3, d.product, -1, SQLITE_STATIC);
+    sqlite3_bind_int(bulk, 4, d.qty);
+    sqlite3_bind_double(bulk, 5, d.price);
+    sqlite3_bind_double(bulk, 6, d.total);
+    sqlite3_bind_text(bulk, 7, d.status, -1, SQLITE_STATIC);
+    sqlite3_bind_int64(bulk, 8, d.now);
+    sqlite3_bind_int64(bulk, 9, d.now);
+    sqlite3_step(bulk);
+    sqlite3_reset(bulk);
+  }
+  sqlite3_finalize(bulk);
+  sqlite3_exec(raw, "COMMIT", NULL, NULL, NULL);
+  int seed_rows = count_rows(raw);
+  printf("  Seeded: %'d rows\n", seed_rows);
 
-  double warmup_ms = 0;
-  sqlite3_exec(raw_handle, "DELETE FROM bench_data", NULL, NULL, NULL);
-  bench_raw_txn_per_write(raw_handle, WARMUP_WRITES, &warmup_ms);
-  printf("  Warmup complete: %.0f ms, %d rows in table\n",
-         warmup_ms, count_rows(raw_handle, "bench_data"));
+  long mem_after_seed = get_resident_mem_kb();
+  printf("  Memory after seed : %'ld KB\n", mem_after_seed);
 
-  // ── Phase 2: Benchmarks ─────────────────────────────────────────
-  printf("\n── Phase 2: 1M Write Benchmarks ─────────────────────────\n\n");
+  // ── Warmup ─────────────────────────────────────────────────────────
+  printf("\n  ── Warmup (%d operations each) ───────────────────────────────\n",
+         WARMUP);
 
-  double t_raw_txn_ms      = 0;
-  double t_ark_exec_ms     = 0;
-  double t_ark_prep_ms     = 0;
-  double t_ark_batch100_ms = 0;
-  double t_ark_batch1k_ms  = 0;
-  double t_raw_batch_ms    = 0;
+  g_seed = 42;
+  g_max_id = seed_rows;
+  bench_insert_raw(raw, WARMUP, 1);
+  printf("\n");
 
-  int rows_raw_txn    = 0;
-  int rows_ark_exec   = 0;
-  int rows_ark_prep   = 0;
-  int rows_ark_b100   = 0;
-  int rows_ark_b1k    = 0;
-  int rows_raw_batch  = 0;
+  // ── Store all results for final display ────────────────────────────
+  enum { R_INSERT, R_UPDATE, R_SEL_PK, R_SEL_RNG, R_NUM };
+  bench_result raw_single[R_NUM], ark_single[R_NUM];
+  bench_result raw_batch[NUM_BATCH], ark_batch[NUM_BATCH];
+  bench_result raw_lat_ins, ark_lat_ins, raw_lat_sel, ark_lat_sel;
 
-  // Run 1: Raw SQLite (txn per write)
-  {
-    printf("  [1/6] Raw SQLite  (explicit BEGIN/COMMIT per write)\n");
-    sqlite3_exec(raw_handle, "DELETE FROM bench_data", NULL, NULL, NULL);
-    g_seed = 42; g_max_id = 0;
-    rows_raw_txn = bench_raw_txn_per_write(raw_handle, TOTAL_WRITES, &t_raw_txn_ms);
-    int final_rows = count_rows(raw_handle, "bench_data");
-    printf("  Result: %d rows, %.0f ms, %.0f writes/sec\n",
-           final_rows, t_raw_txn_ms,
-           (double)TOTAL_WRITES / (t_raw_txn_ms / 1000.0));
+  // ── 1. Single-row throughput ───────────────────────────────────────
+  printf("\n");
+  printf("  "
+         "╔════════════════════════════════════════════════════════════════════"
+         "══════════╗\n");
+  printf("  ║  1. Single-Row Throughput  (1 txn per op, %d ops)                "
+         "  ║\n",
+         OPS);
+  printf("  "
+         "╚════════════════════════════════════════════════════════════════════"
+         "══════════╝\n");
+
+  printf("\n  INSERT:\n");
+  g_seed = 42;
+  g_max_id = seed_rows;
+  raw_single[R_INSERT] = bench_insert_raw(raw, OPS, 1);
+  printf("\n");
+  g_seed = 42;
+  g_max_id = seed_rows;
+  ark_single[R_INSERT] = bench_insert_arkilian(db, OPS);
+  printf("\n");
+
+  printf("  UPDATE (by PK):\n");
+  g_seed = 42;
+  raw_single[R_UPDATE] = bench_update_raw(raw, OPS);
+  printf("\n");
+  ark_single[R_UPDATE] = bench_update_arkilian(db, OPS);
+  printf("\n");
+
+  printf("  SELECT (point by PK):\n");
+  g_seed = 42;
+  raw_single[R_SEL_PK] = bench_select_point_raw(raw, OPS);
+  printf("\n");
+  ark_single[R_SEL_PK] = bench_select_point_arkilian(db, OPS);
+  printf("\n");
+
+  printf("  SELECT (range 100 rows):\n");
+  g_seed = 42;
+  raw_single[R_SEL_RNG] = bench_select_range_raw(raw, OPS / 10);
+  printf("\n");
+  ark_single[R_SEL_RNG] = bench_select_range_arkilian(db, OPS / 10);
+  printf("\n");
+
+  // ── 2. Batched throughput ──────────────────────────────────────────
+  printf("  "
+         "╔════════════════════════════════════════════════════════════════════"
+         "══════════╗\n");
+  printf("  ║  2. Batched INSERT Throughput  (%d ops)                          "
+         "  ║\n",
+         OPS);
+  printf("  "
+         "╚════════════════════════════════════════════════════════════════════"
+         "══════════╝\n");
+
+  for (int bi = 0; bi < NUM_BATCH; bi++) {
+    int bs = BATCH_SIZES[bi];
+    printf("\n  Batch size %d:\n", bs);
+    g_seed = 42;
+    g_max_id = seed_rows;
+    raw_batch[bi] = bench_insert_batched_raw(raw, OPS, bs);
+    printf("\n");
+    g_seed = 42;
+    g_max_id = seed_rows;
+    ark_batch[bi] = bench_insert_batched_arkilian(db, OPS, bs);
+    printf("\n");
   }
 
-  // Run 2: Arkilian db_exec()
+  // ── 3. Latency percentiles ─────────────────────────────────────────
+  int LAT_OPS = OPS < 50000 ? OPS : 50000;
+  printf("  "
+         "╔════════════════════════════════════════════════════════════════════"
+         "══════════╗\n");
+  printf("  ║  3. Latency Percentiles  (P50 / P95 / P99, %d ops)               "
+         " ║\n",
+         LAT_OPS);
+  printf("  "
+         "╚════════════════════════════════════════════════════════════════════"
+         "══════════╝\n");
+
+  printf("\n  INSERT:\n");
+  g_seed = 42;
+  g_max_id = seed_rows;
+  raw_lat_ins = bench_insert_raw(raw, LAT_OPS, 1);
+  printf("\n");
+  g_seed = 42;
+  g_max_id = seed_rows;
+  ark_lat_ins = bench_insert_arkilian(db, LAT_OPS);
+  printf("\n");
+
+  printf("  SELECT (point by PK):\n");
+  g_seed = 42;
+  raw_lat_sel = bench_select_point_raw(raw, LAT_OPS);
+  printf("\n");
+  ark_lat_sel = bench_select_point_arkilian(db, LAT_OPS);
+  printf("\n");
+
+  long mem_now = get_resident_mem_kb();
+
+  // ── 4. Final Summary Table ─────────────────────────────────────────
+  printf("\n");
+  printf("  "
+         "╔════════════════════════════════════════════════════════════════════"
+         "══════════╗\n");
+  printf("  ║                           FINAL RESULTS TABLE                    "
+         "           ║\n");
+  printf("  "
+         "╚════════════════════════════════════════════════════════════════════"
+         "══════════╝\n\n");
+
+  // 4a. Single-row throughput
   {
-    printf("\n  [2/6] Arkilian     (db_exec: mutex + BEGIN/COMMIT + log)\n");
-    sqlite3_exec(raw_handle, "DELETE FROM bench_data", NULL, NULL, NULL);
-
-    // Count log rows before
-    int log_before = db_wal_pending(db);
-
-    g_seed = 42; g_max_id = 0;
-    rows_ark_exec = bench_arkilian_exec(db, TOTAL_WRITES, &t_ark_exec_ms);
-
-    int final_rows = count_rows(raw_handle, "bench_data");
-    int log_after = db_wal_pending(db);
-    int log_added = log_after - log_before;
-
-    printf("  Result: %d rows, %d ring entries, %.0f ms, %.0f writes/sec\n",
-           final_rows, log_added, t_ark_exec_ms,
-           (double)TOTAL_WRITES / (t_ark_exec_ms / 1000.0));
+    const char *opnames[] = {"INSERT", "UPDATE", "SELECT(PK)", "SELECT(range)"};
+    printf("  ┌─ 1. Single-Row Throughput (ops/sec) "
+           "──────────────────────────────────┐\n");
+    printf("  │ %-18s │ %14s │ %14s │ %10s │\n", "Operation", "Raw SQLite",
+           "Arkilian", "Overhead");
+    printf("  "
+           "├─────────────────────┼────────────────┼────────────────┼──────────"
+           "──┤\n");
+    for (int i = 0; i < R_NUM; i++) {
+      double raw_ops = raw_single[i].ops_per_sec;
+      double ark_ops = ark_single[i].ops_per_sec;
+      double pct = raw_ops > 0 ? ((ark_ops - raw_ops) / raw_ops) * 100.0 : 0;
+      printf("  │ %-18s │ %12.0f/s │ %12.0f/s │ %+8.1f%% │\n", opnames[i],
+             raw_ops, ark_ops, pct);
+    }
+    printf("  "
+           "└─────────────────────┴────────────────┴────────────────┴──────────"
+           "──┘\n");
   }
 
-  // Run 3: Arkilian prepare/bind/step/finalize
+  // 4b. Batched throughput
   {
-    printf("\n  [3/6] Arkilian     (prepare/step/finalize per write)\n");
-    sqlite3_exec(raw_handle, "DELETE FROM bench_data", NULL, NULL, NULL);
-
-    int log_before = db_wal_pending(db);
-
-    g_seed = 42; g_max_id = 0;
-    rows_ark_prep = bench_arkilian_prepared(db, TOTAL_WRITES, &t_ark_prep_ms);
-
-    int final_rows = count_rows(raw_handle, "bench_data");
-    int log_after = db_wal_pending(db);
-    int log_added = log_after - log_before;
-
-    printf("  Result: %d rows, %d ring entries, %.0f ms, %.0f writes/sec\n",
-           final_rows, log_added, t_ark_prep_ms,
-           (double)TOTAL_WRITES / (t_ark_prep_ms / 1000.0));
+    printf("\n  ┌─ 2. Batched INSERT Throughput (ops/sec) "
+           "───────────────────────────────┐\n");
+    printf("  │ %-18s │ %14s │ %14s │ %10s │\n", "Batch size", "Raw SQLite",
+           "Arkilian", "Overhead");
+    printf("  "
+           "├─────────────────────┼────────────────┼────────────────┼──────────"
+           "──┤\n");
+    for (int bi = 0; bi < NUM_BATCH; bi++) {
+      double raw_ops = raw_batch[bi].ops_per_sec;
+      double ark_ops = ark_batch[bi].ops_per_sec;
+      double pct = raw_ops > 0 ? ((ark_ops - raw_ops) / raw_ops) * 100.0 : 0;
+      char bs_label[32];
+      if (BATCH_SIZES[bi] == 1)
+        snprintf(bs_label, sizeof(bs_label), "single (auto)");
+      else
+        snprintf(bs_label, sizeof(bs_label), "batch %d", BATCH_SIZES[bi]);
+      printf("  │ %-18s │ %12.0f/s │ %12.0f/s │ %+8.1f%% │\n", bs_label,
+             raw_ops, ark_ops, pct);
+    }
+    printf("  "
+           "└─────────────────────┴────────────────┴────────────────┴──────────"
+           "──┘\n");
   }
 
-  // Run 4: Arkilian batched 100
+  // 4c. Latency
   {
-    printf("\n  [4/6] Arkilian     (batched: db_begin → 100 × db_exec → db_commit)\n");
-    sqlite3_exec(raw_handle, "DELETE FROM bench_data", NULL, NULL, NULL);
+    printf("\n  ┌─ 3. Latency Percentiles (µs) "
+           "─────────────────────────────────────────┐\n");
+    printf("  │ %-18s │ %-30s │ %-30s │\n", "Operation", "Raw SQLite",
+           "Arkilian");
+    printf("  "
+           "├─────────────────────┼────────────────────────────────┼───────────"
+           "─────────────────────┤\n");
 
-    int log_before = db_wal_pending(db);
+    printf(
+        "  │ %-18s │ %8.0f / %5.0f / %5.0f us  │ %8.0f / %5.0f / %5.0f us  │\n",
+        "INSERT", lat_percentile(&raw_lat_ins.lat, 50),
+        lat_percentile(&raw_lat_ins.lat, 95),
+        lat_percentile(&raw_lat_ins.lat, 99),
+        lat_percentile(&ark_lat_ins.lat, 50),
+        lat_percentile(&ark_lat_ins.lat, 95),
+        lat_percentile(&ark_lat_ins.lat, 99));
 
-    g_seed = 42; g_max_id = 0;
-    rows_ark_b100 = bench_arkilian_batched(db, TOTAL_WRITES, 100, &t_ark_batch100_ms);
+    printf(
+        "  │ %-18s │ %8.0f / %5.0f / %5.0f us  │ %8.0f / %5.0f / %5.0f us  │\n",
+        "SELECT(PK)", lat_percentile(&raw_lat_sel.lat, 50),
+        lat_percentile(&raw_lat_sel.lat, 95),
+        lat_percentile(&raw_lat_sel.lat, 99),
+        lat_percentile(&ark_lat_sel.lat, 50),
+        lat_percentile(&ark_lat_sel.lat, 95),
+        lat_percentile(&ark_lat_sel.lat, 99));
 
-    int final_rows = count_rows(raw_handle, "bench_data");
-    int log_after = db_wal_pending(db);
-    int log_added = log_after - log_before;
-
-    printf("  Result: %d rows, %d ring entries, %.0f ms, %.0f writes/sec\n",
-           final_rows, log_added, t_ark_batch100_ms,
-           (double)TOTAL_WRITES / (t_ark_batch100_ms / 1000.0));
+    printf("  "
+           "└─────────────────────┴────────────────────────────────┴───────────"
+           "─────────────────────┘\n");
   }
 
-  // Run 5: Arkilian batched 1000
+  // 4d. Memory
   {
-    printf("\n  [5/6] Arkilian     (batched: db_begin → 1000 × db_exec → db_commit)\n");
-    sqlite3_exec(raw_handle, "DELETE FROM bench_data", NULL, NULL, NULL);
-
-    int log_before = db_wal_pending(db);
-
-    g_seed = 42; g_max_id = 0;
-    rows_ark_b1k = bench_arkilian_batched(db, TOTAL_WRITES, 1000, &t_ark_batch1k_ms);
-
-    int final_rows = count_rows(raw_handle, "bench_data");
-    int log_after = db_wal_pending(db);
-    int log_added = log_after - log_before;
-
-    printf("  Result: %d rows, %d ring entries, %.0f ms, %.0f writes/sec\n",
-           final_rows, log_added, t_ark_batch1k_ms,
-           (double)TOTAL_WRITES / (t_ark_batch1k_ms / 1000.0));
+    printf("\n  ┌─ 4. Memory Footprint "
+           "───────────────────────────────────────────────────┐\n");
+    printf("  │ %-60s │\n", "");
+    printf("  │ Baseline (process empty)     : %14ld KB │\n", mem_before);
+    printf("  │ After 50,000-row seed        : %14ld KB │\n", mem_after_seed);
+    printf("  │ After all benchmarks         : %14ld KB │\n", mem_now);
+    printf("  │ Arkilian overhead            : %14ld KB │\n",
+           mem_now > mem_after_seed ? mem_now - mem_after_seed : 0L);
+    printf(
+        "  │                                                            │\n");
+    printf(
+        "  │ Ring buffer (100K entries)   : ~10,000 KB                   │\n");
+    printf(
+        "  │   (NOT allocated unless                                     │\n");
+    printf(
+        "  │    ARKILIAN_WAL_PUSH_URL is set)                            │\n");
+    printf(
+        "  └────────────────────────────────────────────────────────────┘\n");
   }
 
-  // Run 6: Raw SQLite batched
-  {
-    printf("\n  [6/6] Raw SQLite  (batched: 1 txn per %d writes)\n", BATCH_SIZE);
-    sqlite3_exec(raw_handle, "DELETE FROM bench_data", NULL, NULL, NULL);
+  // ── Notes ──────────────────────────────────────────────────────────
+  printf("\n  ── Notes "
+         "─────────────────────────────────────────────────────────────\n\n");
+  printf(
+      "  • Raw SQLite benchmarks use sqlite3_prepare_v2 + bind/step/reset\n");
+  printf("    (production best practice), not sqlite3_exec.\n");
+  printf(
+      "  • Arkilian db_exec() does prepare→step→finalize + mutex serialize\n");
+  printf("    + ring-buffer capture. The overhead column shows this cost.\n");
+  printf("  • Ring buffer is lazily allocated — zero cost unless\n");
+  printf("    ARKILIAN_WAL_PUSH_URL is configured.\n");
+  printf(
+      "  • Deterministic seed (xorshift32, seed=42) — results reproducible.\n");
+  printf(
+      "  • All benchmarks share the same connection, cache, and WAL file.\n\n");
 
-    g_seed = 42; g_max_id = 0;
-    rows_raw_batch = bench_raw_batched(raw_handle, TOTAL_WRITES, &t_raw_batch_ms);
-
-    int final_rows = count_rows(raw_handle, "bench_data");
-    printf("  Result: %d rows, %.0f ms, %.0f writes/sec\n",
-           final_rows, t_raw_batch_ms,
-           (double)TOTAL_WRITES / (t_raw_batch_ms / 1000.0));
-  }
-
-  // ── Phase 3: Comparison ─────────────────────────────────────────
-  printf("\n── Phase 3: Comparison ────────────────────────────────────\n\n");
-
-  double rps_raw_txn    = (double)TOTAL_WRITES / (t_raw_txn_ms / 1000.0);
-  double rps_ark_exec   = (double)TOTAL_WRITES / (t_ark_exec_ms / 1000.0);
-  double rps_ark_prep   = (double)TOTAL_WRITES / (t_ark_prep_ms / 1000.0);
-  double rps_ark_b100   = (double)TOTAL_WRITES / (t_ark_batch100_ms / 1000.0);
-  double rps_ark_b1k    = (double)TOTAL_WRITES / (t_ark_batch1k_ms / 1000.0);
-  double rps_raw_batch  = (double)TOTAL_WRITES / (t_raw_batch_ms / 1000.0);
-
-  double overhead_exec   = ((t_ark_exec_ms - t_raw_txn_ms) / t_raw_txn_ms) * 100.0;
-  double overhead_prep   = ((t_ark_prep_ms - t_raw_txn_ms) / t_raw_txn_ms) * 100.0;
-  double overhead_b100   = ((t_ark_batch100_ms - t_raw_batch_ms) / t_raw_batch_ms) * 100.0;
-  double overhead_b1k    = ((t_ark_batch1k_ms - t_raw_batch_ms) / t_raw_batch_ms) * 100.0;
-
-  printf("  ┌──────────────────────────┬──────────┬─────────────┬──────────┐\n");
-  printf("  │ Runner                   │ Time (ms)│ Writes/sec  │ Overhead │\n");
-  printf("  ├──────────────────────────┼──────────┼─────────────┼──────────┤\n");
-  printf("  │ Raw (txn/write)          │ %8.0f │ %10.0f │    —     │\n",
-         t_raw_txn_ms, rps_raw_txn);
-  printf("  │ Arkilian db_exec         │ %8.0f │ %10.0f │ %+7.1f%% │\n",
-         t_ark_exec_ms, rps_ark_exec, overhead_exec);
-  printf("  │ Arkilian prepare         │ %8.0f │ %10.0f │ %+7.1f%% │\n",
-         t_ark_prep_ms, rps_ark_prep, overhead_prep);
-  printf("  │ Arkilian batch 100       │ %8.0f │ %10.0f │ %+7.1f%% │\n",
-         t_ark_batch100_ms, rps_ark_b100, overhead_b100);
-  printf("  │ Arkilian batch 1000      │ %8.0f │ %10.0f │ %+7.1f%% │\n",
-         t_ark_batch1k_ms, rps_ark_b1k, overhead_b1k);
-  printf("  │ Raw (batched %4d)       │ %8.0f │ %10.0f │    —     │\n",
-         BATCH_SIZE, t_raw_batch_ms, rps_raw_batch);
-  printf("  └──────────────────────────┴──────────┴─────────────┴──────────┘\n");
-
-  // Log growth
-  {
-    int total_ring = db_wal_pending(db);
-    printf("\n  Ring buffer pending: %d entries\n", total_ring);
-  }
-
-  printf("\n  NOTE: Overhead = (Arkilian_time - Raw_time) / Raw_time\n");
-  printf("        The mutex serializes writes. Ring buffer push is\n");
-  printf("        a fast memcpy outside the transaction path.\n");
-  printf("        Batched runners show the ceiling with transaction\n");
-  printf("        batching (1 txn per N writes).\n\n");
-
-  // ── Cleanup ─────────────────────────────────────────────────────
+  // ── Cleanup ────────────────────────────────────────────────────────
   db_close(db);
-  remove(BENCH_DB);
-
+  remove("bench_1m.db");
   return 0;
 }
