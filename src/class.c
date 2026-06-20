@@ -286,7 +286,13 @@ static void parse_sql_meta(const char *sql, uint8_t *op_out, char *tbl, size_t t
     *op_out = op; *tid_out = 0; *pk_out = 0; return;
   }
 
-#define MATCH(s, literal) (strncasecmp(s, literal, strlen(literal)) == 0)
+#define MATCH(s, literal) ( \
+  strncasecmp(s, literal, strlen(literal)) == 0 && \
+  (s[strlen(literal)] == ' '  || s[strlen(literal)] == '\t' || \
+   s[strlen(literal)] == '\n' || s[strlen(literal)] == '\r' || \
+   s[strlen(literal)] == '('  || s[strlen(literal)] == ';'  || \
+   s[strlen(literal)] == '\0') \
+)
 
   if (MATCH(sql, "INSERT")) {
     op = 1; sql += 6; while (*sql == ' ') sql++;
