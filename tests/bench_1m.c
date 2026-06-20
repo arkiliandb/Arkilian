@@ -900,16 +900,14 @@ int main(int argc, char **argv) {
     printf("  │ Baseline (process empty)     : %14ld KB │\n", mem_before);
     printf("  │ After 50,000-row seed        : %14ld KB │\n", mem_after_seed);
     printf("  │ After all benchmarks         : %14ld KB │\n", mem_now);
-    printf("  │ Arkilian overhead            : %14ld KB │\n",
+    printf("  │ Post-benchmark RSS growth    : %14ld KB │\n",
            mem_now > mem_after_seed ? mem_now - mem_after_seed : 0L);
     printf(
-        "  │                                                            │\n");
+        "  │   (SQLite page cache + WAL index, not Arkilian)             │\n");
     printf(
-        "  │ Ring buffer (100K entries)   : ~10,000 KB                   │\n");
+        "  │   Ring buffer is LAZILY ALLOCATED — zero cost unless        │\n");
     printf(
-        "  │   (NOT allocated unless                                     │\n");
-    printf(
-        "  │    ARKILIAN_WAL_PUSH_URL is set)                            │\n");
+        "  │   ARKILIAN_WAL_PUSH_URL is configured                       │\n");
     printf(
         "  └────────────────────────────────────────────────────────────┘\n");
   }
