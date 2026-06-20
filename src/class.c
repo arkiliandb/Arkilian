@@ -158,8 +158,11 @@ static void wal_dbuf_push(struct wal_double_buf *b, struct wal_entry *e) {
   }
   if (b->shutdown) { pthread_mutex_unlock(&b->swap_mutex); free(e->sql); return; }
 
-  // Swap: old active becomes flushing, old flushing becomes active
+  // Swap: old active becomes flushing, old flushing becomes active.
+  // Push to the newly-active buffer BEFORE signalling — the flush thread
+  // must not read the buffer until our write is visible.
   b->active = 1 - a;
+  b->entries[b->active][b->count[b->active]++] = *e;
   b->is_flushing = 1;
   pthread_cond_signal(&b->flush_cond);
   pthread_mutex_unlock(&b->swap_mutex);
@@ -171,14 +174,11 @@ static void wal_dbuf_push(struct wal_double_buf *b, struct wal_entry *e) {
   }
   if (b->shutdown) { ReleaseMutex(b->swap_mutex); free(e->sql); return; }
   b->active = 1 - a;
+  b->entries[b->active][b->count[b->active]++] = *e;
   b->is_flushing = 1;
   SetEvent(b->flush_event);
   ReleaseMutex(b->swap_mutex);
 #endif
-
-  // Push to the newly-active buffer
-  int na = b->active;
-  b->entries[na][b->count[na]++] = *e;
 }
 
 // Called by the flush thread.  Blocks until a buffer is ready to flush
