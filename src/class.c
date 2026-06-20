@@ -1210,18 +1210,17 @@ int db_finalize(arkilian *db) {
   if (!db) return SQLITE_ERROR;
   sqlite3_stmt *stmt = get_current_stmt(db);
   if (stmt) {
-    int is_write = db->in_write_txn;
     int is_this_write = (db->stmt_current == db->write_stmt_index);
 
     char *expanded = NULL;
-    if (is_write) {
+    if (is_this_write) {
       expanded = sqlite3_expanded_sql(stmt);
     }
 
     sqlite3_finalize(stmt);
     db->stmts[db->stmt_current] = NULL;
 
-    if (is_write) {
+    if (is_this_write) {
       int ok = (db->last_step_rc == SQLITE_DONE ||
                 db->last_step_rc == SQLITE_ROW ||
                 db->last_step_rc == SQLITE_OK);
@@ -1240,17 +1239,15 @@ int db_finalize(arkilian *db) {
       } else {
         if (expanded) sqlite3_free(expanded);
       }
-      if (is_this_write) {
-        db->in_write_txn = 0;
-        db->write_stmt_index = -1;
-        db->current_write_sql[0] = '\0';
-        if (!db->in_batch_txn) {
+      db->in_write_txn = 0;
+      db->write_stmt_index = -1;
+      db->current_write_sql[0] = '\0';
+      if (!db->in_batch_txn) {
 #ifndef _WIN32
-          pthread_mutex_unlock(&db->write_mutex);
+        pthread_mutex_unlock(&db->write_mutex);
 #else
-          ReleaseMutex(db->write_mutex);
+        ReleaseMutex(db->write_mutex);
 #endif
-        }
       }
     }
   }
