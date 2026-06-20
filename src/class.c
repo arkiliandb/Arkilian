@@ -443,6 +443,8 @@ static void check_update_hook_before_push(arkilian *db, struct wal_entry *e) {
   if (db->update_hook_fired) {
     e->op = db->update_hook_op;
     e->table_id = table_name_hash(db->update_hook_table);
+    // sqlite3_update_hook fires per row, but we ship one entry per statement.
+    // pk is the last row touched; rk carries the real row count. by design.
     e->pk = db->update_hook_rowid;
     db->update_hook_fired = 0;
   }
