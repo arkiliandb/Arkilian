@@ -4,6 +4,9 @@
 #ifndef _POSIX_C_SOURCE
 #define _POSIX_C_SOURCE 200809L
 #endif
+#ifndef _DEFAULT_SOURCE
+#define _DEFAULT_SOURCE
+#endif
 
 #include "class.h"
 #include <curl/curl.h>
@@ -313,7 +316,8 @@ static void parse_sql_meta(const char *sql, uint8_t *op_out, char *tbl, size_t t
   } else if (MATCH(sql, "UPDATE")) {
     op = 2; sql += 6; while (*sql == ' ') sql++;
     if (MATCH(sql, "OR")) { sql += 2; while (*sql == ' ') sql++;
-      while (*sql && *sql!=' ') sql++; while (*sql==' ') sql++; }
+      while (*sql && *sql!=' ') sql++;
+      while (*sql==' ') sql++; }
   } else if (MATCH(sql, "DELETE")) {
     op = 3; sql += 6; while (*sql == ' ') sql++;
     if (MATCH(sql, "FROM")) { sql += 4; while (*sql == ' ') sql++; }
@@ -329,8 +333,10 @@ static void parse_sql_meta(const char *sql, uint8_t *op_out, char *tbl, size_t t
       if (MATCH(sql,"TABLE")||MATCH(sql,"INDEX")||MATCH(sql,"VIEW")||MATCH(sql,"TRIGGER"))
         { while (*sql&&*sql!=' ') sql++; while (*sql==' ') sql++; }
       if (MATCH(sql,"IF")) {
-        while (*sql&&*sql!=' ') sql++; while (*sql==' ') sql++;
-        while (*sql&&*sql!=' ') sql++; while (*sql==' ') sql++;
+        while (*sql&&*sql!=' ') sql++;
+        while (*sql==' ') sql++;
+        while (*sql&&*sql!=' ') sql++;
+        while (*sql==' ') sql++;
       }
     } else if (MATCH(sql,"ALTER")) { sql+=5; while (*sql==' ') sql++;
       if (MATCH(sql,"TABLE")) { sql+=5; while (*sql==' ') sql++; }
