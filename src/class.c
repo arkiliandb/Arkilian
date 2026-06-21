@@ -27,6 +27,7 @@
 
 #ifdef _WIN32
 #define strncasecmp _strnicmp
+#define strdup _strdup
 #endif
 
 // ── Double-buffer for out-of-band WAL shipping ────────────────────
