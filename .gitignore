@@ -63,3 +63,5 @@ hydration-task.md
 test_hydration
 invictus.md
 expressions/
+*.sqlite-shm
+*.sqlite-shm

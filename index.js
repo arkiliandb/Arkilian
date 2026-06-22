@@ -179,8 +179,7 @@ class Arkilian {
       }
     }
     this.step();
-    const ok = await this.finalize();
-    console.log({ ok }, "--->");
+    await this.finalize();
     return this;
   }
 
