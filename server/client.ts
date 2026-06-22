@@ -419,8 +419,8 @@ async function runFullBackupPipeline(dbs: DBCtx[]): Promise<BackupResult> {
 
     for (let i = 0; i < WAL_PER_DB; i++) {
       const id = initialRows + i;
-      const sql = `INSERT OR IGNORE INTO events (id, payload, ts) VALUES (${id}, 'wal_${i}_${Math.random().toString(36).slice(2, 6)}', ${Date.now() + i})`;
-      walEntries.push({ ts: Date.now() + i, op: 1, table_id: 1, pk: id, sql });
+    const sql = `INSERT OR IGNORE INTO events (id, payload, ts) VALUES (${id}, 'wal_${i}_${Math.random().toString(36).slice(2, 6)}', ${Date.now() + i})`;
+    walEntries.push({ ts: Date.now() + i, op: 1, table_id: 1, pk: id, sql: sql + ";" });
       insert.run(id, `wal_${i}_${Math.random().toString(36).slice(2, 6)}`, Date.now() + i);
       entriesInBatch++;
       lsn++;
