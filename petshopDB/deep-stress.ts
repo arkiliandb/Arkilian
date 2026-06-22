@@ -480,7 +480,6 @@ export async function runDeepStress(): Promise<{
     const lsn = INTERVALS > 0 ? (r.interval * WRITES_PER_INTERVAL) : 0;
     console.log(`  ${String(r.interval).padEnd(4)} ${String(r.writesDone).padEnd(8)} ${String(r.walPushed).padEnd(10)} ${String(lsn).padEnd(10)} ${fmtBytes(r.snapshotSize).padEnd(12)} ${fmtBytes(r.chunkSize).padEnd(10)} ${r.snapshotVerifyOk ? "✅" : "❌".padEnd(8)}`);
   }
-  }
   console.log("  " + "─".repeat(96));
 
   renderReport(allMetrics, extras);
