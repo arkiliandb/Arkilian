@@ -335,11 +335,13 @@ func signedURL(verb, key string, expiresIn time.Duration) (string, int64) {
 		dateStamp + "/" + s3Region + "/s3/aws4_request\n" +
 		sha256Hex(canonicalRequest)
 
-	signingKey := hmacSHA256([]byte("aws4_request"),
-		hmacSHA256([]byte("s3"),
-			hmacSHA256([]byte(s3Region),
-				hmacSHA256([]byte(dateStamp),
-					[]byte("AWS4"+s3SecretKey)))))
+	signingKey := hmacSHA256(
+		hmacSHA256(
+			hmacSHA256(
+				hmacSHA256([]byte("AWS4"+s3SecretKey), []byte(dateStamp)),
+				[]byte(s3Region)),
+			[]byte("s3")),
+		[]byte("aws4_request"))
 
 	signature := hex.EncodeToString(hmacSHA256(signingKey, []byte(stringToSign)))
 
