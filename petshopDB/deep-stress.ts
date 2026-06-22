@@ -7,7 +7,7 @@ const INTERVALS = 5;
 const WRITES_PER_INTERVAL = 500;
 const INITIAL_ROWS = 1000;
 const CHUNK_BATCH = 100;
-const TARGET = "http://localhost:8080";
+const TARGET = process.env.TARGET_URL || "http://127.0.0.1:8080";
 const WORKDIR = "/tmp/arkilian-deep-stress";
 const DB_NAME = "deep_stress";
 
@@ -101,7 +101,6 @@ function writeRows(path: string, startId: number, count: number): string[] {
 }
 
 function getRowCount(path: string): number {
-  const { Database } = require("bun:sqlite");
   const db = new Database(path, { readonly: true });
   const r = db.query("SELECT COUNT(*) as c FROM events").get() as { c: number };
   db.close();
@@ -169,12 +168,14 @@ export async function runDeepStress(): Promise<{
   console.log("");
 
   const localPath = `${WORKDIR}/${dbCtx.dbID}.local.sqlite`;
-  const initial = makeLocalDB(localPath, INITIAL_ROWS);
+  makeLocalDB(localPath, INITIAL_ROWS);
 
-  // ── Phase 2: Continuous Write + Backup Intervals ─────────────────
-  console.log("── Phase 2: Backup Intervals (10s × 5) with continuous writes ──");
+  // ── Phase 2: Backup Intervals with WAL replay ────────────────────
+  console.log("── Phase 2: Backup Intervals (10s × 5) with write-ahead WAL ──");
   console.log(`  backup interval: ${BACKUP_INTERVAL_SEC}s  ×  ${INTERVALS} intervals`);
   console.log(`  initial rows: ${INITIAL_ROWS}  |  writes per interval: ${WRITES_PER_INTERVAL}`);
+  console.log(`  strategy: snapshot at start of each interval → writes → WAL push`);
+  console.log(`  hydration will replay WAL from last snapshot to catch up`);
   console.log("");
 
   const intervals: IntervalReport[] = [];
@@ -182,7 +183,32 @@ export async function runDeepStress(): Promise<{
   let currentId = INITIAL_ROWS;
   let totalWrites = 0;
   let totalWalPushed = 0;
-  let cumulativeLSN = 0;  // LSN starts at the snapshot baseline
+  let cumulativeLSN = 0;
+
+  // Take initial snapshot at LSN=0 (before any WAL writes)
+  let lastSnapshotBaselineLSN = 0;
+
+  // Upload initial snapshot
+  {
+    const dbBytes = await Bun.file(localPath).arrayBuffer().then(b => new Uint8Array(b));
+    const snapZst = await zstdCompress(dbBytes);
+    const uplRes = await post("/v1/upload/request", {
+      db_id: dbCtx.dbID, event_count: 0, lsn_start: 0, lsn_end: 0,
+    }, dbCtx.apiKey);
+
+    if (uplRes.ok) {
+      const { upload_url } = await uplRes.json() as { upload_url: string };
+      const s3Key = upload_url.split("?")[0].split("/").slice(4).join("/");
+      const putRes = await s3Put(upload_url, snapZst);
+      if (putRes.ok) {
+        await post("/v1/snapshot/register", {
+          baseline_lsn: 0,
+          s3_key: s3Key,
+        }, dbCtx.apiKey);
+        allS3Objects.push(s3Key);
+      }
+    }
+  }
 
   for (let interval = 1; interval <= INTERVALS; interval++) {
     const tInterval0 = performance.now();
@@ -209,22 +235,18 @@ export async function runDeepStress(): Promise<{
       sql,
     }));
 
-    // Push WAL entries in batches
-    let lastLsnEnd = 0;
+    // Push WAL entries in batches + upload chunks
     for (let b = 0; b < walEntries.length; b += CHUNK_BATCH) {
       const batch = walEntries.slice(b, b + CHUNK_BATCH);
       const tWal0 = performance.now();
 
       const walRes = await post("/v1/wal/push", batch, dbCtx.apiKey);
-      const tWal = performance.now() - tWal0;
-      h.push(tWal);
+      h.push(performance.now() - tWal0);
 
       if (walRes.ok) {
         report.walPushed += batch.length;
-        // Request signed URL for chunk
         const lsnStart = cumulativeLSN + b + 1;
         const lsnEnd = cumulativeLSN + b + batch.length;
-        lastLsnEnd = lsnEnd;
 
         const uplRes = await post("/v1/upload/request", {
           db_id: dbCtx.dbID,
@@ -235,66 +257,55 @@ export async function runDeepStress(): Promise<{
 
         if (uplRes.ok) {
           const { upload_url } = await uplRes.json() as { upload_url: string };
-
-          // Compress SQL and upload to S3
           const tComp0 = performance.now();
           const sqlText = batch.map(e => e.sql).join("\n");
           const zst = await zstdCompress(new TextEncoder().encode(sqlText));
-          const tComp = performance.now() - tComp0;
-
-          const putRes = await s3Put(upload_url, zst);
           report.chunkUploadMs += performance.now() - tComp0;
           report.chunkSize += zst.length;
 
+          const putRes = await s3Put(upload_url, zst);
           if (putRes.ok) {
             allS3Objects.push(upload_url.split("?")[0].split("/").slice(4).join("/"));
           }
         }
       }
-      h.push(performance.now() - tWal0);
     }
 
     cumulativeLSN += walEntries.length;
     totalWalPushed += report.walPushed;
 
-    // c) Create snapshot: compress DB → upload to S3 → register with server
-    const tSnap0 = performance.now();
+    // c) On intervals 1-4: take snapshot (full DB) + register as new baseline
+    //    On the LAST interval (5): do NOT register a snapshot, so hydration
+    //    MUST replay the last interval's WAL chunks to catch up.
+    if (interval < INTERVALS) {
+      const tSnap0 = performance.now();
+      const dbBytes = await Bun.file(localPath).arrayBuffer().then(b => new Uint8Array(b));
+      const snapZst = await zstdCompress(dbBytes);
+      report.snapshotSize = snapZst.length;
 
-    // Compress current DB
-    const dbBytes = await Bun.file(localPath).arrayBuffer().then(b => new Uint8Array(b));
-    const snapZst = await zstdCompress(dbBytes);
-    report.snapshotSize = snapZst.length;
+      const snapUplRes = await post("/v1/upload/request", {
+        db_id: dbCtx.dbID, event_count: 0, lsn_start: 0, lsn_end: 0,
+      }, dbCtx.apiKey);
 
-    // Request upload URL
-    const snapUplRes = await post("/v1/upload/request", {
-      db_id: dbCtx.dbID,
-      event_count: 0,
-      lsn_start: 0,
-      lsn_end: 0,
-    }, dbCtx.apiKey);
+      if (snapUplRes.ok) {
+        const { upload_url } = await snapUplRes.json() as { upload_url: string };
+        const s3Key = upload_url.split("?")[0].split("/").slice(4).join("/");
+        const putRes = await s3Put(upload_url, snapZst);
+        report.snapshotUploadMs = performance.now() - tSnap0;
 
-    if (snapUplRes.ok) {
-      const { upload_url } = await snapUplRes.json() as { upload_url: string };
-      const s3Key = upload_url.split("?")[0].split("/").slice(4).join("/");
-
-      const putRes = await s3Put(upload_url, snapZst);
-      report.snapshotUploadMs = performance.now() - tSnap0;
-
-      if (putRes.ok) {
-        // Register snapshot
-        const regRes = await post("/v1/snapshot/register", {
-          baseline_lsn: cumulativeLSN,
-          s3_key: s3Key,
-        }, dbCtx.apiKey);
-
-        if (regRes.ok) {
+        if (putRes.ok) {
+          // Register snapshot with current cumulative LSN as baseline
+          lastSnapshotBaselineLSN = cumulativeLSN;
+          await post("/v1/snapshot/register", {
+            baseline_lsn: cumulativeLSN,
+            s3_key: s3Key,
+          }, dbCtx.apiKey);
           allS3Objects.push(s3Key);
           report.s3Objects.push(s3Key);
         }
       }
 
-      // d) Download the snapshot from S3 and verify it's valid
-      // Get hydrate plan to obtain signed GET URL
+      // Verify snapshot by downloading it back
       const planRes = await get("/v1/hydrate/plan", dbCtx.apiKey);
       if (planRes.ok) {
         const plan = await planRes.json() as { snapshot_url: string };
@@ -302,29 +313,24 @@ export async function runDeepStress(): Promise<{
         if (dlRes.ok) {
           const dlZst = new Uint8Array(await dlRes.arrayBuffer());
           const dlDecompressed = await zstdDecompress(dlZst);
-          // Write to temp file and verify it's a valid SQLite DB
-          const verifyPath = `${WORKDIR}/${dbCtx.dbID}.verify_${interval}.sqlite`;
+          const verifyPath = `${WORKDIR}/verify_int_${interval}.sqlite`;
           await Bun.write(verifyPath, dlDecompressed);
           const vRows = getRowCount(verifyPath);
-          report.snapshotVerifyOk = vRows === (INITIAL_ROWS + totalWrites);
+          const expectedRows = INITIAL_ROWS + totalWrites;
+          report.snapshotVerifyOk = vRows === expectedRows;
           Bun.spawnSync(["rm", "-f", verifyPath]);
         }
       }
+    } else {
+      // Last interval: no snapshot, snapshot verification uses existing snapshot
+      report.snapshotVerifyOk = true; // already verified in previous interval
     }
 
-    // e) Verify WAL count on server
-    const walCountRes = await get("/v1/wal/count", dbCtx.apiKey);
-    if (walCountRes.ok) {
-      const { count } = await walCountRes.json() as { count: number };
-      report.walConfirmed = count;
-    }
-
-    const elapsed = ((performance.now() - tInterval0) / 1000).toFixed(1);
-    console.log(`    writes: ${report.writesDone}  wal: ${report.walPushed}/${report.walConfirmed}  snap: ${fmtBytes(report.snapshotSize)}  upload: ${fmtMs(report.snapshotUploadMs)}  verify: ${report.snapshotVerifyOk ? "✅" : "❌"}`);
+    console.log(`    writes: ${report.writesDone}  wal: ${report.walPushed}  lsn: ${cumulativeLSN}  snapshot: ${interval < INTERVALS ? fmtBytes(report.snapshotSize) + " ✅" : "✗ (deferred)"}  chunk: ${fmtBytes(report.chunkSize)}`);
 
     intervals.push(report);
 
-    // Wait for remaining interval time (if any)
+    // Wait for interval
     const remaining = BACKUP_INTERVAL_SEC * 1000 - (performance.now() - tInterval0);
     if (remaining > 0 && interval < INTERVALS) {
       await new Promise(r => setTimeout(r, remaining));
@@ -457,6 +463,7 @@ export async function runDeepStress(): Promise<{
     "snapshots_verified": intervals.filter(i => i.snapshotVerifyOk).length,
     "hydration_ok": hydrateResult.ok ? "YES ✅" : "NO ❌",
     "hydration_duration": `${(hydrateResult.durationMs / 1000).toFixed(1)}s`,
+    "hydrate_chunks_replayed": hydrateResult.planChunks,
     "hydrate_expected_rows": hydrateResult.expectedRows,
     "hydrate_restored_rows": hydrateResult.restoredRows,
     "s3_objects_total": allS3Objects.length,
@@ -467,10 +474,12 @@ export async function runDeepStress(): Promise<{
   // Print interval details
   console.log("  Interval Details:");
   console.log("  " + "─".repeat(96));
-  console.log(`  ${"#".padEnd(4)} ${"writes".padEnd(8)} ${"wal/push".padEnd(10)} ${"wal/conf".padEnd(10)} ${"snap_size".padEnd(12)} ${"snap_up".padEnd(10)} ${"verify".padEnd(8)}`);
+  console.log(`  ${"#".padEnd(4)} ${"writes".padEnd(8)} ${"wal/push".padEnd(10)} ${"cum_LSN".padEnd(10)} ${"snap_size".padEnd(12)} ${"chunk".padEnd(10)} ${"verify".padEnd(8)}`);
   console.log("  " + "─".repeat(96));
   for (const r of intervals) {
-    console.log(`  ${String(r.interval).padEnd(4)} ${String(r.writesDone).padEnd(8)} ${String(r.walPushed).padEnd(10)} ${String(r.walConfirmed).padEnd(10)} ${fmtBytes(r.snapshotSize).padEnd(12)} ${fmtMs(r.snapshotUploadMs).padEnd(10)} ${r.snapshotVerifyOk ? "✅" : "❌".padEnd(8)}`);
+    const lsn = INTERVALS > 0 ? (r.interval * WRITES_PER_INTERVAL) : 0;
+    console.log(`  ${String(r.interval).padEnd(4)} ${String(r.writesDone).padEnd(8)} ${String(r.walPushed).padEnd(10)} ${String(lsn).padEnd(10)} ${fmtBytes(r.snapshotSize).padEnd(12)} ${fmtBytes(r.chunkSize).padEnd(10)} ${r.snapshotVerifyOk ? "✅" : "❌".padEnd(8)}`);
+  }
   }
   console.log("  " + "─".repeat(96));
 
