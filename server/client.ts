@@ -225,7 +225,6 @@ function asyncPool(max: number) {
 
 function makeLocalDB(path: string, rowCount: number): { rows: number; bytes: number } {
   const db = new Database(path);
-  db.exec("PRAGMA journal_mode=WAL");
   db.exec("CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY, payload TEXT, ts INTEGER)");
   db.exec("CREATE TABLE IF NOT EXISTS _arkilian_meta (key TEXT PRIMARY KEY, value INTEGER)");
   const insert = db.prepare("INSERT INTO events (id, payload, ts) VALUES (?, ?, ?)");
