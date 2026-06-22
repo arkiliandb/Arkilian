@@ -960,13 +960,12 @@ void *run_hourly_backup(void *arg) {
     }
     int status = backup_database(db->handle, db->backup_path);
     if (status == SQLITE_OK) {
-      printf("Backup file made\n");
       char *signed_url = get_signed_url(
           db->signed_url_endpoint, db->database_token, &db->shutdown_requested);
       if (signed_url && strlen(signed_url) > 5) {
         int upload_status =
             upload_to_s3(signed_url, db->backup_path, db->database_token);
-        if (upload_status == 0) printf("S3 Upload Successful!\n");
+        if (upload_status == 0) ; // S3 upload ok
         else fprintf(stderr, "S3 Upload Failed with status: %d\n", upload_status);
       }
       free(signed_url);
@@ -1035,7 +1034,6 @@ int upload_to_s3(const char *signed_url, const char *file_path,
 
   fseek(fd, 0L, SEEK_END);
   long file_size = ftell(fd);
-  printf("Backup size: %fmb\n", ((float)file_size / 1024.0f) / 1024.0f);
   rewind(fd);
 
   curl_easy_setopt(curl, CURLOPT_URL, signed_url);
