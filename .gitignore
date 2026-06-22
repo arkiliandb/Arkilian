@@ -65,3 +65,4 @@ invictus.md
 expressions/
 *.sqlite-shm
 *.sqlite-shm
+server/arkilian-server
