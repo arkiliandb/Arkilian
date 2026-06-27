@@ -166,64 +166,53 @@ typedef struct {
   lat_hist lat;
 } bench_result;
 
-static bench_result bench_insert_raw(sqlite3 *db, int n, int use_prepare) {
+static bench_result bench_insert_raw_prepared(sqlite3 *db, int n) {
   bench_result r = {0};
   lat_hist lat = {0};
 
   sqlite3_stmt *ins = NULL;
-  if (use_prepare) {
-    sqlite3_prepare_v2(
-        db,
-        "INSERT INTO bench_data "
-        "(id,customer,product,qty,price,total,status,note,created,updated) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?)",
-        -1, &ins, NULL);
-  }
+  sqlite3_prepare_v2(
+      db,
+      "INSERT INTO bench_data "
+      "(id,customer,product,qty,price,total,status,note,created,updated) "
+      "VALUES (?,?,?,?,?,?,?,?,?,?)",
+      -1, &ins, NULL);
 
   double t0 = now_ns();
   for (int i = 0; i < n; i++) {
     row_data d = gen_row();
     double op_t0 = now_ns();
 
-    if (use_prepare) {
-      sqlite3_bind_int64(ins, 1, d.id);
-      sqlite3_bind_text(ins, 2, d.customer, -1, SQLITE_STATIC);
-      sqlite3_bind_text(ins, 3, d.product, -1, SQLITE_STATIC);
-      sqlite3_bind_int(ins, 4, d.qty);
-      sqlite3_bind_double(ins, 5, d.price);
-      sqlite3_bind_double(ins, 6, d.total);
-      sqlite3_bind_text(ins, 7, d.status, -1, SQLITE_STATIC);
-      sqlite3_bind_null(ins, 8);
-      sqlite3_bind_int64(ins, 9, d.now);
-      sqlite3_bind_int64(ins, 10, d.now);
-      sqlite3_step(ins);
-      sqlite3_reset(ins);
-    } else {
-      char sql[512];
-      snprintf(
-          sql, sizeof(sql),
-          "INSERT INTO bench_data "
-          "(id,customer,product,qty,price,total,status,note,created,updated) "
-          "VALUES (%d,'%s','%s',%d,%.2f,%.2f,'%s',NULL,%lld,%lld)",
-          d.id, d.customer, d.product, d.qty, d.price, d.total, d.status, d.now,
-          d.now);
-      sqlite3_exec(db, sql, NULL, NULL, NULL);
-    }
+    sqlite3_bind_int64(ins, 1, d.id);
+    sqlite3_bind_text(ins, 2, d.customer, -1, SQLITE_STATIC);
+    sqlite3_bind_text(ins, 3, d.product, -1, SQLITE_STATIC);
+    sqlite3_bind_int(ins, 4, d.qty);
+    sqlite3_bind_double(ins, 5, d.price);
+    sqlite3_bind_double(ins, 6, d.total);
+    sqlite3_bind_text(ins, 7, d.status, -1, SQLITE_STATIC);
+    sqlite3_bind_null(ins, 8);
+    sqlite3_bind_int64(ins, 9, d.now);
+    sqlite3_bind_int64(ins, 10, d.now);
+    sqlite3_step(ins);
+    sqlite3_reset(ins);
 
     lat_record(&lat, now_ns() - op_t0);
-
     if (i > 0 && i % (n / 10) == 0)
-      progress(use_prepare ? "raw-prep INSERT" : "raw-exec INSERT", i, n);
+      progress("raw-prep INSERT", i, n);
   }
+  sqlite3_finalize(ins);
   r.ms = ns_to_ms(now_ns() - t0);
   r.ops_per_sec = (double)n / (r.ms / 1000.0);
   r.lat = lat;
-
-  if (ins)
-    sqlite3_finalize(ins);
-  progress(use_prepare ? "raw-prep INSERT" : "raw-exec INSERT", n, n);
+  progress("raw-prep INSERT", n, n);
   return r;
 }
+
+static bench_result bench_insert_raw(sqlite3 *db, int n, int use_prepare) {
+  if (use_prepare)
+    return bench_insert_raw_prepared(db, n);
+
+  bench_result r = {0};
 
 static bench_result bench_insert_arkilian(arkilian *db, int n) {
   bench_result r = {0};
