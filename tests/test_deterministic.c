@@ -40,8 +40,7 @@ static int tests_passed = 0;
 
 static arkilian *open_test_db(void) {
   setenv("ARKILIAN_ENABLE_BACKUP", "0", 1);
-  unsetenv(
-      "ARKILIAN_WAL_PUSH_URL"); // no flush thread — entries stay in ring buffer
+  setenv("ARKILIAN_WAL_PUSH_URL", "http://127.0.0.1:9", 1);
   arkilian *db = NULL;
   int rc = db_init(&db, TEST_DB);
   ASSERT(rc == 0);

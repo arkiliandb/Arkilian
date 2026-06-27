@@ -49,6 +49,7 @@ struct wal_entry {
 struct wal_double_buf {
   struct wal_entry *entries[2];  // [0] = active, [1] = flushing (or vice versa)
   int count[2];                  // entries in each buffer
+  int capacity[2];               // allocated capacity per buffer (grows on overflow)
   int active;                    // index of the currently-active buffer
   int shutdown;
   int allocated;
@@ -74,7 +75,9 @@ static void wal_dbuf_init(struct wal_double_buf *b) {
   b->entries[1] = NULL;
 
   const char *push_url = getenv("ARKILIAN_WAL_PUSH_URL");
-  int cap = (push_url && strlen(push_url) > 0) ? WAL_BUF_CAPACITY : 1000;
+  if (!push_url || strlen(push_url) == 0) return;
+
+  int cap = WAL_BUF_CAPACITY;
   b->entries[0] = malloc((size_t)cap * sizeof(struct wal_entry));
   b->entries[1] = malloc((size_t)cap * sizeof(struct wal_entry));
   if (!b->entries[0] || !b->entries[1]) {
@@ -84,6 +87,8 @@ static void wal_dbuf_init(struct wal_double_buf *b) {
     b->entries[1] = NULL;
   } else {
     b->allocated = 1;
+    b->capacity[0] = cap;
+    b->capacity[1] = cap;
   }
 
 #ifndef _WIN32
@@ -137,10 +142,7 @@ static void wal_dbuf_push(struct wal_double_buf *b, struct wal_entry *e) {
 
   int a = b->active;
 
-  // Always push to the active buffer.  The flush thread only runs
-  // when ARKILIAN_WAL_PUSH_URL is set, so in offline/testing mode
-  // entries accumulate without network activity.
-  if (b->count[a] < WAL_BUF_CAPACITY) {
+  if (b->count[a] < b->capacity[a]) {
     b->entries[a][b->count[a]++] = *e;
 #ifndef _WIN32
     pthread_mutex_unlock(&b->swap_mutex);
@@ -150,7 +152,34 @@ static void wal_dbuf_push(struct wal_double_buf *b, struct wal_entry *e) {
     return;
   }
 
-  // Active buffer full — try to swap
+  // Active buffer full — grow in-place when no flush thread is running.
+  // The swap/spin path below only works when a flush thread can drain
+  // the flushing buffer; without one we'd deadlock.
+  {
+    const char *push_url = getenv("ARKILIAN_WAL_PUSH_URL");
+    if (!push_url || strlen(push_url) == 0) {
+      int new_cap = b->capacity[a] * 2;
+      if (new_cap < 1) new_cap = 1024;
+      struct wal_entry *p = realloc(b->entries[a],
+                                     (size_t)new_cap * sizeof(struct wal_entry));
+      if (p) {
+        b->entries[a] = p;
+        b->capacity[a] = new_cap;
+        b->entries[a][b->count[a]++] = *e;
+      } else {
+        free(e->sql);
+      }
+#ifndef _WIN32
+      pthread_mutex_unlock(&b->swap_mutex);
+#else
+      ReleaseMutex(b->swap_mutex);
+#endif
+      return;
+    }
+  }
+
+  // Flush thread is running — wait for it to drain the flushing buffer
+  // then swap so the full active buffer becomes the next batch.
 #ifndef _WIN32
   while (b->is_flushing && !b->shutdown) {
     pthread_mutex_unlock(&b->swap_mutex);
@@ -1004,38 +1033,37 @@ void db_close(arkilian *db) {
 
   db->shutdown_requested = 1;
 
-  // Flush any pending WAL entries before joining the flush thread, but
-  // only if a flush thread exists to drain them.  Without a flush thread
-  // the entries will never drain and we'd spin for nothing.
-#ifndef _WIN32
-  if (db->flush_thread_running) {
-#else
-  if (db->flush_thread_handle != NULL) {
-#endif
-    int active = db->wal.active;
-    if (db->wal.count[active] > 0) {
-      db_wal_flush(db);
-    }
-    int waited = 0;
-    while ((db->wal.count[0] > 0 || db->wal.count[1] > 0) && waited < 100) {
-#ifndef _WIN32
-      usleep(100000);
-#else
-      Sleep(100);
-#endif
-      if (db->wal.count[db->wal.active] > 0)
-        db_wal_flush(db);
-      waited++;
-    }
-  }
-
-  // Signal double-buffer shutdown to wake flush thread
+  // Signal the flush thread to drain and exit, then clear any
+  // remaining entries that couldn't be delivered.
   db->wal.shutdown = 1;
 #ifndef _WIN32
   pthread_cond_signal(&db->wal.flush_cond);
 #else
   SetEvent(db->wal.flush_event);
 #endif
+
+  // Give the flush thread a brief window to finish its current POST,
+  // then clear whatever remains.  We must not spin forever against a
+  // non-routable or unreachable server.
+  {
+    int waited = 0;
+    while ((db->wal.count[0] > 0 || db->wal.count[1] > 0) && waited < 20) {
+#ifndef _WIN32
+      usleep(50000);
+#else
+      Sleep(50);
+#endif
+      waited++;
+    }
+  }
+
+  // Clear any undelivered entries so they don't leak
+  if (db->wal.allocated) {
+    wal_entries_free_sql(db->wal.entries[0], db->wal.count[0]);
+    db->wal.count[0] = 0;
+    wal_entries_free_sql(db->wal.entries[1], db->wal.count[1]);
+    db->wal.count[1] = 0;
+  }
 
   // Wait for flush thread (if running)
 #ifndef _WIN32
