@@ -1342,6 +1342,8 @@ int upload_to_s3(const char *signed_url, const char *file_path,
 // buffer for out-of-band streaming.  Read-only statements bypass
 // the write mutex entirely.
 
+static void push_write_wal_entry(arkilian *db, sqlite3_stmt *stmt);
+
 int db_exec(arkilian *db, const char *sql) {
   if (!db || !db->handle || !sql)
     return SQLITE_ERROR;
@@ -1395,36 +1397,11 @@ int db_exec(arkilian *db, const char *sql) {
 
   rc = sqlite3_step(stmt);
 
-  // Deterministic SQL: try preupdate capture first, then expanded SQL, then raw
-  char *deterministic = build_deterministic_sql(db);
-  char *expanded = NULL;
-  if (!deterministic)
-    expanded = sqlite3_expanded_sql(stmt);
-
-  sqlite3_finalize(stmt);
-
   if (rc == SQLITE_DONE || rc == SQLITE_OK || rc == SQLITE_ROW) {
-    db->has_new_writes = 1;
-
-    // Push to ring buffer for async streaming
-    struct wal_entry entry;
-    if (deterministic) {
-      build_wal_entry(&entry, deterministic);
-      free(deterministic);
-    } else if (expanded) {
-      build_wal_entry(&entry, expanded);
-      sqlite3_free(expanded);
-    } else {
-      build_wal_entry(&entry, sql);
-    }
-    check_update_hook_before_push(db, &entry);
-    entry.rk = (uint32_t)sqlite3_changes(db->handle);
-    wal_dbuf_push(&db->wal, &entry);
+    push_write_wal_entry(db, stmt);
     db->in_write_txn = 0;
     db->write_stmt_index = -1;
   } else {
-    if (deterministic) free(deterministic);
-    if (expanded) sqlite3_free(expanded);
     pu_clear(db);
     snprintf(db->last_error_msg, sizeof(db->last_error_msg), "%s",
              sqlite3_errmsg(db->handle));
@@ -1439,13 +1416,13 @@ int db_exec(arkilian *db, const char *sql) {
 #else
       ReleaseMutex(db->write_mutex);
 #endif
+      sqlite3_finalize(stmt);
       return rc;
     }
   }
 
+  sqlite3_finalize(stmt);
   pu_clear(db);
-  db->in_write_txn = 0;
-  db->write_stmt_index = -1;
   if (!mutex_held) {
 #ifndef _WIN32
     pthread_mutex_unlock(&db->write_mutex);
@@ -1456,6 +1433,30 @@ int db_exec(arkilian *db, const char *sql) {
 
   return (rc == SQLITE_DONE || rc == SQLITE_OK || rc == SQLITE_ROW)
     ? SQLITE_DONE : rc;
+}
+
+// ── Push a single write's WAL entry from preupdate capture ──────────
+
+static void push_write_wal_entry(arkilian *db, sqlite3_stmt *stmt) {
+  char *deterministic = build_deterministic_sql(db);
+  char *expanded = NULL;
+  if (!deterministic && stmt)
+    expanded = sqlite3_expanded_sql(stmt);
+
+  db->has_new_writes = 1;
+  struct wal_entry entry;
+  if (deterministic) {
+    build_wal_entry(&entry, deterministic);
+    free(deterministic);
+  } else if (expanded) {
+    build_wal_entry(&entry, expanded);
+    sqlite3_free(expanded);
+  } else {
+    build_wal_entry(&entry, db->current_write_sql);
+  }
+  check_update_hook_before_push(db, &entry);
+  entry.rk = (uint32_t)sqlite3_changes(db->handle);
+  wal_dbuf_push(&db->wal, &entry);
 }
 
 // ── Prepared statement path ─────────────────────────────────────────
@@ -1531,6 +1532,16 @@ int db_step(arkilian *db) {
   if (!stmt) return SQLITE_ERROR;
   int rc = sqlite3_step(stmt);
   db->last_step_rc = rc;
+
+  // Push one WAL entry per successful write execution — enables
+  // statement reuse via db_reset() without losing row data.
+  if (db->stmt_current == db->write_stmt_index && db->pu.fired) {
+    int ok = (rc == SQLITE_DONE || rc == SQLITE_ROW || rc == SQLITE_OK);
+    if (ok) {
+      push_write_wal_entry(db, stmt);
+    }
+    pu_clear(db);
+  }
   return rc;
 }
 
@@ -1540,40 +1551,21 @@ int db_finalize(arkilian *db) {
   if (stmt) {
     int is_this_write = (db->stmt_current == db->write_stmt_index);
 
-    char *deterministic = NULL;
-    char *expanded = NULL;
-    if (is_this_write) {
-      deterministic = build_deterministic_sql(db);
-      if (!deterministic)
-        expanded = sqlite3_expanded_sql(stmt);
+    // Safety: drain any preupdate data from a final step that wasn't
+    // followed by a reset/push (shouldn't happen in normal use).
+    if (is_this_write && db->pu.fired) {
+      int ok = (db->last_step_rc == SQLITE_DONE ||
+                db->last_step_rc == SQLITE_ROW ||
+                db->last_step_rc == SQLITE_OK);
+      if (ok) {
+        push_write_wal_entry(db, stmt);
+      }
     }
 
     sqlite3_finalize(stmt);
     db->stmts[db->stmt_current] = NULL;
 
     if (is_this_write) {
-      int ok = (db->last_step_rc == SQLITE_DONE ||
-                db->last_step_rc == SQLITE_ROW ||
-                db->last_step_rc == SQLITE_OK);
-      if (ok) {
-        db->has_new_writes = 1;
-        struct wal_entry entry;
-        if (deterministic) {
-          build_wal_entry(&entry, deterministic);
-          free(deterministic);
-        } else if (expanded) {
-          build_wal_entry(&entry, expanded);
-          sqlite3_free(expanded);
-        } else {
-          build_wal_entry(&entry, db->current_write_sql);
-        }
-        check_update_hook_before_push(db, &entry);
-        entry.rk = (uint32_t)sqlite3_changes(db->handle);
-        wal_dbuf_push(&db->wal, &entry);
-      } else {
-        if (deterministic) free(deterministic);
-        if (expanded) sqlite3_free(expanded);
-      }
       pu_clear(db);
       db->in_write_txn = 0;
       db->write_stmt_index = -1;
@@ -1593,6 +1585,18 @@ int db_finalize(arkilian *db) {
 int db_reset(arkilian *db) {
   sqlite3_stmt *stmt = get_current_stmt(db);
   if (!stmt) return SQLITE_ERROR;
+
+  // Drain any pending write before reset (safety — db_step should
+  // have already pushed, but a misbehaving caller might skip it).
+  if (db->stmt_current == db->write_stmt_index && db->pu.fired) {
+    int ok = (db->last_step_rc == SQLITE_DONE ||
+              db->last_step_rc == SQLITE_ROW ||
+              db->last_step_rc == SQLITE_OK);
+    if (ok)
+      push_write_wal_entry(db, stmt);
+    pu_clear(db);
+  }
+
   return sqlite3_reset(stmt);
 }
 
