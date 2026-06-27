@@ -519,6 +519,7 @@ static void ar_preupdate_callback(void *pCtx, sqlite3 *db, int op,
       sqlite3_preupdate_old(db, i, &v);
     else
       sqlite3_preupdate_new(db, i, &v);
+    if (a->pu.values[i]) sqlite3_value_free(a->pu.values[i]);
     a->pu.values[i] = sqlite3_value_dup(v ? v : NULL);
   }
 }
