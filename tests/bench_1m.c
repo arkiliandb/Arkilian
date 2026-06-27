@@ -644,6 +644,8 @@ int main(int argc, char **argv) {
 
   WARMUP = OPS < 10000 ? OPS / 2 : 10000;
   setenv("ARKILIAN_WAL_PUSH_URL", "http://localhost:8080/v1/wal/push", 1);
+  setenv("ARKILIAN_DATABASE_TOKEN",
+         "ak_db_d25e9ea4cb93_7c3872fc11e9f12feb644a68533529445124668a0f7ab1c1c5b1157c6ae64bc8", 1);
   setenv("ARKILIAN_ENABLE_BACKUP", "0", 1);
   remove("bench_1m.db");
 
@@ -743,19 +745,19 @@ int main(int argc, char **argv) {
   printf("\n  INSERT:\n");
   sqlite3_exec(raw, "DELETE FROM " TBL_NAME, NULL, NULL, NULL);
   g_seed = 42; g_max_id = 0;
-  raw_single[R_INSERT] = bench_insert_raw(raw, OPS, 1);
+  ark_single[R_INSERT] = bench_insert_arkilian(db, OPS);
   printf("\n");
   sqlite3_exec(raw, "DELETE FROM " TBL_NAME, NULL, NULL, NULL);
   g_seed = 42; g_max_id = 0;
-  ark_single[R_INSERT] = bench_insert_arkilian(db, OPS);
+  raw_single[R_INSERT] = bench_insert_raw(raw, OPS, 1);
   printf("\n");
 
   printf("  UPDATE (by PK):\n");
   reseed_table(raw, 50000);
-  raw_single[R_UPDATE] = bench_update_raw(raw, OPS);
+  ark_single[R_UPDATE] = bench_update_arkilian(db, OPS);
   printf("\n");
   reseed_table(raw, 50000);
-  ark_single[R_UPDATE] = bench_update_arkilian(db, OPS);
+  raw_single[R_UPDATE] = bench_update_raw(raw, OPS);
   printf("\n");
 
   printf("  SELECT (point by PK):\n");
