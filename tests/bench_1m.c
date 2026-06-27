@@ -246,7 +246,7 @@ static bench_result bench_insert_arkilian(arkilian *db, int n) {
   db_prepare(db,
     "INSERT INTO bench_data "
     "(id,customer,product,qty,price,total,status,note,created,updated) "
-    "VALUES (?,?,?,?,?,?,?,NULL,?,?)");
+    "VALUES (?,?,?,?,?,?,?,?,?,?)");
 
   double t0 = now_ns();
   for (int i = 0; i < n; i++) {
@@ -546,7 +546,7 @@ static bench_result bench_insert_batched_arkilian(arkilian *db, int n,
   db_prepare(db,
     "INSERT INTO bench_data "
     "(id,customer,product,qty,price,total,status,note,created,updated) "
-    "VALUES (?,?,?,?,?,?,?,NULL,?,?)");
+    "VALUES (?,?,?,?,?,?,?,?,?,?)");
 
   double t0 = now_ns();
   for (int i = 0; i < n; i++) {
