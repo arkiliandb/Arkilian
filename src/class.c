@@ -726,6 +726,12 @@ struct Memory {
   int *shutdown_flag;
 };
 
+// Discard callback for curl writes (e.g., WAL flush responses)
+static size_t curl_discard_cb(void *data, size_t sz, size_t nmemb, void *userp) {
+  (void)data; (void)userp;
+  return sz * nmemb;  // consume without storing
+}
+
 // ── Config defaults ─────────────────────────────────────────────────
 
 #define DEFAULT_DB_PATH "app.sqlite"
@@ -847,6 +853,10 @@ void *run_wal_flush(void *arg) {
           curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json);
           curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
           curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5L);
+          // Discard response body — prevent server responses from
+          // bleeding into the application's stdout via libcurl's
+          // default write-to-stdout behaviour.
+          curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_discard_cb);
 
           struct curl_slist *headers = NULL;
           headers = curl_slist_append(headers, "Content-Type: application/json");
@@ -964,6 +974,7 @@ int db_init(arkilian **db_ptr, const char *filename) {
   sqlite3_exec(db->handle, "PRAGMA synchronous=NORMAL;", NULL, NULL, NULL);
   sqlite3_exec(db->handle, "PRAGMA busy_timeout=5000;", NULL, NULL, NULL);
   sqlite3_exec(db->handle, "PRAGMA foreign_keys=ON;", NULL, NULL, NULL);
+  sqlite3_exec(db->handle, "PRAGMA wal_autocheckpoint=1000;", NULL, NULL, NULL);
 
   // Register update hook for robust write metadata capture
   sqlite3_update_hook(db->handle, ar_update_hook, db);

@@ -212,7 +212,31 @@ static bench_result bench_insert_raw(sqlite3 *db, int n, int use_prepare) {
   if (use_prepare)
     return bench_insert_raw_prepared(db, n);
 
+  // exec path — kept for backward compat, not used in main comparison
   bench_result r = {0};
+  lat_hist lat = {0};
+  double t0 = now_ns();
+  for (int i = 0; i < n; i++) {
+    row_data d = gen_row();
+    double op_t0 = now_ns();
+    char sql[512];
+    snprintf(sql, sizeof(sql),
+      "INSERT INTO bench_data "
+      "(id,customer,product,qty,price,total,status,note,created,updated) "
+      "VALUES (%d,'%s','%s',%d,%.2f,%.2f,'%s',NULL,%lld,%lld)",
+      d.id, d.customer, d.product, d.qty, d.price, d.total, d.status, d.now,
+      d.now);
+    sqlite3_exec(db, sql, NULL, NULL, NULL);
+    lat_record(&lat, now_ns() - op_t0);
+    if (i > 0 && i % (n / 10) == 0)
+      progress("raw-exec INSERT", i, n);
+  }
+  r.ms = ns_to_ms(now_ns() - t0);
+  r.ops_per_sec = (double)n / (r.ms / 1000.0);
+  r.lat = lat;
+  progress("raw-exec INSERT", n, n);
+  return r;
+}
 
 static bench_result bench_insert_arkilian(arkilian *db, int n) {
   bench_result r = {0};
@@ -372,24 +396,26 @@ static bench_result bench_select_point_arkilian(arkilian *db, int n) {
   bench_result r = {0};
   lat_hist lat = {0};
 
+  db_prepare(db, "SELECT * FROM bench_data WHERE id = ?");
+
   double t0 = now_ns();
   for (int i = 0; i < n; i++) {
     int target = rng_int(1, g_max_id);
     double op_t0 = now_ns();
 
-    db_prepare(db, "SELECT * FROM bench_data WHERE id = ?");
     db_bind_int(db, 1, target);
     int rc = db_step(db);
     if (rc == SQLITE_ROW) {
       for (int c = 0; c < db_column_count(db); c++)
         (void)db_column_text(db, c);
     }
-    db_finalize(db);
+    db_reset(db);
 
     lat_record(&lat, now_ns() - op_t0);
     if (i > 0 && i % (n / 10) == 0)
       progress("ark SELECT(PK)", i, n);
   }
+  db_finalize(db);
   r.ms = ns_to_ms(now_ns() - t0);
   r.ops_per_sec = (double)n / (r.ms / 1000.0);
   r.lat = lat;
@@ -436,23 +462,25 @@ static bench_result bench_select_range_arkilian(arkilian *db, int n) {
   bench_result r = {0};
   lat_hist lat = {0};
 
+  db_prepare(db,
+             "SELECT * FROM bench_data WHERE id BETWEEN ? AND ? ORDER BY id");
+
   double t0 = now_ns();
   for (int i = 0; i < n; i++) {
     int lo = rng_int(1, g_max_id - 100);
     double op_t0 = now_ns();
-    db_prepare(db,
-               "SELECT * FROM bench_data WHERE id BETWEEN ? AND ? ORDER BY id");
     db_bind_int(db, 1, lo);
     db_bind_int(db, 2, lo + 100);
     while (db_step(db) == SQLITE_ROW) {
       for (int c = 0; c < db_column_count(db); c++)
         (void)db_column_text(db, c);
     }
-    db_finalize(db);
+    db_reset(db);
     lat_record(&lat, now_ns() - op_t0);
     if (i > 0 && i % (n / 10) == 0)
       progress("ark SELECT(range)", i, n);
   }
+  db_finalize(db);
   r.ms = ns_to_ms(now_ns() - t0);
   r.ops_per_sec = (double)n / (r.ms / 1000.0);
   r.lat = lat;
