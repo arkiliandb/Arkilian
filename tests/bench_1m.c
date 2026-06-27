@@ -229,25 +229,35 @@ static bench_result bench_insert_arkilian(arkilian *db, int n) {
   bench_result r = {0};
   lat_hist lat = {0};
 
+  // Prepare once, reuse — same pattern as the raw-SQLite baseline.
+  db_prepare(db,
+    "INSERT INTO bench_data "
+    "(id,customer,product,qty,price,total,status,note,created,updated) "
+    "VALUES (?,?,?,?,?,?,?,NULL,?,?)");
+
   double t0 = now_ns();
   for (int i = 0; i < n; i++) {
     row_data d = gen_row();
     double op_t0 = now_ns();
 
-    char sql[512];
-    snprintf(
-        sql, sizeof(sql),
-        "INSERT INTO bench_data "
-        "(id,customer,product,qty,price,total,status,note,created,updated) "
-        "VALUES (%d,'%s','%s',%d,%.2f,%.2f,'%s',NULL,%lld,%lld)",
-        d.id, d.customer, d.product, d.qty, d.price, d.total, d.status, d.now,
-        d.now);
-    db_exec(db, sql);
+    db_bind_int(db, 1, d.id);
+    db_bind_text(db, 2, d.customer);
+    db_bind_text(db, 3, d.product);
+    db_bind_int(db, 4, d.qty);
+    db_bind_double(db, 5, d.price);
+    db_bind_double(db, 6, d.total);
+    db_bind_text(db, 7, d.status);
+    db_bind_null(db, 8);
+    db_bind_int64(db, 9, d.now);
+    db_bind_int64(db, 10, d.now);
+    db_step(db);       // executes INSERT, preupdate hook fires, WAL pushed
+    db_reset(db);      // reset for next row
 
     lat_record(&lat, now_ns() - op_t0);
     if (i > 0 && i % (n / 10) == 0)
       progress("ark INSERT", i, n);
   }
+  db_finalize(db);
   r.ms = ns_to_ms(now_ns() - t0);
   r.ops_per_sec = (double)n / (r.ms / 1000.0);
   r.lat = lat;
@@ -300,6 +310,10 @@ static bench_result bench_update_arkilian(arkilian *db, int n) {
   bench_result r = {0};
   lat_hist lat = {0};
 
+  db_prepare(db,
+    "UPDATE bench_data SET "
+    "qty=?,price=?,total=?,status=?,updated=? WHERE id=?");
+
   double t0 = now_ns();
   for (int i = 0; i < n; i++) {
     int target = rng_int(1, g_max_id);
@@ -307,18 +321,20 @@ static bench_result bench_update_arkilian(arkilian *db, int n) {
     double pr = rng_dbl(1.0, 9999.99);
     double op_t0 = now_ns();
 
-    char sql[256];
-    snprintf(sql, sizeof(sql),
-             "UPDATE bench_data SET "
-             "qty=%d,price=%.2f,total=%.2f,status='shipped',updated=%lld WHERE "
-             "id=%d",
-             qty, pr, qty * pr, (long long)time(NULL), target);
-    db_exec(db, sql);
+    db_bind_int(db, 1, qty);
+    db_bind_double(db, 2, pr);
+    db_bind_double(db, 3, qty * pr);
+    db_bind_text(db, 4, "shipped");
+    db_bind_int64(db, 5, (long long)time(NULL));
+    db_bind_int(db, 6, target);
+    db_step(db);
+    db_reset(db);
 
     lat_record(&lat, now_ns() - op_t0);
     if (i > 0 && i % (n / 10) == 0)
       progress("ark UPDATE", i, n);
   }
+  db_finalize(db);
   r.ms = ns_to_ms(now_ns() - t0);
   r.ops_per_sec = (double)n / (r.ms / 1000.0);
   r.lat = lat;
@@ -506,9 +522,14 @@ static bench_result bench_insert_batched_raw(sqlite3 *db, int n, int batch) {
 }
 
 static bench_result bench_insert_batched_arkilian(arkilian *db, int n,
-                                                  int batch) {
+                                                   int batch) {
   bench_result r = {0};
   lat_hist lat = {0};
+
+  db_prepare(db,
+    "INSERT INTO bench_data "
+    "(id,customer,product,qty,price,total,status,note,created,updated) "
+    "VALUES (?,?,?,?,?,?,?,NULL,?,?)");
 
   double t0 = now_ns();
   for (int i = 0; i < n; i++) {
@@ -517,15 +538,19 @@ static bench_result bench_insert_batched_arkilian(arkilian *db, int n,
 
     row_data d = gen_row();
     double op_t0 = now_ns();
-    char sql[512];
-    snprintf(
-        sql, sizeof(sql),
-        "INSERT INTO bench_data "
-        "(id,customer,product,qty,price,total,status,note,created,updated) "
-        "VALUES (%d,'%s','%s',%d,%.2f,%.2f,'%s',NULL,%lld,%lld)",
-        d.id, d.customer, d.product, d.qty, d.price, d.total, d.status, d.now,
-        d.now);
-    db_exec(db, sql);
+
+    db_bind_int(db, 1, d.id);
+    db_bind_text(db, 2, d.customer);
+    db_bind_text(db, 3, d.product);
+    db_bind_int(db, 4, d.qty);
+    db_bind_double(db, 5, d.price);
+    db_bind_double(db, 6, d.total);
+    db_bind_text(db, 7, d.status);
+    db_bind_null(db, 8);
+    db_bind_int64(db, 9, d.now);
+    db_bind_int64(db, 10, d.now);
+    db_step(db);
+    db_reset(db);
 
     lat_record(&lat, now_ns() - op_t0);
 
@@ -535,6 +560,7 @@ static bench_result bench_insert_batched_arkilian(arkilian *db, int n,
     if (i > 0 && i % (n / 10) == 0)
       progress("ark-batch INSERT", i, n);
   }
+  db_finalize(db);
   r.ms = ns_to_ms(now_ns() - t0);
   r.ops_per_sec = (double)n / (r.ms / 1000.0);
   r.lat = lat;
@@ -617,7 +643,7 @@ int main(int argc, char **argv) {
   }
 
   WARMUP = OPS < 10000 ? OPS / 2 : 10000;
-  unsetenv("ARKILIAN_WAL_PUSH_URL");
+  setenv("ARKILIAN_WAL_PUSH_URL", "http://localhost:8080/v1/wal/push", 1);
   setenv("ARKILIAN_ENABLE_BACKUP", "0", 1);
   remove("bench_1m.db");
 
@@ -916,13 +942,14 @@ int main(int argc, char **argv) {
   printf("\n  ── Notes "
          "─────────────────────────────────────────────────────────────\n\n");
   printf(
-      "  • Raw SQLite benchmarks use sqlite3_prepare_v2 + bind/step/reset\n");
-  printf("    (production best practice), not sqlite3_exec.\n");
+      "  • Both sides use sqlite3_prepare_v2 + bind/step/reset\n");
+  printf("    (production best practice — one compile, many resets).\n");
   printf(
-      "  • Arkilian db_exec() does prepare→step→finalize + mutex serialize\n");
-  printf("    + ring-buffer capture. The overhead column shows this cost.\n");
-  printf("  • Ring buffer is lazily allocated — zero cost unless\n");
-  printf("    ARKILIAN_WAL_PUSH_URL is configured.\n");
+      "  • Arkilian adds: preupdate hook (deterministic SQL expansion),\n");
+  printf(
+      "    + write mutex serialization + per-row WAL push to ring buffer.\n");
+  printf(
+      "  • WAL entries are shipped to the Control Plane via HTTP POST.\n");
   printf(
       "  • Deterministic seed (xorshift32, seed=42) — results reproducible.\n");
   printf(
