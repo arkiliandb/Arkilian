@@ -16,6 +16,11 @@
                                     -Isrc -Isrc/deps/sqlite -lcurl -lsqlite3 -o test_hydration
  ./test_hydration
 
+ cc tests/test_deterministic.c src/class.c src/deps/sqlite/sqlite3.c \
+    -Isrc -Isrc/deps/sqlite -lcurl -lpthread \
+    -DSQLITE_ENABLE_PREUPDATE_HOOK -o test_deterministic
+ ./test_deterministic
+
  # Test server
 #  cd server
 #  go test -v ./...
