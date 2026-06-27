@@ -51,6 +51,7 @@ sqlite3_int64 db_column_int64(arkilian *db, int col);
 
 int db_changes(arkilian *db);
 sqlite3_int64 db_last_insert_rowid(arkilian *db);
+const char* db_wal_last_sql(arkilian *db);  // peek at last shipped SQL (for testing)
 
 #ifdef __cplusplus
 }

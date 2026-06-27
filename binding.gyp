@@ -14,7 +14,7 @@
       ],
       "cflags!": ["-fno-exceptions"],
       "cflags_cc!": ["-fno-exceptions"],
-      "defines": ["NAPI_DISABLE_CPP_EXCEPTIONS"],
+      "defines": ["NAPI_DISABLE_CPP_EXCEPTIONS", "SQLITE_ENABLE_PREUPDATE_HOOK"],
       "conditions": [
         ["OS=='mac'", {
           "xcode_settings": {

@@ -66,3 +66,8 @@ expressions/
 *.sqlite-shm
 *.sqlite-shm
 server/arkilian-server
+*.mp4
+*.jpg
+*.gif
+petshopDB/ARKILIAN_SPEC.md
+test_deterministic

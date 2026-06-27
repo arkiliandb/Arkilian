@@ -74,17 +74,16 @@ static void wal_dbuf_init(struct wal_double_buf *b) {
   b->entries[1] = NULL;
 
   const char *push_url = getenv("ARKILIAN_WAL_PUSH_URL");
-  if (push_url && strlen(push_url) > 0) {
-    b->entries[0] = malloc((size_t)WAL_BUF_CAPACITY * sizeof(struct wal_entry));
-    b->entries[1] = malloc((size_t)WAL_BUF_CAPACITY * sizeof(struct wal_entry));
-    if (!b->entries[0] || !b->entries[1]) {
-      free(b->entries[0]);
-      free(b->entries[1]);
-      b->entries[0] = NULL;
-      b->entries[1] = NULL;
-    } else {
-      b->allocated = 1;
-    }
+  int cap = (push_url && strlen(push_url) > 0) ? WAL_BUF_CAPACITY : 1000;
+  b->entries[0] = malloc((size_t)cap * sizeof(struct wal_entry));
+  b->entries[1] = malloc((size_t)cap * sizeof(struct wal_entry));
+  if (!b->entries[0] || !b->entries[1]) {
+    free(b->entries[0]);
+    free(b->entries[1]);
+    b->entries[0] = NULL;
+    b->entries[1] = NULL;
+  } else {
+    b->allocated = 1;
   }
 
 #ifndef _WIN32
@@ -125,11 +124,6 @@ static void wal_dbuf_destroy(struct wal_double_buf *b) {
 // Swaps buffers if active is full.  If no push URL is configured, this
 // is a no-op (no background thread to drain, no reason to accumulate).
 static void wal_dbuf_push(struct wal_double_buf *b, struct wal_entry *e) {
-  const char *push_url = getenv("ARKILIAN_WAL_PUSH_URL");
-  if (!push_url || strlen(push_url) == 0) {
-    free(e->sql);
-    return;
-  }
   if (!b->allocated) {
     free(e->sql);
     return;
@@ -143,6 +137,9 @@ static void wal_dbuf_push(struct wal_double_buf *b, struct wal_entry *e) {
 
   int a = b->active;
 
+  // Always push to the active buffer.  The flush thread only runs
+  // when ARKILIAN_WAL_PUSH_URL is set, so in offline/testing mode
+  // entries accumulate without network activity.
   if (b->count[a] < WAL_BUF_CAPACITY) {
     b->entries[a][b->count[a]++] = *e;
 #ifndef _WIN32
@@ -372,6 +369,35 @@ static void build_wal_entry(struct wal_entry *e, const char *sql) {
   e->sql = strdup(sql ? sql : "");
 }
 
+// ── Preupdate capture (deterministic SQL expansion) ──────────────
+// Uses sqlite3_preupdate_hook() to capture actual column values
+// as computed by SQLite (DEFAULT, datetime('now'), random(), etc. resolved).
+// This avoids fragile SQL scanning and double-querying the DB.
+
+#define PU_MAX_COLS   64
+#define COL_CACHE_SZ  64
+
+struct col_cache_entry {
+  uint16_t table_id;
+  int      ncol;
+  char     names[PU_MAX_COLS][128];
+};
+
+struct col_cache {
+  int count;
+  struct col_cache_entry e[COL_CACHE_SZ];
+};
+
+struct preupdate_capture {
+  int             fired;
+  int             op;
+  char            table[128];
+  uint16_t        table_id;
+  sqlite3_int64   rowid;
+  int             ncol;
+  sqlite3_value  *values[PU_MAX_COLS];
+};
+
 // ── Arkilian struct ─────────────────────────────────────────────────
 
 struct arkilian {
@@ -413,6 +439,9 @@ struct arkilian {
   char     update_hook_table[128];
   uint64_t update_hook_rowid;
   int      update_hook_fired;
+  // Preupdate hook state (deterministic SQL expansion)
+  struct preupdate_capture  pu;
+  struct col_cache         *col_names;   // lazy column-name cache (allocated on first use)
   int last_step_rc;
   // Cached statements
   sqlite3_stmt *begin_stmt;
@@ -456,6 +485,211 @@ static void check_update_hook_before_push(arkilian *db, struct wal_entry *e) {
     db->update_hook_fired = 0;
   }
 }
+
+// ── Preupdate hook: captures actual column values at write time ─────
+// SQLite fires this during sqlite3_step(), AFTER resolving DEFAULT,
+// evaluating datetime('now'), assigning rowids, etc.
+// We capture the ground-truth values to build deterministic REPLACE
+// statements for logical WAL shipping.
+
+#if defined(SQLITE_ENABLE_PREUPDATE_HOOK)
+static void ar_preupdate_callback(void *pCtx, sqlite3 *db, int op,
+                                  char const *zDb, char const *zName,
+                                  sqlite3_int64 iKey1, sqlite3_int64 iKey2) {
+  arkilian *a = (arkilian *)pCtx;
+  (void)zDb; (void)iKey2;
+
+  a->pu.fired = 1;
+  a->pu.op = op;
+  strncpy(a->pu.table, zName ? zName : "", sizeof(a->pu.table) - 1);
+  a->pu.table[sizeof(a->pu.table) - 1] = '\0';
+  a->pu.table_id = table_name_hash(a->pu.table);
+  a->pu.rowid = iKey1;
+  a->pu.ncol = sqlite3_preupdate_count(db);
+  if (a->pu.ncol > PU_MAX_COLS) a->pu.ncol = PU_MAX_COLS;
+
+  for (int i = 0; i < a->pu.ncol; i++) {
+    sqlite3_value *v = NULL;
+    if (op == SQLITE_DELETE)
+      sqlite3_preupdate_old(db, i, &v);
+    else
+      sqlite3_preupdate_new(db, i, &v);
+    a->pu.values[i] = sqlite3_value_dup(v ? v : NULL);
+  }
+}
+
+static void pu_clear(arkilian *db) {
+  for (int i = 0; i < db->pu.ncol; i++) {
+    if (db->pu.values[i]) { sqlite3_value_free(db->pu.values[i]); db->pu.values[i] = NULL; }
+  }
+  memset(&db->pu, 0, sizeof(db->pu));
+}
+#else
+static void pu_clear(arkilian *db) { (void)db; }
+#endif
+
+// ── Column cache: lazy PRAGMA table_info, keyed by table_name_hash ──
+
+static int ensure_column_cache(arkilian *db, const char *table) {
+#if defined(SQLITE_ENABLE_PREUPDATE_HOOK)
+  uint16_t tid = table_name_hash(table);
+  if (!db->col_names) {
+    db->col_names = calloc(1, sizeof(struct col_cache));
+    if (!db->col_names) return 0;
+  }
+
+  for (int i = 0; i < db->col_names->count; i++) {
+    if (db->col_names->e[i].table_id == tid)
+      return 1;
+  }
+
+  if (db->col_names->count >= COL_CACHE_SZ) return 0;
+
+  // Build "PRAGMA table_info('tablename')" with proper single-quote escaping
+  char sql[320];
+  char escaped[256];
+  {
+    int ei = 0;
+    for (const char *s = table; *s && ei < (int)sizeof(escaped) - 2; s++) {
+      if (*s == '\'') { escaped[ei++] = '\''; escaped[ei++] = '\''; }
+      else { escaped[ei++] = *s; }
+    }
+    escaped[ei] = '\0';
+  }
+  snprintf(sql, sizeof(sql), "PRAGMA table_info('%s')", escaped);
+
+  sqlite3_stmt *stmt = NULL;
+  if (sqlite3_prepare_v2(db->handle, sql, -1, &stmt, NULL) != SQLITE_OK)
+    return 0;
+
+  struct col_cache_entry *e = &db->col_names->e[db->col_names->count];
+  e->table_id = tid;
+  e->ncol = 0;
+  while (e->ncol < PU_MAX_COLS && sqlite3_step(stmt) == SQLITE_ROW) {
+    const char *name = (const char *)sqlite3_column_text(stmt, 1); // "name" column
+    if (name) {
+      strncpy(e->names[e->ncol], name, sizeof(e->names[0]) - 1);
+      e->names[e->ncol][sizeof(e->names[0]) - 1] = '\0';
+    } else {
+      e->names[e->ncol][0] = '\0';
+    }
+    e->ncol++;
+  }
+  sqlite3_finalize(stmt);
+  db->col_names->count++;
+  return 1;
+#else
+  (void)db; (void)table;
+  return 0;
+#endif
+}
+
+// ── Build deterministic SQL from preupdate capture ──────────────────
+
+#if defined(SQLITE_ENABLE_PREUPDATE_HOOK)
+static char *build_deterministic_sql(arkilian *db) {
+  if (!db->pu.fired) return NULL;
+  if (!ensure_column_cache(db, db->pu.table)) return NULL;
+
+  struct col_cache_entry *col = NULL;
+  for (int i = 0; i < db->col_names->count; i++) {
+    if (db->col_names->e[i].table_id == db->pu.table_id) {
+      col = &db->col_names->e[i];
+      break;
+    }
+  }
+  if (!col || col->ncol == 0) return NULL;
+  int ncol = col->ncol;
+  if (ncol > db->pu.ncol) ncol = db->pu.ncol;
+
+  if (db->pu.op == SQLITE_DELETE) {
+    char buf[256];
+    snprintf(buf, sizeof(buf),
+      "DELETE FROM \"%s\" WHERE rowid = %lld",
+      db->pu.table, (long long)db->pu.rowid);
+    return strdup(buf);
+  }
+
+  // INSERT / UPDATE → build REPLACE INTO
+  size_t cap = 256;
+  char *out = malloc(cap);
+  if (!out) return NULL;
+  size_t off = 0;
+
+  off += (size_t)snprintf(out + off, cap - off,
+    "REPLACE INTO \"%s\" (", db->pu.table);
+
+  for (int i = 0; i < ncol; i++) {
+    if (off + strlen(col->names[i]) + 4 >= cap) {
+      cap *= 2;
+      char *tmp = realloc(out, cap);
+      if (!tmp) { free(out); return NULL; }
+      out = tmp;
+    }
+    off += (size_t)snprintf(out + off, cap - off, "\"%s\"%s",
+      col->names[i], (i < ncol - 1) ? ", " : ") VALUES (");
+  }
+
+  for (int i = 0; i < ncol; i++) {
+    sqlite3_value *v = db->pu.values[i];
+    int vtype = v ? sqlite3_value_type(v) : SQLITE_NULL;
+    int need = 32;
+    if (vtype == SQLITE_TEXT)
+      need = sqlite3_value_bytes(v) * 2 + 4; // esc overhead
+    else if (vtype == SQLITE_BLOB)
+      need = sqlite3_value_bytes(v) * 2 + 4;
+
+    if (off + (size_t)need >= cap) {
+      cap = cap * 2 + (size_t)need;
+      char *tmp = realloc(out, cap);
+      if (!tmp) { free(out); return NULL; }
+      out = tmp;
+    }
+
+    if (vtype == SQLITE_NULL || !v) {
+      off += (size_t)snprintf(out + off, cap - off, "NULL");
+    } else if (vtype == SQLITE_INTEGER) {
+      off += (size_t)snprintf(out + off, cap - off, "%lld",
+        (long long)sqlite3_value_int64(v));
+    } else if (vtype == SQLITE_FLOAT) {
+      off += (size_t)snprintf(out + off, cap - off, "%.15g",
+        sqlite3_value_double(v));
+    } else if (vtype == SQLITE_TEXT) {
+      const char *txt = (const char *)sqlite3_value_text(v);
+      int len = sqlite3_value_bytes(v);
+      off += (size_t)snprintf(out + off, cap - off, "'");
+      for (int j = 0; j < len; j++) {
+        if (txt[j] == '\'') {
+          if (off + 2 >= cap) { cap *= 2; char *tmp = realloc(out, cap); if (!tmp) { free(out); return NULL; } out = tmp; }
+          out[off++] = '\''; out[off++] = '\'';
+        } else {
+          if (off + 1 >= cap) { cap *= 2; char *tmp = realloc(out, cap); if (!tmp) { free(out); return NULL; } out = tmp; }
+          out[off++] = txt[j];
+        }
+      }
+      off += (size_t)snprintf(out + off, cap - off, "'");
+    } else if (vtype == SQLITE_BLOB) {
+      const unsigned char *blob = sqlite3_value_blob(v);
+      int len = sqlite3_value_bytes(v);
+      off += (size_t)snprintf(out + off, cap - off, "X'");
+      for (int j = 0; j < len; j++) {
+        if (off + 3 >= cap) { cap *= 2; char *tmp = realloc(out, cap); if (!tmp) { free(out); return NULL; } out = tmp; }
+        off += (size_t)snprintf(out + off, cap - off, "%02X", blob[j]);
+      }
+      off += (size_t)snprintf(out + off, cap - off, "'");
+    } else {
+      off += (size_t)snprintf(out + off, cap - off, "NULL");
+    }
+
+    off += (size_t)snprintf(out + off, cap - off, "%s", (i < ncol - 1) ? ", " : ")");
+  }
+
+  out[off] = '\0';
+  return out;
+}
+#else
+static char *build_deterministic_sql(arkilian *db) { (void)db; return NULL; }
+#endif
 
 struct Memory {
   char *response;
@@ -706,6 +940,13 @@ int db_init(arkilian **db_ptr, const char *filename) {
   sqlite3_update_hook(db->handle, ar_update_hook, db);
   db->update_hook_fired = 0;
 
+  // Register preupdate hook for deterministic SQL expansion
+#if defined(SQLITE_ENABLE_PREUPDATE_HOOK)
+  sqlite3_preupdate_hook(db->handle, ar_preupdate_callback, db);
+#endif
+  memset(&db->pu, 0, sizeof(db->pu));
+  db->col_names = NULL;
+
   // Internal tables
   sqlite3_exec(db->handle,
     "CREATE TABLE IF NOT EXISTS _arkilian_meta (k TEXT PRIMARY KEY, v TEXT);",
@@ -763,11 +1004,14 @@ void db_close(arkilian *db) {
 
   db->shutdown_requested = 1;
 
-  // Flush any pending WAL entries before joining the flush thread.
-  // If the active buffer has unflushed writes, force a swap so the
-  // flush thread drains them.  Spin-wait until both buffers are empty
-  // or a timeout is reached.
-  {
+  // Flush any pending WAL entries before joining the flush thread, but
+  // only if a flush thread exists to drain them.  Without a flush thread
+  // the entries will never drain and we'd spin for nothing.
+#ifndef _WIN32
+  if (db->flush_thread_running) {
+#else
+  if (db->flush_thread_handle != NULL) {
+#endif
     int active = db->wal.active;
     if (db->wal.count[active] > 0) {
       db_wal_flush(db);
@@ -831,6 +1075,9 @@ void db_close(arkilian *db) {
   db->stmt_capacity = 0;
   db->stmt_current = -1;
 
+  pu_clear(db);
+  if (db->col_names) { free(db->col_names); db->col_names = NULL; }
+
   if (db->is_open && db->handle) {
     // Rollback any open transactions
     if (db->in_write_txn || db->in_batch_txn) {
@@ -843,7 +1090,9 @@ void db_close(arkilian *db) {
       if (db->in_batch_txn) {
         sqlite3_step(db->rollback_stmt);
         sqlite3_reset(db->rollback_stmt);
-        db->in_batch_txn = 0;
+      db->in_batch_txn = 0;
+      db->in_write_txn = 0;
+      db->write_stmt_index = -1;
       }
 #ifndef _WIN32
       pthread_mutex_unlock(&db->write_mutex);
@@ -1117,6 +1366,13 @@ int db_exec(arkilian *db, const char *sql) {
   }
 
   rc = sqlite3_step(stmt);
+
+  // Deterministic SQL: try preupdate capture first, then expanded SQL, then raw
+  char *deterministic = build_deterministic_sql(db);
+  char *expanded = NULL;
+  if (!deterministic)
+    expanded = sqlite3_expanded_sql(stmt);
+
   sqlite3_finalize(stmt);
 
   if (rc == SQLITE_DONE || rc == SQLITE_OK || rc == SQLITE_ROW) {
@@ -1124,17 +1380,32 @@ int db_exec(arkilian *db, const char *sql) {
 
     // Push to ring buffer for async streaming
     struct wal_entry entry;
-    build_wal_entry(&entry, sql);
+    if (deterministic) {
+      build_wal_entry(&entry, deterministic);
+      free(deterministic);
+    } else if (expanded) {
+      build_wal_entry(&entry, expanded);
+      sqlite3_free(expanded);
+    } else {
+      build_wal_entry(&entry, sql);
+    }
     check_update_hook_before_push(db, &entry);
     entry.rk = (uint32_t)sqlite3_changes(db->handle);
     wal_dbuf_push(&db->wal, &entry);
+    db->in_write_txn = 0;
+    db->write_stmt_index = -1;
   } else {
+    if (deterministic) free(deterministic);
+    if (expanded) sqlite3_free(expanded);
+    pu_clear(db);
     snprintf(db->last_error_msg, sizeof(db->last_error_msg), "%s",
              sqlite3_errmsg(db->handle));
     if (db->in_batch_txn) {
       sqlite3_step(db->rollback_stmt);
       sqlite3_reset(db->rollback_stmt);
       db->in_batch_txn = 0;
+      db->in_write_txn = 0;
+      db->write_stmt_index = -1;
 #ifndef _WIN32
       pthread_mutex_unlock(&db->write_mutex);
 #else
@@ -1144,6 +1415,9 @@ int db_exec(arkilian *db, const char *sql) {
     }
   }
 
+  pu_clear(db);
+  db->in_write_txn = 0;
+  db->write_stmt_index = -1;
   if (!mutex_held) {
 #ifndef _WIN32
     pthread_mutex_unlock(&db->write_mutex);
@@ -1238,9 +1512,12 @@ int db_finalize(arkilian *db) {
   if (stmt) {
     int is_this_write = (db->stmt_current == db->write_stmt_index);
 
+    char *deterministic = NULL;
     char *expanded = NULL;
     if (is_this_write) {
-      expanded = sqlite3_expanded_sql(stmt);
+      deterministic = build_deterministic_sql(db);
+      if (!deterministic)
+        expanded = sqlite3_expanded_sql(stmt);
     }
 
     sqlite3_finalize(stmt);
@@ -1253,7 +1530,10 @@ int db_finalize(arkilian *db) {
       if (ok) {
         db->has_new_writes = 1;
         struct wal_entry entry;
-        if (expanded) {
+        if (deterministic) {
+          build_wal_entry(&entry, deterministic);
+          free(deterministic);
+        } else if (expanded) {
           build_wal_entry(&entry, expanded);
           sqlite3_free(expanded);
         } else {
@@ -1263,8 +1543,10 @@ int db_finalize(arkilian *db) {
         entry.rk = (uint32_t)sqlite3_changes(db->handle);
         wal_dbuf_push(&db->wal, &entry);
       } else {
+        if (deterministic) free(deterministic);
         if (expanded) sqlite3_free(expanded);
       }
+      pu_clear(db);
       db->in_write_txn = 0;
       db->write_stmt_index = -1;
       db->current_write_sql[0] = '\0';
@@ -1438,6 +1720,20 @@ int db_set_token(arkilian *db, const char *token) {
 int db_wal_pending(arkilian *db) {
   if (!db) return 0;
   return db->wal.count[0] + db->wal.count[1];
+}
+
+// Return the SQL text of the most recently pushed WAL entry.
+// Returns NULL if no entries are pending. For testing / debugging.
+const char *db_wal_last_sql(arkilian *db) {
+  if (!db) return NULL;
+  int a = db->wal.active;
+  int n = db->wal.count[a];
+  if (n == 0) {
+    int f = 1 - a;
+    if (db->wal.count[f] == 0) return NULL;
+    return db->wal.entries[f][db->wal.count[f] - 1].sql;
+  }
+  return db->wal.entries[a][n - 1].sql;
 }
 
 // Force a flush of the WAL double-buffer.  Must be called while the

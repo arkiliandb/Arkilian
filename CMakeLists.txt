@@ -33,6 +33,7 @@ set(ARKILIAN_SOURCES src/class.c src/deps/sqlite/sqlite3.c)
 # Shared Library
 if(ARKILIAN_BUILD_SHARED)
     add_library(arkilian SHARED ${ARKILIAN_SOURCES})
+    target_compile_definitions(arkilian PRIVATE SQLITE_ENABLE_PREUPDATE_HOOK)
     target_include_directories(arkilian PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/deps/sqlite>
@@ -49,6 +50,7 @@ endif()
 # Static Library
 if(ARKILIAN_BUILD_STATIC)
     add_library(arkilian_static STATIC ${ARKILIAN_SOURCES})
+    target_compile_definitions(arkilian_static PRIVATE SQLITE_ENABLE_PREUPDATE_HOOK)
     target_include_directories(arkilian_static PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/deps/sqlite>
@@ -87,6 +89,7 @@ if(CMAKE_JS_VERSION OR ARKILIAN_BUILD_NAPI)
         ${ARKILIAN_SOURCES}
         ${CMAKE_JS_SRC_FILES}
     )
+    target_compile_definitions(arkilian_napi PRIVATE SQLITE_ENABLE_PREUPDATE_HOOK)
 
     set_target_properties(arkilian_napi PROPERTIES
         PREFIX ""
