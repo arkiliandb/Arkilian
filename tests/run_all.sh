@@ -27,7 +27,8 @@
 #  cd ..
 
  # Test benchmark with 1M insertions
-#  cc -O2 tests/bench_1m.c src/class.c src/deps/sqlite/sqlite3.c \
-#                                                           -Isrc -Isrc/deps/sqlite -lcurl -lpthread -o bench_1m
-#  ./bench_1m
+ cc -O2 tests/bench_1m.c src/class.c src/deps/sqlite/sqlite3.c \
+                                                          -Isrc -Isrc/deps/sqlite -lcurl -lpthread -lm \
+                                                          -DSQLITE_ENABLE_PREUPDATE_HOOK -o bench_1m
+ ./bench_1m
 
