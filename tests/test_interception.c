@@ -205,7 +205,6 @@ static void test_prepare_step_insert_pushes_to_ring(void) {
   db_finalize(db);
 
   int after = db_wal_pending(db);
-  fprintf(stderr, "[DEBUG] before=%d after=%d expected=%d\n", before, after, before + 1);
   assert(after == before + 1);
 
   db_prepare(db, "SELECT name FROM t1 WHERE id = 1");
