@@ -41,6 +41,7 @@
 // tiny edge server, etc.).
 
 #define WAL_CHUNK_CAP 10000
+#define WAL_CHUNK_MAX_CAP 100000  // cap chunk growth to prevent unbounded memory
 
 struct wal_entry {
   uint64_t ts;
@@ -151,6 +152,7 @@ static void wal_queue_push(struct wal_queue *q, struct wal_entry *e) {
   // Grow chain when the tail chunk is full
   if (t->count >= t->capacity) {
     int new_cap = t->capacity * 2;
+    if (new_cap > WAL_CHUNK_MAX_CAP) new_cap = WAL_CHUNK_MAX_CAP;
     if (new_cap < 1) new_cap = WAL_CHUNK_CAP;
     struct wal_chunk *c = malloc(sizeof(struct wal_chunk));
     if (!c) goto drop;
@@ -643,6 +645,8 @@ static char *build_deterministic_sql(arkilian *db) {
     else if (vtype == SQLITE_BLOB)   need += (size_t)sqlite3_value_bytes(v) * 2 + 6;
     else                             need += 5;
   }
+  // Add separator bytes not accounted for in the loop
+  need += 9 + (ncol > 0 ? (size_t)(ncol - 1) * 2 : 0);  // last col header + value seps + final )
 
   // ── Pass 2: allocate once and format ──────────────────────────
   char *out = malloc(need);
@@ -1718,9 +1722,19 @@ int db_set_token(arkilian *db, const char *token) {
 // Returns the number of pending WAL entries in the linked-list queue
 int db_wal_pending(arkilian *db) {
   if (!db || !db->wal.allocated) return 0;
+#ifndef _WIN32
+  pthread_mutex_lock(&db->wal.mutex);
+#else
+  WaitForSingleObject(db->wal.mutex, INFINITE);
+#endif
   int total = 0;
   for (struct wal_chunk *c = db->wal.head; c; c = c->next)
     total += c->count - c->consumed;
+#ifndef _WIN32
+  pthread_mutex_unlock(&db->wal.mutex);
+#else
+  ReleaseMutex(db->wal.mutex);
+#endif
   return total;
 }
 
@@ -1728,9 +1742,19 @@ int db_wal_pending(arkilian *db) {
 // Returns NULL if no entries are pending. For testing / debugging.
 const char *db_wal_last_sql(arkilian *db) {
   if (!db || !db->wal.allocated) return NULL;
+#ifndef _WIN32
+  pthread_mutex_lock(&db->wal.mutex);
+#else
+  WaitForSingleObject(db->wal.mutex, INFINITE);
+#endif
   struct wal_chunk *t = db->wal.tail;
-  if (t->count == 0) return NULL;
-  return t->entries[t->count - 1].sql;
+  const char *sql = (t && t->count > 0) ? t->entries[t->count - 1].sql : NULL;
+#ifndef _WIN32
+  pthread_mutex_unlock(&db->wal.mutex);
+#else
+  ReleaseMutex(db->wal.mutex);
+#endif
+  return sql;
 }
 
 // Force a flush of the WAL queue.  Must be called while the
