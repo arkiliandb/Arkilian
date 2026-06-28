@@ -760,13 +760,60 @@ int main(int argc, char **argv) {
          "══════════╝\n");
 
   printf("\n  INSERT:\n");
+
+  // Diagnostic: table state + wall clock before Ark INSERT
+  {
+    struct timespec w; clock_gettime(CLOCK_MONOTONIC, &w);
+    sqlite3_stmt *s; sqlite3_prepare_v2(raw,
+      "SELECT COUNT(*), COALESCE(MAX(id),0) FROM " TBL_NAME, -1, &s, NULL);
+    sqlite3_step(s);
+    printf("  DIAG: ARK START  count=%lld max_id=%lld  wall=%lld.%06ld\n",
+      sqlite3_column_int64(s,0), sqlite3_column_int64(s,1),
+      (long long)w.tv_sec, w.tv_nsec/1000);
+    sqlite3_finalize(s);
+  }
   sqlite3_exec(raw, "DELETE FROM " TBL_NAME, NULL, NULL, NULL);
   g_seed = 42; g_max_id = 0;
   ark_single[R_INSERT] = bench_insert_arkilian(db, OPS);
+  // Diagnostic: rows actually inserted + wall clock after
+  {
+    struct timespec w; clock_gettime(CLOCK_MONOTONIC, &w);
+    sqlite3_stmt *s; sqlite3_prepare_v2(raw,
+      "SELECT COUNT(*), COALESCE(MAX(id),0) FROM " TBL_NAME, -1, &s, NULL);
+    sqlite3_step(s);
+    printf("  DIAG: ARK END    count=%lld max_id=%lld  wall=%lld.%06ld  ops/s=%.0f\n",
+      sqlite3_column_int64(s,0), sqlite3_column_int64(s,1),
+      (long long)w.tv_sec, w.tv_nsec/1000,
+      ark_single[R_INSERT].ops_per_sec);
+    sqlite3_finalize(s);
+  }
   printf("\n");
+  // Diagnostic: table state before raw INSERT
+  {
+    struct timespec w; clock_gettime(CLOCK_MONOTONIC, &w);
+    sqlite3_stmt *s; sqlite3_prepare_v2(raw,
+      "SELECT COUNT(*), COALESCE(MAX(id),0) FROM " TBL_NAME, -1, &s, NULL);
+    sqlite3_step(s);
+    printf("  DIAG: RAW START  count=%lld max_id=%lld  wall=%lld.%06ld\n",
+      sqlite3_column_int64(s,0), sqlite3_column_int64(s,1),
+      (long long)w.tv_sec, w.tv_nsec/1000);
+    sqlite3_finalize(s);
+  }
   sqlite3_exec(raw, "DELETE FROM " TBL_NAME, NULL, NULL, NULL);
   g_seed = 42; g_max_id = 0;
   raw_single[R_INSERT] = bench_insert_raw(raw, OPS, 1);
+  // Diagnostic: rows actually inserted + wall clock after
+  {
+    struct timespec w; clock_gettime(CLOCK_MONOTONIC, &w);
+    sqlite3_stmt *s; sqlite3_prepare_v2(raw,
+      "SELECT COUNT(*), COALESCE(MAX(id),0) FROM " TBL_NAME, -1, &s, NULL);
+    sqlite3_step(s);
+    printf("  DIAG: RAW END    count=%lld max_id=%lld  wall=%lld.%06ld  ops/s=%.0f\n",
+      sqlite3_column_int64(s,0), sqlite3_column_int64(s,1),
+      (long long)w.tv_sec, w.tv_nsec/1000,
+      raw_single[R_INSERT].ops_per_sec);
+    sqlite3_finalize(s);
+  }
   printf("\n");
 
   printf("  UPDATE (by PK):\n");
