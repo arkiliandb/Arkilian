@@ -45,6 +45,7 @@
 struct wal_entry {
   uint64_t ts;
   uint8_t  op;         // 1=INSERT, 2=UPDATE, 3=DELETE, 0=DDL
+  uint8_t  sql_alloc;  // 0=static, 1=malloc'd, 2=sqlite3_malloc'd
   uint16_t table_id;
   uint64_t pk;
   char     *sql;
@@ -99,11 +100,17 @@ static void wal_queue_init(struct wal_queue *q) {
 #endif
 }
 
+static void wal_entry_free_sql(struct wal_entry *e) {
+  if (!e->sql) return;
+  if (e->sql_alloc == 2)      sqlite3_free(e->sql);
+  else if (e->sql_alloc == 1) free(e->sql);
+  e->sql = NULL;
+  e->sql_alloc = 0;
+}
+
 static void wal_entries_free_sql(struct wal_entry *entries, int count) {
-  for (int i = 0; i < count; i++) {
-    free(entries[i].sql);
-    entries[i].sql = NULL;
-  }
+  for (int i = 0; i < count; i++)
+    wal_entry_free_sql(&entries[i]);
 }
 
 static void wal_queue_destroy(struct wal_queue *q) {
@@ -131,7 +138,7 @@ static void wal_queue_destroy(struct wal_queue *q) {
 // Entries are silently dropped when ARKILIAN_WAL_PUSH_URL is unset
 // (no queue allocated).
 static void wal_queue_push(struct wal_queue *q, struct wal_entry *e) {
-  if (!q->allocated) { free(e->sql); return; }
+  if (!q->allocated) { wal_entry_free_sql(e); return; }
 
 #ifndef _WIN32
   pthread_mutex_lock(&q->mutex);
@@ -175,7 +182,7 @@ drop:
 #else
   ReleaseMutex(q->mutex);
 #endif
-  free(e->sql);
+  wal_entry_free_sql(e);
 }
 
 // Called by the flush thread.  Blocks until entries are available or
@@ -229,7 +236,7 @@ static void wal_queue_consume(struct wal_queue *q, int n) {
 
   // Free SQL for the consumed entries
   for (int i = h->consumed - n; i < h->consumed && i < h->count; i++)
-    if (h->entries[i].sql) { free(h->entries[i].sql); h->entries[i].sql = NULL; }
+    wal_entry_free_sql(&h->entries[i]);
 
   // Free fully-consumed chunks (keep at least the tail)
   while (q->head != q->tail && q->head->consumed >= q->head->count) {
@@ -367,11 +374,12 @@ static void parse_sql_meta(const char *sql, uint8_t *op_out, char *tbl, size_t t
 }
 
 // Build a wal_entry from the SQL string
-static void build_wal_entry(struct wal_entry *e, const char *sql) {
+static void build_wal_entry(struct wal_entry *e, char *sql, int sql_alloc) {
   char tbl[128];
   e->ts = (uint64_t)time(NULL);
   parse_sql_meta(sql, &e->op, tbl, sizeof(tbl), &e->table_id, &e->pk);
-  e->sql = strdup(sql ? sql : "");
+  e->sql = sql;
+  e->sql_alloc = (uint8_t)sql_alloc;
 }
 
 // ── Preupdate capture (deterministic SQL expansion) ──────────────
@@ -454,6 +462,11 @@ struct arkilian {
   sqlite3_stmt *rollback_stmt;
   // Chunked WAL queue for out-of-band shipping
   struct wal_queue wal;
+  // Batch WAL accumulation during explicit transactions (db_begin/db_commit).
+  // Entries are built eagerly but deferred-push to avoid per-row queue overhead.
+  struct wal_entry *batched_entries;
+  int batched_count;
+  int batched_cap;
   // Flush thread
 #ifndef _WIN32
   pthread_t flush_thread_id;
@@ -616,78 +629,69 @@ static char *build_deterministic_sql(arkilian *db) {
     return strdup(buf);
   }
 
-  // INSERT / UPDATE → build REPLACE INTO
-  size_t cap = 256;
-  char *out = malloc(cap);
+  // ── Pass 1: measure exact output size ─────────────────────────
+  size_t need = 64;
+  need += strlen(db->pu.table);
+  for (int i = 0; i < ncol; i++) {
+    need += strlen(col->names[i]) + 4;  // "col", 
+    sqlite3_value *v = db->pu.values[i];
+    int vtype = v ? sqlite3_value_type(v) : SQLITE_NULL;
+    if (vtype == SQLITE_NULL)        need += 5;
+    else if (vtype == SQLITE_INTEGER) need += 22;
+    else if (vtype == SQLITE_FLOAT)  need += 32;
+    else if (vtype == SQLITE_TEXT)   need += (size_t)sqlite3_value_bytes(v) * 2 + 4;
+    else if (vtype == SQLITE_BLOB)   need += (size_t)sqlite3_value_bytes(v) * 2 + 6;
+    else                             need += 5;
+  }
+
+  // ── Pass 2: allocate once and format ──────────────────────────
+  char *out = malloc(need);
   if (!out) return NULL;
   size_t off = 0;
 
-  off += (size_t)snprintf(out + off, cap - off,
+  off += (size_t)snprintf(out + off, need - off,
     "REPLACE INTO \"%s\" (", db->pu.table);
 
-  for (int i = 0; i < ncol; i++) {
-    if (off + strlen(col->names[i]) + 4 >= cap) {
-      cap *= 2;
-      char *tmp = realloc(out, cap);
-      if (!tmp) { free(out); return NULL; }
-      out = tmp;
-    }
-    off += (size_t)snprintf(out + off, cap - off, "\"%s\"%s",
+  for (int i = 0; i < ncol; i++)
+    off += (size_t)snprintf(out + off, need - off, "\"%s\"%s",
       col->names[i], (i < ncol - 1) ? ", " : ") VALUES (");
-  }
 
   for (int i = 0; i < ncol; i++) {
     sqlite3_value *v = db->pu.values[i];
     int vtype = v ? sqlite3_value_type(v) : SQLITE_NULL;
-    int need = 32;
-    if (vtype == SQLITE_TEXT)
-      need = sqlite3_value_bytes(v) * 2 + 4; // esc overhead
-    else if (vtype == SQLITE_BLOB)
-      need = sqlite3_value_bytes(v) * 2 + 4;
-
-    if (off + (size_t)need >= cap) {
-      cap = cap * 2 + (size_t)need;
-      char *tmp = realloc(out, cap);
-      if (!tmp) { free(out); return NULL; }
-      out = tmp;
-    }
 
     if (vtype == SQLITE_NULL || !v) {
-      off += (size_t)snprintf(out + off, cap - off, "NULL");
+      off += (size_t)snprintf(out + off, need - off, "NULL");
     } else if (vtype == SQLITE_INTEGER) {
-      off += (size_t)snprintf(out + off, cap - off, "%lld",
+      off += (size_t)snprintf(out + off, need - off, "%lld",
         (long long)sqlite3_value_int64(v));
     } else if (vtype == SQLITE_FLOAT) {
-      off += (size_t)snprintf(out + off, cap - off, "%.15g",
+      off += (size_t)snprintf(out + off, need - off, "%.15g",
         sqlite3_value_double(v));
     } else if (vtype == SQLITE_TEXT) {
       const char *txt = (const char *)sqlite3_value_text(v);
       int len = sqlite3_value_bytes(v);
-      off += (size_t)snprintf(out + off, cap - off, "'");
+      out[off++] = '\'';
       for (int j = 0; j < len; j++) {
-        if (txt[j] == '\'') {
-          if (off + 2 >= cap) { cap *= 2; char *tmp = realloc(out, cap); if (!tmp) { free(out); return NULL; } out = tmp; }
-          out[off++] = '\''; out[off++] = '\'';
-        } else {
-          if (off + 1 >= cap) { cap *= 2; char *tmp = realloc(out, cap); if (!tmp) { free(out); return NULL; } out = tmp; }
-          out[off++] = txt[j];
-        }
+        if (txt[j] == '\'') out[off++] = '\'';
+        out[off++] = txt[j];
       }
-      off += (size_t)snprintf(out + off, cap - off, "'");
+      out[off++] = '\'';
     } else if (vtype == SQLITE_BLOB) {
       const unsigned char *blob = sqlite3_value_blob(v);
       int len = sqlite3_value_bytes(v);
-      off += (size_t)snprintf(out + off, cap - off, "X'");
+      out[off++] = 'X'; out[off++] = '\'';
       for (int j = 0; j < len; j++) {
-        if (off + 3 >= cap) { cap *= 2; char *tmp = realloc(out, cap); if (!tmp) { free(out); return NULL; } out = tmp; }
-        off += (size_t)snprintf(out + off, cap - off, "%02X", blob[j]);
+        static const char hex[] = "0123456789ABCDEF";
+        out[off++] = hex[blob[j] >> 4];
+        out[off++] = hex[blob[j] & 0xF];
       }
-      off += (size_t)snprintf(out + off, cap - off, "'");
+      out[off++] = '\'';
     } else {
-      off += (size_t)snprintf(out + off, cap - off, "NULL");
+      off += (size_t)snprintf(out + off, need - off, "NULL");
     }
-
-    off += (size_t)snprintf(out + off, cap - off, "%s", (i < ncol - 1) ? ", " : ")");
+    off += (size_t)snprintf(out + off, need - off, "%s",
+      (i < ncol - 1) ? ", " : ")");
   }
 
   out[off] = '\0';
@@ -1411,13 +1415,11 @@ static void push_write_wal_entry(arkilian *db, sqlite3_stmt *stmt) {
   db->has_new_writes = 1;
   struct wal_entry entry;
   if (deterministic) {
-    build_wal_entry(&entry, deterministic);
-    free(deterministic);
+    build_wal_entry(&entry, deterministic, 1);
   } else if (expanded) {
-    build_wal_entry(&entry, expanded);
-    sqlite3_free(expanded);
+    build_wal_entry(&entry, expanded, 2);
   } else {
-    build_wal_entry(&entry, db->current_write_sql);
+    build_wal_entry(&entry, strdup(db->current_write_sql), 1);
   }
   check_update_hook_before_push(db, &entry);
   entry.rk = (uint32_t)sqlite3_changes(db->handle);
