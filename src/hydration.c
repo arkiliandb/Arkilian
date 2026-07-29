@@ -223,9 +223,11 @@ static int request_hydrate_plan(const char *server_url, const char *token,
     return err;
   }
 
+  fprintf(stderr, "DEBUG json string: %s\n", json);
   // Parse plan
   memset(plan, 0, sizeof(*plan));
   plan->snapshot_url  = json_get_string(json, "snapshot_url");
+  fprintf(stderr, "DEBUG plan->snapshot_url: %s\n", plan->snapshot_url ? plan->snapshot_url : "NULL");
   plan->baseline_lsn  = json_get_int64(json, "baseline_lsn");
   plan->expires_at    = json_get_int64(json, "expires_at");
   plan->chunk_count   = json_array_count(json, "chunks");
