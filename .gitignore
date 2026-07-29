@@ -71,3 +71,5 @@ server/arkilian-server
 *.gif
 petshopDB/ARKILIAN_SPEC.md
 test_deterministic
+realtime-backup-layer-c-sqlite3.md
+stress_200m

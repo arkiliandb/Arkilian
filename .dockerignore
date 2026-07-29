@@ -1,0 +1,12 @@
+server/app.sqlite*
+node_modules
+build
+.git
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.db
+*.db-wal
+*.db-shm
+stress_app.db*
+test_*.db*

@@ -1,5 +1,7 @@
 # Build stage
-FROM golang:1.21-alpine AS builder
+FROM golang:1.23-alpine AS builder
+
+ENV GOTOOLCHAIN=auto
 
 RUN apk add --no-cache gcc musl-dev sqlite-dev
 
@@ -15,7 +17,7 @@ FROM alpine:3.19
 
 RUN apk add --no-cache ca-certificates
 
-# Create data directory for SQLite (mounted as Fly volume)
+# Create data directory for SQLite
 RUN mkdir -p /data
 
 COPY --from=builder /app/arkilian-server /usr/local/bin/arkilian-server
