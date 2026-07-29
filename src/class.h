@@ -45,6 +45,8 @@ int db_bind_null(arkilian *db, int idx);
 
 int db_column_type(arkilian *db, int col);
 sqlite3_int64 db_column_int64(arkilian *db, int col);
+const void* db_column_blob(arkilian *db, int col);
+int db_column_bytes(arkilian *db, int col);
 
 int db_changes(arkilian *db);
 sqlite3_int64 db_last_insert_rowid(arkilian *db);

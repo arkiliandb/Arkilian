@@ -26,6 +26,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <ctype.h>
 #include <time.h>
 
 #include "deps/sqlite/sqlite3.h"
@@ -82,6 +83,12 @@ struct arkilian {
 
   volatile int wake_flag;
   char last_shipped_payload[1024];
+  char wal_last_buf[1024];
+#ifdef _WIN32
+  CRITICAL_SECTION payload_mutex;
+#else
+  pthread_mutex_t payload_mutex;
+#endif
 
   // Transaction state tracking
   int in_batch_txn;
@@ -122,6 +129,13 @@ static void load_env(void) {
   if (!fp) return;
   char line[256];
   while (fgets(line, sizeof(line), fp)) {
+    // Discard the remainder of overlong lines so a truncated
+    // fragment is never parsed as a separate KEY=VALUE pair.
+    size_t len = strlen(line);
+    if (len > 0 && line[len - 1] != '\n' && !feof(fp)) {
+      int c;
+      while ((c = fgetc(fp)) != EOF && c != '\n') { /* drain */ }
+    }
     char *key = strtok(line, "=");
     char *val = strtok(NULL, "\n\r");
     if (key && val) {
@@ -133,6 +147,54 @@ static void load_env(void) {
     }
   }
   fclose(fp);
+}
+
+// ── Small Shared Helpers ────────────────────────────────────────────
+
+// Escape a string for embedding inside a SQL single-quoted literal
+// (doubles every single quote).  Caller frees.
+static char *sql_literal_escape(const char *s) {
+  size_t len = 0;
+  for (const char *p = s; *p; p++) len += (*p == '\'') ? 2 : 1;
+  char *out = malloc(len + 1);
+  if (!out) return NULL;
+  char *w = out;
+  for (const char *p = s; *p; p++) {
+    if (*p == '\'') *w++ = '\'';
+    *w++ = *p;
+  }
+  *w = '\0';
+  return out;
+}
+
+// Skip leading whitespace and SQL comments so DDL verbs are detected
+// even when the statement doesn't start at column 0.
+static const char *skip_sql_prefix(const char *sql) {
+  for (;;) {
+    while (*sql && isspace((unsigned char)*sql)) sql++;
+    if (sql[0] == '-' && sql[1] == '-') {
+      while (*sql && *sql != '\n') sql++;
+      continue;
+    }
+    if (sql[0] == '/' && sql[1] == '*') {
+      const char *e = strstr(sql + 2, "*/");
+      sql = e ? e + 2 : sql + strlen(sql);
+      continue;
+    }
+    return sql;
+  }
+}
+
+// Pre-signed object-storage URLs carry their own credentials in the
+// query string — attaching our bearer token both leaks the credential
+// to the storage host and breaks signature validation.
+static int url_is_presigned(const char *url) {
+  if (!url) return 0;
+  return strstr(url, "X-Amz-Signature=") != NULL ||
+         strstr(url, "X-Amz-Credential=") != NULL ||
+         strstr(url, "X-Goog-Signature=") != NULL ||
+         strstr(url, "X-Goog-Credential=") != NULL ||
+         strstr(url, "sig=") != NULL; /* Azure SAS */
 }
 
 // ── Trigger Auto-Generator ──────────────────────────────────────────
@@ -150,29 +212,50 @@ static int is_reserved_table(const char *name) {
   return 0;
 }
 
+// Returns 1 if the named table is WITHOUT ROWID, 0 otherwise (including
+// when the check itself fails — older SQLite lacks pragma_table_list).
+static int table_is_without_rowid(sqlite3 *db, const char *table) {
+  int wr = 0;
+  char *q = sqlite3_mprintf(
+      "SELECT wr FROM pragma_table_list WHERE name = %Q", table);
+  if (!q) return 0;
+  sqlite3_stmt *st = NULL;
+  if (sqlite3_prepare_v2(db, q, -1, &st, NULL) == SQLITE_OK) {
+    if (sqlite3_step(st) == SQLITE_ROW) wr = sqlite3_column_int(st, 0);
+  }
+  sqlite3_finalize(st);
+  sqlite3_free(q);
+  return wr;
+}
+
 int sync_backup_triggers(sqlite3 *db, char **err_out) {
   if (!db) return SQLITE_ERROR;
   int rc;
   char *errmsg = NULL;
+  int began = 0;
 
-  rc = sqlite3_exec(db, "BEGIN IMMEDIATE;", NULL, NULL, &errmsg);
-  if (rc != SQLITE_OK) {
-    if (err_out) *err_out = errmsg;
-    else sqlite3_free(errmsg);
-    return rc;
+  // Only open our own transaction when the connection is in autocommit
+  // mode.  When the caller already holds a transaction (e.g. db_begin
+  // batch), join it and leave commit/rollback to the caller.
+  if (sqlite3_get_autocommit(db)) {
+    rc = sqlite3_exec(db, "BEGIN IMMEDIATE;", NULL, NULL, &errmsg);
+    if (rc != SQLITE_OK) {
+      if (err_out) *err_out = errmsg;
+      else sqlite3_free(errmsg);
+      return rc;
+    }
+    began = 1;
   }
 
   // Ensure internal outbox & metadata tables exist
-  sqlite3_exec(db,
+  static const char *const kInternalDDL[] = {
     "CREATE TABLE IF NOT EXISTS _pending_backup ("
     "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
     "  payload TEXT NOT NULL,"
     "  attempts INTEGER NOT NULL DEFAULT 0,"
     "  created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),"
     "  last_attempt_at INTEGER"
-    ");", NULL, NULL, NULL);
-
-  sqlite3_exec(db,
+    ");",
     "CREATE TABLE IF NOT EXISTS _dead_backup ("
     "  id INTEGER PRIMARY KEY,"
     "  payload TEXT NOT NULL,"
@@ -180,20 +263,29 @@ int sync_backup_triggers(sqlite3 *db, char **err_out) {
     "  failed_reason TEXT,"
     "  created_at INTEGER NOT NULL,"
     "  dead_lettered_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))"
-    ");", NULL, NULL, NULL);
-
-  sqlite3_exec(db,
+    ");",
     "CREATE TABLE IF NOT EXISTS _arkilian_meta ("
     "  k TEXT PRIMARY KEY,"
     "  v TEXT"
-    ");", NULL, NULL, NULL);
+    ");",
+    NULL
+  };
+  for (int i = 0; kInternalDDL[i]; i++) {
+    rc = sqlite3_exec(db, kInternalDDL[i], NULL, NULL, &errmsg);
+    if (rc != SQLITE_OK) {
+      if (began) sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
+      if (err_out) *err_out = errmsg;
+      else sqlite3_free(errmsg);
+      return rc;
+    }
+  }
 
   sqlite3_stmt *table_stmt = NULL;
   rc = sqlite3_prepare_v2(db,
       "SELECT name FROM sqlite_master WHERE type = 'table'", -1, &table_stmt, NULL);
   if (rc != SQLITE_OK) {
-    sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
     if (err_out) *err_out = sqlite3_mprintf("prepare table list: %s", sqlite3_errmsg(db));
+    if (began) sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
     return rc;
   }
 
@@ -201,107 +293,210 @@ int sync_backup_triggers(sqlite3 *db, char **err_out) {
     const char *table = (const char *)sqlite3_column_text(table_stmt, 0);
     if (!table || is_reserved_table(table)) continue;
 
-    char *pragma_sql = sqlite3_mprintf("PRAGMA table_info(%w);", table);
+    int without_rowid = table_is_without_rowid(db, table);
+
+    char *pragma_sql = sqlite3_mprintf("PRAGMA table_info(\"%w\");", table);
+    if (!pragma_sql) { rc = SQLITE_NOMEM; goto oom; }
     sqlite3_stmt *col_stmt = NULL;
     rc = sqlite3_prepare_v2(db, pragma_sql, -1, &col_stmt, NULL);
     sqlite3_free(pragma_sql);
 
     if (rc != SQLITE_OK) {
-      sqlite3_finalize(table_stmt);
-      sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
+      // Build the message BEFORE finalizing table_stmt — `table` points
+      // into table_stmt's row buffer and is invalid after finalize.
       if (err_out) *err_out = sqlite3_mprintf("prepare table_info(%s): %s", table, sqlite3_errmsg(db));
+      sqlite3_finalize(table_stmt);
+      if (began) sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
       return rc;
     }
 
-    char *col_names = NULL;
-    char *new_vals = NULL;
-    int col_count = 0;
+    // Column collection (names + primary-key ranks)
+    char **cols = NULL;
+    int *pk_ranks = NULL;
+    int ncols = 0, cap = 0;
 
     while ((rc = sqlite3_step(col_stmt)) == SQLITE_ROW) {
       const char *col = (const char *)sqlite3_column_text(col_stmt, 1);
       if (!col) continue;
-
-      char *next_cols = NULL;
-      char *next_vals = NULL;
-
-      if (col_count == 0) {
-        next_cols = sqlite3_mprintf("\"%w\"", col);
-        next_vals = sqlite3_mprintf("quote(NEW.\"%w\")", col);
-      } else {
-        next_cols = sqlite3_mprintf("%s, \"%w\"", col_names, col);
-        next_vals = sqlite3_mprintf("%s || ', ' || quote(NEW.\"%w\")", new_vals, col);
-        sqlite3_free(col_names);
-        sqlite3_free(new_vals);
+      if (ncols == cap) {
+        int ncap = cap ? cap * 2 : 8;
+        char **nc = realloc(cols, (size_t)ncap * sizeof(char *));
+        int *nr = realloc(pk_ranks, (size_t)ncap * sizeof(int));
+        // A failed realloc leaves the original block intact; a successful
+        // one moved it — adopt each result independently to stay consistent.
+        if (nc) cols = nc;
+        if (nr) pk_ranks = nr;
+        if (!nc || !nr) {
+          sqlite3_finalize(col_stmt);
+          goto oom;
+        }
+        cap = ncap;
       }
-
-      col_names = next_cols;
-      new_vals = next_vals;
-      col_count++;
+      cols[ncols] = strdup(col);
+      pk_ranks[ncols] = sqlite3_column_int(col_stmt, 5);
+      if (!cols[ncols]) { sqlite3_finalize(col_stmt); goto oom; }
+      ncols++;
     }
     sqlite3_finalize(col_stmt);
+    if (rc != SQLITE_DONE) goto fail;
 
-    if (col_count == 0 || !col_names || !new_vals) {
-      if (col_names) sqlite3_free(col_names);
-      if (new_vals) sqlite3_free(new_vals);
-      continue;
-    }
+    if (ncols == 0) goto next_table;
 
-    const char *ops[3][2] = {
-        {"ai", "INSERT"}, {"au", "UPDATE"}, {"ad", "DELETE"}
-    };
-
-    for (int i = 0; i < 3; i++) {
-      char *drop_sql = sqlite3_mprintf("DROP TRIGGER IF EXISTS trg_%w_%s;", table, ops[i][0]);
-      rc = sqlite3_exec(db, drop_sql, NULL, NULL, &errmsg);
-      sqlite3_free(drop_sql);
-      if (rc != SQLITE_OK) {
-        sqlite3_free(col_names);
-        sqlite3_free(new_vals);
-        goto fail;
-      }
-
-      char *create_sql = NULL;
-      if (i == 2) {
-        // DELETE trigger
-        create_sql = sqlite3_mprintf(
-            "CREATE TRIGGER trg_%w_ad AFTER DELETE ON %w BEGIN "
-            "INSERT INTO _pending_backup (payload) VALUES ("
-            "'DELETE FROM %w WHERE rowid = ' || OLD.rowid); END;",
-            table, table, table);
+    // Raw identifier list: "c1", "c2"  and  NEW-value expression:
+    // quote(NEW."c1") || ', ' || quote(NEW."c2")
+    char *raw_cols = NULL;
+    char *new_vals = NULL;
+    for (int i = 0; i < ncols; i++) {
+      char *next_cols, *next_vals;
+      if (i == 0) {
+        next_cols = sqlite3_mprintf("\"%w\"", cols[i]);
+        next_vals = sqlite3_mprintf("quote(NEW.\"%w\")", cols[i]);
       } else {
-        // INSERT / UPDATE trigger
-        create_sql = sqlite3_mprintf(
-            "CREATE TRIGGER trg_%w_%s AFTER %s ON %w BEGIN "
-            "INSERT INTO _pending_backup (payload) VALUES ("
-            "'REPLACE INTO %w (%s) VALUES (' || %s || ')'); END;",
-            table, ops[i][0], ops[i][1], table, table, col_names, new_vals);
+        next_cols = sqlite3_mprintf("%s, \"%w\"", raw_cols, cols[i]);
+        next_vals = sqlite3_mprintf("%s || ', ' || quote(NEW.\"%w\")", new_vals, cols[i]);
       }
-
-      rc = sqlite3_exec(db, create_sql, NULL, NULL, &errmsg);
-      sqlite3_free(create_sql);
-      if (rc != SQLITE_OK) {
-        sqlite3_free(col_names);
-        sqlite3_free(new_vals);
-        goto fail;
+      if (!next_cols || !next_vals) {
+        sqlite3_free(next_cols); sqlite3_free(next_vals);
+        goto oom;
       }
+      sqlite3_free(raw_cols); sqlite3_free(new_vals);
+      raw_cols = next_cols; new_vals = next_vals;
     }
 
-    sqlite3_free(col_names);
-    sqlite3_free(new_vals);
+    // Payload SQL texts.  Literals get a second escape pass so single
+    // quotes inside identifiers survive embedding in the trigger's
+    // string literal; expressions stay raw.
+    char *replace_lit_raw = sqlite3_mprintf("REPLACE INTO \"%w\" (%s) VALUES (", table, raw_cols);
+    char *delete_prefix_raw = sqlite3_mprintf("DELETE FROM \"%w\" WHERE ", table);
+    char *replace_lit = sql_literal_escape(replace_lit_raw ? replace_lit_raw : "");
+    char *delete_prefix = sql_literal_escape(delete_prefix_raw ? delete_prefix_raw : "");
+    sqlite3_free(replace_lit_raw); sqlite3_free(delete_prefix_raw);
+    if (!replace_lit || !delete_prefix) { free(replace_lit); free(delete_prefix); goto oom; }
+
+    // WITHOUT ROWID tables have no rowid — the DELETE payload must
+    // match on primary-key columns instead of OLD.rowid.
+    char *delete_expr = NULL;
+    if (!without_rowid) {
+      delete_expr = sqlite3_mprintf("'%s' || OLD.rowid", delete_prefix);
+    } else {
+      int pk_seen = 0;
+      char *lit_accum = strdup(delete_prefix);
+      if (!lit_accum) goto oom;
+      for (int i = 0; i < ncols; i++) {
+        if (pk_ranks[i] == 0) continue;
+        char *piece = sqlite3_mprintf(pk_seen == 0 ? "\"%w\" = " : " AND \"%w\" = ", cols[i]);
+        if (!piece) { free(lit_accum); goto oom; }
+        char *new_accum = malloc(strlen(lit_accum) + strlen(piece) + 1);
+        if (!new_accum) { sqlite3_free(piece); free(lit_accum); goto oom; }
+        strcpy(new_accum, lit_accum);
+        strcat(new_accum, piece);
+        free(lit_accum); sqlite3_free(piece);
+        lit_accum = new_accum;
+
+        char *esc = sql_literal_escape(lit_accum);
+        char *expr = sqlite3_mprintf("quote(OLD.\"%w\")", cols[i]);
+        if (!esc || !expr) { free(esc); sqlite3_free(expr); free(lit_accum); goto oom; }
+        char *next_expr = delete_expr
+          ? sqlite3_mprintf("%s || '%s' || %s", delete_expr, esc, expr)
+          : sqlite3_mprintf("'%s' || %s", esc, expr);
+        free(esc); sqlite3_free(expr);
+        sqlite3_free(delete_expr);
+        delete_expr = next_expr;
+        if (!delete_expr) { free(lit_accum); goto oom; }
+        lit_accum[0] = '\0';
+        pk_seen++;
+      }
+      free(lit_accum);
+      if (pk_seen == 0) {
+        errmsg = sqlite3_mprintf("table %s is WITHOUT ROWID but has no PRIMARY KEY", table);
+        free(replace_lit); free(delete_prefix);
+        sqlite3_free(raw_cols); sqlite3_free(new_vals);
+        goto fail_with_errmsg;
+      }
+    }
+    if (!delete_expr) { free(replace_lit); free(delete_prefix); sqlite3_free(raw_cols); sqlite3_free(new_vals); goto oom; }
+
+    {
+      const char *ops[3][2] = {
+          {"ai", "INSERT"}, {"au", "UPDATE"}, {"ad", "DELETE"}
+      };
+
+      for (int i = 0; i < 3; i++) {
+        char *drop_sql = sqlite3_mprintf("DROP TRIGGER IF EXISTS \"trg_%w_%s\";", table, ops[i][0]);
+        if (!drop_sql) goto trigger_oom;
+        rc = sqlite3_exec(db, drop_sql, NULL, NULL, &errmsg);
+        sqlite3_free(drop_sql);
+        if (rc != SQLITE_OK) goto trigger_fail;
+
+        char *create_sql = NULL;
+        if (i == 2) {
+          create_sql = sqlite3_mprintf(
+              "CREATE TRIGGER \"trg_%w_ad\" AFTER DELETE ON \"%w\" BEGIN "
+              "INSERT INTO _pending_backup (payload) VALUES (%s); END;",
+              table, table, delete_expr);
+        } else {
+          create_sql = sqlite3_mprintf(
+              "CREATE TRIGGER \"trg_%w_%s\" AFTER %s ON \"%w\" BEGIN "
+              "INSERT INTO _pending_backup (payload) VALUES ("
+              "'%s' || %s || ')'); END;",
+              table, ops[i][0], ops[i][1], table, replace_lit, new_vals);
+        }
+        if (!create_sql) goto trigger_oom;
+
+        rc = sqlite3_exec(db, create_sql, NULL, NULL, &errmsg);
+        sqlite3_free(create_sql);
+        if (rc != SQLITE_OK) goto trigger_fail;
+      }
+      goto triggers_done;
+
+trigger_oom:
+      rc = SQLITE_NOMEM;
+trigger_fail:
+      free(replace_lit); free(delete_prefix); sqlite3_free(delete_expr);
+      sqlite3_free(raw_cols); sqlite3_free(new_vals);
+      goto fail;
+    }
+
+triggers_done:
+    free(replace_lit); free(delete_prefix); sqlite3_free(delete_expr);
+    sqlite3_free(raw_cols); sqlite3_free(new_vals);
+
+next_table:
+    for (int i = 0; i < ncols; i++) free(cols[i]);
+    free(cols); free(pk_ranks);
     continue;
 
+oom:
+    rc = SQLITE_NOMEM;
+    if (!errmsg) errmsg = sqlite3_mprintf("out of memory");
+    goto fail_with_errmsg;
+
 fail:
+    if (!errmsg) errmsg = sqlite3_mprintf("trigger sync failed (rc=%d)", rc);
+fail_with_errmsg:
+    for (int i = 0; i < ncols; i++) free(cols[i]);
+    free(cols); free(pk_ranks);
     sqlite3_finalize(table_stmt);
-    sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
+    if (began) sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
     if (err_out) *err_out = errmsg;
+    else sqlite3_free(errmsg);
     return rc;
   }
   sqlite3_finalize(table_stmt);
 
-  rc = sqlite3_exec(db, "COMMIT;", NULL, NULL, &errmsg);
-  if (rc != SQLITE_OK) {
-    if (err_out) *err_out = errmsg;
+  if (rc != SQLITE_DONE) {
+    if (began) sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
+    if (err_out) *err_out = sqlite3_mprintf("table scan: %s", sqlite3_errmsg(db));
     return rc;
+  }
+
+  if (began) {
+    rc = sqlite3_exec(db, "COMMIT;", NULL, NULL, &errmsg);
+    if (rc != SQLITE_OK) {
+      if (err_out) *err_out = errmsg;
+      else sqlite3_free(errmsg);
+      return rc;
+    }
   }
 
   return SQLITE_OK;
@@ -315,11 +510,19 @@ static void on_db_update(void *user_data, int op_type, char const *db_name,
   (void)op_type; (void)db_name; (void)row_id;
   if (!db || is_reserved_table(table_name)) return;
 
-  db->wake_flag = 1;
+  // The flag and the signal must be issued under the mutex — otherwise
+  // the flush thread can miss the wakeup between its predicate check
+  // and pthread_cond_timedwait().
 #ifndef _WIN32
+  pthread_mutex_lock(&db->wake_mutex);
+  db->wake_flag = 1;
   pthread_cond_signal(&db->wake_cond);
+  pthread_mutex_unlock(&db->wake_mutex);
 #else
+  EnterCriticalSection(&db->wake_mutex);
+  db->wake_flag = 1;
   WakeConditionVariable(&db->wake_cond);
+  LeaveCriticalSection(&db->wake_mutex);
 #endif
 }
 
@@ -333,11 +536,20 @@ static size_t curl_discard_cb(void *data, size_t sz, size_t nmemb, void *userp) 
 typedef enum { SHIP_OK = 0, SHIP_RETRY = 1 } ship_result_t;
 
 static ship_result_t ship_to_backup(arkilian *db, sqlite3_int64 id, const char *payload) {
-  (void)id;
   if (!payload || strlen(payload) == 0) return SHIP_OK;
 
+#ifndef _WIN32
+  pthread_mutex_lock(&db->payload_mutex);
+#else
+  EnterCriticalSection(&db->payload_mutex);
+#endif
   strncpy(db->last_shipped_payload, payload, sizeof(db->last_shipped_payload) - 1);
   db->last_shipped_payload[sizeof(db->last_shipped_payload) - 1] = '\0';
+#ifndef _WIN32
+  pthread_mutex_unlock(&db->payload_mutex);
+#else
+  LeaveCriticalSection(&db->payload_mutex);
+#endif
 
   const char *push_url = getenv("ARKILIAN_WAL_PUSH_URL");
   if (!push_url || strlen(push_url) == 0) {
@@ -359,7 +571,13 @@ static ship_result_t ship_to_backup(arkilian *db, sqlite3_int64 id, const char *
 
   struct curl_slist *headers = NULL;
   headers = curl_slist_append(headers, "Content-Type: application/sql");
-  if (db->database_token && strlen(db->database_token) > 0) {
+  // Idempotency key lets the receiver deduplicate retries of the same row.
+  char id_header[64];
+  snprintf(id_header, sizeof(id_header), "X-Arkilian-Payload-Id: %lld", (long long)id);
+  headers = curl_slist_append(headers, id_header);
+  // Never attach our bearer token to a pre-signed storage URL — the
+  // signature IS the credential, and the token would leak to the host.
+  if (db->database_token && strlen(db->database_token) > 0 && !url_is_presigned(push_url)) {
     char auth[512];
     snprintf(auth, sizeof(auth), "Authorization: Bearer %s", db->database_token);
     headers = curl_slist_append(headers, auth);
@@ -415,6 +633,12 @@ static int drain_batch(arkilian *db, sqlite3_stmt *select_stmt, sqlite3_stmt *de
 
     int new_attempts = attempts + 1;
     if (new_attempts >= MAX_ATTEMPTS) {
+      // `payload` (select_stmt's column text) is still valid here —
+      // select_stmt has not been stepped or reset since the read.
+      fprintf(stderr,
+              "arkilian: payload id=%lld dead-lettered after %d attempts "
+              "(moved to _dead_backup): %.120s\n",
+              (long long)id, new_attempts, (const char *)payload);
       sqlite3_reset(dead_letter_stmt);
       sqlite3_clear_bindings(dead_letter_stmt);
       sqlite3_bind_int(dead_letter_stmt, 1, new_attempts);
@@ -434,7 +658,10 @@ static int drain_batch(arkilian *db, sqlite3_stmt *select_stmt, sqlite3_stmt *de
       sqlite3_bind_int(update_attempts_stmt, 1, new_attempts);
       sqlite3_bind_int64(update_attempts_stmt, 2, id);
       sqlite3_step(update_attempts_stmt);
-      processed_any = 1;
+      // Back off: report "no work drained" so the flush loop waits one
+      // poll interval before retrying instead of hot-spinning on a
+      // failing endpoint and burning through MAX_ATTEMPTS instantly.
+      processed_any = 0;
       break;
     }
   }
@@ -475,9 +702,18 @@ void *run_wal_flush(void *arg) {
       "SELECT id, payload, ?1, ?2, created_at FROM _pending_backup WHERE id = ?3",
       -1, &dead_letter_stmt, NULL);
 
+  int stmts_ok = select_stmt && delete_stmt && update_attempts_stmt && dead_letter_stmt;
+  if (!stmts_ok) {
+    fprintf(stderr, "arkilian: flush thread failed to prepare outbox statements "
+                    "(outbox tables missing or OOM) — shipping disabled\n");
+  }
+
   while (!db->shutdown_requested) {
-    int drained = drain_batch(db, select_stmt, delete_stmt,
-                             update_attempts_stmt, dead_letter_stmt);
+    int drained = 0;
+    if (stmts_ok) {
+      drained = drain_batch(db, select_stmt, delete_stmt,
+                            update_attempts_stmt, dead_letter_stmt);
+    }
 
     if (!drained) {
 #ifndef _WIN32
@@ -551,9 +787,11 @@ int db_init(arkilian **db_ptr, const char *filename) {
 #ifndef _WIN32
   pthread_mutex_init(&db->wake_mutex, NULL);
   pthread_cond_init(&db->wake_cond, NULL);
+  pthread_mutex_init(&db->payload_mutex, NULL);
 #else
   InitializeCriticalSection(&db->wake_mutex);
   InitializeConditionVariable(&db->wake_cond);
+  InitializeCriticalSection(&db->payload_mutex);
 #endif
 
   sqlite3_config(SQLITE_CONFIG_MULTITHREAD);
@@ -566,6 +804,9 @@ int db_init(arkilian **db_ptr, const char *filename) {
   if (rc != SQLITE_OK) {
     const char *err = sqlite3_errstr(rc);
     strncpy(db->last_error_msg, err, sizeof(db->last_error_msg) - 1);
+    db->last_error_msg[sizeof(db->last_error_msg) - 1] = '\0';
+    // sqlite3_open_v2 may allocate a handle even on failure — release it.
+    if (db->handle) sqlite3_close(db->handle);
     db->handle = NULL;
     *db_ptr = db;
     return 1;
@@ -576,6 +817,9 @@ int db_init(arkilian **db_ptr, const char *filename) {
       path, &db->backup_db,
       SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX, NULL);
   if (rc != SQLITE_OK) {
+    snprintf(db->last_error_msg, sizeof(db->last_error_msg),
+             "backup connection: %s", sqlite3_errstr(rc));
+    if (db->backup_db) sqlite3_close(db->backup_db);
     sqlite3_close(db->handle);
     db->handle = NULL;
     db->backup_db = NULL;
@@ -597,15 +841,28 @@ int db_init(arkilian **db_ptr, const char *filename) {
   // Register non-blocking update hook
   sqlite3_update_hook(db->handle, on_db_update, db);
 
-  // Sync backup triggers
+  // Sync backup triggers — a failure here means writes are NOT being
+  // captured for backup.  Surface it loudly instead of swallowing it.
   char *trigger_err = NULL;
-  sync_backup_triggers(db->handle, &trigger_err);
+  int sync_rc = sync_backup_triggers(db->handle, &trigger_err);
+  if (sync_rc != SQLITE_OK) {
+    snprintf(db->last_error_msg, sizeof(db->last_error_msg),
+             "backup trigger sync failed: %s",
+             trigger_err ? trigger_err : "unknown error");
+    fprintf(stderr, "arkilian: %s\n", db->last_error_msg);
+  }
   if (trigger_err) sqlite3_free(trigger_err);
 
   // Transaction statements
   sqlite3_prepare_v2(db->handle, "BEGIN;", -1, &db->begin_stmt, NULL);
   sqlite3_prepare_v2(db->handle, "COMMIT;", -1, &db->commit_stmt, NULL);
   sqlite3_prepare_v2(db->handle, "ROLLBACK;", -1, &db->rollback_stmt, NULL);
+  if (!db->begin_stmt || !db->commit_stmt || !db->rollback_stmt) {
+    snprintf(db->last_error_msg, sizeof(db->last_error_msg),
+             "failed to prepare transaction statements: %s", sqlite3_errmsg(db->handle));
+    *db_ptr = db;
+    return 1;
+  }
 
   db->is_open = 1;
   db->shutdown_requested = 0;
@@ -656,11 +913,15 @@ int db_init(arkilian **db_ptr, const char *filename) {
 void db_close(arkilian *db) {
   if (!db) return;
 
+  // Wake BOTH sleeper threads (flush + hourly backup) under the mutex
+  // so neither can miss the shutdown signal.
+#ifndef _WIN32
+  pthread_mutex_lock(&db->wake_mutex);
   db->shutdown_requested = 1;
   db->wake_flag = 1;
+  pthread_cond_broadcast(&db->wake_cond);
+  pthread_mutex_unlock(&db->wake_mutex);
 
-#ifndef _WIN32
-  pthread_cond_signal(&db->wake_cond);
   if (db->flush_thread_running) {
     pthread_join(db->flush_thread_id, NULL);
     db->flush_thread_running = 0;
@@ -671,8 +932,14 @@ void db_close(arkilian *db) {
   }
   pthread_mutex_destroy(&db->wake_mutex);
   pthread_cond_destroy(&db->wake_cond);
+  pthread_mutex_destroy(&db->payload_mutex);
 #else
-  WakeConditionVariable(&db->wake_cond);
+  EnterCriticalSection(&db->wake_mutex);
+  db->shutdown_requested = 1;
+  db->wake_flag = 1;
+  WakeAllConditionVariable(&db->wake_cond);
+  LeaveCriticalSection(&db->wake_mutex);
+
   if (db->flush_thread_handle) {
     WaitForSingleObject(db->flush_thread_handle, INFINITE);
     CloseHandle(db->flush_thread_handle);
@@ -684,6 +951,7 @@ void db_close(arkilian *db) {
     db->backup_thread_handle = NULL;
   }
   DeleteCriticalSection(&db->wake_mutex);
+  DeleteCriticalSection(&db->payload_mutex);
 #endif
 
   for (int i = 0; i < db->stmt_count; i++) {
@@ -740,11 +1008,19 @@ int db_exec(arkilian *db, const char *sql) {
     return rc;
   }
 
-  if (strncasecmp(sql, "CREATE", 6) == 0 ||
-      strncasecmp(sql, "ALTER", 5) == 0 ||
-      strncasecmp(sql, "DROP", 4) == 0) {
+  const char *sql_verb = skip_sql_prefix(sql);
+  if (strncasecmp(sql_verb, "CREATE", 6) == 0 ||
+      strncasecmp(sql_verb, "ALTER", 5) == 0 ||
+      strncasecmp(sql_verb, "DROP", 4) == 0) {
     char *terr = NULL;
-    sync_backup_triggers(db->handle, &terr);
+    int sync_rc = sync_backup_triggers(db->handle, &terr);
+    if (sync_rc != SQLITE_OK) {
+      // The DDL succeeded but its table is not captured for backup —
+      // make the failure visible instead of silent.
+      snprintf(db->last_error_msg, sizeof(db->last_error_msg),
+               "backup trigger sync failed after DDL: %s", terr ? terr : "unknown error");
+      fprintf(stderr, "arkilian: %s\n", db->last_error_msg);
+    }
     if (terr) sqlite3_free(terr);
 
     sqlite3_stmt *ddl_stmt = NULL;
@@ -774,6 +1050,12 @@ int db_prepare(arkilian *db, const char *sql) {
   if (rc != SQLITE_OK) {
     snprintf(db->last_error_msg, sizeof(db->last_error_msg), "%s", sqlite3_errmsg(db->handle));
     return rc;
+  }
+  if (!stmt) {
+    // Empty/whitespace-only SQL prepares OK but yields a NULL statement —
+    // storing it would create a ghost slot in the pool.
+    snprintf(db->last_error_msg, sizeof(db->last_error_msg), "empty SQL statement");
+    return SQLITE_ERROR;
   }
 
   db->stmts[db->stmt_count] = stmt;
