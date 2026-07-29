@@ -218,7 +218,10 @@ static int request_hydrate_plan(const char *server_url, const char *token,
 
   int err = 0;
   char *json = http_get_string(url, token, &err);
-  if (!json) return err;
+  if (!json) {
+    fprintf(stderr, "DEBUG request_hydrate_plan json is NULL, err=%d, url=%s\n", err, url);
+    return err;
+  }
 
   // Parse plan
   memset(plan, 0, sizeof(*plan));
