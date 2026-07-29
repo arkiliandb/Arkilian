@@ -51,7 +51,7 @@ static int http_init(HttpReq *r, const char *url, const char *token) {
   curl_easy_setopt(r->handle, CURLOPT_CONNECTTIMEOUT, 15L);
   curl_easy_setopt(r->handle, CURLOPT_FOLLOWLOCATION, 1L);
   r->headers = NULL;
-  if (token && strlen(token) > 0) {
+  if (token && strlen(token) > 0 && strstr(url, "X-Amz-Signature=") == NULL) {
     char auth[512];
     snprintf(auth, sizeof(auth), "Authorization: Bearer %s", token);
     r->headers = curl_slist_append(r->headers, auth);
@@ -111,6 +111,7 @@ static int http_download_file(const char *url, const char *token,
   http_free(&r);
 
   if (rc != CURLE_OK || http_code != 200) {
+    fprintf(stderr, "DEBUG http_download_file url=%s rc=%d code=%ld\n", url, rc, http_code);
     fclose(f); free(buf.data); remove(local_path);
     *err_out = HYDRATION_ERR_NET; return -1;
   }
