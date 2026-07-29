@@ -534,7 +534,10 @@ int db_init(arkilian **db_ptr, const char *filename) {
   db->backup_path = malloc(strlen(backup_path_tmp) + 1);
   if (db->backup_path) strcpy(db->backup_path, backup_path_tmp);
 
-  const char *signed_url_tmp = get_env_default("ARKILIAN_SIGNED_URL_ENDPOINT", DEFAULT_SIGNED_URL_ENDPOINT);
+  const char *signed_url_tmp = getenv("ARKILIAN_WAL_PUSH_URL");
+  if (!signed_url_tmp || strlen(signed_url_tmp) == 0) {
+    signed_url_tmp = get_env_default("ARKILIAN_SIGNED_URL_ENDPOINT", DEFAULT_SIGNED_URL_ENDPOINT);
+  }
   db->signed_url_endpoint = malloc(strlen(signed_url_tmp) + 1);
   if (db->signed_url_endpoint) strcpy(db->signed_url_endpoint, signed_url_tmp);
 
@@ -607,6 +610,25 @@ int db_init(arkilian **db_ptr, const char *filename) {
   db->is_open = 1;
   db->shutdown_requested = 0;
   *db_ptr = db;
+
+  // Read configuration environment variables
+  const char *env_backup = getenv("ARKILIAN_ENABLE_BACKUP");
+  if (env_backup && (strcmp(env_backup, "1") == 0 || strcasecmp(env_backup, "true") == 0)) {
+    db->backup_enabled = 1;
+  }
+  const char *env_url = getenv("ARKILIAN_WAL_PUSH_URL");
+  if (env_url && strlen(env_url) > 0) {
+    if (db->signed_url_endpoint) free(db->signed_url_endpoint);
+    db->signed_url_endpoint = strdup(env_url);
+  }
+  const char *env_token = getenv("ARKILIAN_DATABASE_TOKEN");
+  if (env_token && strlen(env_token) > 0) {
+    db_set_token(db, env_token);
+  }
+  const char *env_interval = getenv("ARKILIAN_BACKUP_INTERVAL");
+  if (env_interval && atoi(env_interval) > 0) {
+    db->backup_interval = atoi(env_interval);
+  }
 
   // Start WAL flusher thread
 #ifndef _WIN32
@@ -1030,7 +1052,22 @@ char *get_signed_url(const char *api_endpoint, const char *token, int *shutdown_
     CURLcode res = curl_easy_perform(curl);
     if (headers) curl_slist_free_all(headers);
     curl_easy_cleanup(curl);
-    if (res == CURLE_OK) return chunk.response;
+    if (res == CURLE_OK && chunk.response) {
+      char *url_key = strstr(chunk.response, "\"upload_url\":\"");
+      if (url_key) {
+        url_key += strlen("\"upload_url\":\"");
+        char *end_quote = strchr(url_key, '"');
+        if (end_quote) {
+          size_t url_len = end_quote - url_key;
+          char *clean_url = malloc(url_len + 1);
+          memcpy(clean_url, url_key, url_len);
+          clean_url[url_len] = '\0';
+          free(chunk.response);
+          return clean_url;
+        }
+      }
+      return chunk.response;
+    }
   }
   free(chunk.response);
   return NULL;
@@ -1076,12 +1113,16 @@ DWORD WINAPI run_hourly_backup(LPVOID arg) {
 void *run_hourly_backup(void *arg) {
 #endif
   arkilian *db = (arkilian *)arg;
+  int first_run = 1;
   while (1) {
+    if (!first_run) {
 #ifdef _WIN32
-    Sleep(db->backup_interval * 1000);
+      Sleep(db->backup_interval * 1000);
 #else
-    sleep(db->backup_interval);
+      sleep(db->backup_interval);
 #endif
+    }
+    first_run = 0;
     if (db->shutdown_requested || !db->is_open || !db->handle) break;
 
     int status = backup_database(db->handle, db->backup_path);
