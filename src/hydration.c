@@ -111,7 +111,6 @@ static int http_download_file(const char *url, const char *token,
   http_free(&r);
 
   if (rc != CURLE_OK || http_code != 200) {
-    fprintf(stderr, "DEBUG http_download_file url=%s rc=%d code=%ld\n", url, rc, http_code);
     fclose(f); free(buf.data); remove(local_path);
     *err_out = HYDRATION_ERR_NET; return -1;
   }
@@ -218,16 +217,11 @@ static int request_hydrate_plan(const char *server_url, const char *token,
 
   int err = 0;
   char *json = http_get_string(url, token, &err);
-  if (!json) {
-    fprintf(stderr, "DEBUG request_hydrate_plan json is NULL, err=%d, url=%s\n", err, url);
-    return err;
-  }
+  if (!json) return err;
 
-  fprintf(stderr, "DEBUG json string: %s\n", json);
   // Parse plan
   memset(plan, 0, sizeof(*plan));
   plan->snapshot_url  = json_get_string(json, "snapshot_url");
-  fprintf(stderr, "DEBUG plan->snapshot_url: %s\n", plan->snapshot_url ? plan->snapshot_url : "NULL");
   plan->baseline_lsn  = json_get_int64(json, "baseline_lsn");
   plan->expires_at    = json_get_int64(json, "expires_at");
   plan->chunk_count   = json_array_count(json, "chunks");
