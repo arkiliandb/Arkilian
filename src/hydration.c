@@ -257,7 +257,18 @@ static int download_snapshot(const char *snapshot_url, const char *token,
 
   int err = 0;
   int rc = http_download_file(snapshot_url, token, db_path, &err);
-  if (rc != 0) return err;
+  if (rc != 0) {
+    // If baseline snapshot does not exist yet on object storage (cold-start before 1st snapshot),
+    // initialize a clean target database so log chunks replay from LSN 0 cleanly!
+    sqlite3 *db = NULL;
+    if (sqlite3_open_v2(db_path, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX, NULL) == SQLITE_OK) {
+      sqlite3_exec(db, "CREATE TABLE IF NOT EXISTS _arkilian_meta (k TEXT PRIMARY KEY, v TEXT);", NULL, NULL, NULL);
+      sqlite3_close(db);
+      if (progress) progress(1, 1, 1, user);
+      return 0;
+    }
+    return err;
+  }
 
   if (progress) progress(1, 1, 1, user);
   return 0;
