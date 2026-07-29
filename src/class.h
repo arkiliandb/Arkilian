@@ -8,7 +8,7 @@
 extern "C" {
 #endif
 
-// public header
+// Public C API for Arkilian Managed SQLite Database Engine
 typedef struct arkilian arkilian;
 
 int db_init(arkilian **db, const char *connection_url);
@@ -25,9 +25,6 @@ int db_wal_pending(arkilian *db);
 void db_wal_flush(arkilian *db);
 
 // Statement management — multiple statements can coexist.
-// db_prepare pushes a new statement and makes it "current" (index = count-1).
-// db_use_stmt switches which statement is current by index.
-// db_stmt_count returns how many live statements exist.
 int db_prepare(arkilian *db, const char *sql);
 int db_use_stmt(arkilian *db, int index);
 int db_stmt_count(arkilian *db);
@@ -51,10 +48,13 @@ sqlite3_int64 db_column_int64(arkilian *db, int col);
 
 int db_changes(arkilian *db);
 sqlite3_int64 db_last_insert_rowid(arkilian *db);
-const char* db_wal_last_sql(arkilian *db);  // peek at last shipped SQL (for testing)
+const char* db_wal_last_sql(arkilian *db);
+
+// Auto-generate SQL backup triggers for live tables
+int sync_backup_triggers(sqlite3 *db, char **err_out);
 
 #ifdef __cplusplus
 }
 #endif
 
-#endif
+#endif // ARKILIAN_H

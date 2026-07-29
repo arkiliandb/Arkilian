@@ -11,21 +11,14 @@ class Arkilian {
   constructor(token, dbPath = "app.sqlite") {
     if (!token) throw new Error("Your database token is required");
     this.id = native.db_init(dbPath);
-    this.setToken(token);
     if (!this.id) {
       throw new Error("Failed to initialize database");
     }
+    this.setToken(token);
   }
 
   static async open(token, dbPath = "app.sqlite") {
-    return new Promise((resolve, reject) => {
-      try {
-        const db = new Arkilian(token, dbPath);
-        resolve(db);
-      } catch (err) {
-        reject(err);
-      }
-    });
+    return new Arkilian(token, dbPath);
   }
 
   setToken(token) {
@@ -36,33 +29,21 @@ class Arkilian {
     return this;
   }
 
-  async close() {
-    return new Promise((resolve, reject) => {
-      try {
-        if (this.id) {
-          native.db_close(this.id);
-          this.id = null;
-        }
-        resolve(this);
-      } catch (err) {
-        reject(err);
-      }
-    });
+  close() {
+    if (this.id) {
+      native.db_close(this.id);
+      this.id = null;
+    }
+    return this;
   }
 
-  async exec(sql) {
-    return new Promise((resolve, reject) => {
-      try {
-        const query = typeof sql === "object" && sql !== null ? sql.sql : sql;
-        const result = native.db_exec(this.id, query);
-        if (result !== SQLITE_OK && result !== SQLITE_DONE) {
-          return reject(new Error(native.db_errmsg(this.id)));
-        }
-        resolve(result);
-      } catch (err) {
-        reject(err);
-      }
-    });
+  exec(sql) {
+    const query = typeof sql === "object" && sql !== null ? sql.sql : sql;
+    const result = native.db_exec(this.id, query);
+    if (result !== SQLITE_OK && result !== SQLITE_DONE) {
+      throw new Error(native.db_errmsg(this.id));
+    }
+    return result;
   }
 
   prepare(sql = "") {
@@ -90,32 +71,50 @@ class Arkilian {
     return native.db_step(this.id);
   }
 
-  async finalize() {
-    return new Promise((resolve, reject) => {
-      try {
-        const result = native.db_finalize(this.id);
-        if (result !== SQLITE_OK) {
-          return reject(new Error(native.db_errmsg(this.id)));
-        }
-        resolve(this);
-      } catch (err) {
-        reject(err);
-      }
-    });
+  finalize() {
+    const result = native.db_finalize(this.id);
+    if (result !== SQLITE_OK) {
+      throw new Error(native.db_errmsg(this.id));
+    }
+    return this;
   }
 
-  async reset() {
-    return new Promise((resolve, reject) => {
-      try {
-        const result = native.db_reset(this.id);
-        if (result !== SQLITE_OK) {
-          return reject(new Error(native.db_errmsg(this.id)));
-        }
-        resolve(this);
-      } catch (err) {
-        reject(err);
-      }
-    });
+  reset() {
+    const result = native.db_reset(this.id);
+    if (result !== SQLITE_OK) {
+      throw new Error(native.db_errmsg(this.id));
+    }
+    return this;
+  }
+
+  begin() {
+    const rc = native.db_begin(this.id);
+    if (rc !== SQLITE_OK) throw new Error(native.db_errmsg(this.id));
+    return this;
+  }
+
+  commit() {
+    const rc = native.db_commit(this.id);
+    if (rc !== SQLITE_OK) throw new Error(native.db_errmsg(this.id));
+    return this;
+  }
+
+  rollback() {
+    const rc = native.db_rollback(this.id);
+    if (rc !== SQLITE_OK) throw new Error(native.db_errmsg(this.id));
+    return this;
+  }
+
+  transaction(fn) {
+    this.begin();
+    try {
+      const res = fn(this);
+      this.commit();
+      return res;
+    } catch (err) {
+      this.rollback();
+      throw err;
+    }
   }
 
   getColumns() {
@@ -141,7 +140,7 @@ class Arkilian {
 
   bindText(index, value) {
     const result = native.db_bind_text(this.id, index, value);
-    if (result !== SQLITE_OK && result !== 1) {
+    if (result !== SQLITE_OK) {
       throw new Error(native.db_errmsg(this.id));
     }
     return this;
@@ -149,7 +148,7 @@ class Arkilian {
 
   bindInt(index, value) {
     const result = native.db_bind_int(this.id, index, value);
-    if (result !== SQLITE_OK && result !== 1) {
+    if (result !== SQLITE_OK) {
       throw new Error(native.db_errmsg(this.id));
     }
     return this;
@@ -157,62 +156,65 @@ class Arkilian {
 
   bindDouble(index, value) {
     const result = native.db_bind_double(this.id, index, value);
-    if (result !== SQLITE_OK && result !== 1) {
+    if (result !== SQLITE_OK) {
       throw new Error(native.db_errmsg(this.id));
     }
     return this;
   }
 
-  async run(sql, params = []) {
+  run(sql, params = []) {
     const query = typeof sql === "object" && sql !== null ? sql.sql : sql;
     const bindParams =
       typeof sql === "object" && sql !== null ? sql.params || params : params;
-    await this.prepare(query);
+    this.prepare(query);
     for (let i = 0; i < bindParams.length; i++) {
       const p = bindParams[i];
       if (typeof p === "string") {
         this.bindText(i + 1, p);
       } else if (Number.isInteger(p)) {
         this.bindInt(i + 1, p);
+      } else if (p === null || p === undefined) {
+        native.db_bind_null(this.id, i + 1);
       } else {
         this.bindDouble(i + 1, p);
       }
     }
     this.step();
-    await this.finalize();
+    this.finalize();
     return this;
   }
 
-  async all(sql, params = []) {
-    const results = [];
+  all(sql, params = []) {
     const query = typeof sql === "object" && sql !== null ? sql.sql : sql;
     const bindParams =
       typeof sql === "object" && sql !== null ? sql.params || params : params;
-    await this.prepare(query);
+    this.prepare(query);
     for (let i = 0; i < bindParams.length; i++) {
       const p = bindParams[i];
       if (typeof p === "string") {
         this.bindText(i + 1, p);
       } else if (Number.isInteger(p)) {
         this.bindInt(i + 1, p);
+      } else if (p === null || p === undefined) {
+        native.db_bind_null(this.id, i + 1);
       } else {
         this.bindDouble(i + 1, p);
       }
     }
-    const columns = this.getColumns();
-    while (this.step() === SQLITE_ROW) {
-      const row = {};
-      for (let i = 0; i < columns.length; i++) {
-        row[columns[i]] = this.get(i);
-      }
-      results.push(row);
-    }
-    await this.finalize();
-    return results;
+    // High performance C++ native single-turn fetch
+    return native.db_all_native(this.id);
   }
 
   get lastError() {
     return native.db_errmsg(this.id);
+  }
+
+  get changes() {
+    return native.db_changes(this.id);
+  }
+
+  get lastInsertRowid() {
+    return native.db_last_insert_rowid(this.id);
   }
 
   static get SQLITE_OK() {

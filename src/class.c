@@ -1,6 +1,7 @@
-// Arkilian SQLite Wrapper - C API
+// Arkilian SQLite Wrapper — Production Realtime Backup Engine
+// Implements realtime SQL trigger capture, non-blocking wake signals,
+// and dedicated background WAL shipping.
 
-// Enable POSIX features for portable functions
 #ifndef _POSIX_C_SOURCE
 #define _POSIX_C_SOURCE 200809L
 #endif
@@ -10,724 +11,102 @@
 
 #include "class.h"
 #include <curl/curl.h>
+
 #ifdef _WIN32
 #include <windows.h>
+#define strncasecmp _strnicmp
+#define strdup _strdup
 #else
 #include <pthread.h>
 #include <strings.h>
 #include <unistd.h>
 #endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
 #include <time.h>
-// deps
+
 #include "deps/sqlite/sqlite3.h"
 
-#ifdef _WIN32
-#define strncasecmp _strnicmp
-#define strdup _strdup
-#endif
-
-// ── Chunked WAL queue for out-of-band shipping ─────────────────────
-// Writers push entries to the tail chunk under write_mutex.  When a
-// chunk fills up, a new one is allocated and linked — the writer
-// NEVER blocks waiting for the flush thread.  The flush thread
-// drains from the head, freeing fully-consumed chunks.
-//
-// This avoids the swap/spin deadlock that the old double-buffer
-// design hit when the flush thread couldn't keep up (slow network,
-// tiny edge server, etc.).
-
-#define WAL_CHUNK_CAP 10000
-#define WAL_CHUNK_MAX_CAP 100000  // cap chunk growth to prevent unbounded memory
-
-struct wal_entry {
-  uint64_t ts;
-  uint8_t  op;         // 1=INSERT, 2=UPDATE, 3=DELETE, 0=DDL
-  uint8_t  sql_alloc;  // 0=static, 1=malloc'd, 2=sqlite3_malloc'd
-  uint16_t table_id;
-  uint64_t pk;
-  char     *sql;
-  uint32_t rk;
-};
-
-struct wal_chunk {
-  struct wal_entry  *entries;
-  int                count;       // how many entries are filled
-  int                capacity;    // allocated size of entries[]
-  int                consumed;    // how many the flusher has already sent
-  struct wal_chunk  *next;
-};
-
-struct wal_queue {
-  struct wal_chunk *head;         // flusher drains from here
-  struct wal_chunk *tail;         // writer appends to here
-  int               shutdown;
-  int               allocated;
-#ifndef _WIN32
-  pthread_mutex_t   mutex;
-  pthread_cond_t    cond;
-#else
-  HANDLE            mutex;
-  HANDLE            event;
-#endif
-};
-
-static void wal_queue_init(struct wal_queue *q) {
-  memset(q, 0, sizeof(*q));
-  const char *push_url = getenv("ARKILIAN_WAL_PUSH_URL");
-  if (!push_url || strlen(push_url) == 0) return;
-
-  struct wal_chunk *c = malloc(sizeof(struct wal_chunk));
-  if (!c) return;
-  c->entries  = malloc((size_t)WAL_CHUNK_CAP * sizeof(struct wal_entry));
-  c->capacity = WAL_CHUNK_CAP;
-  c->count    = 0;
-  c->consumed = 0;
-  c->next     = NULL;
-  if (!c->entries) { free(c); return; }
-
-  q->head      = c;
-  q->tail      = c;
-  q->allocated = 1;
-#ifndef _WIN32
-  pthread_mutex_init(&q->mutex, NULL);
-  pthread_cond_init(&q->cond, NULL);
-#else
-  q->mutex = CreateMutex(NULL, FALSE, NULL);
-  q->event = CreateEvent(NULL, FALSE, FALSE, NULL);
-#endif
-}
-
-static void wal_entry_free_sql(struct wal_entry *e) {
-  if (!e->sql) return;
-  if (e->sql_alloc == 2)      sqlite3_free(e->sql);
-  else if (e->sql_alloc == 1) free(e->sql);
-  e->sql = NULL;
-  e->sql_alloc = 0;
-}
-
-static void wal_entries_free_sql(struct wal_entry *entries, int count) {
-  for (int i = 0; i < count; i++)
-    wal_entry_free_sql(&entries[i]);
-}
-
-static void wal_queue_destroy(struct wal_queue *q) {
-  if (!q->allocated) return;
-  struct wal_chunk *c = q->head;
-  while (c) {
-    struct wal_chunk *next = c->next;
-    wal_entries_free_sql(c->entries, c->count);
-    free(c->entries);
-    free(c);
-    c = next;
-  }
-  q->head = q->tail = NULL;
-#ifndef _WIN32
-  pthread_mutex_destroy(&q->mutex);
-  pthread_cond_destroy(&q->cond);
-#else
-  CloseHandle(q->mutex);
-  CloseHandle(q->event);
-#endif
-}
-
-// Push one entry into the tail chunk.  Caller holds write_mutex.
-// Never blocks — if the current chunk is full a new one is allocated.
-// Entries are silently dropped when ARKILIAN_WAL_PUSH_URL is unset
-// (no queue allocated).
-static void wal_queue_push(struct wal_queue *q, struct wal_entry *e) {
-  if (!q->allocated) { wal_entry_free_sql(e); return; }
-
-#ifndef _WIN32
-  pthread_mutex_lock(&q->mutex);
-#else
-  WaitForSingleObject(q->mutex, INFINITE);
-#endif
-
-  struct wal_chunk *t = q->tail;
-
-  // Grow chain when the tail chunk is full
-  if (t->count >= t->capacity) {
-    int new_cap = t->capacity * 2;
-    if (new_cap > WAL_CHUNK_MAX_CAP) new_cap = WAL_CHUNK_MAX_CAP;
-    if (new_cap < 1) new_cap = WAL_CHUNK_CAP;
-    struct wal_chunk *c = malloc(sizeof(struct wal_chunk));
-    if (!c) goto drop;
-    c->entries = malloc((size_t)new_cap * sizeof(struct wal_entry));
-    if (!c->entries) { free(c); goto drop; }
-    c->capacity = new_cap;
-    c->count    = 0;
-    c->consumed = 0;
-    c->next     = NULL;
-    t->next = c;
-    q->tail = c;
-    t = c;
-  }
-
-  t->entries[t->count++] = *e;
-
-#ifndef _WIN32
-  pthread_cond_signal(&q->cond);
-  pthread_mutex_unlock(&q->mutex);
-#else
-  SetEvent(q->event);
-  ReleaseMutex(q->mutex);
-#endif
-  return;
-
-drop:
-#ifndef _WIN32
-  pthread_mutex_unlock(&q->mutex);
-#else
-  ReleaseMutex(q->mutex);
-#endif
-  wal_entry_free_sql(e);
-}
-
-// Called by the flush thread.  Blocks until entries are available or
-// shutdown.  Returns the batch to POST and its size.  The caller MUST
-// call wal_queue_consume after POST.
-static struct wal_entry *wal_queue_acquire(struct wal_queue *q, int *out_n) {
-  if (!q->allocated) { *out_n = 0; return NULL; }
-#ifndef _WIN32
-  pthread_mutex_lock(&q->mutex);
-  while (q->head == q->tail && q->head->count == q->head->consumed && !q->shutdown)
-    pthread_cond_wait(&q->cond, &q->mutex);
-  if (q->shutdown) {
-    pthread_mutex_unlock(&q->mutex);
-    *out_n = 0; return NULL;
-  }
-  int n = q->head->count - q->head->consumed;
-  struct wal_entry *batch = q->head->entries + q->head->consumed;
-  pthread_mutex_unlock(&q->mutex);
-  *out_n = n;
-  return batch;
-#else
-  WaitForSingleObject(q->mutex, INFINITE);
-  while (q->head == q->tail && q->head->count == q->head->consumed && !q->shutdown) {
-    ReleaseMutex(q->mutex);
-    WaitForSingleObject(q->event, INFINITE);
-    WaitForSingleObject(q->mutex, INFINITE);
-  }
-  if (q->shutdown) {
-    ReleaseMutex(q->mutex);
-    *out_n = 0; return NULL;
-  }
-  int n = q->head->count - q->head->consumed;
-  struct wal_entry *batch = q->head->entries + q->head->consumed;
-  ReleaseMutex(q->mutex);
-  *out_n = n;
-  return batch;
-#endif
-}
-
-// Called by the flush thread after POST completes.  Frees SQL strings
-// and advances the head pointer, freeing fully-consumed chunks.
-static void wal_queue_consume(struct wal_queue *q, int n) {
-  if (!q->allocated || n <= 0) return;
-#ifndef _WIN32
-  pthread_mutex_lock(&q->mutex);
-#else
-  WaitForSingleObject(q->mutex, INFINITE);
-#endif
-  struct wal_chunk *h = q->head;
-  h->consumed += n;
-
-  // Free SQL for the consumed entries
-  for (int i = h->consumed - n; i < h->consumed && i < h->count; i++)
-    wal_entry_free_sql(&h->entries[i]);
-
-  // Free fully-consumed chunks (keep at least the tail)
-  while (q->head != q->tail && q->head->consumed >= q->head->count) {
-    struct wal_chunk *old = q->head;
-    q->head = old->next;
-    free(old->entries);
-    free(old);
-  }
-#ifndef _WIN32
-  pthread_mutex_unlock(&q->mutex);
-#else
-  ReleaseMutex(q->mutex);
-#endif
-}
-
-// ── SQL helpers ─────────────────────────────────────────────────────
-
-static uint16_t table_name_hash(const char *s) {
-  unsigned long hash = 5381;
-  int c;
-  while ((c = (unsigned char)*s++))
-    hash = ((hash << 5) + hash) + c;
-  return (uint16_t)(hash & 0xFFFF);
-}
-
-static int extract_pk_from_sql(const char *sql, uint64_t *pk) {
-  // Walk backwards to find the last `= <number>` — this is most likely
-  // the WHERE-clause filter rather than a SET assignment.
-  const char *last = NULL;
-  const char *p = sql;
-  while ((p = strchr(p, '=')) != NULL) {
-    const char *num = p + 1;
-    while (*num == ' ') num++;
-    if (*num >= '0' && *num <= '9') {
-      char *end;
-      unsigned long long v = strtoull(num, &end, 10);
-      if (v > 0 && (*end == ' ' || *end == ';' || *end == '\0' ||
-                    *end == ')' || *end == ','))
-        last = p;
-    }
-    p++;
-  }
-  if (last) {
-    const char *num = last + 1;
-    while (*num == ' ') num++;
-    *pk = (uint64_t)strtoull(num, NULL, 10);
-    return 1;
-  }
-  return 0;
-}
-
-static void parse_sql_meta(const char *sql, uint8_t *op_out, char *tbl, size_t tblsz,
-                            uint16_t *tid_out, uint64_t *pk_out) {
-  uint8_t op = 0; // DDL
-  tbl[0] = '\0';
-
-  // Skip whitespace and leading comments
-  while (*sql == ' ' || *sql == '\t' || *sql == '\n' || *sql == '\r') sql++;
-  while ((*sql == '-' && *(sql+1) == '-') || (*sql == '/' && *(sql+1) == '*')) {
-    if (*sql == '-') {
-      while (*sql && *sql != '\n') sql++;
-      if (*sql == '\n') sql++;
-    } else {
-      sql += 2;
-      while (*sql && !(*sql == '*' && *(sql+1) == '/')) sql++;
-      if (*sql == '*') sql += 2;
-    }
-    while (*sql == ' ' || *sql == '\t' || *sql == '\n' || *sql == '\r') sql++;
-  }
-  if (*sql == '\0') { *op_out = 0; *tid_out = 0; *pk_out = 0; return; }
-
-#define MATCH(s, literal) ( \
-  strncasecmp(s, literal, strlen(literal)) == 0 && \
-  (s[strlen(literal)] == ' '  || s[strlen(literal)] == '\t' || \
-   s[strlen(literal)] == '\n' || s[strlen(literal)] == '\r' || \
-   s[strlen(literal)] == '('  || s[strlen(literal)] == ';'  || \
-   s[strlen(literal)] == '\0') \
-)
-
-  if (MATCH(sql, "INSERT")) {
-    op = 1; sql += 6; while (*sql == ' ') sql++;
-    if (MATCH(sql, "INTO")) { sql += 4; while (*sql == ' ') sql++; }
-    if (MATCH(sql, "OR")) { sql += 2; while (*sql == ' ') sql++;
-      if (MATCH(sql,"REPLACE")||MATCH(sql,"ROLLBACK")||MATCH(sql,"ABORT")||MATCH(sql,"FAIL")||MATCH(sql,"IGNORE"))
-        { while (*sql && *sql!=' ') sql++; while (*sql==' ') sql++; }
-    }
-  } else if (MATCH(sql, "UPDATE")) {
-    op = 2; sql += 6; while (*sql == ' ') sql++;
-    if (MATCH(sql, "OR")) { sql += 2; while (*sql == ' ') sql++;
-      while (*sql && *sql!=' ') sql++;
-      while (*sql==' ') sql++; }
-  } else if (MATCH(sql, "DELETE")) {
-    op = 3; sql += 6; while (*sql == ' ') sql++;
-    if (MATCH(sql, "FROM")) { sql += 4; while (*sql == ' ') sql++; }
-  } else if (MATCH(sql, "REPLACE")) {
-    op = 1; sql += 7; while (*sql == ' ') sql++;
-    if (MATCH(sql, "INTO")) { sql += 4; while (*sql == ' ') sql++; }
-  } else {
-    op = 0;
-    if (MATCH(sql,"CREATE")) { sql+=6; while (*sql==' ') sql++;
-      if (MATCH(sql,"TABLE")||MATCH(sql,"INDEX")||MATCH(sql,"VIEW")||MATCH(sql,"TRIGGER"))
-        { while (*sql&&*sql!=' ') sql++; while (*sql==' ') sql++; }
-    } else if (MATCH(sql,"DROP")) { sql+=4; while (*sql==' ') sql++;
-      if (MATCH(sql,"TABLE")||MATCH(sql,"INDEX")||MATCH(sql,"VIEW")||MATCH(sql,"TRIGGER"))
-        { while (*sql&&*sql!=' ') sql++; while (*sql==' ') sql++; }
-      if (MATCH(sql,"IF")) {
-        while (*sql&&*sql!=' ') sql++;
-        while (*sql==' ') sql++;
-        while (*sql&&*sql!=' ') sql++;
-        while (*sql==' ') sql++;
-      }
-    } else if (MATCH(sql,"ALTER")) { sql+=5; while (*sql==' ') sql++;
-      if (MATCH(sql,"TABLE")) { sql+=5; while (*sql==' ') sql++; }
-    }
-  }
-#undef MATCH
-
-  // Extract table name
-  if (*sql == '`' || *sql == '"' || *sql == '[') {
-    char quote = (*sql == '[') ? ']' : *sql;
-    sql++;
-    size_t i = 0;
-    while (*sql && *sql != quote && i < tblsz - 1) tbl[i++] = *sql++;
-    tbl[i] = '\0';
-  } else {
-    size_t i = 0;
-    while (*sql && *sql != ' ' && *sql != '\t' && *sql != '\n' &&
-           *sql != '(' && *sql != ';' && i < tblsz - 1) tbl[i++] = *sql++;
-    tbl[i] = '\0';
-  }
-
-  *op_out  = op;
-  *tid_out = table_name_hash(tbl);
-  if (!extract_pk_from_sql(sql, pk_out)) *pk_out = 0;
-}
-
-// Build a wal_entry from the SQL string
-static void build_wal_entry(struct wal_entry *e, char *sql, int sql_alloc) {
-  char tbl[128];
-  e->ts = (uint64_t)time(NULL);
-  parse_sql_meta(sql, &e->op, tbl, sizeof(tbl), &e->table_id, &e->pk);
-  e->sql = sql;
-  e->sql_alloc = (uint8_t)sql_alloc;
-}
-
-// ── Preupdate capture (deterministic SQL expansion) ──────────────
-// Uses sqlite3_preupdate_hook() to capture actual column values
-// as computed by SQLite (DEFAULT, datetime('now'), random(), etc. resolved).
-// This avoids fragile SQL scanning and double-querying the DB.
-
-#define PU_MAX_COLS   64
-#define COL_CACHE_SZ  64
-
-struct col_cache_entry {
-  uint16_t table_id;
-  int      ncol;
-  char     names[PU_MAX_COLS][128];
-};
-
-struct col_cache {
-  int count;
-  struct col_cache_entry e[COL_CACHE_SZ];
-};
-
-struct preupdate_capture {
-  int             fired;
-  int             op;
-  char            table[128];
-  uint16_t        table_id;
-  sqlite3_int64   rowid;
-  int             ncol;
-  sqlite3_value  *values[PU_MAX_COLS];
-};
-
-// ── Arkilian struct ─────────────────────────────────────────────────
-
-struct arkilian {
-  sqlite3 *handle;
-  int last_error_code;
-  char last_error_msg[256];
-  int is_open;
-  int has_new_writes;
-  sqlite3_stmt **stmts;
-  int stmt_count;
-  int stmt_capacity;
-  int stmt_current;
-  // Backup config
-  char *backup_path;
-  char *signed_url_endpoint;
-  char *database_token;
-  int backup_interval;
-  int backup_enabled;
-  // Backup thread tracking
-  int shutdown_requested;
-#ifdef _WIN32
-  HANDLE backup_thread_handle;
-#else
-  pthread_t backup_thread_id;
-  int backup_thread_running;
-#endif
-  // Write interception
-#ifndef _WIN32
-  pthread_mutex_t write_mutex;
-#else
-  HANDLE write_mutex;
-#endif
-  int in_write_txn;
-  int write_stmt_index;
-  int in_batch_txn;
-  char current_write_sql[1024];
-  // Update hook state
-  uint8_t  update_hook_op;
-  char     update_hook_table[128];
-  uint64_t update_hook_rowid;
-  int      update_hook_fired;
-  // Preupdate hook state (deterministic SQL expansion)
-  struct preupdate_capture  pu;
-  struct col_cache         *col_names;   // lazy column-name cache (allocated on first use)
-  int last_step_rc;
-  // Cached statements
-  sqlite3_stmt *begin_stmt;
-  sqlite3_stmt *commit_stmt;
-  sqlite3_stmt *rollback_stmt;
-  // Chunked WAL queue for out-of-band shipping
-  struct wal_queue wal;
-  // Batch WAL accumulation during explicit transactions (db_begin/db_commit).
-  // Entries are built eagerly but deferred-push to avoid per-row queue overhead.
-  struct wal_entry *batched_entries;
-  int batched_count;
-  int batched_cap;
-  // Flush thread
-#ifndef _WIN32
-  pthread_t flush_thread_id;
-  int flush_thread_running;
-#else
-  HANDLE flush_thread_handle;
-#endif
-};
-
-static void ar_update_hook(void *user_data, int op_type, char const *db_name,
-                           char const *table_name, sqlite3_int64 row_id) {
-  arkilian *db = (arkilian *)user_data;
-  (void)db_name;
-  db->update_hook_fired = 1;
-  db->update_hook_op = (op_type == SQLITE_INSERT) ? 1 :
-                       (op_type == SQLITE_UPDATE) ? 2 :
-                       (op_type == SQLITE_DELETE) ? 3 : 0;
-  if (table_name) {
-    strncpy(db->update_hook_table, table_name, sizeof(db->update_hook_table) - 1);
-    db->update_hook_table[sizeof(db->update_hook_table) - 1] = '\0';
-  } else {
-    db->update_hook_table[0] = '\0';
-  }
-  db->update_hook_rowid = (uint64_t)row_id;
-}
-
-static void check_update_hook_before_push(arkilian *db, struct wal_entry *e) {
-  if (db->update_hook_fired) {
-    e->op = db->update_hook_op;
-    e->table_id = table_name_hash(db->update_hook_table);
-    // sqlite3_update_hook fires per row, but we ship one entry per statement.
-    // pk is the last row touched; rk carries the real row count. by design.
-    e->pk = db->update_hook_rowid;
-    db->update_hook_fired = 0;
-  }
-}
-
-// ── Preupdate hook: captures actual column values at write time ─────
-// SQLite fires this during sqlite3_step(), AFTER resolving DEFAULT,
-// evaluating datetime('now'), assigning rowids, etc.
-// We capture the ground-truth values to build deterministic REPLACE
-// statements for logical WAL shipping.
-
-#if defined(SQLITE_ENABLE_PREUPDATE_HOOK)
-static void ar_preupdate_callback(void *pCtx, sqlite3 *db, int op,
-                                  char const *zDb, char const *zName,
-                                  sqlite3_int64 iKey1, sqlite3_int64 iKey2) {
-  arkilian *a = (arkilian *)pCtx;
-  (void)zDb; (void)iKey2;
-
-  a->pu.fired = 1;
-  a->pu.op = op;
-  strncpy(a->pu.table, zName ? zName : "", sizeof(a->pu.table) - 1);
-  a->pu.table[sizeof(a->pu.table) - 1] = '\0';
-  a->pu.table_id = table_name_hash(a->pu.table);
-  a->pu.rowid = iKey1;
-  a->pu.ncol = sqlite3_preupdate_count(db);
-  if (a->pu.ncol > PU_MAX_COLS) a->pu.ncol = PU_MAX_COLS;
-
-  for (int i = 0; i < a->pu.ncol; i++) {
-    sqlite3_value *v = NULL;
-    if (op == SQLITE_DELETE)
-      sqlite3_preupdate_old(db, i, &v);
-    else
-      sqlite3_preupdate_new(db, i, &v);
-    if (a->pu.values[i]) sqlite3_value_free(a->pu.values[i]);
-    a->pu.values[i] = sqlite3_value_dup(v ? v : NULL);
-  }
-}
-
-static void pu_clear(arkilian *db) {
-  for (int i = 0; i < db->pu.ncol; i++) {
-    if (db->pu.values[i]) { sqlite3_value_free(db->pu.values[i]); db->pu.values[i] = NULL; }
-  }
-  memset(&db->pu, 0, sizeof(db->pu));
-}
-#else
-static void pu_clear(arkilian *db) { (void)db; }
-#endif
-
-// ── Column cache: lazy PRAGMA table_info, keyed by table_name_hash ──
-
-static int ensure_column_cache(arkilian *db, const char *table) {
-#if defined(SQLITE_ENABLE_PREUPDATE_HOOK)
-  uint16_t tid = table_name_hash(table);
-  if (!db->col_names) {
-    db->col_names = calloc(1, sizeof(struct col_cache));
-    if (!db->col_names) return 0;
-  }
-
-  for (int i = 0; i < db->col_names->count; i++) {
-    if (db->col_names->e[i].table_id == tid)
-      return 1;
-  }
-
-  if (db->col_names->count >= COL_CACHE_SZ) return 0;
-
-  // Build "PRAGMA table_info('tablename')" with proper single-quote escaping
-  char sql[320];
-  char escaped[256];
-  {
-    int ei = 0;
-    for (const char *s = table; *s && ei < (int)sizeof(escaped) - 2; s++) {
-      if (*s == '\'') { escaped[ei++] = '\''; escaped[ei++] = '\''; }
-      else { escaped[ei++] = *s; }
-    }
-    escaped[ei] = '\0';
-  }
-  snprintf(sql, sizeof(sql), "PRAGMA table_info('%s')", escaped);
-
-  sqlite3_stmt *stmt = NULL;
-  if (sqlite3_prepare_v2(db->handle, sql, -1, &stmt, NULL) != SQLITE_OK)
-    return 0;
-
-  struct col_cache_entry *e = &db->col_names->e[db->col_names->count];
-  e->table_id = tid;
-  e->ncol = 0;
-  while (e->ncol < PU_MAX_COLS && sqlite3_step(stmt) == SQLITE_ROW) {
-    const char *name = (const char *)sqlite3_column_text(stmt, 1); // "name" column
-    if (name) {
-      strncpy(e->names[e->ncol], name, sizeof(e->names[0]) - 1);
-      e->names[e->ncol][sizeof(e->names[0]) - 1] = '\0';
-    } else {
-      e->names[e->ncol][0] = '\0';
-    }
-    e->ncol++;
-  }
-  sqlite3_finalize(stmt);
-  db->col_names->count++;
-  return 1;
-#else
-  (void)db; (void)table;
-  return 0;
-#endif
-}
-
-// ── Build deterministic SQL from preupdate capture ──────────────────
-
-#if defined(SQLITE_ENABLE_PREUPDATE_HOOK)
-static char *build_deterministic_sql(arkilian *db) {
-  if (!db->pu.fired) return NULL;
-  if (!ensure_column_cache(db, db->pu.table)) return NULL;
-
-  struct col_cache_entry *col = NULL;
-  for (int i = 0; i < db->col_names->count; i++) {
-    if (db->col_names->e[i].table_id == db->pu.table_id) {
-      col = &db->col_names->e[i];
-      break;
-    }
-  }
-  if (!col || col->ncol == 0) return NULL;
-  int ncol = col->ncol;
-  if (ncol > db->pu.ncol) ncol = db->pu.ncol;
-
-  if (db->pu.op == SQLITE_DELETE) {
-    char buf[256];
-    snprintf(buf, sizeof(buf),
-      "DELETE FROM \"%s\" WHERE rowid = %lld",
-      db->pu.table, (long long)db->pu.rowid);
-    return strdup(buf);
-  }
-
-  // ── Pass 1: measure exact output size ─────────────────────────
-  size_t need = 64;
-  need += strlen(db->pu.table);
-  for (int i = 0; i < ncol; i++) {
-    need += strlen(col->names[i]) + 4;  // "col", 
-    sqlite3_value *v = db->pu.values[i];
-    int vtype = v ? sqlite3_value_type(v) : SQLITE_NULL;
-    if (vtype == SQLITE_NULL)        need += 5;
-    else if (vtype == SQLITE_INTEGER) need += 22;
-    else if (vtype == SQLITE_FLOAT)  need += 32;
-    else if (vtype == SQLITE_TEXT)   need += (size_t)sqlite3_value_bytes(v) * 2 + 4;
-    else if (vtype == SQLITE_BLOB)   need += (size_t)sqlite3_value_bytes(v) * 2 + 6;
-    else                             need += 5;
-  }
-  // Add separator bytes not accounted for in the loop
-  need += 9 + (ncol > 0 ? (size_t)(ncol - 1) * 2 : 0);  // last col header + value seps + final )
-
-  // ── Pass 2: allocate once and format ──────────────────────────
-  char *out = malloc(need);
-  if (!out) return NULL;
-  size_t off = 0;
-
-  off += (size_t)snprintf(out + off, need - off,
-    "REPLACE INTO \"%s\" (", db->pu.table);
-
-  for (int i = 0; i < ncol; i++)
-    off += (size_t)snprintf(out + off, need - off, "\"%s\"%s",
-      col->names[i], (i < ncol - 1) ? ", " : ") VALUES (");
-
-  for (int i = 0; i < ncol; i++) {
-    sqlite3_value *v = db->pu.values[i];
-    int vtype = v ? sqlite3_value_type(v) : SQLITE_NULL;
-
-    if (vtype == SQLITE_NULL || !v) {
-      off += (size_t)snprintf(out + off, need - off, "NULL");
-    } else if (vtype == SQLITE_INTEGER) {
-      off += (size_t)snprintf(out + off, need - off, "%lld",
-        (long long)sqlite3_value_int64(v));
-    } else if (vtype == SQLITE_FLOAT) {
-      off += (size_t)snprintf(out + off, need - off, "%.15g",
-        sqlite3_value_double(v));
-    } else if (vtype == SQLITE_TEXT) {
-      const char *txt = (const char *)sqlite3_value_text(v);
-      int len = sqlite3_value_bytes(v);
-      out[off++] = '\'';
-      for (int j = 0; j < len; j++) {
-        if (txt[j] == '\'') out[off++] = '\'';
-        out[off++] = txt[j];
-      }
-      out[off++] = '\'';
-    } else if (vtype == SQLITE_BLOB) {
-      const unsigned char *blob = sqlite3_value_blob(v);
-      int len = sqlite3_value_bytes(v);
-      out[off++] = 'X'; out[off++] = '\'';
-      for (int j = 0; j < len; j++) {
-        static const char hex[] = "0123456789ABCDEF";
-        out[off++] = hex[blob[j] >> 4];
-        out[off++] = hex[blob[j] & 0xF];
-      }
-      out[off++] = '\'';
-    } else {
-      off += (size_t)snprintf(out + off, need - off, "NULL");
-    }
-    off += (size_t)snprintf(out + off, need - off, "%s",
-      (i < ncol - 1) ? ", " : ")");
-  }
-
-  out[off] = '\0';
-  return out;
-}
-#else
-static char *build_deterministic_sql(arkilian *db) { (void)db; return NULL; }
-#endif
-
-struct Memory {
-  char *response;
-  size_t size;
-  int *shutdown_flag;
-};
-
-// Discard callback for curl writes (e.g., WAL flush responses)
-static size_t curl_discard_cb(void *data, size_t sz, size_t nmemb, void *userp) {
-  (void)data; (void)userp;
-  return sz * nmemb;  // consume without storing
-}
-
-// ── Config defaults ─────────────────────────────────────────────────
+// ── Config Defaults ─────────────────────────────────────────────────
 
 #define DEFAULT_DB_PATH "app.sqlite"
 #define DEFAULT_BACKUP_PATH "backup.sqlite"
 #define DEFAULT_BACKUP_INTERVAL 3600
 #define DEFAULT_SIGNED_URL_ENDPOINT "https://api.arkilian.com/get-signed-url"
 
-// ── Helpers ─────────────────────────────────────────────────────────
+#define BATCH_SIZE 100
+#define MAX_ATTEMPTS 10
+#define POLL_INTERVAL_MS 2000
 
-static const char *get_env_default(const char *env_var,
-                                   const char *default_val) {
+// ── Struct Definitions ──────────────────────────────────────────────
+
+struct arkilian {
+  sqlite3 *handle;            // Primary connection (game / application thread)
+  sqlite3 *backup_db;         // Dedicated secondary connection (backup thread)
+  char *db_path;
+  int is_open;
+  int last_error_code;
+  char last_error_msg[256];
+
+  // Statement pool for caller
+  sqlite3_stmt **stmts;
+  int stmt_count;
+  int stmt_capacity;
+  int stmt_current;
+
+  // Configuration
+  char *backup_path;
+  char *signed_url_endpoint;
+  char *database_token;
+  int backup_interval;
+  int backup_enabled;
+
+  // Background thread tracking & synchronization
+  volatile int shutdown_requested;
+#ifdef _WIN32
+  HANDLE backup_thread_handle;
+  HANDLE flush_thread_handle;
+  CRITICAL_SECTION wake_mutex;
+  CONDITION_VARIABLE wake_cond;
+#else
+  pthread_t backup_thread_id;
+  int backup_thread_running;
+  pthread_t flush_thread_id;
+  int flush_thread_running;
+  pthread_mutex_t wake_mutex;
+  pthread_cond_t wake_cond;
+#endif
+
+  volatile int wake_flag;
+  char last_shipped_payload[1024];
+
+  // Transaction state tracking
+  int in_batch_txn;
+  sqlite3_stmt *begin_stmt;
+  sqlite3_stmt *commit_stmt;
+  sqlite3_stmt *rollback_stmt;
+};
+
+// ── Helper Prototypes ───────────────────────────────────────────────
+
+static void load_env(void);
+static const char *get_env_default(const char *env_var, const char *default_val);
+static int get_env_int_default(const char *env_var, int default_val);
+#ifdef _WIN32
+DWORD WINAPI run_hourly_backup(LPVOID arg);
+DWORD WINAPI run_wal_flush(LPVOID arg);
+#else
+void *run_hourly_backup(void *arg);
+void *run_wal_flush(void *arg);
+#endif
+static size_t curl_discard_cb(void *data, size_t sz, size_t nmemb, void *userp);
+
+// ── Environment Loader ──────────────────────────────────────────────
+
+static const char *get_env_default(const char *env_var, const char *default_val) {
   const char *val = getenv(env_var);
   return (val && strlen(val) > 0) ? val : default_val;
 }
@@ -738,14 +117,13 @@ static int get_env_int_default(const char *env_var, int default_val) {
   return default_val;
 }
 
-void load_env(void) {
-  const char *file = ".env";
-  FILE *fp = fopen(file, "r");
+static void load_env(void) {
+  FILE *fp = fopen(".env", "r");
   if (!fp) return;
   char line[256];
   while (fgets(line, sizeof(line), fp)) {
     char *key = strtok(line, "=");
-    char *val = strtok(NULL, "\n");
+    char *val = strtok(NULL, "\n\r");
     if (key && val) {
 #ifdef _WIN32
       _putenv_s(key, val);
@@ -757,22 +135,312 @@ void load_env(void) {
   fclose(fp);
 }
 
-// ── Forward declarations ────────────────────────────────────────────
+// ── Trigger Auto-Generator ──────────────────────────────────────────
 
-int backup_database(sqlite3 *pSource, const char *zFilename);
-#ifdef _WIN32
-DWORD WINAPI run_hourly_backup(LPVOID arg);
-DWORD WINAPI run_wal_flush(LPVOID arg);
+static const char *RESERVED_TABLES[] = {
+    "_pending_backup", "_dead_backup", "_arkilian_meta", "sqlite_sequence", NULL
+};
+
+static int is_reserved_table(const char *name) {
+  if (!name) return 1;
+  if (strncmp(name, "sqlite_", 7) == 0) return 1;
+  for (int i = 0; RESERVED_TABLES[i]; i++) {
+    if (strcmp(name, RESERVED_TABLES[i]) == 0) return 1;
+  }
+  return 0;
+}
+
+int sync_backup_triggers(sqlite3 *db, char **err_out) {
+  if (!db) return SQLITE_ERROR;
+  int rc;
+  char *errmsg = NULL;
+
+  rc = sqlite3_exec(db, "BEGIN IMMEDIATE;", NULL, NULL, &errmsg);
+  if (rc != SQLITE_OK) {
+    if (err_out) *err_out = errmsg;
+    else sqlite3_free(errmsg);
+    return rc;
+  }
+
+  // Ensure internal outbox & metadata tables exist
+  sqlite3_exec(db,
+    "CREATE TABLE IF NOT EXISTS _pending_backup ("
+    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  payload TEXT NOT NULL,"
+    "  attempts INTEGER NOT NULL DEFAULT 0,"
+    "  created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),"
+    "  last_attempt_at INTEGER"
+    ");", NULL, NULL, NULL);
+
+  sqlite3_exec(db,
+    "CREATE TABLE IF NOT EXISTS _dead_backup ("
+    "  id INTEGER PRIMARY KEY,"
+    "  payload TEXT NOT NULL,"
+    "  attempts INTEGER NOT NULL,"
+    "  failed_reason TEXT,"
+    "  created_at INTEGER NOT NULL,"
+    "  dead_lettered_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))"
+    ");", NULL, NULL, NULL);
+
+  sqlite3_exec(db,
+    "CREATE TABLE IF NOT EXISTS _arkilian_meta ("
+    "  k TEXT PRIMARY KEY,"
+    "  v TEXT"
+    ");", NULL, NULL, NULL);
+
+  sqlite3_stmt *table_stmt = NULL;
+  rc = sqlite3_prepare_v2(db,
+      "SELECT name FROM sqlite_master WHERE type = 'table'", -1, &table_stmt, NULL);
+  if (rc != SQLITE_OK) {
+    sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
+    if (err_out) *err_out = sqlite3_mprintf("prepare table list: %s", sqlite3_errmsg(db));
+    return rc;
+  }
+
+  while ((rc = sqlite3_step(table_stmt)) == SQLITE_ROW) {
+    const char *table = (const char *)sqlite3_column_text(table_stmt, 0);
+    if (!table || is_reserved_table(table)) continue;
+
+    char *pragma_sql = sqlite3_mprintf("PRAGMA table_info(%w);", table);
+    sqlite3_stmt *col_stmt = NULL;
+    rc = sqlite3_prepare_v2(db, pragma_sql, -1, &col_stmt, NULL);
+    sqlite3_free(pragma_sql);
+
+    if (rc != SQLITE_OK) {
+      sqlite3_finalize(table_stmt);
+      sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
+      if (err_out) *err_out = sqlite3_mprintf("prepare table_info(%s): %s", table, sqlite3_errmsg(db));
+      return rc;
+    }
+
+    char *col_names = NULL;
+    char *new_vals = NULL;
+    int col_count = 0;
+
+    while ((rc = sqlite3_step(col_stmt)) == SQLITE_ROW) {
+      const char *col = (const char *)sqlite3_column_text(col_stmt, 1);
+      if (!col) continue;
+
+      char *next_cols = NULL;
+      char *next_vals = NULL;
+
+      if (col_count == 0) {
+        next_cols = sqlite3_mprintf("\"%w\"", col);
+        next_vals = sqlite3_mprintf("quote(NEW.\"%w\")", col);
+      } else {
+        next_cols = sqlite3_mprintf("%s, \"%w\"", col_names, col);
+        next_vals = sqlite3_mprintf("%s || ', ' || quote(NEW.\"%w\")", new_vals, col);
+        sqlite3_free(col_names);
+        sqlite3_free(new_vals);
+      }
+
+      col_names = next_cols;
+      new_vals = next_vals;
+      col_count++;
+    }
+    sqlite3_finalize(col_stmt);
+
+    if (col_count == 0 || !col_names || !new_vals) {
+      if (col_names) sqlite3_free(col_names);
+      if (new_vals) sqlite3_free(new_vals);
+      continue;
+    }
+
+    const char *ops[3][2] = {
+        {"ai", "INSERT"}, {"au", "UPDATE"}, {"ad", "DELETE"}
+    };
+
+    for (int i = 0; i < 3; i++) {
+      char *drop_sql = sqlite3_mprintf("DROP TRIGGER IF EXISTS trg_%w_%s;", table, ops[i][0]);
+      rc = sqlite3_exec(db, drop_sql, NULL, NULL, &errmsg);
+      sqlite3_free(drop_sql);
+      if (rc != SQLITE_OK) {
+        sqlite3_free(col_names);
+        sqlite3_free(new_vals);
+        goto fail;
+      }
+
+      char *create_sql = NULL;
+      if (i == 2) {
+        // DELETE trigger
+        create_sql = sqlite3_mprintf(
+            "CREATE TRIGGER trg_%w_ad AFTER DELETE ON %w BEGIN "
+            "INSERT INTO _pending_backup (payload) VALUES ("
+            "'DELETE FROM %w WHERE rowid = ' || OLD.rowid); END;",
+            table, table, table);
+      } else {
+        // INSERT / UPDATE trigger
+        create_sql = sqlite3_mprintf(
+            "CREATE TRIGGER trg_%w_%s AFTER %s ON %w BEGIN "
+            "INSERT INTO _pending_backup (payload) VALUES ("
+            "'REPLACE INTO %w (%s) VALUES (' || %s || ')'); END;",
+            table, ops[i][0], ops[i][1], table, table, col_names, new_vals);
+      }
+
+      rc = sqlite3_exec(db, create_sql, NULL, NULL, &errmsg);
+      sqlite3_free(create_sql);
+      if (rc != SQLITE_OK) {
+        sqlite3_free(col_names);
+        sqlite3_free(new_vals);
+        goto fail;
+      }
+    }
+
+    sqlite3_free(col_names);
+    sqlite3_free(new_vals);
+    continue;
+
+fail:
+    sqlite3_finalize(table_stmt);
+    sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
+    if (err_out) *err_out = errmsg;
+    return rc;
+  }
+  sqlite3_finalize(table_stmt);
+
+  rc = sqlite3_exec(db, "COMMIT;", NULL, NULL, &errmsg);
+  if (rc != SQLITE_OK) {
+    if (err_out) *err_out = errmsg;
+    return rc;
+  }
+
+  return SQLITE_OK;
+}
+
+// ── Wake Signal Update Hook ─────────────────────────────────────────
+
+static void on_db_update(void *user_data, int op_type, char const *db_name,
+                          char const *table_name, sqlite3_int64 row_id) {
+  arkilian *db = (arkilian *)user_data;
+  (void)op_type; (void)db_name; (void)row_id;
+  if (!db || is_reserved_table(table_name)) return;
+
+  db->wake_flag = 1;
+#ifndef _WIN32
+  pthread_cond_signal(&db->wake_cond);
 #else
-void *run_hourly_backup(void *arg);
-void *run_wal_flush(void *arg);
+  WakeConditionVariable(&db->wake_cond);
 #endif
-char *get_signed_url(const char *api_endpoint, const char *token,
-                     int *shutdown_flag);
-int upload_to_s3(const char *signed_url, const char *file_path,
-                 const char *token);
+}
 
-// ── Background WAL flush thread ─────────────────────────────────────
+// ── Backup Shipping & Delivery Thread ───────────────────────────────
+
+static size_t curl_discard_cb(void *data, size_t sz, size_t nmemb, void *userp) {
+  (void)data; (void)userp;
+  return sz * nmemb;
+}
+
+typedef enum { SHIP_OK = 0, SHIP_RETRY = 1 } ship_result_t;
+
+static ship_result_t ship_to_backup(arkilian *db, sqlite3_int64 id, const char *payload) {
+  (void)id;
+  if (!payload || strlen(payload) == 0) return SHIP_OK;
+
+  strncpy(db->last_shipped_payload, payload, sizeof(db->last_shipped_payload) - 1);
+  db->last_shipped_payload[sizeof(db->last_shipped_payload) - 1] = '\0';
+
+  const char *push_url = getenv("ARKILIAN_WAL_PUSH_URL");
+  if (!push_url || strlen(push_url) == 0) {
+    push_url = db->signed_url_endpoint;
+  }
+
+  if (!push_url || strlen(push_url) == 0 || strcmp(push_url, DEFAULT_SIGNED_URL_ENDPOINT) == 0) {
+    return SHIP_OK;
+  }
+
+  CURL *curl = curl_easy_init();
+  if (!curl) return SHIP_RETRY;
+
+  curl_easy_setopt(curl, CURLOPT_URL, push_url);
+  curl_easy_setopt(curl, CURLOPT_POSTFIELDS, payload);
+  curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
+  curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5L);
+  curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_discard_cb);
+
+  struct curl_slist *headers = NULL;
+  headers = curl_slist_append(headers, "Content-Type: application/sql");
+  if (db->database_token && strlen(db->database_token) > 0) {
+    char auth[512];
+    snprintf(auth, sizeof(auth), "Authorization: Bearer %s", db->database_token);
+    headers = curl_slist_append(headers, auth);
+  }
+  curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+
+  CURLcode res = curl_easy_perform(curl);
+  long http_code = 0;
+  if (res == CURLE_OK) {
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+  }
+
+  curl_slist_free_all(headers);
+  curl_easy_cleanup(curl);
+
+  return (res == CURLE_OK && (http_code == 200 || http_code == 201)) ? SHIP_OK : SHIP_RETRY;
+}
+
+static int drain_batch(arkilian *db, sqlite3_stmt *select_stmt, sqlite3_stmt *delete_stmt,
+                        sqlite3_stmt *update_attempts_stmt, sqlite3_stmt *dead_letter_stmt) {
+  if (!db || !db->backup_db) return 0;
+
+  sqlite3_reset(select_stmt);
+  sqlite3_clear_bindings(select_stmt);
+  sqlite3_bind_int(select_stmt, 1, BATCH_SIZE);
+
+  int processed_any = 0;
+
+  for (;;) {
+    int rc = sqlite3_step(select_stmt);
+    if (rc == SQLITE_DONE) break;
+    if (rc != SQLITE_ROW) break;
+
+    sqlite3_int64 id = sqlite3_column_int64(select_stmt, 0);
+    const unsigned char *payload = sqlite3_column_text(select_stmt, 1);
+    int attempts = sqlite3_column_int(select_stmt, 2);
+    if (!payload) continue;
+
+    char *payload_copy = strdup((const char *)payload);
+    if (!payload_copy) break;
+
+    ship_result_t result = ship_to_backup(db, id, payload_copy);
+    free(payload_copy);
+
+    if (result == SHIP_OK) {
+      sqlite3_reset(delete_stmt);
+      sqlite3_clear_bindings(delete_stmt);
+      sqlite3_bind_int64(delete_stmt, 1, id);
+      sqlite3_step(delete_stmt);
+      processed_any = 1;
+      continue;
+    }
+
+    int new_attempts = attempts + 1;
+    if (new_attempts >= MAX_ATTEMPTS) {
+      sqlite3_reset(dead_letter_stmt);
+      sqlite3_clear_bindings(dead_letter_stmt);
+      sqlite3_bind_int(dead_letter_stmt, 1, new_attempts);
+      sqlite3_bind_text(dead_letter_stmt, 2, "max attempts exceeded", -1, SQLITE_STATIC);
+      sqlite3_bind_int64(dead_letter_stmt, 3, id);
+      if (sqlite3_step(dead_letter_stmt) == SQLITE_DONE) {
+        sqlite3_reset(delete_stmt);
+        sqlite3_clear_bindings(delete_stmt);
+        sqlite3_bind_int64(delete_stmt, 1, id);
+        sqlite3_step(delete_stmt);
+      }
+      processed_any = 1;
+      continue;
+    } else {
+      sqlite3_reset(update_attempts_stmt);
+      sqlite3_clear_bindings(update_attempts_stmt);
+      sqlite3_bind_int(update_attempts_stmt, 1, new_attempts);
+      sqlite3_bind_int64(update_attempts_stmt, 2, id);
+      sqlite3_step(update_attempts_stmt);
+      processed_any = 1;
+      break;
+    }
+  }
+
+  return processed_any;
+}
 
 #ifdef _WIN32
 DWORD WINAPI run_wal_flush(LPVOID arg) {
@@ -780,110 +448,63 @@ DWORD WINAPI run_wal_flush(LPVOID arg) {
 void *run_wal_flush(void *arg) {
 #endif
   arkilian *db = (arkilian *)arg;
-  const char *push_url = getenv("ARKILIAN_WAL_PUSH_URL");
-
-  while (1) {
-    const char *token = db->database_token;
-    int n = 0;
-    struct wal_entry *batch = wal_queue_acquire(&db->wal, &n);
-    if (n == 0) break;
-
-    int pushed = 0;
-
-    if (push_url && strlen(push_url) > 0) {
-      // Build JSON payload
-      size_t json_cap = 64;
-      for (int i = 0; i < n; i++) json_cap += strlen(batch[i].sql) * 6 + 96;
-      char *json = malloc(json_cap);
-      if (json) {
-        size_t off = 0;
-        off += (size_t)snprintf(json + off, json_cap - off, "[");
-        for (int i = 0; i < n; i++) {
-          struct wal_entry *e = &batch[i];
-          if (off + 32 >= json_cap) break;
-          off += (size_t)snprintf(json + off, json_cap - off,
-            "{\"ts\":%llu,\"op\":%u,\"table_id\":%u,\"pk\":%llu,\"rk\":%u,\"sql\":\"",
-            (unsigned long long)e->ts, e->op, e->table_id,
-            (unsigned long long)e->pk, e->rk);
-          for (char *s = e->sql ? e->sql : ""; *s; s++) {
-            if (off + 8 >= json_cap) break;
-            switch (*s) {
-            case '"':  json[off++] = '\\'; json[off++] = '"';  break;
-            case '\\': json[off++] = '\\'; json[off++] = '\\'; break;
-            case '\n': json[off++] = '\\'; json[off++] = 'n';  break;
-            case '\r': json[off++] = '\\'; json[off++] = 'r';  break;
-            case '\t': json[off++] = '\\'; json[off++] = 't';  break;
-            case '\b': json[off++] = '\\'; json[off++] = 'b';  break;
-            case '\f': json[off++] = '\\'; json[off++] = 'f';  break;
-            default:
-              if ((unsigned char)*s < 0x20) {
-                int w = snprintf(json + off, 8, "\\u%04x", (unsigned char)*s);
-                if (w > 0) off += (size_t)w;
-                continue;
-              }
-              json[off++] = *s;
-              break;
-            }
-          }
-          if (off + 16 >= json_cap) break;
-          off += (size_t)snprintf(json + off, json_cap - off,
-            "\"}%s", (i < n - 1) ? "," : "");
-        }
-        if (off + 4 < json_cap)
-          off += (size_t)snprintf(json + off, json_cap - off, "]");
-
-        CURL *curl = curl_easy_init();
-        if (curl) {
-          curl_easy_setopt(curl, CURLOPT_URL, push_url);
-          curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json);
-          curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
-          curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5L);
-          // Discard response body — prevent server responses from
-          // bleeding into the application's stdout via libcurl's
-          // default write-to-stdout behaviour.
-          curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_discard_cb);
-
-          struct curl_slist *headers = NULL;
-          headers = curl_slist_append(headers, "Content-Type: application/json");
-          if (token && strlen(token) > 0) {
-            char auth[512];
-            snprintf(auth, sizeof(auth), "Authorization: Bearer %s", token);
-            headers = curl_slist_append(headers, auth);
-          }
-          curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-
-          CURLcode res = curl_easy_perform(curl);
-          long http_code = 0;
-          if (res == CURLE_OK)
-            curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
-
-          if (res == CURLE_OK && http_code == 200) {
-            pushed = 1;
-          } else {
-            fprintf(stderr, "WAL push failed (HTTP %ld, %s) — retrying next cycle\n",
-                    http_code, curl_easy_strerror(res));
-          }
-
-          curl_slist_free_all(headers);
-          curl_easy_cleanup(curl);
-        }
-        free(json);
-      }
-    }
-
-    if (pushed) {
-      wal_queue_consume(&db->wal, n);
-    } else {
-      // Push failed — entries were not consumed, so the next
-      // wal_queue_acquire will return them again.
-      // Brief backoff before retry to avoid tight spin.
-#ifndef _WIN32
-      usleep(500000);
+  if (!db || !db->backup_db) {
+#ifdef _WIN32
+    return 0;
 #else
-      Sleep(500);
+    return NULL;
+#endif
+  }
+
+  sqlite3_stmt *select_stmt = NULL;
+  sqlite3_stmt *delete_stmt = NULL;
+  sqlite3_stmt *update_attempts_stmt = NULL;
+  sqlite3_stmt *dead_letter_stmt = NULL;
+
+  sqlite3_prepare_v2(db->backup_db,
+      "SELECT id, payload, attempts FROM _pending_backup ORDER BY id LIMIT ?1",
+      -1, &select_stmt, NULL);
+  sqlite3_prepare_v2(db->backup_db,
+      "DELETE FROM _pending_backup WHERE id = ?1",
+      -1, &delete_stmt, NULL);
+  sqlite3_prepare_v2(db->backup_db,
+      "UPDATE _pending_backup SET attempts = ?1, last_attempt_at = strftime('%s','now') WHERE id = ?2",
+      -1, &update_attempts_stmt, NULL);
+  sqlite3_prepare_v2(db->backup_db,
+      "INSERT INTO _dead_backup (id, payload, attempts, failed_reason, created_at) "
+      "SELECT id, payload, ?1, ?2, created_at FROM _pending_backup WHERE id = ?3",
+      -1, &dead_letter_stmt, NULL);
+
+  while (!db->shutdown_requested) {
+    int drained = drain_batch(db, select_stmt, delete_stmt,
+                             update_attempts_stmt, dead_letter_stmt);
+
+    if (!drained) {
+#ifndef _WIN32
+      pthread_mutex_lock(&db->wake_mutex);
+      if (!db->wake_flag && !db->shutdown_requested) {
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_sec += POLL_INTERVAL_MS / 1000;
+        pthread_cond_timedwait(&db->wake_cond, &db->wake_mutex, &ts);
+      }
+      db->wake_flag = 0;
+      pthread_mutex_unlock(&db->wake_mutex);
+#else
+      EnterCriticalSection(&db->wake_mutex);
+      if (!db->wake_flag && !db->shutdown_requested) {
+        SleepConditionVariableCS(&db->wake_cond, &db->wake_mutex, POLL_INTERVAL_MS);
+      }
+      db->wake_flag = 0;
+      LeaveCriticalSection(&db->wake_mutex);
 #endif
     }
   }
+
+  if (select_stmt) sqlite3_finalize(select_stmt);
+  if (delete_stmt) sqlite3_finalize(delete_stmt);
+  if (update_attempts_stmt) sqlite3_finalize(update_attempts_stmt);
+  if (dead_letter_stmt) sqlite3_finalize(dead_letter_stmt);
 
 #ifdef _WIN32
   return 0;
@@ -892,32 +513,28 @@ void *run_wal_flush(void *arg) {
 #endif
 }
 
-// ── db_init / db_close ──────────────────────────────────────────────
+// ── Database Lifecycle: db_init / db_close ──────────────────────────
 
 int db_init(arkilian **db_ptr, const char *filename) {
   if (!db_ptr) return 1;
+
   arkilian *db = malloc(sizeof(arkilian));
   if (!db) return 1;
   memset(db, 0, sizeof(arkilian));
-  db->is_open = 0;
-  db->has_new_writes = 0;
-  db->last_error_msg[0] = '\0';
-  db->stmts = NULL;
-  db->stmt_count = 0;
-  db->stmt_capacity = 0;
-  db->stmt_current = -1;
+
   load_env();
 
-  const char *db_path = (filename != NULL) ? filename :
+  const char *path = (filename != NULL) ? filename :
     get_env_default("ARKILIAN_DB_PATH", DEFAULT_DB_PATH);
 
-  const char *backup_path_tmp =
-    get_env_default("ARKILIAN_BACKUP_PATH", DEFAULT_BACKUP_PATH);
+  db->db_path = malloc(strlen(path) + 1);
+  if (db->db_path) strcpy(db->db_path, path);
+
+  const char *backup_path_tmp = get_env_default("ARKILIAN_BACKUP_PATH", DEFAULT_BACKUP_PATH);
   db->backup_path = malloc(strlen(backup_path_tmp) + 1);
   if (db->backup_path) strcpy(db->backup_path, backup_path_tmp);
 
-  const char *signed_url_tmp = get_env_default("ARKILIAN_SIGNED_URL_ENDPOINT",
-                                                DEFAULT_SIGNED_URL_ENDPOINT);
+  const char *signed_url_tmp = get_env_default("ARKILIAN_SIGNED_URL_ENDPOINT", DEFAULT_SIGNED_URL_ENDPOINT);
   db->signed_url_endpoint = malloc(strlen(signed_url_tmp) + 1);
   if (db->signed_url_endpoint) strcpy(db->signed_url_endpoint, signed_url_tmp);
 
@@ -925,95 +542,85 @@ int db_init(arkilian **db_ptr, const char *filename) {
   db->database_token = malloc(strlen(token_tmp) + 1);
   if (db->database_token) strcpy(db->database_token, token_tmp);
 
-  db->backup_interval =
-    get_env_int_default("ARKILIAN_BACKUP_INTERVAL", DEFAULT_BACKUP_INTERVAL);
+  db->backup_interval = get_env_int_default("ARKILIAN_BACKUP_INTERVAL", DEFAULT_BACKUP_INTERVAL);
   db->backup_enabled = get_env_int_default("ARKILIAN_ENABLE_BACKUP", 1);
 
-  // Write interception state
 #ifndef _WIN32
-  pthread_mutex_init(&db->write_mutex, NULL);
+  pthread_mutex_init(&db->wake_mutex, NULL);
+  pthread_cond_init(&db->wake_cond, NULL);
 #else
-  db->write_mutex = CreateMutex(NULL, FALSE, NULL);
+  InitializeCriticalSection(&db->wake_mutex);
+  InitializeConditionVariable(&db->wake_cond);
 #endif
-  db->in_write_txn = 0;
-  db->write_stmt_index = -1;
-  db->in_batch_txn = 0;
-  db->current_write_sql[0] = '\0';
-  db->last_step_rc = 0;
 
+  sqlite3_config(SQLITE_CONFIG_MULTITHREAD);
+
+  // Open primary connection
   int rc = sqlite3_open_v2(
-      db_path, &db->handle,
+      path, &db->handle,
       SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX, NULL);
 
   if (rc != SQLITE_OK) {
-    db->handle = NULL;
     const char *err = sqlite3_errstr(rc);
     strncpy(db->last_error_msg, err, sizeof(db->last_error_msg) - 1);
-    db->last_error_msg[sizeof(db->last_error_msg) - 1] = '\0';
+    db->handle = NULL;
     *db_ptr = db;
     return 1;
   }
 
-  // PRAGMAs
+  // Open secondary backup connection
+  rc = sqlite3_open_v2(
+      path, &db->backup_db,
+      SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX, NULL);
+  if (rc != SQLITE_OK) {
+    sqlite3_close(db->handle);
+    db->handle = NULL;
+    db->backup_db = NULL;
+    *db_ptr = db;
+    return 1;
+  }
+
+  sqlite3_busy_timeout(db->handle, 5000);
+  sqlite3_busy_timeout(db->backup_db, 5000);
+
   sqlite3_exec(db->handle, "PRAGMA journal_mode=WAL;", NULL, NULL, NULL);
   sqlite3_exec(db->handle, "PRAGMA synchronous=NORMAL;", NULL, NULL, NULL);
-  sqlite3_exec(db->handle, "PRAGMA busy_timeout=5000;", NULL, NULL, NULL);
   sqlite3_exec(db->handle, "PRAGMA foreign_keys=ON;", NULL, NULL, NULL);
-  sqlite3_exec(db->handle, "PRAGMA wal_autocheckpoint=1000;", NULL, NULL, NULL);
+  sqlite3_exec(db->handle, "PRAGMA cache_size=-64000;", NULL, NULL, NULL);
 
-  // Register update hook for robust write metadata capture
-  sqlite3_update_hook(db->handle, ar_update_hook, db);
-  db->update_hook_fired = 0;
+  sqlite3_exec(db->backup_db, "PRAGMA journal_mode=WAL;", NULL, NULL, NULL);
+  sqlite3_exec(db->backup_db, "PRAGMA synchronous=NORMAL;", NULL, NULL, NULL);
 
-  // Register preupdate hook for deterministic SQL expansion
-#if defined(SQLITE_ENABLE_PREUPDATE_HOOK)
-  sqlite3_preupdate_hook(db->handle, ar_preupdate_callback, db);
-#endif
-  memset(&db->pu, 0, sizeof(db->pu));
-  db->col_names = NULL;
+  // Register non-blocking update hook
+  sqlite3_update_hook(db->handle, on_db_update, db);
 
-  // Internal tables
-  sqlite3_exec(db->handle,
-    "CREATE TABLE IF NOT EXISTS _arkilian_meta (k TEXT PRIMARY KEY, v TEXT);",
-    NULL, NULL, NULL);
+  // Sync backup triggers
+  char *trigger_err = NULL;
+  sync_backup_triggers(db->handle, &trigger_err);
+  if (trigger_err) sqlite3_free(trigger_err);
 
-  // Cached transaction statements
-  if (sqlite3_prepare_v2(db->handle, "BEGIN;", -1, &db->begin_stmt, NULL) != SQLITE_OK)
-    db->begin_stmt = NULL;
-  if (sqlite3_prepare_v2(db->handle, "COMMIT;", -1, &db->commit_stmt, NULL) != SQLITE_OK)
-    db->commit_stmt = NULL;
-  if (sqlite3_prepare_v2(db->handle, "ROLLBACK;", -1, &db->rollback_stmt, NULL) != SQLITE_OK)
-    db->rollback_stmt = NULL;
-
-  // Chunked WAL queue for out-of-band shipping
-  wal_queue_init(&db->wal);
+  // Transaction statements
+  sqlite3_prepare_v2(db->handle, "BEGIN;", -1, &db->begin_stmt, NULL);
+  sqlite3_prepare_v2(db->handle, "COMMIT;", -1, &db->commit_stmt, NULL);
+  sqlite3_prepare_v2(db->handle, "ROLLBACK;", -1, &db->rollback_stmt, NULL);
 
   db->is_open = 1;
   db->shutdown_requested = 0;
   *db_ptr = db;
 
-  // Start flush thread (only if a push URL is configured)
-  {
-    const char *url = getenv("ARKILIAN_WAL_PUSH_URL");
-    if (url && strlen(url) > 0) {
+  // Start WAL flusher thread
 #ifndef _WIN32
-      db->flush_thread_running = 0;
-      if (pthread_create(&db->flush_thread_id, NULL, run_wal_flush, db) == 0)
-        db->flush_thread_running = 1;
+  db->flush_thread_running = 0;
+  if (pthread_create(&db->flush_thread_id, NULL, run_wal_flush, db) == 0)
+    db->flush_thread_running = 1;
 #else
-      db->flush_thread_handle = CreateThread(NULL, 0, run_wal_flush, db, 0, NULL);
+  db->flush_thread_handle = CreateThread(NULL, 0, run_wal_flush, db, 0, NULL);
 #endif
-    }
-#ifndef _WIN32
-    else { db->flush_thread_running = 0; }
-#endif
-  }
 
-  // Start backup thread if enabled
+  // Start backup thread
   if (db->backup_enabled) {
 #ifdef _WIN32
-    db->backup_thread_handle =
-        CreateThread(NULL, 0, run_hourly_backup, db, 0, NULL);
+    db->backup_thread_handle = CreateThread(NULL, 0, run_hourly_backup, db, 0, NULL);
 #else
     db->backup_thread_running = 0;
     if (pthread_create(&db->backup_thread_id, NULL, run_hourly_backup, db) == 0)
@@ -1028,139 +635,340 @@ void db_close(arkilian *db) {
   if (!db) return;
 
   db->shutdown_requested = 1;
+  db->wake_flag = 1;
 
-  // Signal the flush thread to drain and exit, then clear any
-  // remaining entries that couldn't be delivered.
-  db->wal.shutdown = 1;
 #ifndef _WIN32
-  pthread_cond_signal(&db->wal.cond);
-#else
-  SetEvent(db->wal.event);
-#endif
-
-  // Wait for flush thread (if running)
-#ifndef _WIN32
+  pthread_cond_signal(&db->wake_cond);
   if (db->flush_thread_running) {
     pthread_join(db->flush_thread_id, NULL);
     db->flush_thread_running = 0;
   }
-#else
-  if (db->flush_thread_handle != NULL) {
-    WaitForSingleObject(db->flush_thread_handle, INFINITE);
-    CloseHandle(db->flush_thread_handle);
-    db->flush_thread_handle = NULL;
-  }
-#endif
-
-  // Wait for backup thread
-#ifndef _WIN32
   if (db->backup_thread_running) {
     pthread_join(db->backup_thread_id, NULL);
     db->backup_thread_running = 0;
   }
+  pthread_mutex_destroy(&db->wake_mutex);
+  pthread_cond_destroy(&db->wake_cond);
 #else
-  if (db->backup_thread_handle != NULL) {
+  WakeConditionVariable(&db->wake_cond);
+  if (db->flush_thread_handle) {
+    WaitForSingleObject(db->flush_thread_handle, INFINITE);
+    CloseHandle(db->flush_thread_handle);
+    db->flush_thread_handle = NULL;
+  }
+  if (db->backup_thread_handle) {
     WaitForSingleObject(db->backup_thread_handle, INFINITE);
     CloseHandle(db->backup_thread_handle);
     db->backup_thread_handle = NULL;
   }
+  DeleteCriticalSection(&db->wake_mutex);
 #endif
 
-  // Clean up user statements
   for (int i = 0; i < db->stmt_count; i++) {
-    if (db->stmts[i]) sqlite3_finalize(db->stmts[i]);
+    if (db->stmts && db->stmts[i]) sqlite3_finalize(db->stmts[i]);
   }
-  free(db->stmts);
-  db->stmts = NULL;
-  db->stmt_count = 0;
-  db->stmt_capacity = 0;
-  db->stmt_current = -1;
+  if (db->stmts) free(db->stmts);
 
-  pu_clear(db);
-  if (db->col_names) { free(db->col_names); db->col_names = NULL; }
+  if (db->begin_stmt) sqlite3_finalize(db->begin_stmt);
+  if (db->commit_stmt) sqlite3_finalize(db->commit_stmt);
+  if (db->rollback_stmt) sqlite3_finalize(db->rollback_stmt);
 
-  if (db->is_open && db->handle) {
-    // Rollback any open transactions
-    if (db->in_write_txn || db->in_batch_txn) {
-      if (db->in_write_txn) {
-        sqlite3_step(db->rollback_stmt);
-        sqlite3_reset(db->rollback_stmt);
-        db->in_write_txn = 0;
-        db->write_stmt_index = -1;
-      }
-      if (db->in_batch_txn) {
-        sqlite3_step(db->rollback_stmt);
-        sqlite3_reset(db->rollback_stmt);
-      db->in_batch_txn = 0;
-      db->in_write_txn = 0;
-      db->write_stmt_index = -1;
-      }
-#ifndef _WIN32
-      pthread_mutex_unlock(&db->write_mutex);
-#else
-      ReleaseMutex(db->write_mutex);
-#endif
-    }
+  if (db->backup_db) {
+    sqlite3_close(db->backup_db);
+    db->backup_db = NULL;
+  }
 
-    // Finalize cached statements
-    if (db->begin_stmt)    { sqlite3_finalize(db->begin_stmt);    db->begin_stmt = NULL; }
-    if (db->commit_stmt)   { sqlite3_finalize(db->commit_stmt);   db->commit_stmt = NULL; }
-    if (db->rollback_stmt) { sqlite3_finalize(db->rollback_stmt); db->rollback_stmt = NULL; }
-
+  if (db->handle) {
     sqlite3_close(db->handle);
     db->handle = NULL;
-    db->is_open = 0;
   }
 
-  if (db->backup_path)        free(db->backup_path);
+  if (db->db_path) free(db->db_path);
+  if (db->backup_path) free(db->backup_path);
   if (db->signed_url_endpoint) free(db->signed_url_endpoint);
-  if (db->database_token)      free(db->database_token);
-
-  wal_queue_destroy(&db->wal);
-
-#ifndef _WIN32
-  pthread_mutex_destroy(&db->write_mutex);
-#else
-  if (db->write_mutex) CloseHandle(db->write_mutex);
-#endif
+  if (db->database_token) free(db->database_token);
 
   free(db);
 }
 
-// ── Public API ──────────────────────────────────────────────────────
+// ── Query Execution ─────────────────────────────────────────────────
 
 const char *db_errmsg(arkilian *db) {
+  if (!db) return "Invalid database handle";
   if (db->last_error_msg[0] != '\0') return db->last_error_msg;
   if (db->handle) return sqlite3_errmsg(db->handle);
   return "Unknown error";
 }
 
-sqlite3 *db_get_handle(arkilian *db) { return db->handle; }
+sqlite3 *db_get_handle(arkilian *db) { return db ? db->handle : NULL; }
 
-// ── Backup ──────────────────────────────────────────────────────────
+int db_exec(arkilian *db, const char *sql) {
+  if (!db || !db->handle || !sql) return SQLITE_ERROR;
 
-int backup_database(sqlite3 *pSource, const char *zFilename) {
-  int rc;
-  sqlite3 *pDest = NULL;
-  sqlite3_backup *pBackup = NULL;
-
-  const char *actualPath =
-      (zFilename != NULL) ? zFilename : DEFAULT_BACKUP_PATH;
-  rc = sqlite3_open_v2(actualPath, &pDest,
-                       SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, NULL);
-
+  char *errmsg = NULL;
+  int rc = sqlite3_exec(db->handle, sql, NULL, NULL, &errmsg);
   if (rc != SQLITE_OK) {
-    fprintf(stderr, "Backup Error: Cannot open destination file %s: %s\n",
-            zFilename, sqlite3_errmsg(pDest));
-    sqlite3_close(pDest);
+    if (errmsg) {
+      strncpy(db->last_error_msg, errmsg, sizeof(db->last_error_msg) - 1);
+      db->last_error_msg[sizeof(db->last_error_msg) - 1] = '\0';
+      sqlite3_free(errmsg);
+    } else {
+      snprintf(db->last_error_msg, sizeof(db->last_error_msg), "%s", sqlite3_errmsg(db->handle));
+    }
     return rc;
   }
 
-  pBackup = sqlite3_backup_init(pDest, "main", pSource, "main");
-  if (pBackup == NULL) {
+  if (strncasecmp(sql, "CREATE", 6) == 0 ||
+      strncasecmp(sql, "ALTER", 5) == 0 ||
+      strncasecmp(sql, "DROP", 4) == 0) {
+    char *terr = NULL;
+    sync_backup_triggers(db->handle, &terr);
+    if (terr) sqlite3_free(terr);
+
+    sqlite3_stmt *ddl_stmt = NULL;
+    if (sqlite3_prepare_v2(db->handle, "INSERT INTO _pending_backup (payload) VALUES (?)", -1, &ddl_stmt, NULL) == SQLITE_OK) {
+      sqlite3_bind_text(ddl_stmt, 1, sql, -1, SQLITE_TRANSIENT);
+      sqlite3_step(ddl_stmt);
+      sqlite3_finalize(ddl_stmt);
+    }
+  }
+
+  return SQLITE_DONE;
+}
+
+int db_prepare(arkilian *db, const char *sql) {
+  if (!db || !db->handle || !sql) return SQLITE_ERROR;
+
+  if (db->stmt_count >= db->stmt_capacity) {
+    int new_cap = (db->stmt_capacity == 0) ? 8 : db->stmt_capacity * 2;
+    sqlite3_stmt **new_arr = realloc(db->stmts, (size_t)new_cap * sizeof(sqlite3_stmt *));
+    if (!new_arr) return SQLITE_NOMEM;
+    db->stmts = new_arr;
+    db->stmt_capacity = new_cap;
+  }
+
+  sqlite3_stmt *stmt = NULL;
+  int rc = sqlite3_prepare_v2(db->handle, sql, -1, &stmt, NULL);
+  if (rc != SQLITE_OK) {
+    snprintf(db->last_error_msg, sizeof(db->last_error_msg), "%s", sqlite3_errmsg(db->handle));
+    return rc;
+  }
+
+  db->stmts[db->stmt_count] = stmt;
+  db->stmt_current = db->stmt_count;
+  db->stmt_count++;
+  return rc;
+}
+
+int db_use_stmt(arkilian *db, int index) {
+  if (!db || index < 0 || index >= db->stmt_count) return SQLITE_ERROR;
+  if (!db->stmts[index]) return SQLITE_ERROR;
+  db->stmt_current = index;
+  return SQLITE_OK;
+}
+
+int db_stmt_count(arkilian *db) {
+  return db ? db->stmt_count : 0;
+}
+
+static sqlite3_stmt *get_current_stmt(arkilian *db) {
+  if (!db || db->stmt_current < 0 || db->stmt_current >= db->stmt_count) return NULL;
+  return db->stmts[db->stmt_current];
+}
+
+int db_step(arkilian *db) {
+  sqlite3_stmt *stmt = get_current_stmt(db);
+  if (!stmt) return SQLITE_ERROR;
+  return sqlite3_step(stmt);
+}
+
+int db_finalize(arkilian *db) {
+  if (!db) return SQLITE_ERROR;
+  sqlite3_stmt *stmt = get_current_stmt(db);
+  if (stmt) {
+    sqlite3_finalize(stmt);
+    db->stmts[db->stmt_current] = NULL;
+  }
+  return SQLITE_OK;
+}
+
+int db_reset(arkilian *db) {
+  sqlite3_stmt *stmt = get_current_stmt(db);
+  if (!stmt) return SQLITE_ERROR;
+  return sqlite3_reset(stmt);
+}
+
+// ── Column & Binding Accessors ──────────────────────────────────────
+
+int db_column_count(arkilian *db) {
+  sqlite3_stmt *stmt = get_current_stmt(db);
+  return stmt ? sqlite3_column_count(stmt) : 0;
+}
+
+const char *db_column_name(arkilian *db, int col) {
+  sqlite3_stmt *stmt = get_current_stmt(db);
+  return stmt ? (const char *)sqlite3_column_name(stmt, col) : NULL;
+}
+
+const char *db_column_text(arkilian *db, int col) {
+  sqlite3_stmt *stmt = get_current_stmt(db);
+  return stmt ? (const char *)sqlite3_column_text(stmt, col) : NULL;
+}
+
+int db_column_int(arkilian *db, int col) {
+  sqlite3_stmt *stmt = get_current_stmt(db);
+  return stmt ? sqlite3_column_int(stmt, col) : 0;
+}
+
+double db_column_double(arkilian *db, int col) {
+  sqlite3_stmt *stmt = get_current_stmt(db);
+  return stmt ? sqlite3_column_double(stmt, col) : 0.0;
+}
+
+sqlite3_int64 db_column_int64(arkilian *db, int col) {
+  sqlite3_stmt *stmt = get_current_stmt(db);
+  return stmt ? sqlite3_column_int64(stmt, col) : 0;
+}
+
+int db_column_type(arkilian *db, int col) {
+  sqlite3_stmt *stmt = get_current_stmt(db);
+  return stmt ? sqlite3_column_type(stmt, col) : SQLITE_NULL;
+}
+
+int db_bind_text(arkilian *db, int idx, const char *val) {
+  sqlite3_stmt *stmt = get_current_stmt(db);
+  if (!stmt || !val) return SQLITE_ERROR;
+  return sqlite3_bind_text(stmt, idx, val, -1, SQLITE_TRANSIENT);
+}
+
+int db_bind_int(arkilian *db, int idx, int val) {
+  sqlite3_stmt *stmt = get_current_stmt(db);
+  return stmt ? sqlite3_bind_int(stmt, idx, val) : SQLITE_ERROR;
+}
+
+int db_bind_int64(arkilian *db, int idx, sqlite3_int64 val) {
+  sqlite3_stmt *stmt = get_current_stmt(db);
+  return stmt ? sqlite3_bind_int64(stmt, idx, val) : SQLITE_ERROR;
+}
+
+int db_bind_double(arkilian *db, int idx, double val) {
+  sqlite3_stmt *stmt = get_current_stmt(db);
+  return stmt ? sqlite3_bind_double(stmt, idx, val) : SQLITE_ERROR;
+}
+
+int db_bind_null(arkilian *db, int idx) {
+  sqlite3_stmt *stmt = get_current_stmt(db);
+  return stmt ? sqlite3_bind_null(stmt, idx) : SQLITE_ERROR;
+}
+
+int db_changes(arkilian *db) {
+  return (db && db->handle) ? sqlite3_changes(db->handle) : 0;
+}
+
+sqlite3_int64 db_last_insert_rowid(arkilian *db) {
+  return (db && db->handle) ? sqlite3_last_insert_rowid(db->handle) : 0;
+}
+
+int db_set_token(arkilian *db, const char *token) {
+  if (!db || !token) return 1;
+  if (db->database_token) free(db->database_token);
+  db->database_token = malloc(strlen(token) + 1);
+  if (!db->database_token) return 1;
+  strcpy(db->database_token, token);
+  return 0;
+}
+
+// ── Transaction Control ─────────────────────────────────────────────
+
+int db_begin(arkilian *db) {
+  if (!db || !db->handle) return SQLITE_ERROR;
+  if (db->in_batch_txn) return SQLITE_BUSY;
+  int rc = sqlite3_step(db->begin_stmt);
+  sqlite3_reset(db->begin_stmt);
+  if (rc == SQLITE_DONE) {
+    db->in_batch_txn = 1;
+    return SQLITE_OK;
+  }
+  return rc;
+}
+
+int db_commit(arkilian *db) {
+  if (!db || !db->handle) return SQLITE_ERROR;
+  if (!db->in_batch_txn) return SQLITE_ERROR;
+  int rc = sqlite3_step(db->commit_stmt);
+  sqlite3_reset(db->commit_stmt);
+  db->in_batch_txn = 0;
+  return (rc == SQLITE_DONE) ? SQLITE_OK : rc;
+}
+
+int db_rollback(arkilian *db) {
+  if (!db || !db->handle) return SQLITE_ERROR;
+  if (!db->in_batch_txn) return SQLITE_ERROR;
+  sqlite3_step(db->rollback_stmt);
+  sqlite3_reset(db->rollback_stmt);
+  db->in_batch_txn = 0;
+  return SQLITE_OK;
+}
+
+// ── Introspection & Diagnostics ─────────────────────────────────────
+
+int db_wal_pending(arkilian *db) {
+  if (!db || !db->handle) return 0;
+  sqlite3_stmt *stmt = NULL;
+  int count = 0;
+  if (sqlite3_prepare_v2(db->handle, "SELECT COUNT(*) FROM _pending_backup", -1, &stmt, NULL) == SQLITE_OK) {
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+      count = sqlite3_column_int(stmt, 0);
+    }
+    sqlite3_finalize(stmt);
+  }
+  return count;
+}
+
+const char *db_wal_last_sql(arkilian *db) {
+  if (!db || !db->handle) return NULL;
+  static char payload_buf[1024];
+  payload_buf[0] = '\0';
+  sqlite3_stmt *stmt = NULL;
+  if (sqlite3_prepare_v2(db->handle, "SELECT payload FROM _pending_backup ORDER BY id DESC LIMIT 1", -1, &stmt, NULL) == SQLITE_OK) {
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+      const char *p = (const char *)sqlite3_column_text(stmt, 0);
+      if (p) {
+        strncpy(payload_buf, p, sizeof(payload_buf) - 1);
+        payload_buf[sizeof(payload_buf) - 1] = '\0';
+      }
+    }
+    sqlite3_finalize(stmt);
+  }
+  if (payload_buf[0] != '\0') return payload_buf;
+  return db->last_shipped_payload[0] != '\0' ? db->last_shipped_payload : NULL;
+}
+
+void db_wal_flush(arkilian *db) {
+  if (!db) return;
+  db->wake_flag = 1;
+#ifndef _WIN32
+  pthread_cond_signal(&db->wake_cond);
+#else
+  WakeConditionVariable(&db->wake_cond);
+#endif
+}
+
+// ── Hourly Backup Implementation ────────────────────────────────────
+
+int backup_database(sqlite3 *pSource, const char *zFilename) {
+  if (!pSource) return SQLITE_ERROR;
+  sqlite3 *pDest = NULL;
+  const char *actualPath = (zFilename != NULL) ? zFilename : DEFAULT_BACKUP_PATH;
+  int rc = sqlite3_open_v2(actualPath, &pDest, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, NULL);
+  if (rc != SQLITE_OK) {
+    if (pDest) sqlite3_close(pDest);
+    return rc;
+  }
+
+  sqlite3_backup *pBackup = sqlite3_backup_init(pDest, "main", pSource, "main");
+  if (!pBackup) {
     rc = sqlite3_errcode(pDest);
-    fprintf(stderr, "Backup Error: Initialization failed: %s\n",
-            sqlite3_errmsg(pDest));
     sqlite3_close(pDest);
     return rc;
   }
@@ -1173,62 +981,16 @@ int backup_database(sqlite3 *pSource, const char *zFilename) {
   } while (rc == SQLITE_OK || rc == SQLITE_BUSY || rc == SQLITE_LOCKED);
 
   (void)sqlite3_backup_finish(pBackup);
-
   if (rc == SQLITE_DONE) rc = SQLITE_OK;
-  else fprintf(stderr, "Backup Error: Step failed with code %d: %s\n", rc,
-               sqlite3_errmsg(pDest));
-
   sqlite3_close(pDest);
   return rc;
 }
 
-#ifdef _WIN32
-DWORD WINAPI run_hourly_backup(LPVOID arg) {
-#else
-void *run_hourly_backup(void *arg) {
-#endif
-  arkilian *db = (arkilian *)arg;
-  while (1) {
-#ifdef _WIN32
-    Sleep(db->backup_interval * 1000);
-#else
-    sleep(db->backup_interval);
-#endif
-    if (db->shutdown_requested) {
-#ifdef _WIN32
-      return 0;
-#else
-      return NULL;
-#endif
-    }
-    if (!db->is_open || db->handle == NULL) {
-#ifdef _WIN32
-      return 0;
-#else
-      return NULL;
-#endif
-    }
-    int status = backup_database(db->handle, db->backup_path);
-    if (status == SQLITE_OK) {
-      char *signed_url = get_signed_url(
-          db->signed_url_endpoint, db->database_token, &db->shutdown_requested);
-      if (signed_url && strlen(signed_url) > 5) {
-        int upload_status =
-            upload_to_s3(signed_url, db->backup_path, db->database_token);
-        if (upload_status == 0) ; // S3 upload ok
-        else fprintf(stderr, "S3 Upload Failed with status: %d\n", upload_status);
-      }
-      free(signed_url);
-    } else {
-      fprintf(stderr, "Backup failed with error code: %d\n", status);
-    }
-  }
-#ifdef _WIN32
-  return 0;
-#else
-  return NULL;
-#endif
-}
+struct Memory {
+  char *response;
+  size_t size;
+  int *shutdown_flag;
+};
 
 static size_t write_cb(void *data, size_t size, size_t nmemb, void *userp) {
   struct Memory *mem = (struct Memory *)userp;
@@ -1243,8 +1005,7 @@ static size_t write_cb(void *data, size_t size, size_t nmemb, void *userp) {
   return realsize;
 }
 
-char *get_signed_url(const char *api_endpoint, const char *token,
-                     int *shutdown_flag) {
+char *get_signed_url(const char *api_endpoint, const char *token, int *shutdown_flag) {
   CURL *curl = curl_easy_init();
   struct Memory chunk;
   chunk.response = malloc(1);
@@ -1275,8 +1036,7 @@ char *get_signed_url(const char *api_endpoint, const char *token,
   return NULL;
 }
 
-int upload_to_s3(const char *signed_url, const char *file_path,
-                 const char *token) {
+int upload_to_s3(const char *signed_url, const char *file_path, const char *token) {
   CURL *curl = curl_easy_init();
   if (!curl) return 1;
   FILE *fd = fopen(file_path, "rb");
@@ -1310,462 +1070,32 @@ int upload_to_s3(const char *signed_url, const char *file_path,
   return (res == CURLE_OK) ? 0 : 1;
 }
 
-// ── Core write execution ────────────────────────────────────────────
-// db_exec: run the SQL against SQLite, then push metadata to the ring
-// buffer for out-of-band streaming.  Read-only statements bypass
-// the write mutex entirely.
-
-static void push_write_wal_entry(arkilian *db, sqlite3_stmt *stmt);
-
-int db_exec(arkilian *db, const char *sql) {
-  if (!db || !db->handle || !sql)
-    return SQLITE_ERROR;
-
-  // Fast path for reads — skip prepare, mutex, ring buffer, everything.
-  // Just let SQLite handle it directly.
-  const char *p = sql;
-  while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
-  if ((p[0] == 'S' || p[0] == 's') &&
-      (p[1] == 'E' || p[1] == 'e') &&
-      (p[2] == 'L' || p[2] == 'l') &&
-      (p[3] == 'E' || p[3] == 'e') &&
-      (p[4] == 'C' || p[4] == 'c') &&
-      (p[5] == 'T' || p[5] == 't') &&
-      (p[6] == ' ' || p[6] == '\t' || p[6] == '\n' || p[6] == '\r' || p[6] == '\0')) {
-    int rc = sqlite3_exec(db->handle, sql, NULL, NULL, NULL);
-    if (rc != SQLITE_OK)
-      snprintf(db->last_error_msg, sizeof(db->last_error_msg), "%s",
-               sqlite3_errmsg(db->handle));
-    return rc;
-  }
-
-  sqlite3_stmt *stmt = NULL;
-  int rc = sqlite3_prepare_v2(db->handle, sql, -1, &stmt, NULL);
-  if (rc != SQLITE_OK) {
-    snprintf(db->last_error_msg, sizeof(db->last_error_msg), "%s",
-             sqlite3_errmsg(db->handle));
-    return rc;
-  }
-
-  // Reads just execute — no mutex, no ring push
-  if (sqlite3_stmt_readonly(stmt)) {
-    rc = sqlite3_step(stmt);
-    sqlite3_finalize(stmt);
-    return rc;
-  }
-
-  // Write path
-  // Mutex may already be held by db_prepare (in_write_txn) or db_begin (in_batch_txn)
-  int mutex_held = db->in_write_txn || db->in_batch_txn;
-
-  if (!mutex_held) {
-#ifndef _WIN32
-    pthread_mutex_lock(&db->write_mutex);
+#ifdef _WIN32
+DWORD WINAPI run_hourly_backup(LPVOID arg) {
 #else
-    WaitForSingleObject(db->write_mutex, INFINITE);
+void *run_hourly_backup(void *arg) {
 #endif
-    // Autocommit: each write is its own implicit transaction via SQLite.
-    // If the user wants batching they use db_begin / db_commit.
-  }
-
-  rc = sqlite3_step(stmt);
-
-  if (rc == SQLITE_DONE || rc == SQLITE_OK || rc == SQLITE_ROW) {
-    push_write_wal_entry(db, stmt);
-    db->in_write_txn = 0;
-    db->write_stmt_index = -1;
-  } else {
-    pu_clear(db);
-    snprintf(db->last_error_msg, sizeof(db->last_error_msg), "%s",
-             sqlite3_errmsg(db->handle));
-    if (db->in_batch_txn) {
-      sqlite3_step(db->rollback_stmt);
-      sqlite3_reset(db->rollback_stmt);
-      db->in_batch_txn = 0;
-      db->in_write_txn = 0;
-      db->write_stmt_index = -1;
-#ifndef _WIN32
-      pthread_mutex_unlock(&db->write_mutex);
+  arkilian *db = (arkilian *)arg;
+  while (1) {
+#ifdef _WIN32
+    Sleep(db->backup_interval * 1000);
 #else
-      ReleaseMutex(db->write_mutex);
+    sleep(db->backup_interval);
 #endif
-      sqlite3_finalize(stmt);
-      return rc;
-    }
-  }
+    if (db->shutdown_requested || !db->is_open || !db->handle) break;
 
-  sqlite3_finalize(stmt);
-  pu_clear(db);
-  if (!mutex_held) {
-#ifndef _WIN32
-    pthread_mutex_unlock(&db->write_mutex);
-#else
-    ReleaseMutex(db->write_mutex);
-#endif
-  }
-
-  return (rc == SQLITE_DONE || rc == SQLITE_OK || rc == SQLITE_ROW)
-    ? SQLITE_DONE : rc;
-}
-
-// ── Push a single write's WAL entry from preupdate capture ──────────
-
-static void push_write_wal_entry(arkilian *db, sqlite3_stmt *stmt) {
-  char *deterministic = build_deterministic_sql(db);
-  char *expanded = NULL;
-  if (!deterministic && stmt)
-    expanded = sqlite3_expanded_sql(stmt);
-
-  db->has_new_writes = 1;
-  struct wal_entry entry;
-  if (deterministic) {
-    build_wal_entry(&entry, deterministic, 1);
-  } else if (expanded) {
-    build_wal_entry(&entry, expanded, 2);
-  } else {
-    build_wal_entry(&entry, strdup(db->current_write_sql), 1);
-  }
-  check_update_hook_before_push(db, &entry);
-  entry.rk = (uint32_t)sqlite3_changes(db->handle);
-  wal_queue_push(&db->wal, &entry);
-}
-
-// ── Prepared statement path ─────────────────────────────────────────
-
-int db_prepare(arkilian *db, const char *sql) {
-  if (!db || !db->handle || !sql)
-    return SQLITE_ERROR;
-
-  if (db->stmt_count >= db->stmt_capacity) {
-    int new_cap = (db->stmt_capacity == 0) ? 4 : db->stmt_capacity * 2;
-    sqlite3_stmt **new_arr =
-        realloc(db->stmts, (size_t)new_cap * sizeof(sqlite3_stmt *));
-    if (!new_arr) return SQLITE_NOMEM;
-    db->stmts = new_arr;
-    db->stmt_capacity = new_cap;
-  }
-
-  sqlite3_stmt *stmt = NULL;
-  int rc = sqlite3_prepare_v2(db->handle, sql, -1, &stmt, NULL);
-  if (rc != SQLITE_OK) {
-    snprintf(db->last_error_msg, sizeof(db->last_error_msg), "%s",
-             sqlite3_errmsg(db->handle));
-    return rc;
-  }
-
-  // Write statements: acquire mutex (autocommit — each write runs in its own txn)
-  if (!sqlite3_stmt_readonly(stmt)) {
-    int was_in_write = db->in_write_txn;
-    if (db->in_write_txn || db->in_batch_txn) {
-      // Already in a transaction from a previous write prepare or db_begin
-    } else {
-#ifndef _WIN32
-      pthread_mutex_lock(&db->write_mutex);
-#else
-      WaitForSingleObject(db->write_mutex, INFINITE);
-#endif
-    }
-    db->in_write_txn = 1;
-    // Only record the first write in a transaction as the tracked statement
-    if (!was_in_write) {
-      db->write_stmt_index = db->stmt_count;
-      strncpy(db->current_write_sql, sql, sizeof(db->current_write_sql) - 1);
-      db->current_write_sql[sizeof(db->current_write_sql) - 1] = '\0';
-    }
-  }
-
-  db->stmts[db->stmt_count] = stmt;
-  db->stmt_current = db->stmt_count;
-  db->stmt_count++;
-  return rc;
-}
-
-int db_use_stmt(arkilian *db, int index) {
-  if (!db || index < 0 || index >= db->stmt_count) return SQLITE_ERROR;
-  if (!db->stmts[index]) return SQLITE_ERROR;
-  db->stmt_current = index;
-  return SQLITE_OK;
-}
-
-int db_stmt_count(arkilian *db) {
-  if (!db) return 0;
-  return db->stmt_count;
-}
-
-static sqlite3_stmt *get_current_stmt(arkilian *db) {
-  if (!db || db->stmt_current < 0 || db->stmt_current >= db->stmt_count)
-    return NULL;
-  return db->stmts[db->stmt_current];
-}
-
-int db_step(arkilian *db) {
-  sqlite3_stmt *stmt = get_current_stmt(db);
-  if (!stmt) return SQLITE_ERROR;
-  int rc = sqlite3_step(stmt);
-  db->last_step_rc = rc;
-
-  // Push one WAL entry per successful write execution — enables
-  // statement reuse via db_reset() without losing row data.
-  if (db->stmt_current == db->write_stmt_index && db->pu.fired) {
-    int ok = (rc == SQLITE_DONE || rc == SQLITE_ROW || rc == SQLITE_OK);
-    if (ok) {
-      push_write_wal_entry(db, stmt);
-    }
-    pu_clear(db);
-  }
-  return rc;
-}
-
-int db_finalize(arkilian *db) {
-  if (!db) return SQLITE_ERROR;
-  sqlite3_stmt *stmt = get_current_stmt(db);
-  if (stmt) {
-    int is_this_write = (db->stmt_current == db->write_stmt_index);
-
-    // Safety: drain any preupdate data from a final step that wasn't
-    // followed by a reset/push (shouldn't happen in normal use).
-    if (is_this_write && db->pu.fired) {
-      int ok = (db->last_step_rc == SQLITE_DONE ||
-                db->last_step_rc == SQLITE_ROW ||
-                db->last_step_rc == SQLITE_OK);
-      if (ok) {
-        push_write_wal_entry(db, stmt);
+    int status = backup_database(db->handle, db->backup_path);
+    if (status == SQLITE_OK && db->signed_url_endpoint) {
+      char *signed_url = get_signed_url(db->signed_url_endpoint, db->database_token, (int *)&db->shutdown_requested);
+      if (signed_url && strlen(signed_url) > 5) {
+        upload_to_s3(signed_url, db->backup_path, db->database_token);
       }
-    }
-
-    sqlite3_finalize(stmt);
-    db->stmts[db->stmt_current] = NULL;
-
-    if (is_this_write) {
-      pu_clear(db);
-      db->in_write_txn = 0;
-      db->write_stmt_index = -1;
-      db->current_write_sql[0] = '\0';
-      if (!db->in_batch_txn) {
-#ifndef _WIN32
-        pthread_mutex_unlock(&db->write_mutex);
-#else
-        ReleaseMutex(db->write_mutex);
-#endif
-      }
+      free(signed_url);
     }
   }
-  return SQLITE_OK;
-}
-
-int db_reset(arkilian *db) {
-  sqlite3_stmt *stmt = get_current_stmt(db);
-  if (!stmt) return SQLITE_ERROR;
-
-  // Drain any pending write before reset (safety — db_step should
-  // have already pushed, but a misbehaving caller might skip it).
-  if (db->stmt_current == db->write_stmt_index && db->pu.fired) {
-    int ok = (db->last_step_rc == SQLITE_DONE ||
-              db->last_step_rc == SQLITE_ROW ||
-              db->last_step_rc == SQLITE_OK);
-    if (ok)
-      push_write_wal_entry(db, stmt);
-    pu_clear(db);
-  }
-
-  return sqlite3_reset(stmt);
-}
-
-// ── Column access ───────────────────────────────────────────────────
-
-int db_column_count(arkilian *db) {
-  sqlite3_stmt *stmt = get_current_stmt(db);
-  if (!stmt) return 0;
-  return sqlite3_column_count(stmt);
-}
-
-const char *db_column_name(arkilian *db, int col) {
-  sqlite3_stmt *stmt = get_current_stmt(db);
-  if (!stmt) return NULL;
-  return (const char *)sqlite3_column_name(stmt, col);
-}
-
-const char *db_column_text(arkilian *db, int col) {
-  sqlite3_stmt *stmt = get_current_stmt(db);
-  if (!stmt) return NULL;
-  return (const char *)sqlite3_column_text(stmt, col);
-}
-
-int db_column_int(arkilian *db, int col) {
-  sqlite3_stmt *stmt = get_current_stmt(db);
-  if (!stmt) return 0;
-  return sqlite3_column_int(stmt, col);
-}
-
-double db_column_double(arkilian *db, int col) {
-  sqlite3_stmt *stmt = get_current_stmt(db);
-  if (!stmt) return 0.0;
-  return sqlite3_column_double(stmt, col);
-}
-
-int db_bind_text(arkilian *db, int idx, const char *val) {
-  sqlite3_stmt *stmt = get_current_stmt(db);
-  if (!stmt || !val) return SQLITE_ERROR;
-  return sqlite3_bind_text(stmt, idx, val, -1, SQLITE_TRANSIENT);
-}
-
-int db_bind_int(arkilian *db, int idx, int val) {
-  sqlite3_stmt *stmt = get_current_stmt(db);
-  if (!stmt) return SQLITE_ERROR;
-  return sqlite3_bind_int(stmt, idx, val);
-}
-
-int db_bind_double(arkilian *db, int idx, double val) {
-  sqlite3_stmt *stmt = get_current_stmt(db);
-  if (!stmt) return SQLITE_ERROR;
-  return sqlite3_bind_double(stmt, idx, val);
-}
-
-// ── Batch transaction API ───────────────────────────────────────────
-
-int db_begin(arkilian *db) {
-  if (!db || !db->handle) return SQLITE_ERROR;
-  if (db->in_batch_txn || db->in_write_txn) return SQLITE_BUSY;
-#ifndef _WIN32
-  pthread_mutex_lock(&db->write_mutex);
-#else
-  WaitForSingleObject(db->write_mutex, INFINITE);
-#endif
-  int rc = sqlite3_step(db->begin_stmt);
-  sqlite3_reset(db->begin_stmt);
-  if (rc != SQLITE_DONE) {
-    snprintf(db->last_error_msg, sizeof(db->last_error_msg), "%s",
-             sqlite3_errmsg(db->handle));
-#ifndef _WIN32
-    pthread_mutex_unlock(&db->write_mutex);
-#else
-    ReleaseMutex(db->write_mutex);
-#endif
-    return rc;
-  }
-  db->in_batch_txn = 1;
-  return SQLITE_OK;
-}
-
-int db_commit(arkilian *db) {
-  if (!db || !db->handle) return SQLITE_ERROR;
-  if (!db->in_batch_txn) return SQLITE_ERROR;
-  int rc = sqlite3_step(db->commit_stmt);
-  sqlite3_reset(db->commit_stmt);
-  db->in_batch_txn = 0;
-  db->has_new_writes = 1;
-#ifndef _WIN32
-  pthread_mutex_unlock(&db->write_mutex);
-#else
-  ReleaseMutex(db->write_mutex);
-#endif
-  return (rc == SQLITE_DONE) ? SQLITE_OK : rc;
-}
-
-int db_rollback(arkilian *db) {
-  if (!db || !db->handle) return SQLITE_ERROR;
-  if (!db->in_batch_txn) return SQLITE_ERROR;
-  sqlite3_step(db->rollback_stmt);
-  sqlite3_reset(db->rollback_stmt);
-  db->in_batch_txn = 0;
-#ifndef _WIN32
-  pthread_mutex_unlock(&db->write_mutex);
-#else
-  ReleaseMutex(db->write_mutex);
-#endif
-  return SQLITE_OK;
-}
-
-int db_bind_null(arkilian *db, int idx) {
-  sqlite3_stmt *stmt = get_current_stmt(db);
-  if (!stmt) return SQLITE_ERROR;
-  return sqlite3_bind_null(stmt, idx);
-}
-
-int db_bind_int64(arkilian *db, int idx, sqlite3_int64 val) {
-  sqlite3_stmt *stmt = get_current_stmt(db);
-  if (!stmt) return SQLITE_ERROR;
-  return sqlite3_bind_int64(stmt, idx, val);
-}
-
-sqlite3_int64 db_column_int64(arkilian *db, int col) {
-  sqlite3_stmt *stmt = get_current_stmt(db);
-  if (!stmt) return 0;
-  return sqlite3_column_int64(stmt, col);
-}
-
-int db_column_type(arkilian *db, int col) {
-  sqlite3_stmt *stmt = get_current_stmt(db);
-  if (!stmt) return SQLITE_NULL;
-  return sqlite3_column_type(stmt, col);
-}
-
-int db_changes(arkilian *db) {
-  if (!db || !db->handle) return 0;
-  return sqlite3_changes(db->handle);
-}
-
-sqlite3_int64 db_last_insert_rowid(arkilian *db) {
-  if (!db || !db->handle) return 0;
-  return sqlite3_last_insert_rowid(db->handle);
-}
-
-int db_set_token(arkilian *db, const char *token) {
-  if (!db || !token) return 1;
-  if (db->database_token) free(db->database_token);
-  db->database_token = malloc(strlen(token) + 1);
-  if (!db->database_token) return 1;
-  strcpy(db->database_token, token);
+#ifdef _WIN32
   return 0;
-}
-
-// Returns the number of pending WAL entries in the linked-list queue
-int db_wal_pending(arkilian *db) {
-  if (!db || !db->wal.allocated) return 0;
-#ifndef _WIN32
-  pthread_mutex_lock(&db->wal.mutex);
 #else
-  WaitForSingleObject(db->wal.mutex, INFINITE);
-#endif
-  int total = 0;
-  for (struct wal_chunk *c = db->wal.head; c; c = c->next)
-    total += c->count - c->consumed;
-#ifndef _WIN32
-  pthread_mutex_unlock(&db->wal.mutex);
-#else
-  ReleaseMutex(db->wal.mutex);
-#endif
-  return total;
-}
-
-// Return the SQL text of the most recently pushed WAL entry.
-// Returns NULL if no entries are pending. For testing / debugging.
-const char *db_wal_last_sql(arkilian *db) {
-  if (!db || !db->wal.allocated) return NULL;
-#ifndef _WIN32
-  pthread_mutex_lock(&db->wal.mutex);
-#else
-  WaitForSingleObject(db->wal.mutex, INFINITE);
-#endif
-  struct wal_chunk *t = db->wal.tail;
-  const char *sql = (t && t->count > 0) ? t->entries[t->count - 1].sql : NULL;
-#ifndef _WIN32
-  pthread_mutex_unlock(&db->wal.mutex);
-#else
-  ReleaseMutex(db->wal.mutex);
-#endif
-  return sql;
-}
-
-// Force a flush of the WAL queue.  Must be called while the
-// write_mutex is NOT held.
-void db_wal_flush(arkilian *db) {
-  // Linked-list queue drains continuously — no explicit swap needed.
-  // Signal the flush thread to wake up and process what's available.
-  if (!db || !db->handle || !db->wal.allocated) return;
-#ifndef _WIN32
-  pthread_cond_signal(&db->wal.cond);
-#else
-  SetEvent(db->wal.event);
+  return NULL;
 #endif
 }
