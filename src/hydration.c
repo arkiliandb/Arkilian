@@ -137,8 +137,17 @@ char *json_get_string(const char *json, const char *key) {
   size_t len = (size_t)(end - pos);
   char *val = malloc(len + 1);
   if (!val) return NULL;
-  memcpy(val, pos, len);
-  val[len] = '\0';
+
+  size_t out_idx = 0;
+  for (size_t i = 0; i < len; i++) {
+    if (i + 5 < len && strncmp(&pos[i], "\\u0026", 6) == 0) {
+      val[out_idx++] = '&';
+      i += 5;
+    } else {
+      val[out_idx++] = pos[i];
+    }
+  }
+  val[out_idx] = '\0';
   return val;
 }
 
