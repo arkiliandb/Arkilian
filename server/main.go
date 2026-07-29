@@ -685,8 +685,8 @@ func handleHydratePlan(w http.ResponseWriter, r *http.Request) {
 		 WHERE db_id = ? ORDER BY baseline_lsn DESC LIMIT 1`,
 		dbID).Scan(&snapLSN, &snapKey)
 	if err != nil {
-		http.Error(w, `{"error":"no snapshot available"}`, http.StatusNotFound)
-		return
+		snapLSN = 0
+		snapKey = fmt.Sprintf("db_%s/backup.sqlite", dbID)
 	}
 
 	snapURL, snapExpires := signedURL("GET", snapKey, 1*time.Hour)
