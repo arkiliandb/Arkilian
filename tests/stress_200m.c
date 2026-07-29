@@ -33,6 +33,7 @@ static double now_ms(void) {
 }
 
 int main(int argc, char **argv) {
+  setvbuf(stdout, NULL, _IONBF, 0);
   unsigned long long write_target = STRESS_WRITE_GOAL;
   unsigned long long read_target = STRESS_READ_GOAL;
 
