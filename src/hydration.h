@@ -33,6 +33,7 @@ extern "C" {
 #define HYDRATION_ERR_SQL       -5   // SQL replay failed
 #define HYDRATION_ERR_DECOMP    -6   // decompression failure
 #define HYDRATION_ERR_EXPIRED   -7   // signed URL expired, caller should retry
+#define HYDRATION_ERR_NOTFOUND  -8   // snapshot not yet uploaded (cold start)
 
 // ── Types ───────────────────────────────────────────────────────────
 
@@ -89,6 +90,12 @@ int hydrate_replay_chunk(sqlite3 *db, const char *raw_sql, int64_t chunk_lsn);
 
 // Free all memory associated with a HydratePlan.
 void hydrate_plan_free(HydratePlan *plan);
+
+// Remove db_path along with its SQLite sidecar files (-wal, -shm,
+// -journal).  Must be called before installing a downloaded snapshot:
+// leftover WAL frames from a previous database file would otherwise be
+// replayed into the new snapshot, silently corrupting it.
+void hydration_remove_db_files(const char *db_path);
 
 #ifdef __cplusplus
 }

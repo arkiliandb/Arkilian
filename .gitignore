@@ -74,3 +74,4 @@ test_deterministic
 realtime-backup-layer-c-sqlite3.md
 stress_200m
 test_minio_hydrate
+test_regressions

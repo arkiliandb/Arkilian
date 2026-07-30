@@ -187,6 +187,91 @@ static void test_json_array_get_element(void) {
   free(elem);
 }
 
+// ── JSON regression tests (audit fixes) ─────────────────────────────
+
+static void test_json_string_escapes(void) {
+  // Every standard escape must decode, not just &.
+  const char *json = "{\"u\":\"a\\\"b\\/c&d\\\\e\\n\"}";
+  char *v = json_get_string(json, "u");
+  assert(v != NULL && strcmp(v, "a\"b/c&d\\e\n") == 0);
+  free(v);
+}
+
+static void test_json_string_whitespace_around_colon(void) {
+  const char *json = "{ \"snapshot_url\" : \"http://x/y\" }";
+  char *v = json_get_string(json, "snapshot_url");
+  assert(v != NULL && strcmp(v, "http://x/y") == 0);
+  free(v);
+}
+
+static void test_json_escaped_quote_does_not_terminate(void) {
+  // Old parser used strchr(pos,'"') — this value was truncated.
+  const char *json = "{\"msg\":\"say \\\"hi\\\" ok\"}";
+  char *v = json_get_string(json, "msg");
+  assert(v != NULL && strcmp(v, "say \"hi\" ok") == 0);
+  free(v);
+}
+
+static void test_json_array_count_ignores_braces_in_strings(void) {
+  // Braces inside string values and objects AFTER the array must not
+  // inflate the count (old parser scanned to end-of-string).
+  const char *json =
+    "{\"chunks\":[{\"url\":\"http://x/{a}\"},{\"url\":\"u2\"}],"
+    "\"other\":[{\"z\":1},{\"z\":2},{\"z\":3}]}";
+  assert(json_array_count(json, "chunks") == 2);
+}
+
+static void test_json_array_count_empty(void) {
+  const char *json = "{\"chunks\":[]}";
+  assert(json_array_count(json, "chunks") == 0);
+}
+
+static void test_json_array_get_with_string_braces(void) {
+  const char *json = "{\"chunks\":[{\"url\":\"a}{b\"},{\"url\":\"u2\"}]}";
+  char *elem = json_array_get(json, "chunks", 1);
+  assert(elem != NULL && strstr(elem, "u2") != NULL);
+  free(elem);
+  // Out-of-range index must return NULL, not garbage
+  assert(json_array_get(json, "chunks", 5) == NULL);
+}
+
+static void test_json_key_inside_string_value_not_matched(void) {
+  // "baseline_lsn" appearing inside a string VALUE must not be treated
+  // as a key (exact top-level key matching).
+  const char *json = "{\"note\":\"see baseline_lsn here\",\"baseline_lsn\":7}";
+  assert(json_get_int64(json, "baseline_lsn") == 7);
+}
+
+// ── Snapshot install hygiene (stale WAL corruption fix) ─────────────
+
+static void test_hydration_remove_db_files(void) {
+  const char *base = "/tmp/test_ark_rm.db";
+  char path[128];
+  const char *suffixes[] = {"", "-wal", "-shm", "-journal"};
+  for (int i = 0; i < 4; i++) {
+    snprintf(path, sizeof(path), "%s%s", base, suffixes[i]);
+    FILE *f = fopen(path, "w");
+    assert(f != NULL);
+    fputs("x", f);
+    fclose(f);
+  }
+  // An unrelated sibling must survive
+  FILE *keep = fopen("/tmp/test_ark_rm_keep.db", "w");
+  assert(keep != NULL); fputs("x", keep); fclose(keep);
+
+  hydration_remove_db_files(base);
+
+  for (int i = 0; i < 4; i++) {
+    snprintf(path, sizeof(path), "%s%s", base, suffixes[i]);
+    FILE *f = fopen(path, "r");
+    assert(f == NULL); // all gone
+  }
+  FILE *f = fopen("/tmp/test_ark_rm_keep.db", "r");
+  assert(f != NULL); // untouched
+  fclose(f);
+  remove("/tmp/test_ark_rm_keep.db");
+}
+
 // ── Integration (requires running Control Plane) ────────────────────
 
 static void test_hydration_integration(void) {
@@ -232,6 +317,18 @@ int main(int argc, char **argv) {
   RUN_TEST(test_json_get_int64);
   RUN_TEST(test_json_array_count);
   RUN_TEST(test_json_array_get_element);
+
+  printf("\n[JSON Regressions]\n");
+  RUN_TEST(test_json_string_escapes);
+  RUN_TEST(test_json_string_whitespace_around_colon);
+  RUN_TEST(test_json_escaped_quote_does_not_terminate);
+  RUN_TEST(test_json_array_count_ignores_braces_in_strings);
+  RUN_TEST(test_json_array_count_empty);
+  RUN_TEST(test_json_array_get_with_string_braces);
+  RUN_TEST(test_json_key_inside_string_value_not_matched);
+
+  printf("\n[Snapshot Install Hygiene]\n");
+  RUN_TEST(test_hydration_remove_db_files);
 
   if (integration) {
     printf("\n[Integration]\n");

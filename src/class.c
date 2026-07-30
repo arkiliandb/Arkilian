@@ -377,7 +377,7 @@ int sync_backup_triggers(sqlite3 *db, char **err_out) {
     // match on primary-key columns instead of OLD.rowid.
     char *delete_expr = NULL;
     if (!without_rowid) {
-      delete_expr = sqlite3_mprintf("'%s' || OLD.rowid", delete_prefix);
+      delete_expr = sqlite3_mprintf("'%srowid = ' || OLD.rowid", delete_prefix);
     } else {
       int pk_seen = 0;
       char *lit_accum = strdup(delete_prefix);
@@ -1139,6 +1139,16 @@ int db_column_type(arkilian *db, int col) {
   return stmt ? sqlite3_column_type(stmt, col) : SQLITE_NULL;
 }
 
+const void *db_column_blob(arkilian *db, int col) {
+  sqlite3_stmt *stmt = get_current_stmt(db);
+  return stmt ? sqlite3_column_blob(stmt, col) : NULL;
+}
+
+int db_column_bytes(arkilian *db, int col) {
+  sqlite3_stmt *stmt = get_current_stmt(db);
+  return stmt ? sqlite3_column_bytes(stmt, col) : 0;
+}
+
 int db_bind_text(arkilian *db, int idx, const char *val) {
   sqlite3_stmt *stmt = get_current_stmt(db);
   if (!stmt || !val) return SQLITE_ERROR;
@@ -1231,30 +1241,50 @@ int db_wal_pending(arkilian *db) {
 
 const char *db_wal_last_sql(arkilian *db) {
   if (!db || !db->handle) return NULL;
-  static char payload_buf[1024];
-  payload_buf[0] = '\0';
+  // Per-instance buffer — a static buffer would race and leak data
+  // across database instances.
+  db->wal_last_buf[0] = '\0';
   sqlite3_stmt *stmt = NULL;
   if (sqlite3_prepare_v2(db->handle, "SELECT payload FROM _pending_backup ORDER BY id DESC LIMIT 1", -1, &stmt, NULL) == SQLITE_OK) {
     if (sqlite3_step(stmt) == SQLITE_ROW) {
       const char *p = (const char *)sqlite3_column_text(stmt, 0);
       if (p) {
-        strncpy(payload_buf, p, sizeof(payload_buf) - 1);
-        payload_buf[sizeof(payload_buf) - 1] = '\0';
+        strncpy(db->wal_last_buf, p, sizeof(db->wal_last_buf) - 1);
+        db->wal_last_buf[sizeof(db->wal_last_buf) - 1] = '\0';
       }
     }
     sqlite3_finalize(stmt);
   }
-  if (payload_buf[0] != '\0') return payload_buf;
-  return db->last_shipped_payload[0] != '\0' ? db->last_shipped_payload : NULL;
+  if (db->wal_last_buf[0] != '\0') return db->wal_last_buf;
+#ifndef _WIN32
+  pthread_mutex_lock(&db->payload_mutex);
+#else
+  EnterCriticalSection(&db->payload_mutex);
+#endif
+  if (db->last_shipped_payload[0] != '\0') {
+    strncpy(db->wal_last_buf, db->last_shipped_payload, sizeof(db->wal_last_buf) - 1);
+    db->wal_last_buf[sizeof(db->wal_last_buf) - 1] = '\0';
+  }
+#ifndef _WIN32
+  pthread_mutex_unlock(&db->payload_mutex);
+#else
+  LeaveCriticalSection(&db->payload_mutex);
+#endif
+  return db->wal_last_buf[0] != '\0' ? db->wal_last_buf : NULL;
 }
 
 void db_wal_flush(arkilian *db) {
   if (!db) return;
-  db->wake_flag = 1;
 #ifndef _WIN32
+  pthread_mutex_lock(&db->wake_mutex);
+  db->wake_flag = 1;
   pthread_cond_signal(&db->wake_cond);
+  pthread_mutex_unlock(&db->wake_mutex);
 #else
+  EnterCriticalSection(&db->wake_mutex);
+  db->wake_flag = 1;
   WakeConditionVariable(&db->wake_cond);
+  LeaveCriticalSection(&db->wake_mutex);
 #endif
 }
 
@@ -1315,6 +1345,7 @@ char *get_signed_url(const char *api_endpoint, const char *token, int *shutdown_
   chunk.response = malloc(1);
   chunk.size = 0;
   chunk.shutdown_flag = shutdown_flag;
+  if (!chunk.response) return NULL;
 
   if (curl) {
     curl_easy_setopt(curl, CURLOPT_URL, api_endpoint);
@@ -1332,9 +1363,14 @@ char *get_signed_url(const char *api_endpoint, const char *token, int *shutdown_
     }
 
     CURLcode res = curl_easy_perform(curl);
+    long http_code = 0;
+    if (res == CURLE_OK) curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
     if (headers) curl_slist_free_all(headers);
     curl_easy_cleanup(curl);
-    if (res == CURLE_OK && chunk.response) {
+
+    // Only a 200 response is a valid answer — an error body must never
+    // be mistaken for an upload URL.
+    if (res == CURLE_OK && http_code == 200 && chunk.response) {
       char *url_key = strstr(chunk.response, "\"upload_url\":\"");
       if (url_key) {
         url_key += strlen("\"upload_url\":\"");
@@ -1342,13 +1378,18 @@ char *get_signed_url(const char *api_endpoint, const char *token, int *shutdown_
         if (end_quote) {
           size_t url_len = end_quote - url_key;
           char *clean_url = malloc(url_len + 1);
+          if (!clean_url) { free(chunk.response); return NULL; }
           memcpy(clean_url, url_key, url_len);
           clean_url[url_len] = '\0';
           free(chunk.response);
           return clean_url;
         }
       }
-      return chunk.response;
+      // Fallback: some control planes return the URL as a plain-text body.
+      if (strncmp(chunk.response, "http://", 7) == 0 ||
+          strncmp(chunk.response, "https://", 8) == 0) {
+        return chunk.response;
+      }
     }
   }
   free(chunk.response);
@@ -1359,7 +1400,10 @@ int upload_to_s3(const char *signed_url, const char *file_path, const char *toke
   CURL *curl = curl_easy_init();
   if (!curl) return 1;
   FILE *fd = fopen(file_path, "rb");
-  if (!fd) return 1;
+  if (!fd) {
+    curl_easy_cleanup(curl);
+    return 1;
+  }
 
   fseek(fd, 0L, SEEK_END);
   long file_size = ftell(fd);
@@ -1372,7 +1416,10 @@ int upload_to_s3(const char *signed_url, const char *file_path, const char *toke
 
   struct curl_slist *headers = NULL;
   headers = curl_slist_append(headers, "Content-Type: application/x-sqlite3");
-  if (token && strlen(token) > 0) {
+  // Pre-signed URLs must NOT carry our bearer token — it leaks the
+  // credential to the storage host and S3 rejects requests that mix
+  // an Authorization header with a query-string signature.
+  if (token && strlen(token) > 0 && !url_is_presigned(signed_url)) {
     char auth_header[512];
     snprintf(auth_header, sizeof(auth_header), "Authorization: Bearer %s", token);
     headers = curl_slist_append(headers, auth_header);
@@ -1383,10 +1430,21 @@ int upload_to_s3(const char *signed_url, const char *file_path, const char *toke
   curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
 
   CURLcode res = curl_easy_perform(curl);
+  long http_code = 0;
+  if (res == CURLE_OK) curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+
   fclose(fd);
   curl_slist_free_all(headers);
   curl_easy_cleanup(curl);
-  return (res == CURLE_OK) ? 0 : 1;
+
+  // A completed transfer is not success — check the HTTP status so
+  // rejected uploads (4xx/5xx) are reported rather than swallowed.
+  int ok = (res == CURLE_OK && http_code >= 200 && http_code < 300);
+  if (!ok) {
+    fprintf(stderr, "arkilian: backup upload failed (curl_rc=%d http=%ld)\n",
+            (int)res, http_code);
+  }
+  return ok ? 0 : 1;
 }
 
 #ifdef _WIN32
@@ -1395,23 +1453,53 @@ DWORD WINAPI run_hourly_backup(LPVOID arg) {
 void *run_hourly_backup(void *arg) {
 #endif
   arkilian *db = (arkilian *)arg;
-  int first_run = 1;
+  // First backup runs immediately, then every backup_interval seconds.
+  // The wait is interruptible so db_close() never blocks on a sleeping
+  // backup interval (previously close could hang for up to an hour).
+  time_t next_backup = time(NULL);
+
   while (1) {
-    if (!first_run) {
-#ifdef _WIN32
-      Sleep(db->backup_interval * 1000);
-#else
-      sleep(db->backup_interval);
-#endif
+#ifndef _WIN32
+    pthread_mutex_lock(&db->wake_mutex);
+    while (!db->shutdown_requested) {
+      time_t now = time(NULL);
+      if (now >= next_backup) break;
+      struct timespec ts;
+      ts.tv_sec = next_backup;
+      ts.tv_nsec = 0;
+      pthread_cond_timedwait(&db->wake_cond, &db->wake_mutex, &ts);
     }
-    first_run = 0;
-    if (db->shutdown_requested || !db->is_open || !db->handle) break;
+    int shutdown = db->shutdown_requested;
+    pthread_mutex_unlock(&db->wake_mutex);
+#else
+    EnterCriticalSection(&db->wake_mutex);
+    while (!db->shutdown_requested) {
+      time_t now = time(NULL);
+      if (now >= next_backup) break;
+      DWORD remaining_ms = (DWORD)((next_backup - now) * 1000);
+      SleepConditionVariableCS(&db->wake_cond, &db->wake_mutex, remaining_ms);
+    }
+    int shutdown = db->shutdown_requested;
+    LeaveCriticalSection(&db->wake_mutex);
+#endif
+
+    if (shutdown || !db->is_open || !db->handle) break;
+    next_backup = time(NULL) + db->backup_interval;
 
     int status = backup_database(db->handle, db->backup_path);
-    if (status == SQLITE_OK && db->signed_url_endpoint) {
+
+    // Skip the remote upload when no endpoint has been configured —
+    // never phone home to the vendor default with a customer database.
+    int endpoint_configured = db->signed_url_endpoint &&
+        strlen(db->signed_url_endpoint) > 0 &&
+        strcmp(db->signed_url_endpoint, DEFAULT_SIGNED_URL_ENDPOINT) != 0;
+
+    if (status == SQLITE_OK && endpoint_configured) {
       char *signed_url = get_signed_url(db->signed_url_endpoint, db->database_token, (int *)&db->shutdown_requested);
       if (signed_url && strlen(signed_url) > 5) {
-        upload_to_s3(signed_url, db->backup_path, db->database_token);
+        if (upload_to_s3(signed_url, db->backup_path, db->database_token) != 0) {
+          fprintf(stderr, "arkilian: scheduled backup upload failed\n");
+        }
       }
       free(signed_url);
     }

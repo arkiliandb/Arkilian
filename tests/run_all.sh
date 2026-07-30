@@ -11,6 +11,11 @@
                                                        -Isrc -Isrc/deps/sqlite -lcurl -lpthread -o test_interception
  ./test_interception
 
+ # Regression tests for production audit fixes
+ cc tests/test_regressions.c src/class.c src/deps/sqlite/sqlite3.c \
+                                                       -Isrc -Isrc/deps/sqlite -lcurl -lpthread -o test_regressions
+ ./test_regressions
+
  # Test hydration
  cc tests/test_hydration.c src/hydration.c \
                                     -Isrc -Isrc/deps/sqlite -lcurl -lsqlite3 -o test_hydration

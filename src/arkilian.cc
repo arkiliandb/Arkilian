@@ -1,13 +1,36 @@
 #include <napi.h>
 #include <cstring>
 #include <cstdio>
+#include <mutex>
+#include <unordered_set>
 #include "class.h"
+
+// ── Handle Registry ─────────────────────────────────────────────────
+// Raw pointers are handed to JS as numbers.  Without a registry, any
+// stale or crafted number is a use-after-free / wild-pointer deref.
+// Every live handle is registered at init and removed at close; lookups
+// validate membership before the pointer is ever dereferenced.
+static std::mutex g_registry_mutex;
+static std::unordered_set<arkilian*> g_registry;
+
+static void registerDb(arkilian* db) {
+  std::lock_guard<std::mutex> lock(g_registry_mutex);
+  g_registry.insert(db);
+}
+
+// Returns true (and removes the handle) only if it was live.
+static bool unregisterDb(arkilian* db) {
+  std::lock_guard<std::mutex> lock(g_registry_mutex);
+  return g_registry.erase(db) > 0;
+}
 
 // Direct pointer conversion — zero-overhead handle lookup
 static inline arkilian* getDbFromArg(const Napi::CallbackInfo& info) {
   if (info.Length() < 1 || !info[0].IsNumber()) return nullptr;
   int64_t id = info[0].As<Napi::Number>().Int64Value();
-  return reinterpret_cast<arkilian*>(id);
+  arkilian* db = reinterpret_cast<arkilian*>(id);
+  std::lock_guard<std::mutex> lock(g_registry_mutex);
+  return g_registry.count(db) ? db : nullptr;
 }
 
 Napi::Value db_init(const Napi::CallbackInfo& info) {
@@ -16,23 +39,29 @@ Napi::Value db_init(const Napi::CallbackInfo& info) {
     Napi::TypeError::New(env, "String expected for database path").ThrowAsJavaScriptException();
     return env.Null();
   }
-  
+
   std::string path = info[0].As<Napi::String>().Utf8Value();
   arkilian* db = nullptr;
-  
+
   int result = db_init(&db, path.c_str());
   if (result != 0 || db == nullptr) {
-    Napi::Error::New(env, db ? db_errmsg(db) : "Failed to initialize database").ThrowAsJavaScriptException();
+    std::string msg = db ? db_errmsg(db) : "Failed to initialize database";
+    if (db) db_close(db); // release the partially-initialized handle
+    Napi::Error::New(env, msg).ThrowAsJavaScriptException();
     return env.Null();
   }
-  
+
+  registerDb(db);
   return Napi::Number::New(env, reinterpret_cast<int64_t>(db));
 }
 
 Napi::Value db_close(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
-  arkilian* db = getDbFromArg(info);
-  if (db) {
+  if (info.Length() < 1 || !info[0].IsNumber()) return env.Null();
+  int64_t id = info[0].As<Napi::Number>().Int64Value();
+  arkilian* db = reinterpret_cast<arkilian*>(id);
+  // Close only live handles — double-close / stale-id is a no-op.
+  if (unregisterDb(db)) {
     db_close(db);
   }
   return env.Null();
@@ -186,6 +215,27 @@ Napi::Value db_bind_int(const Napi::CallbackInfo& info) {
   return Napi::Number::New(env, db_bind_int(db, idx, val));
 }
 
+Napi::Value db_bind_int64(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  arkilian* db = getDbFromArg(info);
+  if (!db || info.Length() < 3 || !info[1].IsNumber() || !info[2].IsNumber()) return env.Null();
+  int idx = info[1].As<Napi::Number>().Int32Value();
+  // JS callers must only route safe integers here (|v| <= 2^53-1).
+  double d = info[2].As<Napi::Number>().DoubleValue();
+  return Napi::Number::New(env, db_bind_int64(db, idx, (sqlite3_int64)d));
+}
+
+Napi::Value db_column_int64(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  arkilian* db = getDbFromArg(info);
+  if (!db || info.Length() < 2 || !info[1].IsNumber()) return Napi::Number::New(env, 0);
+  int col = info[1].As<Napi::Number>().Int32Value();
+  sqlite3_int64 v = db_column_int64(db, col);
+  if (v > 9007199254740991LL || v < -9007199254740991LL)
+    return Napi::BigInt::New(env, v);
+  return Napi::Number::New(env, (double)v);
+}
+
 Napi::Value db_bind_double(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   arkilian* db = getDbFromArg(info);
@@ -269,12 +319,17 @@ Napi::Value db_all_native(const Napi::CallbackInfo& info) {
     col_names[i] = name ? name : "";
   }
 
-  while (db_step(db) == SQLITE_ROW) {
+  int step_rc = SQLITE_OK;
+  while ((step_rc = db_step(db)) == SQLITE_ROW) {
     Napi::Object row = Napi::Object::New(env);
     for (int i = 0; i < col_count; i++) {
       int type = db_column_type(db, i);
       if (type == SQLITE_INTEGER) {
-        row.Set(col_names[i], Napi::Number::New(env, db_column_int64(db, i)));
+        sqlite3_int64 v = db_column_int64(db, i);
+        if (v > 9007199254740991LL || v < -9007199254740991LL)
+          row.Set(col_names[i], Napi::BigInt::New(env, v));
+        else
+          row.Set(col_names[i], Napi::Number::New(env, (double)v));
       } else if (type == SQLITE_FLOAT) {
         row.Set(col_names[i], Napi::Number::New(env, db_column_double(db, i)));
       } else if (type == SQLITE_TEXT) {
@@ -282,12 +337,30 @@ Napi::Value db_all_native(const Napi::CallbackInfo& info) {
         row.Set(col_names[i], txt ? Napi::String::New(env, txt) : env.Null());
       } else if (type == SQLITE_NULL) {
         row.Set(col_names[i], env.Null());
+      } else if (type == SQLITE_BLOB) {
+        // BLOBs are binary — coercing them through column_text truncates
+        // at the first NUL and mangles the bytes.
+        const void *blob = db_column_blob(db, i);
+        int nbytes = db_column_bytes(db, i);
+        if (blob && nbytes > 0)
+          row.Set(col_names[i], Napi::Buffer<char>::Copy(env, (const char *)blob, nbytes));
+        else
+          row.Set(col_names[i], Napi::Buffer<char>::New(env, 0));
       } else {
         const char *txt = db_column_text(db, i);
         row.Set(col_names[i], txt ? Napi::String::New(env, txt) : env.Null());
       }
     }
     results.Set(row_idx++, row);
+  }
+
+  // Surface step errors (constraint violations, I/O errors) instead of
+  // silently returning a partial result set.
+  if (step_rc != SQLITE_DONE) {
+    std::string msg = db_errmsg(db);
+    db_finalize(db);
+    Napi::Error::New(env, msg).ThrowAsJavaScriptException();
+    return env.Null();
   }
 
   db_finalize(db);
@@ -308,10 +381,12 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
   exports.Set("db_column_name", Napi::Function::New<db_column_name>(env));
   exports.Set("db_column_text", Napi::Function::New<db_column_text>(env));
   exports.Set("db_column_int", Napi::Function::New<db_column_int>(env));
+  exports.Set("db_column_int64", Napi::Function::New<db_column_int64>(env));
   exports.Set("db_column_double", Napi::Function::New<db_column_double>(env));
   exports.Set("db_column_type", Napi::Function::New<db_column_type>(env));
   exports.Set("db_bind_text", Napi::Function::New<db_bind_text>(env));
   exports.Set("db_bind_int", Napi::Function::New<db_bind_int>(env));
+  exports.Set("db_bind_int64", Napi::Function::New<db_bind_int64>(env));
   exports.Set("db_bind_double", Napi::Function::New<db_bind_double>(env));
   exports.Set("db_bind_null", Napi::Function::New<db_bind_null>(env));
   exports.Set("db_begin", Napi::Function::New<db_begin>(env));

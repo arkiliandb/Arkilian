@@ -154,6 +154,41 @@ class Arkilian {
     return this;
   }
 
+  bindInt64(index, value) {
+    const result = native.db_bind_int64(this.id, index, value);
+    if (result !== SQLITE_OK) {
+      throw new Error(native.db_errmsg(this.id));
+    }
+    return this;
+  }
+
+  // Route a JS number to the correct binder. Integers beyond 32 bits
+  // MUST go through bind_int64 — Int32Value() would silently wrap them
+  // (epoch-ms timestamps, large IDs, etc.).
+  _bindParam(index, p) {
+    if (typeof p === "string") {
+      this.bindText(index, p);
+    } else if (typeof p === "bigint") {
+      if (p > 9007199254740991n || p < -9007199254740991n) {
+        throw new Error("BigInt parameter out of safe range (|v| > 2^53-1)");
+      }
+      this.bindInt64(index, Number(p));
+    } else if (Number.isInteger(p)) {
+      if (!Number.isSafeInteger(p)) {
+        throw new Error("Integer parameter out of safe range (|v| > 2^53-1)");
+      }
+      if (p >= -2147483648 && p <= 2147483647) {
+        this.bindInt(index, p);
+      } else {
+        this.bindInt64(index, p);
+      }
+    } else if (p === null || p === undefined) {
+      native.db_bind_null(this.id, index);
+    } else {
+      this.bindDouble(index, p);
+    }
+  }
+
   bindDouble(index, value) {
     const result = native.db_bind_double(this.id, index, value);
     if (result !== SQLITE_OK) {
@@ -168,18 +203,16 @@ class Arkilian {
       typeof sql === "object" && sql !== null ? sql.params || params : params;
     this.prepare(query);
     for (let i = 0; i < bindParams.length; i++) {
-      const p = bindParams[i];
-      if (typeof p === "string") {
-        this.bindText(i + 1, p);
-      } else if (Number.isInteger(p)) {
-        this.bindInt(i + 1, p);
-      } else if (p === null || p === undefined) {
-        native.db_bind_null(this.id, i + 1);
-      } else {
-        this.bindDouble(i + 1, p);
-      }
+      this._bindParam(i + 1, bindParams[i]);
     }
-    this.step();
+    // A failed step (UNIQUE/NOT NULL/FK constraint, I/O error) must
+    // throw — silently swallowing it is silent data loss.
+    const rc = this.step();
+    if (rc !== SQLITE_DONE && rc !== SQLITE_ROW) {
+      const msg = native.db_errmsg(this.id);
+      this.finalize();
+      throw new Error(msg);
+    }
     this.finalize();
     return this;
   }
@@ -190,16 +223,7 @@ class Arkilian {
       typeof sql === "object" && sql !== null ? sql.params || params : params;
     this.prepare(query);
     for (let i = 0; i < bindParams.length; i++) {
-      const p = bindParams[i];
-      if (typeof p === "string") {
-        this.bindText(i + 1, p);
-      } else if (Number.isInteger(p)) {
-        this.bindInt(i + 1, p);
-      } else if (p === null || p === undefined) {
-        native.db_bind_null(this.id, i + 1);
-      } else {
-        this.bindDouble(i + 1, p);
-      }
+      this._bindParam(i + 1, bindParams[i]);
     }
     // High performance C++ native single-turn fetch
     return native.db_all_native(this.id);
