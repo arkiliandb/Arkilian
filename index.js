@@ -169,10 +169,7 @@ class Arkilian {
     if (typeof p === "string") {
       this.bindText(index, p);
     } else if (typeof p === "bigint") {
-      if (p > 9007199254740991n || p < -9007199254740991n) {
-        throw new Error("BigInt parameter out of safe range (|v| > 2^53-1)");
-      }
-      this.bindInt64(index, Number(p));
+      this.bindInt64(index, p);
     } else if (Number.isInteger(p)) {
       if (!Number.isSafeInteger(p)) {
         throw new Error("Integer parameter out of safe range (|v| > 2^53-1)");

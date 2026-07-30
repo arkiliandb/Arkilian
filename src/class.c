@@ -799,8 +799,6 @@ int db_init(arkilian **db_ptr, const char *filename) {
   InitializeCriticalSection(&db->payload_mutex);
 #endif
 
-  sqlite3_config(SQLITE_CONFIG_MULTITHREAD);
-
   // Open primary connection
   int rc = sqlite3_open_v2(
       path, &db->handle,
@@ -810,7 +808,6 @@ int db_init(arkilian **db_ptr, const char *filename) {
     const char *err = sqlite3_errstr(rc);
     strncpy(db->last_error_msg, err, sizeof(db->last_error_msg) - 1);
     db->last_error_msg[sizeof(db->last_error_msg) - 1] = '\0';
-    // sqlite3_open_v2 may allocate a handle even on failure — release it.
     if (db->handle) sqlite3_close(db->handle);
     db->handle = NULL;
     *db_ptr = db;
@@ -847,14 +844,21 @@ int db_init(arkilian **db_ptr, const char *filename) {
   sqlite3_update_hook(db->handle, on_db_update, db);
 
   // Sync backup triggers — a failure here means writes are NOT being
-  // captured for backup.  Surface it loudly instead of swallowing it.
+  // captured for backup. Surface it loudly and return error.
   char *trigger_err = NULL;
   int sync_rc = sync_backup_triggers(db->handle, &trigger_err);
   if (sync_rc != SQLITE_OK) {
     snprintf(db->last_error_msg, sizeof(db->last_error_msg),
              "backup trigger sync failed: %s",
              trigger_err ? trigger_err : "unknown error");
-    fprintf(stderr, "arkilian: %s\n", db->last_error_msg);
+    fprintf(stderr, "arkilian error: %s\n", db->last_error_msg);
+    if (trigger_err) sqlite3_free(trigger_err);
+    if (db->backup_db) sqlite3_close(db->backup_db);
+    sqlite3_close(db->handle);
+    db->handle = NULL;
+    db->backup_db = NULL;
+    *db_ptr = db;
+    return sync_rc;
   }
   if (trigger_err) sqlite3_free(trigger_err);
 
@@ -1312,15 +1316,17 @@ int backup_database(sqlite3 *pSource, const char *zFilename) {
     return rc;
   }
 
+  int retry_count = 0;
   do {
     rc = sqlite3_backup_step(pBackup, 5);
     if (rc == SQLITE_OK || rc == SQLITE_BUSY || rc == SQLITE_LOCKED) {
       if (rc != SQLITE_OK) sqlite3_sleep(100);
     }
-  } while (rc == SQLITE_OK || rc == SQLITE_BUSY || rc == SQLITE_LOCKED);
+  } while ((rc == SQLITE_OK || rc == SQLITE_BUSY || rc == SQLITE_LOCKED) && ++retry_count < 6000);
 
-  (void)sqlite3_backup_finish(pBackup);
-  if (rc == SQLITE_DONE) rc = SQLITE_OK;
+  int finish_rc = sqlite3_backup_finish(pBackup);
+  if (finish_rc != SQLITE_OK && rc == SQLITE_DONE) rc = finish_rc;
+  else if (rc == SQLITE_DONE) rc = SQLITE_OK;
   sqlite3_close(pDest);
   return rc;
 }

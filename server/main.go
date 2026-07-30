@@ -348,10 +348,15 @@ func signedURL(verb, key string, expiresIn time.Duration) (string, int64) {
 
 	signature := hex.EncodeToString(hmacSHA256(signingKey, []byte(stringToSign)))
 
-	url := fmt.Sprintf("http://%s/%s/%s?X-Amz-Algorithm=AWS4-HMAC-SHA256"+
+	scheme := "http"
+	if strings.HasPrefix(s3Endpoint, "https://") || os.Getenv("S3_SSL") == "true" {
+		scheme = "https"
+	}
+
+	url := fmt.Sprintf("%s://%s/%s/%s?X-Amz-Algorithm=AWS4-HMAC-SHA256"+
 		"&X-Amz-Credential=%s&X-Amz-Date=%s&X-Amz-Expires=%d"+
 		"&X-Amz-SignedHeaders=host&X-Amz-Signature=%s",
-		host, s3Bucket, key,
+		scheme, host, s3Bucket, key,
 		urlEncode(credential), amzDate, expiresIn/time.Second, signature)
 
 	return url, expires
@@ -622,11 +627,29 @@ func handleWALPush(w http.ResponseWriter, r *http.Request) {
 	mu.Unlock()
 
 	// Stream log chunk directly into MinIO S3 bucket
-	key := fmt.Sprintf("db_%s/chunks/wal_%d.sql", dbID, time.Now().UnixNano())
+	payloadID := r.Header.Get("X-Arkilian-Payload-Id")
+	chunkName := fmt.Sprintf("wal_%d.sql", time.Now().UnixNano())
+	if payloadID != "" {
+		chunkName = fmt.Sprintf("wal_%s.sql", payloadID)
+	}
+	key := fmt.Sprintf("db_%s/chunks/%s", dbID, chunkName)
 	putURL, _ := signedURL("PUT", key, 10*time.Minute)
-	req, _ := http.NewRequest("PUT", putURL, strings.NewReader(string(body)))
-	req.Header.Set("Content-Type", "text/plain")
-	http.DefaultClient.Do(req)
+	req, err := http.NewRequest("PUT", putURL, strings.NewReader(string(body)))
+	if err == nil {
+		req.Header.Set("Content-Type", "text/plain")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil || (resp != nil && resp.StatusCode >= 300) {
+			if resp != nil {
+				resp.Body.Close()
+			}
+			log.Printf("S3 WAL upload error for db %s: %v", dbID, err)
+			http.Error(w, `{"error":"s3 upload failed"}`, http.StatusInternalServerError)
+			return
+		}
+		if resp != nil {
+			resp.Body.Close()
+		}
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	fmt.Fprintf(w, `{"ok":true,"inserted":%d}`, len(entries))
