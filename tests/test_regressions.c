@@ -143,6 +143,30 @@ static void test_table_name_with_spaces(void) {
   cleanup("test_reg_spaces.db");
 }
 
+static void test_generated_columns_excluded_from_payloads(void) {
+  arkilian *db = open_db("test_reg_gen.db");
+  assert(db_exec(db, "CREATE TABLE g (a INT, b INT GENERATED ALWAYS AS (a * 2) VIRTUAL)") == SQLITE_DONE);
+  assert(db_exec(db, "INSERT INTO g (a) VALUES (21)") == SQLITE_DONE);
+
+  // Payload must list only real columns — a generated column in a
+  // REPLACE INTO column list fails on the replay side.
+  assert(count_payloads(db, "REPLACE INTO \"g\" (\"a\")%") >= 1);
+
+  // And the captured payload must actually replay cleanly.
+  const char *payload = db_wal_last_sql(db);
+  assert(payload != NULL && strstr(payload, "REPLACE INTO \"g\"") != NULL);
+  assert(db_exec(db, payload) == SQLITE_DONE);
+
+  // Generated values still correct locally
+  db_prepare(db, "SELECT b FROM g WHERE a = 21");
+  assert(db_step(db) == SQLITE_ROW);
+  assert(db_column_int(db, 0) == 42);
+  db_finalize(db);
+
+  db_close(db);
+  cleanup("test_reg_gen.db");
+}
+
 // ── DDL detection ───────────────────────────────────────────────────
 
 static void test_leading_whitespace_ddl_syncs_triggers(void) {
@@ -298,6 +322,7 @@ int main(void) {
   printf("\n[Special Table Names]\n");
   RUN_TEST(test_keyword_table_name_gets_triggers);
   RUN_TEST(test_table_name_with_spaces);
+  RUN_TEST(test_generated_columns_excluded_from_payloads);
 
   printf("\n[DDL Detection]\n");
   RUN_TEST(test_leading_whitespace_ddl_syncs_triggers);

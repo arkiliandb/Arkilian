@@ -378,11 +378,14 @@ char *json_array_get(const char *json, const char *key, int index) {
 
 static int request_hydrate_plan(const char *server_url, const char *token,
                                  HydratePlan *plan) {
-  char url[1024];
-  snprintf(url, sizeof(url), "%s/hydrate/plan", server_url);
+  size_t url_len = strlen(server_url) + strlen("/hydrate/plan") + 1;
+  char *url = malloc(url_len);
+  if (!url) return HYDRATION_ERR_MEM;
+  snprintf(url, url_len, "%s/hydrate/plan", server_url);
 
   int err = 0;
   char *json = http_get_string(url, token, &err);
+  free(url);
   if (!json) return err;
 
   // Parse plan

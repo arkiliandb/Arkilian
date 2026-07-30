@@ -295,7 +295,7 @@ int sync_backup_triggers(sqlite3 *db, char **err_out) {
 
     int without_rowid = table_is_without_rowid(db, table);
 
-    char *pragma_sql = sqlite3_mprintf("PRAGMA table_info(\"%w\");", table);
+    char *pragma_sql = sqlite3_mprintf("PRAGMA table_xinfo(\"%w\");", table);
     if (!pragma_sql) { rc = SQLITE_NOMEM; goto oom; }
     sqlite3_stmt *col_stmt = NULL;
     rc = sqlite3_prepare_v2(db, pragma_sql, -1, &col_stmt, NULL);
@@ -318,6 +318,11 @@ int sync_backup_triggers(sqlite3 *db, char **err_out) {
     while ((rc = sqlite3_step(col_stmt)) == SQLITE_ROW) {
       const char *col = (const char *)sqlite3_column_text(col_stmt, 1);
       if (!col) continue;
+      // table_xinfo's 7th column flags hidden (1) and generated (2/3)
+      // columns — those can never appear in INSERT/REPLACE column lists,
+      // so capturing them would produce payloads that fail on replay.
+      if (sqlite3_column_count(col_stmt) > 6 &&
+          sqlite3_column_int(col_stmt, 6) != 0) continue;
       if (ncols == cap) {
         int ncap = cap ? cap * 2 : 8;
         char **nc = realloc(cols, (size_t)ncap * sizeof(char *));
