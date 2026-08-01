@@ -420,6 +420,8 @@ Napi::Value db_last_insert_rowid(const Napi::CallbackInfo& info) {
 }
 
 // ── Native Fast Path: Single N-API Turn Query Execution ─────────────
+// Optional second argument maxRows caps the materialized result set —
+// without it, an unbounded query loads the entire table into JS memory.
 
 Napi::Value db_all_native(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
@@ -427,6 +429,11 @@ Napi::Value db_all_native(const Napi::CallbackInfo& info) {
   if (!db) {
     Napi::Error::New(env, "Invalid database id").ThrowAsJavaScriptException();
     return env.Null();
+  }
+
+  uint32_t max_rows = 0; // 0 = unlimited
+  if (info.Length() >= 2 && info[1].IsNumber()) {
+    max_rows = info[1].As<Napi::Number>().Uint32Value();
   }
 
   int col_count = db_column_count(db);
@@ -441,6 +448,7 @@ Napi::Value db_all_native(const Napi::CallbackInfo& info) {
 
   int step_rc = SQLITE_OK;
   while ((step_rc = db_step(db)) == SQLITE_ROW) {
+    if (max_rows > 0 && row_idx >= max_rows) break;
     Napi::Object row = Napi::Object::New(env);
     for (int i = 0; i < col_count; i++) {
       int type = db_column_type(db, i);

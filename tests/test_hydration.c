@@ -328,9 +328,9 @@ static void *mock_plan_run(void *arg) {
     if (c < 0) break;
     char buf[8192];
     ssize_t n = recv(c, buf, sizeof(buf) - 1, 0);
+    if (s->stop) { close(c); break; } // stop-kick connection: exit now
     if (n > 0) {
       buf[n] = '\0';
-      if (s->stop) { close(c); break; }
       int is_plan = strstr(buf, "/hydrate/plan") != NULL;
       if (is_plan) {
         char resp[1024];

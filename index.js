@@ -273,7 +273,9 @@ class Arkilian {
     return this;
   }
 
-  all(sql, params = []) {
+  // High performance C++ native single-turn fetch. Optional maxRows caps
+  // the materialized result set (0/unset = unlimited).
+  all(sql, params = [], maxRows = 0) {
     const query = typeof sql === "object" && sql !== null ? sql.sql : sql;
     const bindParams =
       typeof sql === "object" && sql !== null ? sql.params || params : params;
@@ -281,8 +283,7 @@ class Arkilian {
     for (let i = 0; i < bindParams.length; i++) {
       this._bindParam(i + 1, bindParams[i]);
     }
-    // High performance C++ native single-turn fetch
-    return native.db_all_native(this.id);
+    return native.db_all_native(this.id, maxRows);
   }
 
   get lastError() {

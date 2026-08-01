@@ -160,7 +160,10 @@ For Node.js projects, you can install via npm:
 npm install arkilian
 ```
 
-The package will attempt to download prebuilt binaries for your platform. If no prebuilt binary is available, it will fall back to building from source using cmake-js.
+The package builds the native addon from source on install (requires a C
+toolchain and libcurl development headers). Prebuilt binaries are not
+published yet — CI produces them on releases, but the npm install path
+currently compiles.
 
 ## System Constraints and Design Choices
 Unlike complex distributed SQLite systems (e.g., LiteFS or rqlite), Arkilian embraces single-writer architectures partitioned by micro-datasets. It purposefully avoids:

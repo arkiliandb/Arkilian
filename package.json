@@ -45,13 +45,8 @@
     "src/deps/sqlite/sqlite3ext.h"
   ],
   "engines": {
-    "node": ">=14.0.0",
-    "bun": ">=0.1.0"
+    "node": ">=18.0.0",
+    "bun": ">=1.0.0"
   },
-  "private": false,
-  "binary": {
-    "module_name": "arkilian",
-    "module_path": "./build/Release",
-    "host": "https://github.com/CodeDynasty-dev/birth-of-Arkilian/releases/download/{version}"
-  }
+  "private": false
 }

@@ -103,15 +103,18 @@ build_c test_monitoring    tests/test_monitoring.c
 build_c test_virtual_tables tests/test_virtual_tables.c "-DSQLITE_ENABLE_FTS5"
 build_c test_e2e_stress tests/test_e2e_stress.c
 build_c stress_200m      tests/stress_200m.c
+# Hydration links hydration.c, not class.c
+cc -O2 tests/test_hydration.c src/hydration.c "$BIN/sqlite3.o" \
+   -Isrc -Isrc/deps/sqlite -lcurl -lpthread -o "$BIN/test_hydration"
 cc -O2 tools/arkilian-dlq.c "$BIN/sqlite3.o" -Isrc -Isrc/deps/sqlite -o "$BIN/arkilian-dlq"
-ok "11 binaries built"
+ok "12 binaries built"
 
 # ── Phase 1: local test suites ──────────────────────────────────────
 
 log "Phase 1: local C test suites"
 for t in test_basic test_interception test_regressions test_deterministic \
          test_kill_switch test_load_contention test_kill_resilience \
-         test_monitoring test_virtual_tables; do
+         test_monitoring test_virtual_tables test_hydration; do
   if run_in_work "$BIN/$t" > "$WORK/$t.log" 2>&1; then
     ok "$t"
   else

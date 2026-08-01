@@ -54,6 +54,9 @@
 #define MAX_ATTEMPTS 10
 #define POLL_INTERVAL_MS 2000
 
+// Internal outbox schema version (see _arkilian_meta.schema_version).
+#define ARKILIAN_SCHEMA_VERSION 1
+
 // ── Struct Definitions ──────────────────────────────────────────────
 
 struct arkilian {
@@ -375,6 +378,16 @@ int sync_backup_triggers(sqlite3 *db, char **err_out) {
     "  k TEXT PRIMARY KEY,"
     "  v TEXT"
     ");",
+    // Oldest-pending-age monitoring does MIN(created_at) on the app
+    // thread; without an index that's a full scan of a (possibly large)
+    // backlog.
+    "CREATE INDEX IF NOT EXISTS idx_pending_backup_created "
+    "  ON _pending_backup(created_at);",
+    // Internal-schema version marker: future releases bump
+    // ARKILIAN_SCHEMA_VERSION and migrate; a node whose schema version
+    // EXCEEDS the running binary's is detected at init instead of
+    // corrupting a newer outbox format.
+    "INSERT OR IGNORE INTO _arkilian_meta (k, v) VALUES ('schema_version', '1');",
     NULL
   };
   for (int i = 0; kInternalDDL[i]; i++) {
@@ -681,7 +694,17 @@ static int curl_abort_cb(void *clientp, curl_off_t dltotal, curl_off_t dlnow,
 
 typedef enum { SHIP_OK = 0, SHIP_RETRY = 1 } ship_result_t;
 
-static ship_result_t ship_to_backup(arkilian *db, sqlite3_int64 id, const char *payload) {
+// Adaptive request timeout: base seconds plus ~10s per MB of payload, so
+// large rows/snapshots aren't dead-lettered by a fixed short window.
+static long curl_timeout_sec(size_t bytes, long base) {
+  long extra = (long)(bytes / 100000);
+  long t = base + extra;
+  if (t > 600) t = 600; // hard cap: 10 minutes
+  return t;
+}
+
+static ship_result_t ship_to_backup(arkilian *db, CURL *curl,
+                                    sqlite3_int64 id, const char *payload) {
   if (!payload || strlen(payload) == 0) return SHIP_OK;
 
 #ifndef _WIN32
@@ -710,8 +733,13 @@ static ship_result_t ship_to_backup(arkilian *db, sqlite3_int64 id, const char *
     return SHIP_RETRY;
   }
 
-  CURL *curl = curl_easy_init();
+  // The flush thread owns one CURL handle for ALL ships: curl_easy_reset
+  // between requests keeps the connection pool (TCP + TLS) alive, so a
+  // 100k-row backlog is 100k requests over one connection instead of
+  // 100k TCP+TLS handshakes. A fresh curl_easy_init per row caps
+  // real-world WAN throughput at a few rows/sec.
   if (!curl) return SHIP_RETRY;
+  curl_easy_reset(curl);
 
   // Every curl_easy_setopt / curl_slist_append return code is checked: a
   // misconfigured transfer must never be shipped silently — report and
@@ -721,7 +749,7 @@ static ship_result_t ship_to_backup(arkilian *db, sqlite3_int64 id, const char *
 
   rc = curl_easy_setopt(curl, CURLOPT_URL, push_url);
   if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_POSTFIELDS, payload);
-  if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
+  if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_TIMEOUT, curl_timeout_sec(strlen(payload), 10));
   if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5L);
   if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_discard_cb);
   if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
@@ -767,7 +795,6 @@ static ship_result_t ship_to_backup(arkilian *db, sqlite3_int64 id, const char *
   }
 
   curl_slist_free_all(headers);
-  curl_easy_cleanup(curl);
 
   return result;
 }
@@ -785,8 +812,9 @@ typedef struct {
   int attempts;
 } outbox_row;
 
-static int drain_batch(arkilian *db, sqlite3_stmt *select_stmt, sqlite3_stmt *delete_stmt,
-                        sqlite3_stmt *update_attempts_stmt, sqlite3_stmt *dead_letter_stmt) {
+static int drain_batch(arkilian *db, CURL *ship_curl, sqlite3_stmt *select_stmt,
+                        sqlite3_stmt *delete_stmt, sqlite3_stmt *update_attempts_stmt,
+                        sqlite3_stmt *dead_letter_stmt) {
   if (!db || !db->backup_db) return 0;
 
   // Pass 1: read the batch into heap memory.
@@ -831,7 +859,7 @@ static int drain_batch(arkilian *db, sqlite3_stmt *select_stmt, sqlite3_stmt *de
     sqlite3_int64 id = rows[i].id;
     const char *payload = rows[i].payload;
 
-    ship_result_t result = ship_to_backup(db, id, payload);
+    ship_result_t result = ship_to_backup(db, ship_curl, id, payload);
 
     if (result == SHIP_OK) {
       sqlite3_reset(delete_stmt);
@@ -1008,7 +1036,18 @@ void *run_wal_flush(void *arg) {
     if (backoff_s < 60) backoff_s *= 2;
   }
 
-  while (!db->shutdown_requested && select_stmt) {
+  // One CURL handle for every ship in this thread: reset (not cleanup)
+  // between rows keeps the TCP/TLS connection pool alive — the
+  // difference between ~3 rows/sec and thousands over a WAN. Created
+  // after curl_global_init (db_init) and owned exclusively by this
+  // thread (spec §3.1).
+  CURL *ship_curl = curl_easy_init();
+  if (!ship_curl) {
+    ark_log(db, ARK_LOG_ERROR,
+            "flush thread: curl_easy_init failed — shipping disabled");
+  }
+
+  while (!db->shutdown_requested && select_stmt && ship_curl) {
     // Liveness heartbeat (spec §9): the watchdog reads this from another
     // thread; a stale age means the thread died silently.
     db->last_heartbeat_sec = (int)(now_ms_mono() / 1000);
@@ -1023,7 +1062,7 @@ void *run_wal_flush(void *arg) {
     // would dead-letter rows after MAX_ATTEMPTS — which for a missing
     // destination is data destruction, not a transient failure.
     if (db->backup_enabled && db->push_url && strlen(db->push_url) > 0) {
-      drained = drain_batch(db, select_stmt, delete_stmt,
+      drained = drain_batch(db, ship_curl, select_stmt, delete_stmt,
                             update_attempts_stmt, dead_letter_stmt);
     }
 
@@ -1053,6 +1092,7 @@ void *run_wal_flush(void *arg) {
   if (delete_stmt) sqlite3_finalize(delete_stmt);
   if (update_attempts_stmt) sqlite3_finalize(update_attempts_stmt);
   if (dead_letter_stmt) sqlite3_finalize(dead_letter_stmt);
+  if (ship_curl) curl_easy_cleanup(ship_curl);
 
 #ifdef _WIN32
   return 0;
@@ -1286,6 +1326,28 @@ int db_init(arkilian **db_ptr, const char *filename) {
     }
     if (trigger_err) sqlite3_free(trigger_err);
   }
+
+  // Internal-schema version check: an outbox written by a NEWER release
+  // must never be touched by this (older) binary — refuse capture rather
+  // than corrupt a format we don't understand. Never fatal to the game.
+  if (capture_ok) {
+    sqlite3_stmt *sv = NULL;
+    int db_version = 0;
+    if (sqlite3_prepare_v2(db->handle,
+          "SELECT v FROM _arkilian_meta WHERE k = 'schema_version'",
+          -1, &sv, NULL) == SQLITE_OK) {
+      if (sqlite3_step(sv) == SQLITE_ROW) db_version = sqlite3_column_int(sv, 0);
+      sqlite3_finalize(sv);
+    }
+    if (db_version > ARKILIAN_SCHEMA_VERSION) {
+      ark_log(db, ARK_LOG_ERROR,
+              "outbox schema version %d is NEWER than this binary supports (%d) — "
+              "capture disabled; upgrade the client",
+              db_version, ARKILIAN_SCHEMA_VERSION);
+      capture_ok = 0;
+    }
+  }
+
   if (!capture_ok) {
     db->backup_enabled = 0; // kill-switch state: game runs, nothing ships
     snprintf(db->last_error_msg, sizeof(db->last_error_msg),
@@ -1369,10 +1431,6 @@ void db_close(arkilian *db) {
     pthread_join(db->backup_thread_id, NULL);
     db->backup_thread_running = 0;
   }
-  pthread_mutex_destroy(&db->wake_mutex);
-  pthread_cond_destroy(&db->wake_cond);
-  pthread_mutex_destroy(&db->payload_mutex);
-  pthread_mutex_destroy(&db->token_mutex);
 #else
   EnterCriticalSection(&db->wake_mutex);
   db->shutdown_requested = 1;
@@ -1390,9 +1448,6 @@ void db_close(arkilian *db) {
     CloseHandle(db->backup_thread_handle);
     db->backup_thread_handle = NULL;
   }
-  DeleteCriticalSection(&db->wake_mutex);
-  DeleteCriticalSection(&db->payload_mutex);
-  DeleteCriticalSection(&db->token_mutex);
 #endif
 
   for (int i = 0; i < db->stmt_count; i++) {
@@ -1416,9 +1471,24 @@ void db_close(arkilian *db) {
   }
 
   if (db->handle) {
-    sqlite3_close(db->handle);
+    sqlite3_close(db->handle); // deregisters the update hook
     db->handle = NULL;
   }
+
+  // Destroy the sync primitives only now: threads are joined and the
+  // update hook is deregistered, so nothing can acquire them again. The
+  // caller must not race db_close with in-flight DB statements on the
+  // game thread — that is UB by contract (see class.h).
+#ifndef _WIN32
+  pthread_mutex_destroy(&db->wake_mutex);
+  pthread_cond_destroy(&db->wake_cond);
+  pthread_mutex_destroy(&db->payload_mutex);
+  pthread_mutex_destroy(&db->token_mutex);
+#else
+  DeleteCriticalSection(&db->wake_mutex);
+  DeleteCriticalSection(&db->payload_mutex);
+  DeleteCriticalSection(&db->token_mutex);
+#endif
 
   if (db->db_path) free(db->db_path);
   if (db->backup_path) free(db->backup_path);
@@ -2153,7 +2223,9 @@ static int upload_to_s3(arkilian *db, const char *signed_url,
   if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_UPLOAD, 1L);
   if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_READDATA, fd);
   if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_INFILESIZE_LARGE, (curl_off_t)file_size);
-  if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
+  // Timeout scales with file size (~10s per MB past the 30s base) so
+  // multi-hundred-MB snapshots aren't guaranteed failures on a WAN.
+  if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_TIMEOUT, curl_timeout_sec((size_t)file_size, 30));
   if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
   if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
   if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, curl_abort_cb);
