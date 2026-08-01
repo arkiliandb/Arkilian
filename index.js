@@ -69,6 +69,12 @@ class Arkilian {
     return native.db_backup_trigger_coverage(this.id);
   }
 
+  // Tables with no PRIMARY KEY are skipped by capture (unreplayable).
+  // Must be 0 — every skipped table is data that never leaves the box.
+  get backupSkippedTableCount() {
+    return native.db_backup_skipped_table_count(this.id);
+  }
+
   get backupHealthy() {
     return native.db_backup_is_healthy(this.id);
   }

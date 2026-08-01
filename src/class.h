@@ -100,11 +100,19 @@ int db_backup_dead_letter_count(arkilian *db);
 // never beat (not running). An age far above the poll interval means the
 // thread died silently.
 long long db_backup_thread_heartbeat_age_ms(arkilian *db);
-// Trigger coverage sanity check (spec §9): 0 = every non-reserved table
+// Trigger coverage sanity check (spec §9): 0 = every PK-capable table
 // has its 3 capture triggers, N>0 = N triggers missing.
 int db_backup_trigger_coverage(arkilian *db);
-// 1 when the backup subsystem is healthy: flush thread alive AND queue
-// depth below ARKILIAN_MAX_QUEUE_DEPTH (default 100000). 0 otherwise.
+// Tables that are NOT captured: real tables with no PRIMARY KEY
+// (row-level replication cannot be replayed for them, so they are
+// skipped loudly at sync time). Must be 0 in a fully-backed-up schema —
+// every skipped table is data that never leaves the box.
+int db_backup_skipped_table_count(arkilian *db);
+// 1 when the backup subsystem is healthy: backup enabled, a push
+// destination configured, flush thread alive, and queue depth below
+// ARKILIAN_MAX_QUEUE_DEPTH (default 100000). 0 otherwise — including
+// when the kill-switch is on or capture was disabled at init: a green
+// light while nothing ships is a silent failure.
 int db_backup_is_healthy(arkilian *db);
 
 #ifdef __cplusplus

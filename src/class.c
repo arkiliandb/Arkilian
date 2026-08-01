@@ -1112,6 +1112,23 @@ int db_init(arkilian **db_ptr, const char *filename) {
             "is not set — rows will accumulate in _pending_backup and never ship");
   }
 
+  // Credential transport hygiene: over http:// the bearer token and every
+  // payload cross the wire in cleartext. Never a hard failure (internal
+  // networks are legitimate) — but loud, so a misconfiguration is visible
+  // before the first token goes over the wire.
+  if (db->push_url && strlen(db->push_url) > 0 &&
+      strncmp(db->push_url, "https://", 8) != 0) {
+    ark_log(db, ARK_LOG_WARN,
+            "ARKILIAN_WAL_PUSH_URL is not https — the bearer token and every "
+            "backup payload will be sent in cleartext");
+  }
+  if (db->signed_url_endpoint && strlen(db->signed_url_endpoint) > 0 &&
+      strncmp(db->signed_url_endpoint, "https://", 8) != 0) {
+    ark_log(db, ARK_LOG_WARN,
+            "ARKILIAN_SIGNED_URL_ENDPOINT is not https — the bearer token will "
+            "be sent in cleartext");
+  }
+
 #ifndef _WIN32
   pthread_mutex_init(&db->wake_mutex, NULL);
   pthread_cond_init(&db->wake_cond, NULL);
@@ -1874,6 +1891,12 @@ int db_backup_trigger_coverage(arkilian *db) {
 
 int db_backup_is_healthy(arkilian *db) {
   if (!db) return 0;
+  // A disabled subsystem is NOT healthy — whether kill-switched, forced
+  // off by an init failure (WAL/trigger setup), or configured without a
+  // destination. A green light while nothing is shipping is exactly the
+  // silent failure monitoring exists to catch.
+  if (!db->backup_enabled) return 0;
+  if (!db->push_url || strlen(db->push_url) == 0) return 0;
   long long hb_age = db_backup_thread_heartbeat_age_ms(db);
   // The flush thread beats once per loop iteration, but a single slow
   // ship (curl timeout is 10s) legitimately ages the heartbeat past any
@@ -1883,6 +1906,27 @@ int db_backup_is_healthy(arkilian *db) {
   int max_depth = get_env_int_default("ARKILIAN_MAX_QUEUE_DEPTH", DEFAULT_MAX_QUEUE_DEPTH);
   if (db_backup_queue_depth(db) >= max_depth) return 0;
   return 1;
+}
+
+// Count of real (non-virtual, non-shadow) tables that are NOT captured:
+// rowid tables with no PRIMARY KEY are unreplayable and skipped by
+// sync_backup_triggers. Every skipped table is data that never leaves
+// the box — operators must see this, not just the one-time WARN.
+int db_backup_skipped_table_count(arkilian *db) {
+  if (!db || !db->handle) return -1;
+  sqlite3_stmt *stmt = NULL;
+  int count = -1;
+  if (sqlite3_prepare_v2(db->handle,
+        "SELECT COUNT(*) FROM pragma_table_list t "
+        "WHERE t.schema = 'main' AND t.type = 'table' "
+        "AND t.name NOT LIKE 'sqlite\\_%' ESCAPE '\\' "
+        "AND t.name NOT IN ('_pending_backup', '_dead_backup', '_arkilian_meta') "
+        "AND NOT EXISTS (SELECT 1 FROM pragma_table_xinfo(t.name) WHERE pk > 0)",
+        -1, &stmt, NULL) == SQLITE_OK) {
+    if (sqlite3_step(stmt) == SQLITE_ROW) count = sqlite3_column_int(stmt, 0);
+    sqlite3_finalize(stmt);
+  }
+  return count;
 }
 
 int db_resync_triggers(arkilian *db) {

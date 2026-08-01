@@ -377,6 +377,12 @@ Napi::Value db_backup_trigger_coverage(const Napi::CallbackInfo& info) {
   return Napi::Number::New(env, db ? db_backup_trigger_coverage(db) : -1);
 }
 
+Napi::Value db_backup_skipped_table_count(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  arkilian* db = getDbFromArg(info);
+  return Napi::Number::New(env, db ? db_backup_skipped_table_count(db) : -1);
+}
+
 Napi::Value db_backup_is_healthy(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   arkilian* db = getDbFromArg(info);
@@ -515,6 +521,7 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
   exports.Set("db_backup_dead_letter_count", Napi::Function::New<db_backup_dead_letter_count>(env));
   exports.Set("db_backup_thread_heartbeat_age_ms", Napi::Function::New<db_backup_thread_heartbeat_age_ms>(env));
   exports.Set("db_backup_trigger_coverage", Napi::Function::New<db_backup_trigger_coverage>(env));
+  exports.Set("db_backup_skipped_table_count", Napi::Function::New<db_backup_skipped_table_count>(env));
   exports.Set("db_backup_is_healthy", Napi::Function::New<db_backup_is_healthy>(env));
   exports.Set("db_resync_triggers", Napi::Function::New<db_resync_triggers>(env));
   exports.Set("db_set_token", Napi::Function::New<db_set_token>(env));

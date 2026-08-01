@@ -144,6 +144,8 @@ static void test_trigger_coverage_and_resync(void) {
 
   // 2 tables → 6 triggers; coverage must report 0 missing.
   assert(db_backup_trigger_coverage(db) == 0);
+  // Both tables are keyed → nothing silently skipped.
+  assert(db_backup_skipped_table_count(db) == 0);
 
   // Simulate schema drift from an external migration tool: drop a
   // trigger through raw sqlite3 so db_exec's DDL re-sync hook doesn't
@@ -189,6 +191,15 @@ static void test_health(void) {
   assert(db_backup_is_healthy(db) == 0);
   unsetenv("ARKILIAN_MAX_QUEUE_DEPTH");
 
+  // Kill-switch → unhealthy: a green light while nothing ships is a
+  // silent failure, and a deliberate disable must be visible.
+  db_backup_set_enabled(db, 0);
+  assert(db_backup_is_healthy(db) == 0);
+  db_backup_set_enabled(db, 1);
+  // Re-enabled with a live destination → healthy again (queue is far
+  // below the default ceiling and the flush thread beats continuously).
+  assert(db_backup_is_healthy(db) == 1);
+
   db_close(db);
   cleanup("test_mon_health.db");
 }
@@ -207,6 +218,9 @@ static void test_log_callback_captures_init_warning(void) {
   assert(db_init(&db, "test_mon_log.db") == 0);
   assert(g_capture_count > 0);
   assert(strstr(g_captured, "ARKILIAN_WAL_PUSH_URL") != NULL);
+  // Enabled but destinationless must never read as healthy: rows
+  // accumulate forever without shipping.
+  assert(db_backup_is_healthy(db) == 0);
 
   db_set_default_log_callback(NULL, NULL);
   db_close(db);

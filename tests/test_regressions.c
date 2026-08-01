@@ -419,6 +419,9 @@ static void test_keyless_table_skipped(void) {
   assert(db_exec(db, "CREATE TABLE ok (id INTEGER PRIMARY KEY, v TEXT)") == SQLITE_OK);
 
   assert(db_backup_trigger_coverage(db) == 0); // only ok counts, fully covered
+  // The skipped table is visible to monitoring — data that never leaves
+  // the box must never read as "all covered".
+  assert(db_backup_skipped_table_count(db) == 1);
   db_prepare(db, "SELECT COUNT(*) FROM sqlite_master "
                  "WHERE type='trigger' AND name LIKE 'trg\\_%' ESCAPE '\\'");
   assert(db_step(db) == SQLITE_ROW);
