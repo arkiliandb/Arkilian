@@ -75,3 +75,7 @@ realtime-backup-layer-c-sqlite3.md
 stress_200m
 test_minio_hydrate
 test_regressions
+test_kill_resilience
+test_kill_switch
+test_load_contention 
+test_monitoring
