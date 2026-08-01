@@ -621,15 +621,30 @@ static ship_result_t ship_to_backup(arkilian *db, sqlite3_int64 id, const char *
   return result;
 }
 
+// Batch rows are copied off the SELECT into heap memory before any
+// network I/O or write, and the SELECT's read transaction is ended
+// (reset) before the first DELETE runs. Holding a read snapshot across a
+// write on the same connection is a WAL hazard: if another connection
+// checkpoints and truncates the WAL in between, the write fails with
+// SQLITE_BUSY_SNAPSHOT (extended rc 517) and the busy handler does not
+// retry it.
+typedef struct {
+  sqlite3_int64 id;
+  char *payload; // heap copy, valid for the whole pass
+  int attempts;
+} outbox_row;
+
 static int drain_batch(arkilian *db, sqlite3_stmt *select_stmt, sqlite3_stmt *delete_stmt,
                         sqlite3_stmt *update_attempts_stmt, sqlite3_stmt *dead_letter_stmt) {
   if (!db || !db->backup_db) return 0;
 
+  // Pass 1: read the batch into heap memory.
+  outbox_row rows[BATCH_SIZE];
+  int nrows = 0;
+
   sqlite3_reset(select_stmt);
   sqlite3_clear_bindings(select_stmt);
   sqlite3_bind_int(select_stmt, 1, BATCH_SIZE);
-
-  int processed_any = 0;
 
   for (;;) {
     int rc = sqlite3_step(select_stmt);
@@ -639,44 +654,57 @@ static int drain_batch(arkilian *db, sqlite3_stmt *select_stmt, sqlite3_stmt *de
               sqlite3_errmsg(db->backup_db));
       break;
     }
-
-    sqlite3_int64 id = sqlite3_column_int64(select_stmt, 0);
+    if (nrows >= BATCH_SIZE) break; // defensive; LIMIT already bounds it
     const unsigned char *payload = sqlite3_column_text(select_stmt, 1);
-    int attempts = sqlite3_column_int(select_stmt, 2);
     if (!payload) continue;
-
-    char *payload_copy = strdup((const char *)payload);
-    if (!payload_copy) {
-      fprintf(stderr, "arkilian: OOM copying payload id=%lld\n", (long long)id);
+    char *copy = strdup((const char *)payload);
+    if (!copy) {
+      fprintf(stderr, "arkilian: OOM copying payload id=%lld\n",
+              (long long)sqlite3_column_int64(select_stmt, 0));
       break;
     }
+    rows[nrows].id = sqlite3_column_int64(select_stmt, 0);
+    rows[nrows].attempts = sqlite3_column_int(select_stmt, 2);
+    rows[nrows].payload = copy;
+    nrows++;
+  }
 
-    ship_result_t result = ship_to_backup(db, id, payload_copy);
-    free(payload_copy);
+  // End the SELECT's read transaction before any write statement runs.
+  sqlite3_reset(select_stmt);
+
+  // Pass 2: ship + write, one row at a time. Ordering is preserved:
+  // rows are handled strictly in id order and a retryable failure stops
+  // the pass so the first unshipped row is retried next time.
+  int processed_any = 0;
+  for (int i = 0; i < nrows; i++) {
+    sqlite3_int64 id = rows[i].id;
+    const char *payload = rows[i].payload;
+
+    ship_result_t result = ship_to_backup(db, id, payload);
 
     if (result == SHIP_OK) {
       sqlite3_reset(delete_stmt);
       sqlite3_clear_bindings(delete_stmt);
       sqlite3_bind_int64(delete_stmt, 1, id);
-      if (sqlite3_step(delete_stmt) != SQLITE_DONE) {
+      int del_rc = sqlite3_step(delete_stmt);
+      if (del_rc != SQLITE_DONE) {
         // The row shipped but the delete failed — it will ship again next
         // pass. Safe: delivery is at-least-once, destination must dedupe.
-        fprintf(stderr, "arkilian: delete after ship failed id=%lld: %s\n",
-                (long long)id, sqlite3_errmsg(db->backup_db));
+        fprintf(stderr, "arkilian: delete after ship failed id=%lld rc=%d ext=%d: %s\n",
+                (long long)id, del_rc, sqlite3_extended_errcode(db->backup_db),
+                sqlite3_errmsg(db->backup_db));
         break;
       }
       processed_any = 1;
       continue;
     }
 
-    int new_attempts = attempts + 1;
+    int new_attempts = rows[i].attempts + 1;
     if (new_attempts >= MAX_ATTEMPTS) {
-      // `payload` (select_stmt's column text) is still valid here —
-      // select_stmt has not been stepped or reset since the read.
       fprintf(stderr,
               "arkilian: payload id=%lld dead-lettered after %d attempts "
               "(moved to _dead_backup): %.120s\n",
-              (long long)id, new_attempts, (const char *)payload);
+              (long long)id, new_attempts, payload);
       sqlite3_reset(dead_letter_stmt);
       sqlite3_clear_bindings(dead_letter_stmt);
       sqlite3_bind_int(dead_letter_stmt, 1, new_attempts);
@@ -715,6 +743,7 @@ static int drain_batch(arkilian *db, sqlite3_stmt *select_stmt, sqlite3_stmt *de
     }
   }
 
+  for (int i = 0; i < nrows; i++) free(rows[i].payload);
   return processed_any;
 }
 
@@ -905,6 +934,9 @@ int db_init(arkilian **db_ptr, const char *filename) {
   if (db->database_token) strcpy(db->database_token, token_tmp);
 
   db->backup_interval = get_env_int_default("ARKILIAN_BACKUP_INTERVAL", DEFAULT_BACKUP_INTERVAL);
+  // A 0 or negative interval would make the hourly thread hot-loop
+  // (backup + signed-URL request with no sleep in between). Clamp it.
+  if (db->backup_interval < 1) db->backup_interval = 1;
   db->backup_enabled = get_env_int_default("ARKILIAN_ENABLE_BACKUP", 1);
 
 #ifndef _WIN32
@@ -1013,6 +1045,7 @@ int db_init(arkilian **db_ptr, const char *filename) {
   if (env_interval && atoi(env_interval) > 0) {
     db->backup_interval = atoi(env_interval);
   }
+  if (db->backup_interval < 1) db->backup_interval = 1; // never hot-loop
 
   // Start WAL flusher thread. This thread drains _pending_backup — without
   // it, no write ever reaches the destination. A failure to create it is a

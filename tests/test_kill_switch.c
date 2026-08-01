@@ -169,6 +169,7 @@ static void test_disabled_at_startup(void) {
   cleanup("test_ks_off.db");
   setenv("ARKILIAN_ENABLE_BACKUP", "0", 1);
   setenv("ARKILIAN_WAL_PUSH_URL", "http://127.0.0.1:1", 1);
+  setenv("ARKILIAN_BACKUP_INTERVAL", "3600", 1); // hermetic: no .env dependence
   arkilian *db = NULL;
   assert(db_init(&db, "test_ks_off.db") == 0);
   assert(db_backup_is_enabled(db) == 0);
@@ -203,6 +204,7 @@ static void test_runtime_kill_switch(void) {
   snprintf(url, sizeof(url), "http://127.0.0.1:%d/push", srv.port);
   setenv("ARKILIAN_ENABLE_BACKUP", "1", 1);
   setenv("ARKILIAN_WAL_PUSH_URL", url, 1);
+  setenv("ARKILIAN_BACKUP_INTERVAL", "3600", 1); // hermetic: no .env dependence
 
   arkilian *db = NULL;
   assert(db_init(&db, "test_ks_toggle.db") == 0);
@@ -219,8 +221,14 @@ static void test_runtime_kill_switch(void) {
   int shipped_enabled = srv.requests;
   assert(shipped_enabled >= 5);
 
+  // Let the flush thread finish its pass and fall asleep in cond-wait
+  // before flipping the switch, so no drain is mid-flight across the
+  // toggle (an in-flight pass completes by design).
+  sleep(2); // > POLL_INTERVAL_MS (2s)
+
   // Phase 2 — kill-switch off: nothing ships, nothing is deleted,
   // attempts stay 0 (queue just accumulates for later replay).
+  // Disable BEFORE writing so no pass can start mid-stream.
   db_backup_set_enabled(db, 0);
   assert(db_backup_is_enabled(db) == 0);
   for (int i = 0; i < 5; i++) {
@@ -228,9 +236,10 @@ static void test_runtime_kill_switch(void) {
     snprintf(sql, sizeof(sql), "INSERT INTO t (v) VALUES ('off%d')", i);
     assert(db_exec(db, sql) == SQLITE_DONE);
   }
+  int baseline = srv.requests; // thread confirmed asleep: nothing in flight
   sleep(3); // > poll interval
   assert(db_wal_pending(db) == 5);             // queued, not drained
-  assert(srv.requests == shipped_enabled);     // zero new requests
+  assert(srv.requests == baseline);            // zero new requests
   assert(sum_attempts(db) == 0);               // zero ship attempts
 
   // Phase 3 — re-enabled: shipping resumes from the queue, no data lost.
