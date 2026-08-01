@@ -279,6 +279,25 @@ Napi::Value db_errmsg(const Napi::CallbackInfo& info) {
   return msg ? Napi::String::New(env, msg) : env.Null();
 }
 
+Napi::Value db_backup_set_enabled(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  arkilian* db = getDbFromArg(info);
+  if (!db) {
+    Napi::TypeError::New(env, "Invalid database id").ThrowAsJavaScriptException();
+    return env.Null();
+  }
+  bool enabled = info.Length() < 2 ? true : info[1].As<Napi::Boolean>().Value();
+  db_backup_set_enabled(db, enabled ? 1 : 0);
+  return env.Null();
+}
+
+Napi::Value db_backup_is_enabled(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  arkilian* db = getDbFromArg(info);
+  if (!db) return Napi::Boolean::New(env, false);
+  return Napi::Boolean::New(env, db_backup_is_enabled(db) != 0);
+}
+
 Napi::Value db_set_token(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   arkilian* db = getDbFromArg(info);
@@ -393,6 +412,8 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
   exports.Set("db_commit", Napi::Function::New<db_commit>(env));
   exports.Set("db_rollback", Napi::Function::New<db_rollback>(env));
   exports.Set("db_errmsg", Napi::Function::New<db_errmsg>(env));
+  exports.Set("db_backup_set_enabled", Napi::Function::New<db_backup_set_enabled>(env));
+  exports.Set("db_backup_is_enabled", Napi::Function::New<db_backup_is_enabled>(env));
   exports.Set("db_set_token", Napi::Function::New<db_set_token>(env));
   exports.Set("db_changes", Napi::Function::New<db_changes>(env));
   exports.Set("db_last_insert_rowid", Napi::Function::New<db_last_insert_rowid>(env));

@@ -24,6 +24,13 @@ int db_rollback(arkilian *db);
 int db_wal_pending(arkilian *db);
 void db_wal_flush(arkilian *db);
 
+// Runtime kill-switch (spec §1): disable/enable all outbound backup
+// activity without a restart. Capture keeps running while disabled —
+// rows accumulate in _pending_backup (nothing is deleted, attempts stay
+// 0) and shipping resumes exactly where it left off on re-enable.
+void db_backup_set_enabled(arkilian *db, int enabled);
+int db_backup_is_enabled(arkilian *db);
+
 // Statement management — multiple statements can coexist.
 int db_prepare(arkilian *db, const char *sql);
 int db_use_stmt(arkilian *db, int index);

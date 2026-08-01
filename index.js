@@ -29,6 +29,19 @@ class Arkilian {
     return this;
   }
 
+  // Runtime kill-switch (spec §1): stops all outbound backup activity
+  // (WAL shipping + snapshot uploads) without a restart. Capture keeps
+  // running — rows queue up in _pending_backup and shipping resumes
+  // where it left off when re-enabled. Intended for incident response.
+  setBackupEnabled(enabled) {
+    native.db_backup_set_enabled(this.id, enabled);
+    return this;
+  }
+
+  get backupEnabled() {
+    return native.db_backup_is_enabled(this.id);
+  }
+
   close() {
     if (this.id) {
       native.db_close(this.id);

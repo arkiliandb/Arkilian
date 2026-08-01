@@ -63,7 +63,7 @@ struct arkilian {
   char *signed_url_endpoint;
   char *database_token;
   int backup_interval;
-  int backup_enabled;
+  volatile int backup_enabled; // runtime kill-switch (written under wake_mutex)
 
   // Background thread tracking & synchronization
   volatile int shutdown_requested;
@@ -829,8 +829,14 @@ void *run_wal_flush(void *arg) {
 
   while (!db->shutdown_requested && select_stmt) {
     int drained = 0;
-    drained = drain_batch(db, select_stmt, delete_stmt,
-                          update_attempts_stmt, dead_letter_stmt);
+    // Kill-switch check: when backup is disabled, do not ship (and
+    // critically, do not DELETE) anything — the queue just accumulates
+    // until re-enabled. Skipping drain_batch entirely keeps attempts at
+    // 0 so no row is ever dead-lettered while disabled.
+    if (db->backup_enabled) {
+      drained = drain_batch(db, select_stmt, delete_stmt,
+                            update_attempts_stmt, dead_letter_stmt);
+    }
 
     if (!drained) {
 #ifndef _WIN32
@@ -1434,6 +1440,41 @@ void db_wal_flush(arkilian *db) {
 #endif
 }
 
+// ── Runtime Kill-Switch ─────────────────────────────────────────────
+
+// db_backup_set_enabled is the incident-response kill-switch (spec §1).
+// Disabling stops ALL outbound backup activity — WAL shipping to the
+// destination and hourly snapshot uploads — without touching game logic
+// or requiring a restart. Capture keeps running: rows still accumulate
+// in _pending_backup (attempts stay 0, nothing is deleted), so
+// re-enabling resumes exactly where the queue left off.
+//
+// An in-flight ship/upload completes before the threads observe the new
+// state; the switch gates new work, not already-running requests.
+void db_backup_set_enabled(arkilian *db, int enabled) {
+  if (!db) return;
+#ifndef _WIN32
+  pthread_mutex_lock(&db->wake_mutex);
+  db->backup_enabled = enabled ? 1 : 0;
+  // Wake both threads so the new state is observed immediately (the
+  // flush thread drains right away on re-enable instead of waiting out
+  // the poll interval).
+  db->wake_flag = 1;
+  pthread_cond_broadcast(&db->wake_cond);
+  pthread_mutex_unlock(&db->wake_mutex);
+#else
+  EnterCriticalSection(&db->wake_mutex);
+  db->backup_enabled = enabled ? 1 : 0;
+  db->wake_flag = 1;
+  WakeAllConditionVariable(&db->wake_cond);
+  LeaveCriticalSection(&db->wake_mutex);
+#endif
+}
+
+int db_backup_is_enabled(arkilian *db) {
+  return (db && db->backup_enabled) ? 1 : 0;
+}
+
 // ── Hourly Backup Implementation ────────────────────────────────────
 
 int backup_database(sqlite3 *pSource, const char *zFilename) {
@@ -1666,6 +1707,11 @@ void *run_hourly_backup(void *arg) {
 
     if (shutdown || !db->is_open || !db->handle) break;
     next_backup = time(NULL) + db->backup_interval;
+
+    // Kill-switch check: skip the snapshot + upload entirely while
+    // disabled. The interval still advances so re-enabling resumes on
+    // the normal schedule (the flush thread handles realtime resume).
+    if (!db->backup_enabled) continue;
 
     int status = backup_database(db->handle, db->backup_path);
 

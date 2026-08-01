@@ -16,6 +16,11 @@
                                                        -Isrc -Isrc/deps/sqlite -lcurl -lpthread -o test_regressions
  ./test_regressions
 
+ # Kill-switch tests (runtime disable/enable of the backup subsystem)
+ cc tests/test_kill_switch.c src/class.c src/deps/sqlite/sqlite3.c \
+                                                       -Isrc -Isrc/deps/sqlite -lcurl -lpthread -o test_kill_switch
+ ./test_kill_switch
+
  # Test hydration
  cc tests/test_hydration.c src/hydration.c \
                                     -Isrc -Isrc/deps/sqlite -lcurl -lsqlite3 -o test_hydration
