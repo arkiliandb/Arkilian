@@ -369,6 +369,99 @@ func TestDBManagementRequiresSession(t *testing.T) {
 	}
 }
 
+// ── At-least-once dedup (spec §8.2) ─────────────────────────────────
+
+func TestWALPushDeduplicatesReplay(t *testing.T) {
+	setupTestDB(t)
+	defer db.Close()
+
+	token := registerAndLogin(t)
+	dbID, apiKey := createDB(t, token, "dedup-db")
+
+	entry := `{"ts":100,"op":1,"table_id":1,"pk":1,"sql":"INSERT INTO t VALUES (1)"}`
+	push := func() string {
+		req := httptest.NewRequest("POST", "/v1/wal/push", strings.NewReader(entry))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+		req.Header.Set("X-Arkilian-Payload-Id", "42")
+		w := httptest.NewRecorder()
+		handleWALPush(w, req)
+		return w.Body.String()
+	}
+
+	// First delivery inserts the row.
+	if got := push(); !strings.Contains(got, `"inserted":1`) {
+		t.Fatalf("first push: expected inserted:1, got %s", got)
+	}
+	// Replay of the same payload id (crash between ack and delete) is a no-op.
+	if got := push(); !strings.Contains(got, `"inserted":0`) {
+		t.Fatalf("replay push: expected inserted:0, got %s", got)
+	}
+
+	var count int
+	db.QueryRow("SELECT COUNT(*) FROM wal_entries WHERE db_id = ?", dbID).Scan(&count)
+	if count != 1 {
+		t.Fatalf("expected exactly 1 wal entry after replay, got %d", count)
+	}
+}
+
+func TestWALPushDedupKeyedPerPayload(t *testing.T) {
+	setupTestDB(t)
+	defer db.Close()
+
+	token := registerAndLogin(t)
+	dbID, apiKey := createDB(t, token, "dedup-keys")
+
+	entry := `{"ts":100,"op":1,"table_id":1,"pk":1,"sql":"INSERT INTO t VALUES (1)"}`
+	// Same body, different payload ids → both inserted (distinct rows).
+	for _, pid := range []string{"1", "2"} {
+		req := httptest.NewRequest("POST", "/v1/wal/push", strings.NewReader(entry))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+		req.Header.Set("X-Arkilian-Payload-Id", pid)
+		w := httptest.NewRecorder()
+		handleWALPush(w, req)
+		if w.Code != 200 {
+			t.Fatalf("push %s: %d", pid, w.Code)
+		}
+	}
+
+	var count int
+	db.QueryRow("SELECT COUNT(*) FROM wal_entries WHERE db_id = ?", dbID).Scan(&count)
+	if count != 2 {
+		t.Fatalf("expected 2 wal entries, got %d", count)
+	}
+}
+
+func TestWALPushBulkArrayNotDeduped(t *testing.T) {
+	setupTestDB(t)
+	defer db.Close()
+
+	token := registerAndLogin(t)
+	_, apiKey := createDB(t, token, "bulk-db")
+
+	// Bulk array pushes carry no per-entry key — every entry inserts.
+	entries := `[
+		{"ts":1,"op":1,"table_id":1,"pk":1,"sql":"INSERT"},
+		{"ts":2,"op":1,"table_id":1,"pk":2,"sql":"INSERT"}
+	]`
+	req := httptest.NewRequest("POST", "/v1/wal/push", strings.NewReader(entries))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	req.Header.Set("X-Arkilian-Payload-Id", "bulk")
+	w := httptest.NewRecorder()
+	handleWALPush(w, req)
+	if !strings.Contains(w.Body.String(), `"inserted":2`) {
+		t.Fatalf("expected inserted:2, got %s", w.Body.String())
+	}
+
+	var count int
+	db.QueryRow("SELECT COUNT(*) FROM wal_entries").Scan(&count)
+	if count != 2 {
+		t.Fatalf("expected 2 wal entries, got %d", count)
+	}
+}
+
 // ── Monitoring ──────────────────────────────────────────────────────
 
 func TestWALPushUpdatesMonitorStats(t *testing.T) {

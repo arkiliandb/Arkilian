@@ -326,7 +326,32 @@ func initDB(path string) error {
 	db.SetConnMaxLifetime(0)
 
 	_, err = db.Exec(schemaSQL)
-	return err
+	if err != nil {
+		return err
+	}
+	return migrateDB()
+}
+
+// migrateDB brings pre-existing control-plane databases up to date with
+// the current schema (CREATE TABLE IF NOT EXISTS never alters existing
+// tables). Idempotent; safe to run on every boot.
+func migrateDB() error {
+	var has int
+	err := db.QueryRow(
+		"SELECT COUNT(*) FROM pragma_table_info('wal_entries') WHERE name = 'payload_id'").Scan(&has)
+	if err != nil {
+		return fmt.Errorf("check payload_id column: %w", err)
+	}
+	if has == 0 {
+		if _, err := db.Exec("ALTER TABLE wal_entries ADD COLUMN payload_id TEXT"); err != nil {
+			return fmt.Errorf("add payload_id column: %w", err)
+		}
+	}
+	if _, err := db.Exec(
+		"CREATE UNIQUE INDEX IF NOT EXISTS idx_wal_payload_id ON wal_entries(payload_id)"); err != nil {
+		return fmt.Errorf("payload_id unique index: %w", err)
+	}
+	return nil
 }
 
 // ── Monitoring counters ─────────────────────────────────────────────
@@ -690,9 +715,22 @@ func handleWALPush(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// At-least-once redelivery (§8.2): the idempotency key from the
+	// X-Arkilian-Payload-Id header (the client's _pending_backup row id)
+	// makes a replayed push a no-op instead of a duplicate row. Only
+	// applies to single-entry pushes — the C client ships one payload
+	// per request; bulk array pushes (no meaningful key) insert as-is.
+	payloadID := r.Header.Get("X-Arkilian-Payload-Id")
+	useDedup := payloadID != "" && len(entries) == 1
+	var dedupKey interface{}
+	if useDedup {
+		dedupKey = payloadID
+	}
+
 	stmt, err := tx.Prepare(
-		`INSERT INTO wal_entries (db_id, ts, op, table_id, pk, sql)
-		 VALUES (?, ?, ?, ?, ?, ?)`)
+		`INSERT INTO wal_entries (db_id, ts, op, table_id, pk, sql, payload_id)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)
+		 ON CONFLICT(payload_id) DO NOTHING`)
 	if err != nil {
 		tx.Rollback()
 		mu.Unlock()
@@ -700,23 +738,41 @@ func handleWALPush(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Every insert result is checked — a silently dropped row is silent
+	// data loss. RowsAffected() is 0 for a deduped replay.
+	inserted := 0
 	for i := range entries {
 		e := &entries[i]
-		stmt.Exec(dbID, e.TS, e.Op, e.TableID, e.PK, e.SQL)
+		res, err := stmt.Exec(dbID, e.TS, e.Op, e.TableID, e.PK, e.SQL, dedupKey)
+		if err != nil {
+			tx.Rollback()
+			stmt.Close()
+			mu.Unlock()
+			log.Printf("wal push insert error for db %s: %v", dbID, err)
+			http.Error(w, "db error", http.StatusInternalServerError)
+			return
+		}
+		if n, _ := res.RowsAffected(); n > 0 {
+			inserted++
+		}
 	}
 	stmt.Close()
-	tx.Commit()
+	if err := tx.Commit(); err != nil {
+		mu.Unlock()
+		log.Printf("wal push commit error for db %s: %v", dbID, err)
+		http.Error(w, "db error", http.StatusInternalServerError)
+		return
+	}
 	mu.Unlock()
 
 	// Update monitoring counters (best-effort, after commit).
-	recordActivity(dbID, int64(len(entries)), int64(len(body)))
+	recordActivity(dbID, int64(inserted), int64(len(body)))
 
 	// Mirror the push body to object storage as a raw log chunk. This is a
 	// best-effort convenience copy for audit — the authoritative store is
 	// wal_entries above, so an unreachable object store must not turn a
 	// committed push into a 500 (which would make the client retry and
 	// duplicate). Failures are logged instead.
-	payloadID := r.Header.Get("X-Arkilian-Payload-Id")
 	chunkName := fmt.Sprintf("wal_%d.sql", time.Now().UnixNano())
 	if payloadID != "" {
 		chunkName = fmt.Sprintf("wal_%s.sql", payloadID)
@@ -741,7 +797,7 @@ func handleWALPush(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	fmt.Fprintf(w, `{"ok":true,"inserted":%d}`, len(entries))
+	fmt.Fprintf(w, `{"ok":true,"inserted":%d}`, inserted)
 }
 
 // ── Upload request (api_key auth) ───────────────────────────────────
