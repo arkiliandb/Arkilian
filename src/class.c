@@ -1844,15 +1844,16 @@ int db_backup_trigger_coverage(arkilian *db) {
   if (!db || !db->handle) return -1;
   sqlite3_stmt *stmt = NULL;
   int expect = 0, have = 0;
-  // Expected: 3 triggers per real (non-virtual, non-shadow) table.
-  // Must use pragma_table_list like the trigger scan — sqlite_master
-  // lists FTS/rtree shadow tables as type='table' and would inflate
-  // the expected count.
+  // Expected: 3 triggers per captured table. Must mirror the trigger
+  // scan exactly: real (non-virtual, non-shadow) tables WITH a PRIMARY
+  // KEY — keyless rowid tables are skipped (unreplayable) and get no
+  // triggers.
   if (sqlite3_prepare_v2(db->handle,
-        "SELECT COUNT(*) FROM pragma_table_list "
-        "WHERE schema = 'main' AND type = 'table' "
-        "AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\' "
-        "AND name NOT IN ('_pending_backup', '_dead_backup', '_arkilian_meta')",
+        "SELECT COUNT(*) FROM pragma_table_list t "
+        "WHERE t.schema = 'main' AND t.type = 'table' "
+        "AND t.name NOT LIKE 'sqlite\\_%' ESCAPE '\\' "
+        "AND t.name NOT IN ('_pending_backup', '_dead_backup', '_arkilian_meta') "
+        "AND EXISTS (SELECT 1 FROM pragma_table_xinfo(t.name) WHERE pk > 0)",
         -1, &stmt, NULL) == SQLITE_OK) {
     if (sqlite3_step(stmt) == SQLITE_ROW) expect = 3 * sqlite3_column_int(stmt, 0);
     sqlite3_finalize(stmt);

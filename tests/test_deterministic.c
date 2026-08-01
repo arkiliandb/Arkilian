@@ -158,7 +158,7 @@ static void test_update_is_replaced_deterministically(void) {
   cleanup_files();
 }
 
-static void test_delete_is_rowid_deterministic(void) {
+static void test_delete_is_pk_deterministic(void) {
   arkilian *db = open_test_db();
   db_exec(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)");
   db_exec(db, "INSERT INTO t (name) VALUES ('x')");
@@ -167,10 +167,14 @@ static void test_delete_is_rowid_deterministic(void) {
   db_step(db);
   db_finalize(db);
 
+  // DELETEs are keyed on the PRIMARY KEY, not rowid: REPLACE deletes +
+  // reinserts, so rowids shift on the destination after any UPDATE —
+  // rowid-keyed deletes would hit the wrong row (proven divergence).
   const char *sql = db_wal_last_sql(db);
   ASSERT(sql != NULL);
   ASSERT(str_contains(sql, "DELETE FROM"));
-  ASSERT(str_contains(sql, "WHERE rowid ="));
+  ASSERT(str_contains(sql, "WHERE \"id\" ="));
+  ASSERT(!str_contains(sql, "rowid"));
   ASSERT(!str_contains(sql, "name = 'x'"));
 
   db_close(db);
@@ -293,7 +297,7 @@ int main(void) {
   RUN_TEST(test_default_value_is_expanded_prepare);
   RUN_TEST(test_random_is_expanded_prepare);
   RUN_TEST(test_update_is_replaced_deterministically);
-  RUN_TEST(test_delete_is_rowid_deterministic);
+  RUN_TEST(test_delete_is_pk_deterministic);
 
   // db_exec direct path
   RUN_TEST(test_exec_insert_is_expanded);

@@ -21,6 +21,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 static int tests_run = 0;
 static int tests_passed = 0;
@@ -101,12 +102,15 @@ static void test_without_rowid_delete_works(void) {
   cleanup("test_reg_worowid.db");
 }
 
-static void test_rowid_table_delete_payload_unchanged(void) {
+static void test_rowid_table_delete_payload_is_pk_keyed(void) {
   arkilian *db = open_db("test_reg_rowid.db");
   db_exec(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)");
   db_exec(db, "INSERT INTO t (v) VALUES ('x')");
   assert(db_exec(db, "DELETE FROM t WHERE id = 1") == SQLITE_OK);
-  assert(count_payloads(db, "DELETE FROM \"t\" WHERE rowid = %") >= 1);
+  // PK-keyed, never rowid-keyed: REPLACE shifts destination rowids after
+  // any UPDATE, so rowid-keyed deletes would remove the wrong row.
+  assert(count_payloads(db, "DELETE FROM \"t\" WHERE \"id\" = %") >= 1);
+  assert(count_payloads(db, "DELETE FROM \"t\" WHERE rowid%") == 0);
   db_close(db);
   cleanup("test_reg_rowid.db");
 }
@@ -145,12 +149,14 @@ static void test_table_name_with_spaces(void) {
 
 static void test_generated_columns_excluded_from_payloads(void) {
   arkilian *db = open_db("test_reg_gen.db");
-  assert(db_exec(db, "CREATE TABLE g (a INT, b INT GENERATED ALWAYS AS (a * 2) VIRTUAL)") == SQLITE_OK);
+  assert(db_exec(db, "CREATE TABLE g (id INTEGER PRIMARY KEY, a INT, "
+                     "b INT GENERATED ALWAYS AS (a * 2) VIRTUAL)") == SQLITE_OK);
   assert(db_exec(db, "INSERT INTO g (a) VALUES (21)") == SQLITE_OK);
 
   // Payload must list only real columns — a generated column in a
   // REPLACE INTO column list fails on the replay side.
-  assert(count_payloads(db, "REPLACE INTO \"g\" (\"a\")%") >= 1);
+  assert(count_payloads(db, "REPLACE INTO \"g\" (\"id\", \"a\")%") >= 1);
+  assert(count_payloads(db, "REPLACE INTO \"g\" (\"id\", \"a\", \"b\")%") == 0);
 
   // And the captured payload must actually replay cleanly.
   const char *payload = db_wal_last_sql(db);
@@ -158,7 +164,7 @@ static void test_generated_columns_excluded_from_payloads(void) {
   assert(db_exec(db, payload) == SQLITE_OK);
 
   // Generated values still correct locally
-  db_prepare(db, "SELECT b FROM g WHERE a = 21");
+  db_prepare(db, "SELECT b FROM g WHERE id = 1");
   assert(db_step(db) == SQLITE_ROW);
   assert(db_column_int(db, 0) == 42);
   db_finalize(db);
@@ -310,6 +316,122 @@ static void test_sync_success_leaves_errmsg_clean(void) {
   cleanup("test_reg_clean.db");
 }
 
+// ── No destination configured → rows must survive ───────────────────
+// Regression for a proven data-loss bug: ship_to_backup reported
+// SHIP_OK when ARKILIAN_WAL_PUSH_URL was unset, so the drain loop
+// DELETED every captured row. Backup is enabled by default — the
+// default configuration was quietly destroying data.
+
+static void test_no_destination_rows_survive(void) {
+  cleanup("test_reg_nodest.db");
+  unsetenv("ARKILIAN_WAL_PUSH_URL");
+  setenv("ARKILIAN_ENABLE_BACKUP", "1", 1);
+  setenv("ARKILIAN_BACKUP_INTERVAL", "3600", 1);
+  arkilian *db = NULL;
+  assert(db_init(&db, "test_reg_nodest.db") == 0);
+  assert(db_exec(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)") == SQLITE_OK);
+  assert(db_exec(db, "INSERT INTO t (v) VALUES ('a')") == SQLITE_OK);
+  assert(db_exec(db, "INSERT INTO t (v) VALUES ('b')") == SQLITE_OK);
+
+  sleep(3); // > poll interval — a buggy drain would have deleted by now
+  int depth = db_backup_queue_depth(db);
+  assert(depth == 3); // DDL + 2 inserts: everything preserved
+  db_prepare(db, "SELECT COALESCE(SUM(attempts), 0) FROM _pending_backup");
+  assert(db_step(db) == SQLITE_ROW);
+  assert(db_column_int(db, 0) == 0); // never attempted, never dead-lettered
+  db_finalize(db);
+
+  db_close(db);
+  cleanup("test_reg_nodest.db");
+}
+
+// ── Replay fidelity for non-INTEGER-PK rowid tables ─────────────────
+// Regression for proven divergence: REPLACE INTO deletes+reinserts, so
+// destination rowids shift after any UPDATE while the source's rowid
+// stays — rowid-keyed deletes then hit the wrong row and stale copies
+// remain. DELETEs are now keyed on the PRIMARY KEY, which survives
+// REPLACE, so replay must converge exactly.
+
+static void test_text_pk_replay_fidelity(void) {
+  cleanup("test_reg_fid.db");
+  setenv("ARKILIAN_ENABLE_BACKUP", "1", 1);
+  setenv("ARKILIAN_WAL_PUSH_URL", "http://127.0.0.1:1", 1); // keep rows in outbox
+  setenv("ARKILIAN_BACKUP_INTERVAL", "3600", 1);
+  arkilian *db = NULL;
+  assert(db_init(&db, "test_reg_fid.db") == 0);
+  assert(db_exec(db, "CREATE TABLE kv (k TEXT PRIMARY KEY, v TEXT)") == SQLITE_OK);
+  assert(db_exec(db, "INSERT INTO kv (k, v) VALUES ('k1', 'v1')") == SQLITE_OK);
+  assert(db_exec(db, "INSERT INTO kv (k, v) VALUES ('k2', 'v2')") == SQLITE_OK);
+  assert(db_exec(db, "UPDATE kv SET v = 'v1-updated' WHERE k = 'k1'") == SQLITE_OK);
+  assert(db_exec(db, "DELETE FROM kv WHERE k = 'k2'") == SQLITE_OK);
+
+  // Collect the captured payloads in id order.
+  char payloads[8][512];
+  int n = 0;
+  db_prepare(db, "SELECT payload FROM _pending_backup ORDER BY id");
+  while (db_step(db) == SQLITE_ROW && n < 8) {
+    snprintf(payloads[n++], sizeof(payloads[0]), "%s", db_column_text(db, 0));
+  }
+  db_finalize(db);
+  assert(n >= 4);
+
+  // Replay onto a fresh destination with the identical schema.
+  sqlite3 *dst = NULL;
+  assert(sqlite3_open_v2("test_reg_fid_dst.db", &dst,
+                         SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, NULL) == SQLITE_OK);
+  assert(sqlite3_exec(dst, "CREATE TABLE kv (k TEXT PRIMARY KEY, v TEXT)",
+                      NULL, NULL, NULL) == SQLITE_OK);
+  for (int i = 0; i < n; i++) {
+    // Skip the DDL capture row; replay only table payloads.
+    if (strncmp(payloads[i], "REPLACE INTO \"kv\"", 17) == 0 ||
+        strncmp(payloads[i], "DELETE FROM \"kv\"", 16) == 0) {
+      assert(sqlite3_exec(dst, payloads[i], NULL, NULL, NULL) == SQLITE_OK);
+    }
+  }
+
+  // Destination must converge EXACTLY with the source: one row, updated.
+  sqlite3_stmt *st = NULL;
+  sqlite3_prepare_v2(dst, "SELECT k, v FROM kv", -1, &st, NULL);
+  assert(sqlite3_step(st) == SQLITE_ROW);
+  assert(strcmp((const char *)sqlite3_column_text(st, 0), "k1") == 0);
+  assert(strcmp((const char *)sqlite3_column_text(st, 1), "v1-updated") == 0);
+  assert(sqlite3_step(st) == SQLITE_DONE); // no stale k2, no duplicate k1
+  sqlite3_finalize(st);
+  sqlite3_close(dst);
+
+  db_close(db);
+  cleanup("test_reg_fid.db");
+  cleanup("test_reg_fid_dst.db");
+}
+
+// ── Keyless rowid tables are skipped loudly, not mis-replicated ─────
+
+static void test_keyless_table_skipped(void) {
+  cleanup("test_reg_keyless.db");
+  setenv("ARKILIAN_ENABLE_BACKUP", "1", 1);
+  setenv("ARKILIAN_WAL_PUSH_URL", "http://127.0.0.1:1", 1);
+  setenv("ARKILIAN_BACKUP_INTERVAL", "3600", 1);
+  arkilian *db = NULL;
+  assert(db_init(&db, "test_reg_keyless.db") == 0);
+  // Keyless rowid table (unreplayable: REPLACE appends, rowids drift).
+  assert(db_exec(db, "CREATE TABLE ev (ts INTEGER, ev TEXT)") == SQLITE_OK);
+  // A keyed table next to it still captures.
+  assert(db_exec(db, "CREATE TABLE ok (id INTEGER PRIMARY KEY, v TEXT)") == SQLITE_OK);
+
+  assert(db_backup_trigger_coverage(db) == 0); // only ok counts, fully covered
+  db_prepare(db, "SELECT COUNT(*) FROM sqlite_master "
+                 "WHERE type='trigger' AND name LIKE 'trg\\_%' ESCAPE '\\'");
+  assert(db_step(db) == SQLITE_ROW);
+  assert(db_column_int(db, 0) == 3); // exactly ok's 3 triggers
+  db_finalize(db);
+
+  // Writes to the keyless table still work locally.
+  assert(db_exec(db, "INSERT INTO ev (ts, ev) VALUES (1, 'x')") == SQLITE_OK);
+
+  db_close(db);
+  cleanup("test_reg_keyless.db");
+}
+
 // ── Main ────────────────────────────────────────────────────────────
 
 int main(void) {
@@ -317,7 +439,7 @@ int main(void) {
 
   printf("[WITHOUT ROWID]\n");
   RUN_TEST(test_without_rowid_delete_works);
-  RUN_TEST(test_rowid_table_delete_payload_unchanged);
+  RUN_TEST(test_rowid_table_delete_payload_is_pk_keyed);
 
   printf("\n[Special Table Names]\n");
   RUN_TEST(test_keyword_table_name_gets_triggers);
@@ -342,6 +464,11 @@ int main(void) {
   printf("\n[Isolation]\n");
   RUN_TEST(test_wal_last_sql_is_per_instance);
   RUN_TEST(test_sync_success_leaves_errmsg_clean);
+
+  printf("\n[Replay Integrity]\n");
+  RUN_TEST(test_no_destination_rows_survive);
+  RUN_TEST(test_text_pk_replay_fidelity);
+  RUN_TEST(test_keyless_table_skipped);
 
   printf("\n=== Results: %d/%d passed ===\n", tests_passed, tests_run);
   return (tests_passed == tests_run) ? 0 : 1;

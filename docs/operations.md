@@ -172,11 +172,35 @@ Real environment variables always win over a `./.env` file.
 - **Payload format is replayable SQL text, not JSON.** The spec's §6 JSON
   sketch (`{id, table, op, data}`) was a suggestion; the shipped format is
   the SQL statement itself (`REPLACE INTO "t" (...) VALUES (...)` /
-  `DELETE FROM "t" WHERE rowid = ...`), which any SQLite can apply
+  `DELETE FROM "t" WHERE <pk> = ...`), which any SQLite can apply
   directly. One format, one destination. The deduplication key is the
   `X-Arkilian-Payload-Id` header, not an `id` field in the body — the
   destination MUST dedupe on that header (the bundled control plane
   does).
+- **DELETE payloads are keyed on the PRIMARY KEY, never rowid.** REPLACE
+  INTO deletes + reinserts, so destination rowids shift after any UPDATE
+  while the source's stays — rowid-keyed deletes would remove the wrong
+  row (proven divergence) and leave stale copies. PK values survive
+  REPLACE, so PK-keyed deletes stay correct for INTEGER, TEXT, and
+  composite keys. Tables with **no PRIMARY KEY at all** (plain rowid
+  tables) are unreplayable and are skipped at trigger-generation time
+  with a loud warning — they are never silently mis-replicated.
+- **No destination configured ⇒ rows are preserved, never deleted.**
+  With backup enabled but `ARKILIAN_WAL_PUSH_URL` unset, the flush
+  thread does not drain: rows accumulate in `_pending_backup` with
+  attempts 0 (never dead-lettered) until a destination is configured.
+  A startup warning names the misconfiguration.
+- **One connection per thread** (§3.1): game connection, flush-thread
+  connection, and a third connection owned by the hourly snapshot
+  thread. Sharing one handle between the two backup threads would make
+  shipping contend with the snapshot file copy.
+- **`db_set_token()` is thread-safe** — readers snapshot the token under
+  a mutex, so rotating it mid-request can never free memory a backup
+  thread is reading (use-after-free).
+- **`db_close()` is bounded** — the snapshot copy aborts on the shutdown
+  flag between retry steps (no 10-minute join under persistent
+  `SQLITE_BUSY`), and in-flight curl transfers abort via a progress
+  callback that observes shutdown.
 - **Ordering is strict** (§8.1): the drain stops on a retryable failure
   so the first unshipped row is always retried first. If your destination
   doesn't need ordering, skip-and-continue is the higher-throughput
