@@ -126,13 +126,15 @@ fi
 
 # Control plane always runs as a local binary: the compose image build
 # needs to download a full Go toolchain (go.mod requires go 1.25), which
-# is slow and network-fragile on first run.
+# is slow and network-fragile on first run. Run it from $WORK so no
+# repo-root .env can inject credentials, and use the ARKILIAN_AWS_* var
+# names (the server prefers them over S3_*).
 log "Building control plane (local Go binary)"
 (cd "$ROOT/server" && go build -o "$BIN/arkilian-server" .)
-ARKILIAN_DB_PATH="$WORK/cp.db" \
-S3_ENDPOINT="http://localhost:9000" S3_BUCKET="arkilian-backups" \
-S3_KEY="minioadmin" S3_SECRET="minioadmin" S3_REGION="us-east-1" \
-PORT=18080 "$BIN/arkilian-server" > "$WORK/cp.log" 2>&1 &
+(cd "$WORK" && ARKILIAN_DB_PATH="$WORK/cp.db" \
+ARKILIAN_AWS_ENDPOINT_URL="http://localhost:9000" ARKILIAN_AWS_BUCKET="arkilian-backups" \
+ARKILIAN_AWS_ACCESS_KEY_ID="minioadmin" ARKILIAN_AWS_SECRET_ACCESS_KEY="minioadmin" \
+S3_REGION="us-east-1" PORT=18080 "$BIN/arkilian-server" > "$WORK/cp.log" 2>&1) &
 CP_PID=$!
 if wait_for_http "http://localhost:18080/health" 30; then
   CP_URL="http://localhost:18080"
@@ -196,6 +198,14 @@ COUNT="$(curl -s "$CP_URL/v1/wal/count" -H "Authorization: Bearer $API_KEY" | js
 ok "control plane wal_entries for $DB_ID: $COUNT"
 SUMMARY="$(curl -s "$CP_URL/v1/monitor/summary" -H "Authorization: Bearer $TOKEN")"
 ok "dashboard summary: $SUMMARY"
+# The e2e phase ran with a 5s snapshot interval — at least one snapshot
+# must have been registered AND uploaded to MinIO through a signed URL.
+SNAPS="$(echo "$SUMMARY" | python3 -c 'import sys,json;d=json.load(sys.stdin);print(sum(x.get("snapshots",0) for x in d))')"
+if [ "${SNAPS:-0}" -ge 1 ]; then
+  ok "S3 snapshot round-trip confirmed ($SNAPS snapshot(s) registered)"
+else
+  fail "no snapshots registered — S3 signed-URL path broken"
+fi
 HTTP_CODE="$(curl -s -o /dev/null -w '%{http_code}' "$CP_URL/")"
 [ "$HTTP_CODE" = "200" ] || fail "dashboard / returned $HTTP_CODE"
 ok "dashboard served (HTTP $HTTP_CODE)"

@@ -31,10 +31,13 @@ CREATE TABLE IF NOT EXISTS wal_entries (
 );
 CREATE INDEX IF NOT EXISTS idx_wal_db ON wal_entries(db_id, lsn);
 -- At-least-once redelivery (§8.2): the client sends X-Arkilian-Payload-Id
--- (its _pending_backup row id); this index makes replays of the same
--- payload no-ops instead of duplicates. NULL payload_ids (bulk array
--- pushes) are never deduped — SQLite UNIQUE allows multiple NULLs.
-CREATE UNIQUE INDEX IF NOT EXISTS idx_wal_payload_id ON wal_entries(payload_id);
+-- (its _pending_backup row id) and replays of the same payload must be
+-- no-ops instead of duplicates. The key is scoped PER DATABASE: outbox
+-- ids restart at 1 for every fresh client file, so a global unique
+-- index would silently drop one tenant's rows when ids collide with
+-- another tenant's. NULL payload_ids (bulk array pushes) are never
+-- deduped — SQLite UNIQUE allows multiple NULLs.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_wal_payload_id ON wal_entries(db_id, payload_id);
 CREATE TABLE IF NOT EXISTS snapshots (
 	id           INTEGER PRIMARY KEY AUTOINCREMENT,
 	db_id        TEXT NOT NULL REFERENCES databases(db_id),

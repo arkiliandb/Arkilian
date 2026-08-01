@@ -433,6 +433,37 @@ func TestWALPushDedupKeyedPerPayload(t *testing.T) {
 	}
 }
 
+func TestWALPushDedupIsolatedPerDatabase(t *testing.T) {
+	setupTestDB(t)
+	defer db.Close()
+
+	token := registerAndLogin(t)
+	_, apiKey1 := createDB(t, token, "dedup-db1")
+	_, apiKey2 := createDB(t, token, "dedup-db2")
+
+	// Two different tenants, same payload id (outbox ids restart at 1 in
+	// every fresh client file) — both inserts must land. A global dedup
+	// key would silently drop the second tenant's rows.
+	entry := `{"ts":100,"op":1,"table_id":1,"pk":1,"sql":"INSERT INTO t VALUES (1)"}`
+	for _, key := range []string{apiKey1, apiKey2} {
+		req := httptest.NewRequest("POST", "/v1/wal/push", strings.NewReader(entry))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+key)
+		req.Header.Set("X-Arkilian-Payload-Id", "1")
+		w := httptest.NewRecorder()
+		handleWALPush(w, req)
+		if !strings.Contains(w.Body.String(), `"inserted":1`) {
+			t.Fatalf("expected inserted:1, got %s", w.Body.String())
+		}
+	}
+
+	var count int
+	db.QueryRow("SELECT COUNT(*) FROM wal_entries").Scan(&count)
+	if count != 2 {
+		t.Fatalf("expected 2 wal entries across tenants, got %d", count)
+	}
+}
+
 func TestWALPushBulkArrayNotDeduped(t *testing.T) {
 	setupTestDB(t)
 	defer db.Close()

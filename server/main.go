@@ -259,6 +259,16 @@ func randStr(n int) string {
 	return hex.EncodeToString(b)[:n]
 }
 
+// writeJSON emits v without HTML escaping. Go's default encoder escapes
+// `&` as \u0026, which corrupts signed URLs (query strings) consumed by
+// naive client-side string parsers — presigned PUT/GET links must round
+// trip byte-for-byte.
+func writeJSON(w http.ResponseWriter, v any) {
+	enc := json.NewEncoder(w)
+	enc.SetEscapeHTML(false)
+	enc.Encode(v)
+}
+
 // sessionAuth extracts user_id from a JWT session token.
 func sessionAuth(r *http.Request) (int64, bool) {
 	auth := r.Header.Get("Authorization")
@@ -347,8 +357,14 @@ func migrateDB() error {
 			return fmt.Errorf("add payload_id column: %w", err)
 		}
 	}
+	// Replace any pre-existing global (db_id-less) dedup index with the
+	// per-database composite — a global key drops rows when two tenants'
+	// outbox ids collide.
+	if _, err := db.Exec("DROP INDEX IF EXISTS idx_wal_payload_id"); err != nil {
+		return fmt.Errorf("drop legacy dedup index: %w", err)
+	}
 	if _, err := db.Exec(
-		"CREATE UNIQUE INDEX IF NOT EXISTS idx_wal_payload_id ON wal_entries(payload_id)"); err != nil {
+		"CREATE UNIQUE INDEX IF NOT EXISTS idx_wal_payload_id ON wal_entries(db_id, payload_id)"); err != nil {
 		return fmt.Errorf("payload_id unique index: %w", err)
 	}
 	return nil
@@ -561,7 +577,7 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 	resp := LoginResponse{Token: token, UserID: userID, Expires: exp}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
+	writeJSON(w, resp)
 }
 
 // ── Database management handlers ────────────────────────────────────
@@ -600,7 +616,7 @@ func handleDBCreate(w http.ResponseWriter, r *http.Request) {
 	resp := CreateDBResponse{DBID: dbID, APIKey: apiKey, Name: req.Name}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
-	json.NewEncoder(w).Encode(resp)
+	writeJSON(w, resp)
 }
 
 func handleDBList(w http.ResponseWriter, r *http.Request) {
@@ -632,7 +648,7 @@ func handleDBList(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(dbs)
+	writeJSON(w, dbs)
 }
 
 func handleDBKey(w http.ResponseWriter, r *http.Request) {
@@ -660,7 +676,7 @@ func handleDBKey(w http.ResponseWriter, r *http.Request) {
 
 	resp := KeyResponse{DBID: dbID, APIKey: apiKey}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
+	writeJSON(w, resp)
 }
 
 // ── WAL push (api_key auth, stores entries per database) ────────────
@@ -730,7 +746,7 @@ func handleWALPush(w http.ResponseWriter, r *http.Request) {
 	stmt, err := tx.Prepare(
 		`INSERT INTO wal_entries (db_id, ts, op, table_id, pk, sql, payload_id)
 		 VALUES (?, ?, ?, ?, ?, ?, ?)
-		 ON CONFLICT(payload_id) DO NOTHING`)
+		 ON CONFLICT(db_id, payload_id) DO NOTHING`)
 	if err != nil {
 		tx.Rollback()
 		mu.Unlock()
@@ -831,7 +847,7 @@ func handleUploadRequest(w http.ResponseWriter, r *http.Request) {
 	resp := UploadResponse{UploadURL: putURL, ExpiresAt: expires}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
+	writeJSON(w, resp)
 }
 
 // ── Hydrate plan (api_key auth) ─────────────────────────────────────
@@ -889,7 +905,7 @@ func handleHydratePlan(w http.ResponseWriter, r *http.Request) {
 	}
 	recordActivity(dbID, 0, 0)
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
+	writeJSON(w, resp)
 }
 
 // ── Snapshot register (api_key auth) ────────────────────────────────
@@ -1013,7 +1029,7 @@ func handleMonitorSummary(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(out)
+	writeJSON(w, out)
 }
 
 func handleMonitorDetail(w http.ResponseWriter, r *http.Request) {
@@ -1086,7 +1102,7 @@ func handleMonitorDetail(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(detail)
+	writeJSON(w, detail)
 }
 
 // ── Health ──────────────────────────────────────────────────────────

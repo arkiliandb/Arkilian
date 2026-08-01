@@ -32,11 +32,22 @@
 #include "deps/sqlite/sqlite3.h"
 
 // ── Config Defaults ─────────────────────────────────────────────────
+//
+// Configuration via environment (or a ./.env file in the working
+// directory; real environment variables always win over .env values).
+// No endpoint defaults to a vendor URL — nothing phones home unless
+// explicitly configured:
+//
+//   ARKILIAN_WAL_PUSH_URL          realtime destination for _pending_backup
+//                                  payloads (e.g. control plane /v1/wal/push)
+//   ARKILIAN_SIGNED_URL_ENDPOINT   signed-URL issuer for hourly snapshot
+//                                  uploads (e.g. control plane
+//                                  /v1/upload/request). Independent of the
+//                                  push URL — they are different endpoints.
 
 #define DEFAULT_DB_PATH "app.sqlite"
 #define DEFAULT_BACKUP_PATH "backup.sqlite"
 #define DEFAULT_BACKUP_INTERVAL 3600
-#define DEFAULT_SIGNED_URL_ENDPOINT "https://api.arkilian.com/get-signed-url"
 
 #define BATCH_SIZE 100
 #define MAX_ATTEMPTS 10
@@ -60,7 +71,8 @@ struct arkilian {
 
   // Configuration
   char *backup_path;
-  char *signed_url_endpoint;
+  char *push_url;              // realtime WAL payload destination
+  char *signed_url_endpoint;   // signed-URL issuer for hourly snapshots
   char *database_token;
   int backup_interval;
   volatile int backup_enabled; // runtime kill-switch (written under wake_mutex)
@@ -124,6 +136,17 @@ static int get_env_int_default(const char *env_var, int default_val) {
   return default_val;
 }
 
+// Boolean env var accepting 1/0/true/false/yes/no.
+static int get_env_bool_default(const char *env_var, int default_val) {
+  const char *val = getenv(env_var);
+  if (!val || strlen(val) == 0) return default_val;
+  if (strcasecmp(val, "true") == 0 || strcasecmp(val, "yes") == 0 ||
+      strcmp(val, "1") == 0) return 1;
+  if (strcasecmp(val, "false") == 0 || strcasecmp(val, "no") == 0 ||
+      strcmp(val, "0") == 0) return 0;
+  return atoi(val) != 0;
+}
+
 static void load_env(void) {
   FILE *fp = fopen(".env", "r");
   if (!fp) return;
@@ -138,11 +161,14 @@ static void load_env(void) {
     }
     char *key = strtok(line, "=");
     char *val = strtok(NULL, "\n\r");
-    if (key && val) {
+    // A real environment variable always wins over a ./.env value —
+    // a stray .env in the working directory must never override the
+    // deployment's explicit configuration.
+    if (key && val && !getenv(key)) {
 #ifdef _WIN32
       _putenv_s(key, val);
 #else
-      setenv(key, val, 1);
+      setenv(key, val, 0);
 #endif
     }
   }
@@ -556,12 +582,11 @@ static ship_result_t ship_to_backup(arkilian *db, sqlite3_int64 id, const char *
   LeaveCriticalSection(&db->payload_mutex);
 #endif
 
-  const char *push_url = getenv("ARKILIAN_WAL_PUSH_URL");
+  // No push destination configured → nothing to ship. This is the
+  // realtime WAL endpoint (ARKILIAN_WAL_PUSH_URL), independent of the
+  // signed-URL endpoint used by the hourly snapshot thread.
+  const char *push_url = db->push_url;
   if (!push_url || strlen(push_url) == 0) {
-    push_url = db->signed_url_endpoint;
-  }
-
-  if (!push_url || strlen(push_url) == 0 || strcmp(push_url, DEFAULT_SIGNED_URL_ENDPOINT) == 0) {
     return SHIP_OK;
   }
 
@@ -922,10 +947,15 @@ int db_init(arkilian **db_ptr, const char *filename) {
   db->backup_path = malloc(strlen(backup_path_tmp) + 1);
   if (db->backup_path) strcpy(db->backup_path, backup_path_tmp);
 
-  const char *signed_url_tmp = getenv("ARKILIAN_WAL_PUSH_URL");
-  if (!signed_url_tmp || strlen(signed_url_tmp) == 0) {
-    signed_url_tmp = get_env_default("ARKILIAN_SIGNED_URL_ENDPOINT", DEFAULT_SIGNED_URL_ENDPOINT);
-  }
+  // Realtime WAL destination: where _pending_backup payloads are shipped.
+  const char *push_url_tmp = get_env_default("ARKILIAN_WAL_PUSH_URL", "");
+  db->push_url = malloc(strlen(push_url_tmp) + 1);
+  if (db->push_url) strcpy(db->push_url, push_url_tmp);
+
+  // Signed-URL issuer for hourly snapshot uploads (e.g. control plane
+  // /v1/upload/request). Deliberately independent from the push URL —
+  // they are different endpoints serving different purposes.
+  const char *signed_url_tmp = get_env_default("ARKILIAN_SIGNED_URL_ENDPOINT", "");
   db->signed_url_endpoint = malloc(strlen(signed_url_tmp) + 1);
   if (db->signed_url_endpoint) strcpy(db->signed_url_endpoint, signed_url_tmp);
 
@@ -937,7 +967,7 @@ int db_init(arkilian **db_ptr, const char *filename) {
   // A 0 or negative interval would make the hourly thread hot-loop
   // (backup + signed-URL request with no sleep in between). Clamp it.
   if (db->backup_interval < 1) db->backup_interval = 1;
-  db->backup_enabled = get_env_int_default("ARKILIAN_ENABLE_BACKUP", 1);
+  db->backup_enabled = get_env_bool_default("ARKILIAN_ENABLE_BACKUP", 1);
 
 #ifndef _WIN32
   pthread_mutex_init(&db->wake_mutex, NULL);
@@ -1026,26 +1056,6 @@ int db_init(arkilian **db_ptr, const char *filename) {
   db->is_open = 1;
   db->shutdown_requested = 0;
   *db_ptr = db;
-
-  // Read configuration environment variables
-  const char *env_backup = getenv("ARKILIAN_ENABLE_BACKUP");
-  if (env_backup && (strcmp(env_backup, "1") == 0 || strcasecmp(env_backup, "true") == 0)) {
-    db->backup_enabled = 1;
-  }
-  const char *env_url = getenv("ARKILIAN_WAL_PUSH_URL");
-  if (env_url && strlen(env_url) > 0) {
-    if (db->signed_url_endpoint) free(db->signed_url_endpoint);
-    db->signed_url_endpoint = strdup(env_url);
-  }
-  const char *env_token = getenv("ARKILIAN_DATABASE_TOKEN");
-  if (env_token && strlen(env_token) > 0) {
-    db_set_token(db, env_token);
-  }
-  const char *env_interval = getenv("ARKILIAN_BACKUP_INTERVAL");
-  if (env_interval && atoi(env_interval) > 0) {
-    db->backup_interval = atoi(env_interval);
-  }
-  if (db->backup_interval < 1) db->backup_interval = 1; // never hot-loop
 
   // Start WAL flusher thread. This thread drains _pending_backup — without
   // it, no write ever reaches the destination. A failure to create it is a
@@ -1160,6 +1170,7 @@ void db_close(arkilian *db) {
 
   if (db->db_path) free(db->db_path);
   if (db->backup_path) free(db->backup_path);
+  if (db->push_url) free(db->push_url);
   if (db->signed_url_endpoint) free(db->signed_url_endpoint);
   if (db->database_token) free(db->database_token);
 
@@ -1572,7 +1583,11 @@ char *get_signed_url(const char *api_endpoint, const char *token, int *shutdown_
   char *result = NULL;
   if (curl) {
     CURLcode rc = CURLE_OK;
+    // Signed-URL issuance is a POST against the control plane's
+    // /v1/upload/request (it requires POST; GET would 405). An empty
+    // body selects the snapshot branch on the control plane.
     rc = curl_easy_setopt(curl, CURLOPT_URL, api_endpoint);
+    if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_POSTFIELDS, "");
     if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_cb);
     if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)&chunk);
     if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
@@ -1748,11 +1763,10 @@ void *run_hourly_backup(void *arg) {
 
     int status = backup_database(db->handle, db->backup_path);
 
-    // Skip the remote upload when no endpoint has been configured —
-    // never phone home to the vendor default with a customer database.
+    // Skip the remote upload when no signed-URL endpoint has been
+    // configured — nothing phones home unless explicitly enabled.
     int endpoint_configured = db->signed_url_endpoint &&
-        strlen(db->signed_url_endpoint) > 0 &&
-        strcmp(db->signed_url_endpoint, DEFAULT_SIGNED_URL_ENDPOINT) != 0;
+        strlen(db->signed_url_endpoint) > 0;
 
     if (status == SQLITE_OK && endpoint_configured) {
       char *signed_url = get_signed_url(db->signed_url_endpoint, db->database_token, (int *)&db->shutdown_requested);

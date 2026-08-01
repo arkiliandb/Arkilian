@@ -53,22 +53,29 @@ sudo cmake --install build
 
 ### Configuration
 
-Arkilian uses environment variables with the `ARKILIAN_` prefix for configuration:
+Arkilian uses environment variables with the `ARKILIAN_` prefix for configuration
+(read from the environment or a `./.env` file in the working directory — real
+environment variables always win over `.env` values). Both endpoint variables
+default to empty; nothing phones home unless explicitly configured.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `ARKILIAN_DB_PATH` | `app.sqlite` | Path to the SQLite database file |
-| `ARKILIAN_BACKUP_PATH` | `backup.sqlite` | Path for backup files |
-| `ARKILIAN_BACKUP_INTERVAL` | `3600` | Backup interval in seconds (default: 1 hour) |
-| `ARKILIAN_SIGNED_URL_ENDPOINT` | (none) | API endpoint for getting S3 presigned URLs |
-| `ARKILIAN_ENABLE_BACKUP` | `1` | Set to `0` to disable automated backups |
+| `ARKILIAN_BACKUP_PATH` | `backup.sqlite` | Local path for hourly snapshot copies |
+| `ARKILIAN_BACKUP_INTERVAL` | `3600` | Hourly snapshot interval in seconds (min 1) |
+| `ARKILIAN_WAL_PUSH_URL` | (none) | Realtime destination for row changes — every write is shipped here as replayable SQL (e.g. control plane `POST /v1/wal/push`) |
+| `ARKILIAN_SIGNED_URL_ENDPOINT` | (none) | Signed-URL issuer for hourly snapshot uploads (e.g. control plane `POST /v1/upload/request`). Independent of `ARKILIAN_WAL_PUSH_URL` — they are different endpoints |
+| `ARKILIAN_DATABASE_TOKEN` | (none) | Bearer token sent with both endpoints (never attached to pre-signed storage URLs) |
+| `ARKILIAN_ENABLE_BACKUP` | `1` | `0`/`false` disables outbound backup at startup; can be toggled at runtime with `db_backup_set_enabled()` |
 
 Example `.env` file:
 ```
 ARKILIAN_DB_PATH=myapp.db
 ARKILIAN_BACKUP_PATH=/backups/myapp-backup.db
 ARKILIAN_BACKUP_INTERVAL=7200
-ARKILIAN_SIGNED_URL_ENDPOINT=https://myapi.com/get-signed-url
+ARKILIAN_WAL_PUSH_URL=https://api.example.com/v1/wal/push
+ARKILIAN_SIGNED_URL_ENDPOINT=https://api.example.com/v1/upload/request
+ARKILIAN_DATABASE_TOKEN=ak_...
 ARKILIAN_ENABLE_BACKUP=1
 ```
 
