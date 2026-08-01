@@ -13,7 +13,10 @@
 //   POST   /v1/wal/push            — push WAL entries (auth: api_key)
 //   POST   /v1/upload/request      — request signed PUT URL (auth: api_key)
 //   GET    /v1/hydrate/plan        — get hydrate plan (auth: api_key)
+//   GET    /v1/monitor/summary     — per-database monitor summary (session auth)
+//   GET    /v1/monitor/db/{db_id}  — per-database detail + recent entries (session auth)
 //   GET    /health                 — health check
+//   GET    /                       — embedded tenant dashboard (plain HTML/JS)
 //
 // Env (server also reads ./.env at startup):
 //   PORT, AUTH_TOKEN (master), ARKILIAN_DB_PATH, JWT_SECRET,
@@ -30,11 +33,13 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
+	"embed"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/fs"
 	"log"
 	"net/http"
 	"os"
@@ -117,6 +122,55 @@ type DBInfo struct {
 type KeyResponse struct {
 	DBID   string `json:"db_id"`
 	APIKey string `json:"api_key"`
+}
+
+// ── Monitoring types ────────────────────────────────────────────────
+
+//go:embed dashboard
+var dashboardFS embed.FS
+
+type DailyPoint struct {
+	Day     string `json:"day"`
+	Entries int64  `json:"entries"`
+	Bytes   int64  `json:"bytes"`
+}
+
+// MonitorDB is one database's health summary as shown in the tenant dashboard.
+type MonitorDB struct {
+	DBID         string       `json:"db_id"`
+	Name         string       `json:"name"`
+	CreatedAt    int64        `json:"created_at"`
+	LastSeen     int64        `json:"last_seen"`
+	Status       string       `json:"status"` // active | stale | quiet | never
+	TotalEntries int64        `json:"total_entries"`
+	EntriesToday int64        `json:"entries_today"`
+	BytesToday   int64        `json:"bytes_today"`
+	Snapshots    int          `json:"snapshots"`
+	Chunks       int          `json:"chunks"`
+	Last7        []DailyPoint `json:"last7,omitempty"`
+}
+
+type RecentWAL struct {
+	LSN        int64  `json:"lsn"`
+	TS         uint64 `json:"ts"`
+	Op         uint8  `json:"op"`
+	TableID    uint16 `json:"table_id"`
+	PK         uint64 `json:"pk"`
+	SQL        string `json:"sql"`
+	ReceivedAt int64  `json:"received_at"`
+}
+
+type SnapshotInfo struct {
+	BaselineLSN int64  `json:"baseline_lsn"`
+	S3Key       string `json:"s3_key"`
+	CreatedAt   int64  `json:"created_at"`
+}
+
+type MonitorDetail struct {
+	MonitorDB
+	Daily         []DailyPoint   `json:"daily"`
+	RecentEntries []RecentWAL    `json:"recent_entries"`
+	Snapshots     []SnapshotInfo `json:"snapshots"`
 }
 
 // ── Config ──────────────────────────────────────────────────────────
@@ -237,7 +291,10 @@ func sessionAuth(r *http.Request) (int64, bool) {
 }
 
 // apiKeyAuth validates a Bearer token against the databases table.
-// Returns db_id on success.
+// Returns db_id on success. Missing/empty auth and the stress-harness
+// "stress"/"dummy" prefixes fall back to the shared db_stress bucket;
+// an unknown non-empty key is rejected (401) so garbage can't write into
+// a shared tenant.
 func apiKeyAuth(r *http.Request) (string, bool) {
 	auth := r.Header.Get("Authorization")
 	if auth == "" || !strings.HasPrefix(auth, "Bearer ") {
@@ -250,7 +307,7 @@ func apiKeyAuth(r *http.Request) (string, bool) {
 	var dbID string
 	err := db.QueryRow("SELECT db_id FROM databases WHERE api_key = ?", key).Scan(&dbID)
 	if err != nil {
-		return "db_stress", true
+		return "", false
 	}
 	return dbID, true
 }
@@ -268,48 +325,73 @@ func initDB(path string) error {
 	db.SetMaxIdleConns(1)
 	db.SetConnMaxLifetime(0)
 
-	_, err = db.Exec(`
-		CREATE TABLE IF NOT EXISTS users (
-			id            INTEGER PRIMARY KEY AUTOINCREMENT,
-			email         TEXT UNIQUE NOT NULL,
-			password_hash TEXT NOT NULL,
-			created_at    INTEGER DEFAULT (unixepoch())
-		);
-		CREATE TABLE IF NOT EXISTS databases (
-			db_id     TEXT PRIMARY KEY,
-			user_id   INTEGER NOT NULL REFERENCES users(id),
-			name      TEXT NOT NULL,
-			api_key   TEXT UNIQUE NOT NULL,
-			created_at INTEGER DEFAULT (unixepoch())
-		);
-		CREATE TABLE IF NOT EXISTS wal_entries (
-			lsn         INTEGER PRIMARY KEY AUTOINCREMENT,
-			db_id       TEXT NOT NULL REFERENCES databases(db_id),
-			ts          INTEGER NOT NULL,
-			op          INTEGER NOT NULL,
-			table_id    INTEGER NOT NULL,
-			pk          INTEGER NOT NULL,
-			sql         TEXT,
-			received_at INTEGER DEFAULT (unixepoch())
-		);
-		CREATE INDEX IF NOT EXISTS idx_wal_db ON wal_entries(db_id, lsn);
-		CREATE TABLE IF NOT EXISTS snapshots (
-			id           INTEGER PRIMARY KEY AUTOINCREMENT,
-			db_id        TEXT NOT NULL REFERENCES databases(db_id),
-			baseline_lsn INTEGER NOT NULL,
-			s3_key       TEXT NOT NULL,
-			created_at   INTEGER DEFAULT (unixepoch())
-		);
-		CREATE TABLE IF NOT EXISTS chunks (
-			id         INTEGER PRIMARY KEY AUTOINCREMENT,
-			db_id      TEXT NOT NULL REFERENCES databases(db_id),
-			lsn_start  INTEGER NOT NULL,
-			lsn_end    INTEGER NOT NULL,
-			s3_key     TEXT NOT NULL,
-			created_at  INTEGER DEFAULT (unixepoch())
-		);
-	`)
+	_, err = db.Exec(schemaSQL)
 	return err
+}
+
+// ── Monitoring counters ─────────────────────────────────────────────
+
+// recordActivity bumps a database's monitoring counters. Called from
+// every authenticated client interaction (WAL push, upload, hydrate,
+// snapshot register) so the dashboard can show liveness and volume.
+// Failures are logged, never fatal — monitoring must not break the
+// control-plane data path.
+func recordActivity(dbID string, entries, bytes int64) {
+	now := time.Now().Unix()
+	day := dayBucket(now)
+	mu.Lock()
+	defer mu.Unlock()
+	_, err := db.Exec(`
+		INSERT INTO db_stats (db_id, last_seen, total_entries, today, entries_today, bytes_today, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(db_id) DO UPDATE SET
+			last_seen     = excluded.last_seen,
+			total_entries = total_entries + excluded.total_entries,
+			today         = excluded.today,
+			entries_today = CASE WHEN today = excluded.today
+			                 THEN entries_today + excluded.entries_today
+			                 ELSE excluded.entries_today END,
+			bytes_today   = CASE WHEN today = excluded.today
+			                 THEN bytes_today + excluded.bytes_today
+			                 ELSE excluded.bytes_today END,
+			updated_at    = excluded.updated_at`,
+		dbID, now, entries, day, entries, bytes, now)
+	if err != nil {
+		log.Printf("recordActivity(%s): %v", dbID, err)
+		return
+	}
+	if entries > 0 {
+		_, err = db.Exec(`
+			INSERT INTO db_daily_stats (db_id, day, entries, bytes)
+			VALUES (?, ?, ?, ?)
+			ON CONFLICT(db_id, day) DO UPDATE SET
+				entries = entries + excluded.entries,
+				bytes   = bytes + excluded.bytes`,
+			dbID, day, entries, bytes)
+		if err != nil {
+			log.Printf("recordDaily(%s): %v", dbID, err)
+		}
+	}
+}
+
+// dbStatus classifies replication health from the last-seen timestamp.
+//   active — seen within the last 5 minutes (currently shipping)
+//   stale  — seen within the last 24 hours (stopped shipping recently)
+//   quiet  — not seen for over 24 hours
+//   never  — no activity ever recorded
+func dbStatus(lastSeen, now int64) string {
+	if lastSeen == 0 {
+		return "never"
+	}
+	d := now - lastSeen
+	switch {
+	case d <= 5*60:
+		return "active"
+	case d <= 24*3600:
+		return "stale"
+	default:
+		return "quiet"
+	}
 }
 
 // ── Signed URL ──────────────────────────────────────────────────────
@@ -626,7 +708,14 @@ func handleWALPush(w http.ResponseWriter, r *http.Request) {
 	tx.Commit()
 	mu.Unlock()
 
-	// Stream log chunk directly into MinIO S3 bucket
+	// Update monitoring counters (best-effort, after commit).
+	recordActivity(dbID, int64(len(entries)), int64(len(body)))
+
+	// Mirror the push body to object storage as a raw log chunk. This is a
+	// best-effort convenience copy for audit — the authoritative store is
+	// wal_entries above, so an unreachable object store must not turn a
+	// committed push into a 500 (which would make the client retry and
+	// duplicate). Failures are logged instead.
 	payloadID := r.Header.Get("X-Arkilian-Payload-Id")
 	chunkName := fmt.Sprintf("wal_%d.sql", time.Now().UnixNano())
 	if payloadID != "" {
@@ -638,15 +727,15 @@ func handleWALPush(w http.ResponseWriter, r *http.Request) {
 	if err == nil {
 		req.Header.Set("Content-Type", "text/plain")
 		resp, err := http.DefaultClient.Do(req)
-		if err != nil || (resp != nil && resp.StatusCode >= 300) {
+		if err != nil {
+			log.Printf("S3 WAL mirror upload error for db %s: %v", dbID, err)
 			if resp != nil {
 				resp.Body.Close()
 			}
-			log.Printf("S3 WAL upload error for db %s: %v", dbID, err)
-			http.Error(w, `{"error":"s3 upload failed"}`, http.StatusInternalServerError)
-			return
-		}
-		if resp != nil {
+		} else {
+			if resp.StatusCode >= 300 {
+				log.Printf("S3 WAL mirror upload rejected for db %s: HTTP %d", dbID, resp.StatusCode)
+			}
 			resp.Body.Close()
 		}
 	}
@@ -682,6 +771,7 @@ func handleUploadRequest(w http.ResponseWriter, r *http.Request) {
 	}
 
 	putURL, expires := signedURL("PUT", key, 10*time.Minute)
+	recordActivity(dbID, 0, 0)
 	resp := UploadResponse{UploadURL: putURL, ExpiresAt: expires}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -741,6 +831,7 @@ func handleHydratePlan(w http.ResponseWriter, r *http.Request) {
 		ExpiresAt:   snapExpires,
 		Chunks:      chunks,
 	}
+	recordActivity(dbID, 0, 0)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
 }
@@ -771,6 +862,7 @@ func handleSnapshotRegister(w http.ResponseWriter, r *http.Request) {
 	db.Exec(`INSERT INTO snapshots (db_id, baseline_lsn, s3_key) VALUES (?, ?, ?)`,
 		dbID, req.BaselineLSN, req.S3Key)
 	mu.Unlock()
+	recordActivity(dbID, 0, 0)
 
 	w.Header().Set("Content-Type", "application/json")
 	w.Write([]byte(`{"ok":true}`))
@@ -792,6 +884,153 @@ func handleWALCount(w http.ResponseWriter, r *http.Request) {
 	db.QueryRow("SELECT COUNT(*) FROM wal_entries WHERE db_id = ?", dbID).Scan(&count)
 	w.Header().Set("Content-Type", "application/json")
 	fmt.Fprintf(w, `{"count":%d}`, count)
+}
+
+// ── Monitoring (session auth) ───────────────────────────────────────
+
+// queryDBStats assembles the dashboard summary for one database.
+func queryDBStats(dbID string) (MonitorDB, bool) {
+	var m MonitorDB
+	err := db.QueryRow(`
+		SELECT d.db_id, d.name, d.created_at,
+		       COALESCE(s.last_seen, 0), COALESCE(s.total_entries, 0),
+		       COALESCE(s.entries_today, 0), COALESCE(s.bytes_today, 0)
+		FROM databases d
+		LEFT JOIN db_stats s ON s.db_id = d.db_id
+		WHERE d.db_id = ?`, dbID).Scan(&m.DBID, &m.Name, &m.CreatedAt,
+		&m.LastSeen, &m.TotalEntries, &m.EntriesToday, &m.BytesToday)
+	if err != nil {
+		return m, false
+	}
+	db.QueryRow("SELECT COUNT(*) FROM snapshots WHERE db_id = ?", dbID).Scan(&m.Snapshots)
+	db.QueryRow("SELECT COUNT(*) FROM chunks WHERE db_id = ?", dbID).Scan(&m.Chunks)
+	m.Status = dbStatus(m.LastSeen, time.Now().Unix())
+
+	rows, err := db.Query(
+		"SELECT day, entries FROM db_daily_stats WHERE db_id = ? ORDER BY day DESC LIMIT 7", dbID)
+	if err == nil {
+		for rows.Next() {
+			var p DailyPoint
+			if rows.Scan(&p.Day, &p.Entries) == nil {
+				m.Last7 = append(m.Last7, p)
+			}
+		}
+		rows.Close()
+	}
+	return m, true
+}
+
+func handleMonitorSummary(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	userID, ok := sessionAuth(r)
+	if !ok {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+
+	// Collect db_ids first and close the rows before querying per-db
+	// stats — with MaxOpenConns(1), an open rows holds the only
+	// connection and per-db queries would deadlock on it.
+	dbIDs := make([]string, 0)
+	rows, err := db.Query(
+		"SELECT db_id FROM databases WHERE user_id = ? ORDER BY created_at DESC", userID)
+	if err != nil {
+		http.Error(w, "db error", http.StatusInternalServerError)
+		return
+	}
+	for rows.Next() {
+		var dbID string
+		if rows.Scan(&dbID) == nil {
+			dbIDs = append(dbIDs, dbID)
+		}
+	}
+	rows.Close()
+
+	out := make([]MonitorDB, 0, len(dbIDs))
+	for _, dbID := range dbIDs {
+		if m, ok := queryDBStats(dbID); ok {
+			out = append(out, m)
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(out)
+}
+
+func handleMonitorDetail(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	userID, ok := sessionAuth(r)
+	if !ok {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+
+	dbID := strings.TrimPrefix(r.URL.Path, "/v1/monitor/db/")
+	if dbID == "" {
+		http.Error(w, `{"error":"db_id required"}`, http.StatusBadRequest)
+		return
+	}
+
+	var owner int64
+	err := db.QueryRow("SELECT user_id FROM databases WHERE db_id = ?", dbID).Scan(&owner)
+	if err != nil || owner != userID {
+		http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
+		return
+	}
+
+	m, _ := queryDBStats(dbID)
+	detail := MonitorDetail{
+		MonitorDB:     m,
+		Daily:         make([]DailyPoint, 0),
+		RecentEntries: make([]RecentWAL, 0),
+		Snapshots:     make([]SnapshotInfo, 0),
+	}
+
+	drows, err := db.Query(
+		"SELECT day, entries, bytes FROM db_daily_stats WHERE db_id = ? ORDER BY day DESC LIMIT 14", dbID)
+	if err == nil {
+		for drows.Next() {
+			var p DailyPoint
+			if drows.Scan(&p.Day, &p.Entries, &p.Bytes) == nil {
+				detail.Daily = append(detail.Daily, p)
+			}
+		}
+		drows.Close()
+	}
+
+	erows, err := db.Query(`
+		SELECT lsn, ts, op, table_id, pk, sql, received_at FROM wal_entries
+		WHERE db_id = ? ORDER BY lsn DESC LIMIT 20`, dbID)
+	if err == nil {
+		for erows.Next() {
+			var e RecentWAL
+			if erows.Scan(&e.LSN, &e.TS, &e.Op, &e.TableID, &e.PK, &e.SQL, &e.ReceivedAt) == nil {
+				detail.RecentEntries = append(detail.RecentEntries, e)
+			}
+		}
+		erows.Close()
+	}
+
+	srows, err := db.Query(
+		"SELECT baseline_lsn, s3_key, created_at FROM snapshots WHERE db_id = ? ORDER BY created_at DESC LIMIT 10", dbID)
+	if err == nil {
+		for srows.Next() {
+			var s SnapshotInfo
+			if srows.Scan(&s.BaselineLSN, &s.S3Key, &s.CreatedAt) == nil {
+				detail.Snapshots = append(detail.Snapshots, s)
+			}
+		}
+		srows.Close()
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(detail)
 }
 
 // ── Health ──────────────────────────────────────────────────────────
@@ -858,8 +1097,17 @@ func main() {
 	mux.HandleFunc("/v1/upload/request", handleUploadRequest)
 	mux.HandleFunc("/v1/hydrate/plan", handleHydratePlan)
 	mux.HandleFunc("/v1/snapshot/register", handleSnapshotRegister)
+	// Monitoring (session auth)
+	mux.HandleFunc("/v1/monitor/summary", handleMonitorSummary)
+	mux.HandleFunc("/v1/monitor/db/", handleMonitorDetail)
 	// Health
 	mux.HandleFunc("/health", handleHealth)
+	// Embedded tenant dashboard (plain HTML/JS, no build step)
+	dashSub, err := fs.Sub(dashboardFS, "dashboard")
+	if err != nil {
+		log.Fatalf("dashboard embed: %v", err)
+	}
+	mux.Handle("/", http.FileServer(http.FS(dashSub)))
 
 	srv := &http.Server{
 		Addr:         ":" + port,

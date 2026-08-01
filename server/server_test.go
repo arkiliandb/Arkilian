@@ -26,47 +26,7 @@ func setupTestDB(t *testing.T) {
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
 
-	_, err = db.Exec(`
-		CREATE TABLE IF NOT EXISTS users (
-			id            INTEGER PRIMARY KEY AUTOINCREMENT,
-			email         TEXT UNIQUE NOT NULL,
-			password_hash TEXT NOT NULL,
-			created_at    INTEGER DEFAULT (unixepoch())
-		);
-		CREATE TABLE IF NOT EXISTS databases (
-			db_id     TEXT PRIMARY KEY,
-			user_id   INTEGER NOT NULL REFERENCES users(id),
-			name      TEXT NOT NULL,
-			api_key   TEXT UNIQUE NOT NULL,
-			created_at INTEGER DEFAULT (unixepoch())
-		);
-		CREATE TABLE IF NOT EXISTS wal_entries (
-			lsn         INTEGER PRIMARY KEY AUTOINCREMENT,
-			db_id       TEXT NOT NULL REFERENCES databases(db_id),
-			ts          INTEGER NOT NULL,
-			op          INTEGER NOT NULL,
-			table_id    INTEGER NOT NULL,
-			pk          INTEGER NOT NULL,
-			sql         TEXT,
-			received_at INTEGER DEFAULT (unixepoch())
-		);
-		CREATE INDEX IF NOT EXISTS idx_wal_db ON wal_entries(db_id, lsn);
-		CREATE TABLE IF NOT EXISTS snapshots (
-			id           INTEGER PRIMARY KEY AUTOINCREMENT,
-			db_id        TEXT NOT NULL REFERENCES databases(db_id),
-			baseline_lsn INTEGER NOT NULL,
-			s3_key       TEXT NOT NULL,
-			created_at   INTEGER DEFAULT (unixepoch())
-		);
-		CREATE TABLE IF NOT EXISTS chunks (
-			id         INTEGER PRIMARY KEY AUTOINCREMENT,
-			db_id      TEXT NOT NULL REFERENCES databases(db_id),
-			lsn_start  INTEGER NOT NULL,
-			lsn_end    INTEGER NOT NULL,
-			s3_key     TEXT NOT NULL,
-			created_at  INTEGER DEFAULT (unixepoch())
-		);
-	`)
+	_, err = db.Exec(schemaSQL)
 	if err != nil {
 		t.Fatalf("create schema: %v", err)
 	}
@@ -406,6 +366,186 @@ func TestDBManagementRequiresSession(t *testing.T) {
 	handleDBCreate(w, req)
 	if w.Code != 401 {
 		t.Fatalf("expected 401, got %d", w.Code)
+	}
+}
+
+// ── Monitoring ──────────────────────────────────────────────────────
+
+func TestWALPushUpdatesMonitorStats(t *testing.T) {
+	setupTestDB(t)
+	defer db.Close()
+
+	token := registerAndLogin(t)
+	dbID, apiKey := createDB(t, token, "stats-db")
+
+	entries := `[
+		{"ts":100,"op":1,"table_id":1,"pk":1,"sql":"INSERT INTO t VALUES (1)"},
+		{"ts":101,"op":1,"table_id":1,"pk":2,"sql":"INSERT INTO t VALUES (2)"}
+	]`
+	req := httptest.NewRequest("POST", "/v1/wal/push", strings.NewReader(entries))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	w := httptest.NewRecorder()
+	handleWALPush(w, req)
+	if w.Code != 200 {
+		t.Fatalf("wal push: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var total, today int64
+	var lastSeen int64
+	err := db.QueryRow(
+		"SELECT total_entries, entries_today, last_seen FROM db_stats WHERE db_id = ?",
+		dbID).Scan(&total, &today, &lastSeen)
+	if err != nil {
+		t.Fatalf("db_stats row missing after push: %v", err)
+	}
+	if total != 2 || today != 2 {
+		t.Fatalf("expected total=2 today=2, got total=%d today=%d", total, today)
+	}
+	if lastSeen == 0 {
+		t.Fatal("expected last_seen to be set after push")
+	}
+
+	// Daily series must contain today's bucket.
+	var dayEntries int64
+	err = db.QueryRow(
+		"SELECT entries FROM db_daily_stats WHERE db_id = ? AND day = ?",
+		dbID, dayBucket(lastSeen)).Scan(&dayEntries)
+	if err != nil || dayEntries != 2 {
+		t.Fatalf("daily stats: expected 2 entries today, got %d (err=%v)", dayEntries, err)
+	}
+}
+
+func TestMonitorSummary(t *testing.T) {
+	setupTestDB(t)
+	defer db.Close()
+
+	token := registerAndLogin(t)
+	dbID, apiKey := createDB(t, token, "monitor-db")
+
+	req := httptest.NewRequest("POST", "/v1/wal/push",
+		strings.NewReader(`{"ts":1,"op":1,"table_id":1,"pk":1,"sql":"INSERT"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	w := httptest.NewRecorder()
+	handleWALPush(w, req)
+	if w.Code != 200 {
+		t.Fatalf("wal push: %d", w.Code)
+	}
+
+	req = httptest.NewRequest("GET", "/v1/monitor/summary", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	w = httptest.NewRecorder()
+	handleMonitorSummary(w, req)
+	if w.Code != 200 {
+		t.Fatalf("summary: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var dbs []MonitorDB
+	json.NewDecoder(w.Body).Decode(&dbs)
+	if len(dbs) != 1 {
+		t.Fatalf("expected 1 database in summary, got %d", len(dbs))
+	}
+	d := dbs[0]
+	if d.DBID != dbID || d.Name != "monitor-db" {
+		t.Fatalf("summary mismatch: %+v", d)
+	}
+	if d.TotalEntries != 1 || d.EntriesToday != 1 {
+		t.Fatalf("expected total=1 today=1, got total=%d today=%d", d.TotalEntries, d.EntriesToday)
+	}
+	if d.Status != "active" {
+		t.Fatalf("expected status active after push, got %q", d.Status)
+	}
+	if len(d.Last7) != 1 {
+		t.Fatalf("expected 1 daily point in last7, got %d", len(d.Last7))
+	}
+}
+
+func TestMonitorDetail(t *testing.T) {
+	setupTestDB(t)
+	defer db.Close()
+
+	token := registerAndLogin(t)
+	dbID, apiKey := createDB(t, token, "detail-db")
+
+	req := httptest.NewRequest("POST", "/v1/wal/push",
+		strings.NewReader(`[{"ts":1,"op":1,"table_id":1,"pk":1,"sql":"INSERT INTO t VALUES (1)"},{"ts":2,"op":2,"table_id":2,"pk":7,"sql":"UPDATE t SET v=2 WHERE id=7"}]`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	w := httptest.NewRecorder()
+	handleWALPush(w, req)
+	if w.Code != 200 {
+		t.Fatalf("wal push: %d", w.Code)
+	}
+
+	req = httptest.NewRequest("GET", "/v1/monitor/db/"+dbID, nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	w = httptest.NewRecorder()
+	handleMonitorDetail(w, req)
+	if w.Code != 200 {
+		t.Fatalf("detail: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var d MonitorDetail
+	json.NewDecoder(w.Body).Decode(&d)
+	if d.DBID != dbID {
+		t.Fatalf("detail db_id mismatch: %s", d.DBID)
+	}
+	if len(d.RecentEntries) != 2 {
+		t.Fatalf("expected 2 recent entries, got %d", len(d.RecentEntries))
+	}
+	if d.RecentEntries[0].SQL != "UPDATE t SET v=2 WHERE id=7" {
+		t.Fatalf("expected newest entry first, got %q", d.RecentEntries[0].SQL)
+	}
+	if len(d.Daily) != 1 {
+		t.Fatalf("expected 1 daily point, got %d", len(d.Daily))
+	}
+}
+
+func TestMonitorRequiresSession(t *testing.T) {
+	setupTestDB(t)
+	defer db.Close()
+
+	req := httptest.NewRequest("GET", "/v1/monitor/summary", nil)
+	w := httptest.NewRecorder()
+	handleMonitorSummary(w, req)
+	if w.Code != 401 {
+		t.Fatalf("summary without auth: expected 401, got %d", w.Code)
+	}
+
+	req = httptest.NewRequest("GET", "/v1/monitor/db/db_x", nil)
+	w = httptest.NewRecorder()
+	handleMonitorDetail(w, req)
+	if w.Code != 401 {
+		t.Fatalf("detail without auth: expected 401, got %d", w.Code)
+	}
+}
+
+func TestMonitorDetailWrongUser(t *testing.T) {
+	setupTestDB(t)
+	defer db.Close()
+
+	token1 := registerAndLogin(t)
+	dbID, _ := createDB(t, token1, "user1-db")
+
+	body := `{"email":"user2@test.com","password":"secret123"}`
+	req := httptest.NewRequest("POST", "/v1/auth/register", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	handleRegister(w, req)
+	req = httptest.NewRequest("POST", "/v1/auth/login", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w = httptest.NewRecorder()
+	handleLogin(w, req)
+	var lr LoginResponse
+	json.NewDecoder(w.Body).Decode(&lr)
+
+	req = httptest.NewRequest("GET", "/v1/monitor/db/"+dbID, nil)
+	req.Header.Set("Authorization", "Bearer "+lr.Token)
+	w = httptest.NewRecorder()
+	handleMonitorDetail(w, req)
+	if w.Code != 404 {
+		t.Fatalf("detail as wrong user: expected 404, got %d", w.Code)
 	}
 }
 

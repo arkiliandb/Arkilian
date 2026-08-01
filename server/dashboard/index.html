@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Arkilian Control — Tenant Dashboard</title>
+<link rel="stylesheet" href="style.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%234f8cff'/%3E%3Cpath d='M9 23V9h4.2v9.8H22V23z' fill='%230b0e14'/%3E%3C/svg%3E">
+</head>
+<body>
+
+<!-- ── Login view ── -->
+<div id="view-login" class="view hidden">
+  <form id="login-form" class="card login-card" autocomplete="on">
+    <div class="logo">A</div>
+    <h1>Arkilian <span>Control</span></h1>
+    <p class="sub">Tenant monitoring dashboard</p>
+    <label>Email
+      <input id="login-email" type="email" autocomplete="username" required>
+    </label>
+    <label>Password
+      <input id="login-password" type="password" autocomplete="current-password" required>
+    </label>
+    <p id="login-error" class="error hidden"></p>
+    <button type="submit">Sign in</button>
+    <p class="foot">Replication health for your databases — shipped, applied, protected.</p>
+  </form>
+</div>
+
+<!-- ── Dashboard view ── -->
+<div id="view-dash" class="view hidden">
+  <header class="topbar">
+    <div class="brand"><span class="logo sm">A</span> Arkilian <span>Control</span></div>
+    <div class="topbar-right">
+      <span id="user-email" class="muted mono"></span>
+      <button id="logout-btn" class="ghost" type="button">Sign out</button>
+    </div>
+  </header>
+
+  <main>
+    <section class="cards">
+      <div class="card stat">
+        <div class="stat-num" id="stat-dbs">–</div>
+        <div class="stat-label">Databases</div>
+      </div>
+      <div class="card stat">
+        <div class="stat-num" id="stat-active">–</div>
+        <div class="stat-label">Active now</div>
+      </div>
+      <div class="card stat">
+        <div class="stat-num" id="stat-today">–</div>
+        <div class="stat-label">Entries today</div>
+      </div>
+      <div class="card stat">
+        <div class="stat-num" id="stat-total">–</div>
+        <div class="stat-label">Total entries</div>
+      </div>
+    </section>
+
+    <!-- Overview -->
+    <section id="view-overview">
+      <div class="panel card">
+        <div class="panel-head">
+          <h2>Databases</h2>
+          <span id="last-refresh" class="muted"></span>
+        </div>
+        <div class="table-wrap">
+          <table id="db-table">
+            <thead>
+              <tr>
+                <th>Name</th>
+                <th>Status</th>
+                <th>Entries today</th>
+                <th>Total</th>
+                <th>Last seen</th>
+                <th>Snapshots</th>
+                <th>Last 7 days</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <p id="empty-state" class="muted empty hidden">
+          No databases yet. Create one from your application with
+          <code>POST /v1/db/create</code>, then push WAL entries with the returned api_key.
+        </p>
+      </div>
+    </section>
+
+    <!-- Detail -->
+    <section id="view-detail" class="hidden">
+      <button id="back-btn" class="ghost" type="button">&larr; All databases</button>
+      <div class="panel card">
+        <div class="panel-head wrap">
+          <div>
+            <h2 id="detail-name">–</h2>
+            <span id="detail-id" class="mono muted"></span>
+          </div>
+          <span id="detail-status" class="badge"></span>
+        </div>
+
+        <div class="cards">
+          <div class="card stat">
+            <div class="stat-num" id="detail-total">–</div>
+            <div class="stat-label">Total entries</div>
+          </div>
+          <div class="card stat">
+            <div class="stat-num" id="detail-today">–</div>
+            <div class="stat-label" id="detail-today-label">Entries today</div>
+          </div>
+          <div class="card stat">
+            <div class="stat-num" id="detail-snap">–</div>
+            <div class="stat-label">Snapshots</div>
+          </div>
+          <div class="card stat">
+            <div class="stat-num" id="detail-chunks">–</div>
+            <div class="stat-label">Chunks</div>
+          </div>
+        </div>
+
+        <h3>Entries — last 14 days</h3>
+        <div id="chart-14d" class="chart"></div>
+
+        <h3>Recent WAL entries</h3>
+        <div class="table-wrap">
+          <table id="entries-table">
+            <thead>
+              <tr><th>LSN</th><th>Received</th><th>Op</th><th>Table</th><th>PK</th><th>SQL</th></tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+
+        <h3>Snapshots</h3>
+        <div class="table-wrap">
+          <table id="snap-table">
+            <thead>
+              <tr><th>Baseline LSN</th><th>S3 key</th><th>Created</th></tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>
