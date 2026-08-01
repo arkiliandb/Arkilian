@@ -138,7 +138,7 @@ int main(int argc, char **argv) {
   // 1. Capture phase.
   if (db_exec(db, "CREATE TABLE IF NOT EXISTS e2e ("
                   " id INTEGER PRIMARY KEY AUTOINCREMENT,"
-                  " user_id INT NOT NULL, payload TEXT NOT NULL, ts INT NOT NULL)") != SQLITE_DONE) {
+                  " user_id INT NOT NULL, payload TEXT NOT NULL, ts INT NOT NULL)") != SQLITE_OK) {
     fprintf(stderr, "FAIL: create table\n");
     return 1;
   }
@@ -152,7 +152,7 @@ int main(int argc, char **argv) {
       snprintf(sql, sizeof(sql),
                "INSERT INTO e2e (user_id, payload, ts) VALUES (%d, 'e2e-%d', %ld)",
                written % 1000, written, (long)time(NULL));
-      if (db_exec(db, sql) != SQLITE_DONE) {
+      if (db_exec(db, sql) != SQLITE_OK) {
         fprintf(stderr, "FAIL: insert %d: %s\n", written, db_errmsg(db));
         return 1;
       }

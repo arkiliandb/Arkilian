@@ -98,7 +98,7 @@ static void test_errmsg_no_error(void) {
 static void test_errmsg_after_bad_sql(void) {
   arkilian *db = open_test_db();
   int rc = db_exec(db, "THIS IS NOT SQL");
-  assert(rc != SQLITE_DONE);
+  assert(rc != SQLITE_OK);
   const char *msg = db_errmsg(db);
   assert(msg != NULL);
   assert(strlen(msg) > 0);
@@ -113,7 +113,7 @@ static void test_errmsg_after_bad_sql(void) {
 static void test_exec_create_table(void) {
   arkilian *db = open_test_db();
   int rc = db_exec(db, "CREATE TABLE t1 (id INTEGER PRIMARY KEY, name TEXT)");
-  assert(rc == SQLITE_DONE);
+  assert(rc == SQLITE_OK);
   db_close(db);
   cleanup_files();
 }
@@ -122,7 +122,7 @@ static void test_exec_insert(void) {
   arkilian *db = open_test_db();
   db_exec(db, "CREATE TABLE t1 (id INTEGER PRIMARY KEY, name TEXT)");
   int rc = db_exec(db, "INSERT INTO t1 (name) VALUES ('hello')");
-  assert(rc == SQLITE_DONE);
+  assert(rc == SQLITE_OK);
   db_close(db);
   cleanup_files();
 }
@@ -130,7 +130,7 @@ static void test_exec_insert(void) {
 static void test_exec_invalid_sql_returns_error(void) {
   arkilian *db = open_test_db();
   int rc = db_exec(db, "DROP TABLE nonexistent_table_xyz");
-  assert(rc != SQLITE_DONE);
+  assert(rc != SQLITE_OK);
   db_close(db);
   cleanup_files();
 }

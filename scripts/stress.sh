@@ -88,7 +88,10 @@ run_in_work() { (cd "$WORK" && "$@"); }
 
 log "Phase 0: building binaries"
 cd "$ROOT"
-cc -O2 -c src/deps/sqlite/sqlite3.c -Isrc -Isrc/deps/sqlite -o "$BIN/sqlite3.o"
+# FTS5 ships inside the amalgamation; enabled for the whole build so the
+# virtual-table regression test links against the same object.
+cc -O2 -c src/deps/sqlite/sqlite3.c -Isrc -Isrc/deps/sqlite \
+   -DSQLITE_ENABLE_FTS5 -o "$BIN/sqlite3.o"
 build_c test_basic       tests/test_basic.c
 build_c test_interception tests/test_interception.c
 build_c test_regressions tests/test_regressions.c
@@ -97,16 +100,18 @@ build_c test_kill_switch tests/test_kill_switch.c
 build_c test_load_contention tests/test_load_contention.c
 build_c test_kill_resilience tests/test_kill_resilience.c
 build_c test_monitoring    tests/test_monitoring.c
+build_c test_virtual_tables tests/test_virtual_tables.c "-DSQLITE_ENABLE_FTS5"
 build_c test_e2e_stress tests/test_e2e_stress.c
 build_c stress_200m      tests/stress_200m.c
 cc -O2 tools/arkilian-dlq.c "$BIN/sqlite3.o" -Isrc -Isrc/deps/sqlite -o "$BIN/arkilian-dlq"
-ok "10 binaries built"
+ok "11 binaries built"
 
 # ── Phase 1: local test suites ──────────────────────────────────────
 
 log "Phase 1: local C test suites"
 for t in test_basic test_interception test_regressions test_deterministic \
-         test_kill_switch test_load_contention test_kill_resilience test_monitoring; do
+         test_kill_switch test_load_contention test_kill_resilience \
+         test_monitoring test_virtual_tables; do
   if run_in_work "$BIN/$t" > "$WORK/$t.log" 2>&1; then
     ok "$t"
   else

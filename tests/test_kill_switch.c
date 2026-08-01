@@ -175,8 +175,8 @@ static void test_disabled_at_startup(void) {
   assert(db_backup_is_enabled(db) == 0);
 
   // Game runs correctly with the backup subsystem disabled (§10.7).
-  assert(db_exec(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)") == SQLITE_DONE);
-  assert(db_exec(db, "INSERT INTO t (v) VALUES ('x')") == SQLITE_DONE);
+  assert(db_exec(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)") == SQLITE_OK);
+  assert(db_exec(db, "INSERT INTO t (v) VALUES ('x')") == SQLITE_OK);
   db_prepare(db, "SELECT COUNT(*) FROM t");
   assert(db_step(db) == SQLITE_ROW);
   assert(db_column_int(db, 0) == 1);
@@ -209,13 +209,13 @@ static void test_runtime_kill_switch(void) {
   arkilian *db = NULL;
   assert(db_init(&db, "test_ks_toggle.db") == 0);
   assert(db_backup_is_enabled(db) == 1);
-  assert(db_exec(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)") == SQLITE_DONE);
+  assert(db_exec(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)") == SQLITE_OK);
 
   // Phase 1 — enabled: rows ship, queue drains, destination receives them.
   for (int i = 0; i < 5; i++) {
     char sql[128];
     snprintf(sql, sizeof(sql), "INSERT INTO t (v) VALUES ('row%d')", i);
-    assert(db_exec(db, sql) == SQLITE_DONE);
+    assert(db_exec(db, sql) == SQLITE_OK);
   }
   assert(wait_queue_empty(db, 10000) == 0);
   int shipped_enabled = srv.requests;
@@ -234,7 +234,7 @@ static void test_runtime_kill_switch(void) {
   for (int i = 0; i < 5; i++) {
     char sql[128];
     snprintf(sql, sizeof(sql), "INSERT INTO t (v) VALUES ('off%d')", i);
-    assert(db_exec(db, sql) == SQLITE_DONE);
+    assert(db_exec(db, sql) == SQLITE_OK);
   }
   int baseline = srv.requests; // thread confirmed asleep: nothing in flight
   sleep(3); // > poll interval

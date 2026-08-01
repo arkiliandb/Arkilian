@@ -166,3 +166,32 @@ destination is configured.
 | `ARKILIAN_DB_PATH` / `ARKILIAN_BACKUP_PATH` | Database and snapshot file paths |
 
 Real environment variables always win over a `./.env` file.
+
+## 7. Design decisions (reviewed, spec §8.1 / §11)
+
+- **Payload format is replayable SQL text, not JSON.** The spec's §6 JSON
+  sketch (`{id, table, op, data}`) was a suggestion; the shipped format is
+  the SQL statement itself (`REPLACE INTO "t" (...) VALUES (...)` /
+  `DELETE FROM "t" WHERE rowid = ...`), which any SQLite can apply
+  directly. One format, one destination. The deduplication key is the
+  `X-Arkilian-Payload-Id` header, not an `id` field in the body — the
+  destination MUST dedupe on that header (the bundled control plane
+  does).
+- **Ordering is strict** (§8.1): the drain stops on a retryable failure
+  so the first unshipped row is always retried first. If your destination
+  doesn't need ordering, skip-and-continue is the higher-throughput
+  alternative — change it deliberately, not by accident.
+- **Wake hook takes a mutex on the game thread.** This deviates from
+  §5's lock-free sketch to eliminate the lost-wakeup race; the cost is an
+  uncontended ~20 ns lock. The load-contention suite (spec §10.3) runs
+  the game write path under a 20 ms/destination backup load and measures
+  P99 write latency ≈ 0.6 ms (vs 1.3 ms baseline) — no measurable
+  impact. Re-benchmark before changing it.
+- **`db_close` aborts in-flight transfers** via a libcurl progress
+  callback that observes the shutdown flag — shutdown never waits out a
+  full 10 s/30 s curl timeout.
+- **Init never fails on backup errors** (spec §0/§1): WAL failure,
+  trigger-sync failure, or thread-creation failure logs loudly and drops
+  the subsystem into the kill-switch's disabled state — the game always
+  starts. `db_backup_is_enabled()` + `db_backup_is_healthy()` + the
+  monitoring signals make the outage visible.

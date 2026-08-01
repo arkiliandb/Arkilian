@@ -177,7 +177,7 @@ static void *writer_main(void *arg) {
     double t0 = now_ms();
     int rc = db_exec(w->db, sql);
     w->latencies[i] = now_ms() - t0;
-    if (rc != SQLITE_DONE) {
+    if (rc != SQLITE_OK) {
       fprintf(stderr, "writer: insert failed rc=%d: %s\n", rc, db_errmsg(w->db));
       w->latencies[i] = -1.0;
     }
@@ -211,7 +211,7 @@ static void test_load_contention(void) {
 
   arkilian *db = NULL;
   assert(db_init(&db, "test_load.db") == 0);
-  assert(db_exec(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)") == SQLITE_DONE);
+  assert(db_exec(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)") == SQLITE_OK);
 
   // Baseline: latency with no backup pressure (already shipped rows drain
   // meanwhile, but the flush thread is idle after the first pass).

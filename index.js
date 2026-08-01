@@ -92,7 +92,8 @@ class Arkilian {
   exec(sql) {
     const query = typeof sql === "object" && sql !== null ? sql.sql : sql;
     const result = native.db_exec(this.id, query);
-    if (result !== SQLITE_OK && result !== SQLITE_DONE) {
+    // db_exec's public contract is SQLITE_OK on success.
+    if (result !== SQLITE_OK) {
       throw new Error(native.db_errmsg(this.id));
     }
     return result;

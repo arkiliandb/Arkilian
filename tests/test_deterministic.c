@@ -266,11 +266,11 @@ static void test_shipped_sql_can_be_replayed(void) {
 
   // Replay the shipped SQL — should be idempotent
   int rc1 = db_exec(db, shipped);
-  ASSERT(rc1 == SQLITE_DONE);
+  ASSERT(rc1 == SQLITE_OK);
 
   // Replay again — REPLACE should handle this
   int rc2 = db_exec(db, shipped);
-  ASSERT(rc2 == SQLITE_DONE);
+  ASSERT(rc2 == SQLITE_OK);
 
   // Verify only one row exists (REPLACE upserts)
   db_prepare(db, "SELECT COUNT(*) FROM t");

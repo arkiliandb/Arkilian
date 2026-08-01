@@ -70,9 +70,9 @@ static void test_queue_depth_and_oldest_age(void) {
   setenv("ARKILIAN_WAL_PUSH_URL", "http://127.0.0.1:1", 1); // failing dest
   arkilian *db = NULL;
   assert(db_init(&db, "test_mon_depth.db") == 0);
-  assert(db_exec(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)") == SQLITE_DONE);
-  assert(db_exec(db, "INSERT INTO t (v) VALUES ('a')") == SQLITE_DONE);
-  assert(db_exec(db, "INSERT INTO t (v) VALUES ('b')") == SQLITE_DONE);
+  assert(db_exec(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)") == SQLITE_OK);
+  assert(db_exec(db, "INSERT INTO t (v) VALUES ('a')") == SQLITE_OK);
+  assert(db_exec(db, "INSERT INTO t (v) VALUES ('b')") == SQLITE_OK);
 
   int depth = db_backup_queue_depth(db);
   assert(depth >= 3); // DDL + 2 inserts, none shipped (failing dest)
@@ -99,10 +99,10 @@ static void test_dead_letter_count(void) {
   // this after MAX_ATTEMPTS — no need to wait 20s of backoff here).
   assert(db_exec(db,
       "INSERT INTO _dead_backup (id, payload, attempts, failed_reason, created_at) "
-      "VALUES (99, 'REPLACE INTO \"t\" (\"a\") VALUES (1)', 10, 'max attempts exceeded', 0)") == SQLITE_DONE);
+      "VALUES (99, 'REPLACE INTO \"t\" (\"a\") VALUES (1)', 10, 'max attempts exceeded', 0)") == SQLITE_OK);
   assert(db_backup_dead_letter_count(db) == 1);
   assert(db_exec(db, "INSERT INTO _dead_backup (id, payload, attempts, failed_reason, created_at) "
-                     "VALUES (100, 'DELETE FROM \"t\" WHERE rowid = 3', 10, 'max attempts exceeded', 0)") == SQLITE_DONE);
+                     "VALUES (100, 'DELETE FROM \"t\" WHERE rowid = 3', 10, 'max attempts exceeded', 0)") == SQLITE_OK);
   assert(db_backup_dead_letter_count(db) == 2);
 
   db_close(db);
@@ -139,8 +139,8 @@ static void test_trigger_coverage_and_resync(void) {
   setenv("ARKILIAN_WAL_PUSH_URL", "http://127.0.0.1:1", 1);
   arkilian *db = NULL;
   assert(db_init(&db, "test_mon_trg.db") == 0);
-  assert(db_exec(db, "CREATE TABLE a (id INTEGER PRIMARY KEY)") == SQLITE_DONE);
-  assert(db_exec(db, "CREATE TABLE b (id INTEGER PRIMARY KEY, v TEXT)") == SQLITE_DONE);
+  assert(db_exec(db, "CREATE TABLE a (id INTEGER PRIMARY KEY)") == SQLITE_OK);
+  assert(db_exec(db, "CREATE TABLE b (id INTEGER PRIMARY KEY, v TEXT)") == SQLITE_OK);
 
   // 2 tables → 6 triggers; coverage must report 0 missing.
   assert(db_backup_trigger_coverage(db) == 0);
@@ -182,7 +182,7 @@ static void test_health(void) {
   for (int i = 0; i < 20; i++) {
     char sql[64];
     snprintf(sql, sizeof(sql), "INSERT INTO t (v) VALUES ('x%d')", i);
-    assert(db_exec(db, sql) == SQLITE_DONE);
+    assert(db_exec(db, sql) == SQLITE_OK);
   }
   int depth = db_backup_queue_depth(db);
   assert(depth >= 20);

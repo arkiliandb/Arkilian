@@ -289,13 +289,13 @@ static int child_entrypoint(int argc, char **argv) {
 
   arkilian *db = NULL;
   if (db_init(&db, db_path) != 0) return 2;
-  if (db_exec(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)") != SQLITE_DONE) return 2;
+  if (db_exec(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)") != SQLITE_OK) return 2;
 
   // Committed rows.
   for (int i = 0; i < CHILD_WRITES; i++) {
     char sql[128];
     snprintf(sql, sizeof(sql), "INSERT INTO t (v) VALUES ('committed-%d')", i);
-    if (db_exec(db, sql) != SQLITE_DONE) return 2;
+    if (db_exec(db, sql) != SQLITE_OK) return 2;
   }
 
   if (kill_mode == 0) {
@@ -304,7 +304,7 @@ static int child_entrypoint(int argc, char **argv) {
     for (int i = 0; i < 50; i++) {
       char sql[128];
       snprintf(sql, sizeof(sql), "INSERT INTO t (v) VALUES ('uncommitted-%d')", i);
-      if (db_exec(db, sql) != SQLITE_DONE) return 2;
+      if (db_exec(db, sql) != SQLITE_OK) return 2;
     }
     if (write(pipe_fd, "intxn\n", 6) != 6) return 2;
   } else {

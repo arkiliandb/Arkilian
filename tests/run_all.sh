@@ -36,6 +36,12 @@
                                                        -Isrc -Isrc/deps/sqlite -lcurl -lpthread -o test_monitoring
  ./test_monitoring
 
+ # Virtual-table tests (FTS5 must not break init — spec §0/§1)
+ cc tests/test_virtual_tables.c src/class.c src/deps/sqlite/sqlite3.c \
+                                                       -Isrc -Isrc/deps/sqlite -lcurl -lpthread \
+                                                       -DSQLITE_ENABLE_FTS5 -o test_virtual_tables
+ ./test_virtual_tables
+
  # Test hydration
  cc tests/test_hydration.c src/hydration.c \
                                     -Isrc -Isrc/deps/sqlite -lcurl -lsqlite3 -o test_hydration

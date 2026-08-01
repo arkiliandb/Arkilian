@@ -78,14 +78,14 @@ static int count_payloads(arkilian *db, const char *like_pattern) {
 static void test_without_rowid_delete_works(void) {
   arkilian *db = open_db("test_reg_worowid.db");
   int rc = db_exec(db, "CREATE TABLE wr (id TEXT PRIMARY KEY, v TEXT) WITHOUT ROWID");
-  assert(rc == SQLITE_DONE);
+  assert(rc == SQLITE_OK);
 
   rc = db_exec(db, "INSERT INTO wr (id, v) VALUES ('k1', 'hello')");
-  assert(rc == SQLITE_DONE);
+  assert(rc == SQLITE_OK);
 
   // Previously this FAILED at trigger fire time: "no such column: OLD.rowid"
   rc = db_exec(db, "DELETE FROM wr WHERE id = 'k1'");
-  assert(rc == SQLITE_DONE);
+  assert(rc == SQLITE_OK);
 
   // Row is actually gone
   db_prepare(db, "SELECT COUNT(*) FROM wr");
@@ -105,7 +105,7 @@ static void test_rowid_table_delete_payload_unchanged(void) {
   arkilian *db = open_db("test_reg_rowid.db");
   db_exec(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)");
   db_exec(db, "INSERT INTO t (v) VALUES ('x')");
-  assert(db_exec(db, "DELETE FROM t WHERE id = 1") == SQLITE_DONE);
+  assert(db_exec(db, "DELETE FROM t WHERE id = 1") == SQLITE_OK);
   assert(count_payloads(db, "DELETE FROM \"t\" WHERE rowid = %") >= 1);
   db_close(db);
   cleanup("test_reg_rowid.db");
@@ -118,10 +118,10 @@ static void test_keyword_table_name_gets_triggers(void) {
   // Previously the unquoted %w made sync fail and ROLLBACK the whole
   // backup infrastructure — _pending_backup wouldn't even exist.
   int rc = db_exec(db, "CREATE TABLE \"order\" (id INTEGER PRIMARY KEY, item TEXT)");
-  assert(rc == SQLITE_DONE);
+  assert(rc == SQLITE_OK);
 
   rc = db_exec(db, "INSERT INTO \"order\" (item) VALUES ('widget')");
-  assert(rc == SQLITE_DONE);
+  assert(rc == SQLITE_OK);
 
   int n = count_payloads(db, "REPLACE INTO \"order\" (%");
   assert(n >= 1);
@@ -136,8 +136,8 @@ static void test_keyword_table_name_gets_triggers(void) {
 
 static void test_table_name_with_spaces(void) {
   arkilian *db = open_db("test_reg_spaces.db");
-  assert(db_exec(db, "CREATE TABLE \"my table\" (id INTEGER PRIMARY KEY)") == SQLITE_DONE);
-  assert(db_exec(db, "INSERT INTO \"my table\" (id) VALUES (1)") == SQLITE_DONE);
+  assert(db_exec(db, "CREATE TABLE \"my table\" (id INTEGER PRIMARY KEY)") == SQLITE_OK);
+  assert(db_exec(db, "INSERT INTO \"my table\" (id) VALUES (1)") == SQLITE_OK);
   assert(count_payloads(db, "REPLACE INTO \"my table\"%") >= 1);
   db_close(db);
   cleanup("test_reg_spaces.db");
@@ -145,8 +145,8 @@ static void test_table_name_with_spaces(void) {
 
 static void test_generated_columns_excluded_from_payloads(void) {
   arkilian *db = open_db("test_reg_gen.db");
-  assert(db_exec(db, "CREATE TABLE g (a INT, b INT GENERATED ALWAYS AS (a * 2) VIRTUAL)") == SQLITE_DONE);
-  assert(db_exec(db, "INSERT INTO g (a) VALUES (21)") == SQLITE_DONE);
+  assert(db_exec(db, "CREATE TABLE g (a INT, b INT GENERATED ALWAYS AS (a * 2) VIRTUAL)") == SQLITE_OK);
+  assert(db_exec(db, "INSERT INTO g (a) VALUES (21)") == SQLITE_OK);
 
   // Payload must list only real columns — a generated column in a
   // REPLACE INTO column list fails on the replay side.
@@ -155,7 +155,7 @@ static void test_generated_columns_excluded_from_payloads(void) {
   // And the captured payload must actually replay cleanly.
   const char *payload = db_wal_last_sql(db);
   assert(payload != NULL && strstr(payload, "REPLACE INTO \"g\"") != NULL);
-  assert(db_exec(db, payload) == SQLITE_DONE);
+  assert(db_exec(db, payload) == SQLITE_OK);
 
   // Generated values still correct locally
   db_prepare(db, "SELECT b FROM g WHERE a = 21");
@@ -172,8 +172,8 @@ static void test_generated_columns_excluded_from_payloads(void) {
 static void test_leading_whitespace_ddl_syncs_triggers(void) {
   arkilian *db = open_db("test_reg_ws.db");
   // Leading whitespace used to bypass the CREATE detection entirely.
-  assert(db_exec(db, "   CREATE TABLE ws_t (id INTEGER PRIMARY KEY, v TEXT)") == SQLITE_DONE);
-  assert(db_exec(db, "INSERT INTO ws_t (v) VALUES ('x')") == SQLITE_DONE);
+  assert(db_exec(db, "   CREATE TABLE ws_t (id INTEGER PRIMARY KEY, v TEXT)") == SQLITE_OK);
+  assert(db_exec(db, "INSERT INTO ws_t (v) VALUES ('x')") == SQLITE_OK);
   assert(count_payloads(db, "REPLACE INTO \"ws_t\"%") >= 1);
   db_close(db);
   cleanup("test_reg_ws.db");
@@ -181,8 +181,8 @@ static void test_leading_whitespace_ddl_syncs_triggers(void) {
 
 static void test_leading_comment_ddl_syncs_triggers(void) {
   arkilian *db = open_db("test_reg_comment.db");
-  assert(db_exec(db, "-- migration 42\nCREATE TABLE c_t (id INTEGER PRIMARY KEY)") == SQLITE_DONE);
-  assert(db_exec(db, "INSERT INTO c_t (id) VALUES (1)") == SQLITE_DONE);
+  assert(db_exec(db, "-- migration 42\nCREATE TABLE c_t (id INTEGER PRIMARY KEY)") == SQLITE_OK);
+  assert(db_exec(db, "INSERT INTO c_t (id) VALUES (1)") == SQLITE_OK);
   assert(count_payloads(db, "REPLACE INTO \"c_t\"%") >= 1);
   db_close(db);
   cleanup("test_reg_comment.db");
@@ -193,9 +193,9 @@ static void test_ddl_inside_batch_txn_syncs_triggers(void) {
   assert(db_begin(db) == 0);
   // sync_backup_triggers must join the ambient transaction, not fail
   // with "cannot start a transaction within a transaction".
-  assert(db_exec(db, "CREATE TABLE bt (id INTEGER PRIMARY KEY, v TEXT)") == SQLITE_DONE);
+  assert(db_exec(db, "CREATE TABLE bt (id INTEGER PRIMARY KEY, v TEXT)") == SQLITE_OK);
   assert(db_commit(db) == 0);
-  assert(db_exec(db, "INSERT INTO bt (v) VALUES ('x')") == SQLITE_DONE);
+  assert(db_exec(db, "INSERT INTO bt (v) VALUES ('x')") == SQLITE_OK);
   assert(count_payloads(db, "REPLACE INTO \"bt\"%") >= 1);
   db_close(db);
   cleanup("test_reg_batch.db");

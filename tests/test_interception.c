@@ -127,7 +127,7 @@ static void test_exec_insert_pushes_to_ring(void) {
 
   int before = db_wal_pending(db);
   int rc = db_exec(db, "INSERT INTO t1 (name) VALUES ('alice')");
-  assert(rc == SQLITE_DONE);
+  assert(rc == SQLITE_OK);
   int after = db_wal_pending(db);
   assert(after > before);  // write was captured (exact count is racy with flush thread)
 
@@ -147,7 +147,7 @@ static void test_exec_update_pushes_to_ring(void) {
   db_exec(db, "INSERT INTO t1 (name) VALUES ('bob')");
   int before = db_wal_pending(db);
   int rc = db_exec(db, "UPDATE t1 SET name = 'bob-updated' WHERE id = 1");
-  assert(rc == SQLITE_DONE);
+  assert(rc == SQLITE_OK);
   int after = db_wal_pending(db);
   assert(after > before);  // write was captured (exact count is racy with flush thread)
   db_close(db);
@@ -160,7 +160,7 @@ static void test_exec_delete_pushes_to_ring(void) {
   db_exec(db, "INSERT INTO t1 (name) VALUES ('charlie')");
   int before = db_wal_pending(db);
   int rc = db_exec(db, "DELETE FROM t1 WHERE id = 1");
-  assert(rc == SQLITE_DONE);
+  assert(rc == SQLITE_OK);
   int after = db_wal_pending(db);
   assert(after > before);  // write was captured (exact count is racy with flush thread)
   db_close(db);
@@ -171,7 +171,7 @@ static void test_exec_create_table_pushes_to_ring(void) {
   arkilian *db = open_test_db();
   int before = db_wal_pending(db);
   int rc = db_exec(db, "CREATE TABLE t2 (a INT, b TEXT)");
-  assert(rc == SQLITE_DONE);
+  assert(rc == SQLITE_OK);
   int after = db_wal_pending(db);
   assert(after > before);  // write was captured (exact count is racy with flush thread)
   db_close(db);
@@ -183,7 +183,7 @@ static void test_exec_drop_table_pushes_to_ring(void) {
   db_exec(db, "CREATE TABLE t_drop (x INT)");
   int before = db_wal_pending(db);
   int rc = db_exec(db, "DROP TABLE t_drop");
-  assert(rc == SQLITE_DONE);
+  assert(rc == SQLITE_OK);
   int after = db_wal_pending(db);
   assert(after > before);  // write was captured (exact count is racy with flush thread)
   db_close(db);
@@ -306,7 +306,7 @@ static void test_exec_failed_write_does_not_push(void) {
   db_exec(db, "CREATE TABLE t1 (id INTEGER PRIMARY KEY, val INT NOT NULL)");
   int before = db_wal_pending(db);
   int rc = db_exec(db, "INSERT INTO t1 (val) VALUES (NULL)");
-  assert(rc != SQLITE_DONE);
+  assert(rc != SQLITE_OK);
   int after = db_wal_pending(db);
   assert(after <= before);  // reads never push (flush may consume between checks)
   db_close(db);
@@ -355,7 +355,7 @@ static void *concurrent_writer_thread(void *arg) {
              "INSERT INTO t_concurrent (thread_id, seq) VALUES (%d, %d)",
              args->thread_id, i);
     int rc = db_exec(args->db, sql);
-    if (rc == SQLITE_DONE)
+    if (rc == SQLITE_OK)
       args->success_count++;
     else
       args->fail_count++;
@@ -492,7 +492,7 @@ static void test_write_atomicity_all_or_nothing(void) {
 
   int before = db_wal_pending(db);
   int rc = db_exec(db, "INSERT INTO atomic_a (val) VALUES (99)");
-  assert(rc != SQLITE_DONE);
+  assert(rc != SQLITE_OK);
   int after = db_wal_pending(db);
   assert(after <= before);  // reads never push (flush may consume between checks) // failed write doesn't push to ring
 
@@ -521,7 +521,7 @@ static void test_batch_begin_commit_works(void) {
   for (int i = 0; i < 50; i++) {
     char sql[64];
     snprintf(sql, sizeof(sql), "INSERT INTO t (val) VALUES (%d)", i);
-    assert(db_exec(db, sql) == SQLITE_DONE);
+    assert(db_exec(db, sql) == SQLITE_OK);
   }
   assert(db_commit(db) == 0);
 
@@ -546,7 +546,7 @@ static void test_batch_rollback_works(void) {
   for (int i = 0; i < 50; i++) {
     char sql[64];
     snprintf(sql, sizeof(sql), "INSERT INTO t (val) VALUES (%d)", i);
-    assert(db_exec(db, sql) == SQLITE_DONE);
+    assert(db_exec(db, sql) == SQLITE_OK);
   }
   // Rollback — ring entries were already pushed (best-effort),
   // but data must not be committed
@@ -583,7 +583,7 @@ static void test_perf_batch_insert_1000_rows(void) {
     snprintf(sql, sizeof(sql),
              "INSERT INTO perf (val, num) VALUES ('row-%d', %d)", i, i);
     int rc = db_exec(db, sql);
-    assert(rc == SQLITE_DONE);
+    assert(rc == SQLITE_OK);
   }
   double elapsed = now_ms() - start;
 

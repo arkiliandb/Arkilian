@@ -109,8 +109,12 @@ struct arkilian {
   sqlite3_stmt *commit_stmt;
   sqlite3_stmt *rollback_stmt;
 
-  // Monitoring (spec §9)
-  volatile long long last_heartbeat_ms; // flush thread liveness (monotonic)
+  // Monitoring (spec §9). Seconds-based (not ms): a 32-bit int is never
+  // torn on any platform — a 64-bit heartbeat could be read half-written
+  // on 32-bit ARM and cause spurious unhealthy alerts. Writes to the
+  // other shared flags are always done under wake_mutex; reads are
+  // volatile int, which is atomic on every supported target.
+  volatile int last_heartbeat_sec;      // flush thread liveness (monotonic)
   ark_log_fn_t log_fn;                  // optional structured log sink
   void *log_ctx;
 };
@@ -366,9 +370,21 @@ int sync_backup_triggers(sqlite3 *db, char **err_out) {
     }
   }
 
+  // Scan only real tables. pragma_table_list's type column distinguishes
+  // 'table' from 'virtual' (FTS5, rtree) and 'shadow' (FTS shadow
+  // tables) — CREATE TRIGGER ON a virtual table is rejected by SQLite,
+  // so those MUST be excluded or the whole scan fails and (per spec
+  // §0/§1) the game would be prevented from starting. Fall back to
+  // sqlite_master on SQLite versions without pragma_table_list.
   sqlite3_stmt *table_stmt = NULL;
   rc = sqlite3_prepare_v2(db,
-      "SELECT name FROM sqlite_master WHERE type = 'table'", -1, &table_stmt, NULL);
+      "SELECT name FROM pragma_table_list "
+      "WHERE schema = 'main' AND type = 'table'", -1, &table_stmt, NULL);
+  if (rc != SQLITE_OK) {
+    rc = sqlite3_prepare_v2(db,
+        "SELECT name FROM sqlite_master WHERE type = 'table'",
+        -1, &table_stmt, NULL);
+  }
   if (rc != SQLITE_OK) {
     if (err_out) *err_out = sqlite3_mprintf("prepare table list: %s", sqlite3_errmsg(db));
     if (began) sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
@@ -499,10 +515,16 @@ int sync_backup_triggers(sqlite3 *db, char **err_out) {
       }
       free(lit_accum);
       if (pk_seen == 0) {
-        errmsg = sqlite3_mprintf("table %s is WITHOUT ROWID but has no PRIMARY KEY", table);
+        // Cannot happen through normal SQL (SQLite rejects WITHOUT ROWID
+        // without a PK) — but if it ever does, skip the table rather than
+        // taking the whole game down (spec §0/§1).
+        ark_log(NULL, ARK_LOG_WARN,
+                "trigger sync: skipping table %s (WITHOUT ROWID without PRIMARY KEY) — "
+                "it will not be captured for backup",
+                table);
         free(replace_lit); free(delete_prefix);
         sqlite3_free(raw_cols); sqlite3_free(new_vals);
-        goto fail_with_errmsg;
+        goto next_table;
       }
     }
     if (!delete_expr) { free(replace_lit); free(delete_prefix); sqlite3_free(raw_cols); sqlite3_free(new_vals); goto oom; }
@@ -624,6 +646,16 @@ static size_t curl_discard_cb(void *data, size_t sz, size_t nmemb, void *userp) 
   return sz * nmemb;
 }
 
+// Abort callback for in-flight transfers: returns non-zero when shutdown
+// is requested so db_close() never waits out a full curl timeout (10s /
+// 30s) joining a thread stuck in a slow request.
+static int curl_abort_cb(void *clientp, curl_off_t dltotal, curl_off_t dlnow,
+                         curl_off_t ultotal, curl_off_t ulnow) {
+  (void)dltotal; (void)dlnow; (void)ultotal; (void)ulnow;
+  volatile int *shutdown_flag = (volatile int *)clientp;
+  return (shutdown_flag && *shutdown_flag) ? 1 : 0;
+}
+
 typedef enum { SHIP_OK = 0, SHIP_RETRY = 1 } ship_result_t;
 
 static ship_result_t ship_to_backup(arkilian *db, sqlite3_int64 id, const char *payload) {
@@ -664,6 +696,9 @@ static ship_result_t ship_to_backup(arkilian *db, sqlite3_int64 id, const char *
   if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
   if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5L);
   if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_discard_cb);
+  if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+  if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, curl_abort_cb);
+  if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_XFERINFODATA, (void *)&db->shutdown_requested);
 
   struct curl_slist *headers = NULL;
   if (rc == CURLE_OK) {
@@ -945,7 +980,7 @@ void *run_wal_flush(void *arg) {
   while (!db->shutdown_requested && select_stmt) {
     // Liveness heartbeat (spec §9): the watchdog reads this from another
     // thread; a stale age means the thread died silently.
-    db->last_heartbeat_ms = now_ms_mono();
+    db->last_heartbeat_sec = (int)(now_ms_mono() / 1000);
 
     int drained = 0;
     // Kill-switch check: when backup is disabled, do not ship (and
@@ -1088,35 +1123,83 @@ int db_init(arkilian **db_ptr, const char *filename) {
   sqlite3_busy_timeout(db->handle, 5000);
   sqlite3_busy_timeout(db->backup_db, 5000);
 
-  sqlite3_exec(db->handle, "PRAGMA journal_mode=WAL;", NULL, NULL, NULL);
-  sqlite3_exec(db->handle, "PRAGMA synchronous=NORMAL;", NULL, NULL, NULL);
-  sqlite3_exec(db->handle, "PRAGMA foreign_keys=ON;", NULL, NULL, NULL);
-  sqlite3_exec(db->handle, "PRAGMA cache_size=-64000;", NULL, NULL, NULL);
-
-  sqlite3_exec(db->backup_db, "PRAGMA journal_mode=WAL;", NULL, NULL, NULL);
-  sqlite3_exec(db->backup_db, "PRAGMA synchronous=NORMAL;", NULL, NULL, NULL);
+  // ── Checked PRAGMA application (spec §0: no unchecked SQLite calls) ──
+  // WAL is load-bearing for the entire design: if it silently failed
+  // (read-only FS, wrong lock holder) the subsystem would run with the
+  // wrong durability/contention profile and nothing would notice. If
+  // WAL is not active, shipping is disabled outright. Other PRAGMA
+  // failures are logged, not fatal.
+  int capture_ok = 1;
+  char *perr = NULL;
+  if (sqlite3_exec(db->handle, "PRAGMA journal_mode=WAL;", NULL, NULL, &perr) != SQLITE_OK) {
+    ark_log(db, ARK_LOG_ERROR, "PRAGMA journal_mode=WAL failed: %s",
+            perr ? perr : "unknown error");
+    sqlite3_free(perr);
+    perr = NULL;
+    capture_ok = 0;
+  }
+  if (capture_ok) {
+    // Verify the mode actually took — exec can report OK while the
+    // journal stays rollback-mode on some paths.
+    sqlite3_stmt *jm = NULL;
+    if (sqlite3_prepare_v2(db->handle, "PRAGMA journal_mode", -1, &jm, NULL) == SQLITE_OK &&
+        sqlite3_step(jm) == SQLITE_ROW) {
+      const char *mode = (const char *)sqlite3_column_text(jm, 0);
+      capture_ok = mode && strcmp(mode, "wal") == 0;
+    }
+    sqlite3_finalize(jm);
+    if (!capture_ok) {
+      ark_log(db, ARK_LOG_ERROR,
+              "journal mode is not WAL — backup capture disabled");
+    }
+  }
+  {
+    const struct { const char *sql; const char *what; } pragmas[] = {
+      { "PRAGMA synchronous=NORMAL;", "synchronous=NORMAL" },
+      { "PRAGMA foreign_keys=ON;",    "foreign_keys=ON" },
+      { "PRAGMA cache_size=-64000;",  "cache_size" },
+      { NULL, NULL }
+    };
+    for (int i = 0; pragmas[i].sql; i++) {
+      if (sqlite3_exec(db->handle, pragmas[i].sql, NULL, NULL, &perr) != SQLITE_OK) {
+        ark_log(db, ARK_LOG_WARN, "PRAGMA %s failed: %s",
+                pragmas[i].what, perr ? perr : "unknown error");
+        sqlite3_free(perr);
+        perr = NULL;
+      }
+    }
+    if (sqlite3_exec(db->backup_db, "PRAGMA journal_mode=WAL;", NULL, NULL, &perr) != SQLITE_OK ||
+        sqlite3_exec(db->backup_db, "PRAGMA synchronous=NORMAL;", NULL, NULL, &perr) != SQLITE_OK) {
+      ark_log(db, ARK_LOG_WARN, "backup connection PRAGMA failed: %s",
+              perr ? perr : "unknown error");
+      sqlite3_free(perr);
+      perr = NULL;
+    }
+  }
 
   // Register non-blocking update hook
   sqlite3_update_hook(db->handle, on_db_update, db);
 
-  // Sync backup triggers — a failure here means writes are NOT being
-  // captured for backup. Surface it loudly and return error.
-  char *trigger_err = NULL;
-  int sync_rc = sync_backup_triggers(db->handle, &trigger_err);
-  if (sync_rc != SQLITE_OK) {
-    snprintf(db->last_error_msg, sizeof(db->last_error_msg),
-             "backup trigger sync failed: %s",
-             trigger_err ? trigger_err : "unknown error");
-    ark_log(db, ARK_LOG_ERROR, "%s", db->last_error_msg);
+  // Sync backup triggers. Per spec §0/§1 a capture failure must NEVER
+  // prevent the game from starting: log loudly and fall back to the
+  // kill-switch's disabled state — the game runs normally, nothing
+  // ships, and db_backup_is_enabled() + monitoring make the outage
+  // visible instead of silent.
+  if (capture_ok) {
+    char *trigger_err = NULL;
+    if (sync_backup_triggers(db->handle, &trigger_err) != SQLITE_OK) {
+      ark_log(db, ARK_LOG_ERROR,
+              "backup trigger sync FAILED — capture disabled: %s",
+              trigger_err ? trigger_err : "unknown error");
+      capture_ok = 0;
+    }
     if (trigger_err) sqlite3_free(trigger_err);
-    if (db->backup_db) sqlite3_close(db->backup_db);
-    sqlite3_close(db->handle);
-    db->handle = NULL;
-    db->backup_db = NULL;
-    *db_ptr = db;
-    return sync_rc;
   }
-  if (trigger_err) sqlite3_free(trigger_err);
+  if (!capture_ok) {
+    db->backup_enabled = 0; // kill-switch state: game runs, nothing ships
+    snprintf(db->last_error_msg, sizeof(db->last_error_msg),
+             "backup disabled: WAL or trigger setup failed");
+  }
 
   // Transaction statements
   sqlite3_prepare_v2(db->handle, "BEGIN;", -1, &db->begin_stmt, NULL);
@@ -1133,48 +1216,42 @@ int db_init(arkilian **db_ptr, const char *filename) {
   db->shutdown_requested = 0;
   *db_ptr = db;
 
-  // Start WAL flusher thread. This thread drains _pending_backup — without
-  // it, no write ever reaches the destination. A failure to create it is a
-  // hard initialization error, surfaced to the caller, so backup being
-  // silently absent is never mistaken for backup working.
+  // Start WAL flusher thread. A creation failure must not take the game
+  // down (spec §0/§1): log loudly and drop into the kill-switch's
+  // disabled state.
 #ifndef _WIN32
   db->flush_thread_running = 0;
   if (pthread_create(&db->flush_thread_id, NULL, run_wal_flush, db) != 0) {
-    snprintf(db->last_error_msg, sizeof(db->last_error_msg),
-             "failed to start WAL flush thread");
-    *db_ptr = db;
-    return 1;
+    ark_log(db, ARK_LOG_ERROR,
+            "failed to start WAL flush thread — backup disabled");
+    db->backup_enabled = 0;
+  } else {
+    db->flush_thread_running = 1;
   }
-  db->flush_thread_running = 1;
 #else
   db->flush_thread_handle = CreateThread(NULL, 0, run_wal_flush, db, 0, NULL);
   if (!db->flush_thread_handle) {
-    snprintf(db->last_error_msg, sizeof(db->last_error_msg),
-             "failed to start WAL flush thread");
-    *db_ptr = db;
-    return 1;
+    ark_log(db, ARK_LOG_ERROR,
+            "failed to start WAL flush thread — backup disabled");
+    db->backup_enabled = 0;
   }
 #endif
 
-  // Start backup thread
+  // Start backup thread. Failure here only loses the hourly snapshots —
+  // realtime shipping keeps running; the failure is logged loudly.
   if (db->backup_enabled) {
 #ifdef _WIN32
     db->backup_thread_handle = CreateThread(NULL, 0, run_hourly_backup, db, 0, NULL);
     if (!db->backup_thread_handle) {
-      snprintf(db->last_error_msg, sizeof(db->last_error_msg),
-               "failed to start backup thread");
-      *db_ptr = db;
-      return 1;
+      ark_log(db, ARK_LOG_ERROR, "failed to start hourly backup thread");
     }
 #else
     db->backup_thread_running = 0;
     if (pthread_create(&db->backup_thread_id, NULL, run_hourly_backup, db) != 0) {
-      snprintf(db->last_error_msg, sizeof(db->last_error_msg),
-               "failed to start backup thread");
-      *db_ptr = db;
-      return 1;
+      ark_log(db, ARK_LOG_ERROR, "failed to start hourly backup thread");
+    } else {
+      db->backup_thread_running = 1;
     }
-    db->backup_thread_running = 1;
 #endif
   }
 
@@ -1297,13 +1374,21 @@ int db_exec(arkilian *db, const char *sql) {
 
     sqlite3_stmt *ddl_stmt = NULL;
     if (sqlite3_prepare_v2(db->handle, "INSERT INTO _pending_backup (payload) VALUES (?)", -1, &ddl_stmt, NULL) == SQLITE_OK) {
-      sqlite3_bind_text(ddl_stmt, 1, sql, -1, SQLITE_TRANSIENT);
-      sqlite3_step(ddl_stmt);
+      int bind_rc = sqlite3_bind_text(ddl_stmt, 1, sql, -1, SQLITE_TRANSIENT);
+      int step_rc = (bind_rc == SQLITE_OK) ? sqlite3_step(ddl_stmt) : bind_rc;
+      if (step_rc != SQLITE_DONE) {
+        ark_log(db, ARK_LOG_ERROR,
+                "DDL capture to _pending_backup failed (rc=%d): %s",
+                step_rc, sqlite3_errmsg(db->handle));
+      }
       sqlite3_finalize(ddl_stmt);
     }
   }
 
-  return SQLITE_DONE;
+  // Public contract: SQLITE_OK (0) on success. sqlite3_exec returns
+  // SQLITE_OK; surfacing SQLITE_DONE here would break every C caller
+  // that compares against the conventional success code.
+  return SQLITE_OK;
 }
 
 int db_prepare(arkilian *db, const char *sql) {
@@ -1490,9 +1575,14 @@ int db_commit(arkilian *db) {
 int db_rollback(arkilian *db) {
   if (!db || !db->handle) return SQLITE_ERROR;
   if (!db->in_batch_txn) return SQLITE_ERROR;
-  sqlite3_step(db->rollback_stmt);
+  int rc = sqlite3_step(db->rollback_stmt);
   sqlite3_reset(db->rollback_stmt);
   db->in_batch_txn = 0;
+  if (rc != SQLITE_DONE) {
+    ark_log(db, ARK_LOG_ERROR, "rollback failed (rc=%d): %s",
+            rc, sqlite3_errmsg(db->handle));
+    return rc;
+  }
   return SQLITE_OK;
 }
 
@@ -1631,20 +1721,25 @@ int db_backup_dead_letter_count(arkilian *db) {
 
 long long db_backup_thread_heartbeat_age_ms(arkilian *db) {
   if (!db) return -1;
-  long long hb = db->last_heartbeat_ms;
+  int hb = db->last_heartbeat_sec;
   if (hb == 0) return -1; // never beat — thread not (yet) running
   long long now = now_ms_mono();
-  return (now >= hb) ? (now - hb) : 0;
+  long long hb_ms = (long long)hb * 1000LL;
+  return (now >= hb_ms) ? (now - hb_ms) : 0;
 }
 
 int db_backup_trigger_coverage(arkilian *db) {
   if (!db || !db->handle) return -1;
   sqlite3_stmt *stmt = NULL;
   int expect = 0, have = 0;
-  // Expected: 3 triggers per non-reserved, non-sqlite_ table.
+  // Expected: 3 triggers per real (non-virtual, non-shadow) table.
+  // Must use pragma_table_list like the trigger scan — sqlite_master
+  // lists FTS/rtree shadow tables as type='table' and would inflate
+  // the expected count.
   if (sqlite3_prepare_v2(db->handle,
-        "SELECT COUNT(*) FROM sqlite_master "
-        "WHERE type = 'table' AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\' "
+        "SELECT COUNT(*) FROM pragma_table_list "
+        "WHERE schema = 'main' AND type = 'table' "
+        "AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\' "
         "AND name NOT IN ('_pending_backup', '_dead_backup', '_arkilian_meta')",
         -1, &stmt, NULL) == SQLITE_OK) {
     if (sqlite3_step(stmt) == SQLITE_ROW) expect = 3 * sqlite3_column_int(stmt, 0);
@@ -1761,6 +1856,9 @@ static char *get_signed_url(arkilian *db, const char *api_endpoint,
     if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)&chunk);
     if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
     if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5L);
+    if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+    if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, curl_abort_cb);
+    if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_XFERINFODATA, (void *)shutdown_flag);
 
     struct curl_slist *headers = NULL;
     if (rc == CURLE_OK && token && strlen(token) > 0) {
@@ -1845,6 +1943,9 @@ static int upload_to_s3(arkilian *db, const char *signed_url,
   if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_INFILESIZE_LARGE, (curl_off_t)file_size);
   if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
   if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
+  if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+  if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, curl_abort_cb);
+  if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_XFERINFODATA, (void *)&db->shutdown_requested);
 
   struct curl_slist *headers = NULL;
   if (rc == CURLE_OK) {
@@ -1931,7 +2032,12 @@ void *run_hourly_backup(void *arg) {
     // the normal schedule (the flush thread handles realtime resume).
     if (!db->backup_enabled) continue;
 
-    int status = backup_database(db->handle, db->backup_path);
+    // Snapshot from the BACKUP connection, never the game connection:
+    // sqlite3_backup_step page I/O would otherwise hold the game
+    // connection's mutex for the whole copy (bounded only by 6000 retry
+    // steps), making game-thread writes wait on the backup thread — the
+    // exact §3.3 failure mode the spec forbids.
+    int status = backup_database(db->backup_db, db->backup_path);
 
     // Skip the remote upload when no signed-URL endpoint has been
     // configured — nothing phones home unless explicitly enabled.
