@@ -568,37 +568,57 @@ static ship_result_t ship_to_backup(arkilian *db, sqlite3_int64 id, const char *
   CURL *curl = curl_easy_init();
   if (!curl) return SHIP_RETRY;
 
-  curl_easy_setopt(curl, CURLOPT_URL, push_url);
-  curl_easy_setopt(curl, CURLOPT_POSTFIELDS, payload);
-  curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
-  curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5L);
-  curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_discard_cb);
+  // Every curl_easy_setopt / curl_slist_append return code is checked: a
+  // misconfigured transfer must never be shipped silently — report and
+  // retry it like any other failure.
+  ship_result_t result = SHIP_RETRY;
+  CURLcode rc = CURLE_OK;
+
+  rc = curl_easy_setopt(curl, CURLOPT_URL, push_url);
+  if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_POSTFIELDS, payload);
+  if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
+  if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5L);
+  if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_discard_cb);
 
   struct curl_slist *headers = NULL;
-  headers = curl_slist_append(headers, "Content-Type: application/sql");
+  if (rc == CURLE_OK) {
+    headers = curl_slist_append(headers, "Content-Type: application/sql");
+    if (!headers) rc = CURLE_OUT_OF_MEMORY;
+  }
   // Idempotency key lets the receiver deduplicate retries of the same row.
   char id_header[64];
   snprintf(id_header, sizeof(id_header), "X-Arkilian-Payload-Id: %lld", (long long)id);
-  headers = curl_slist_append(headers, id_header);
+  if (rc == CURLE_OK) {
+    headers = curl_slist_append(headers, id_header);
+    if (!headers) rc = CURLE_OUT_OF_MEMORY;
+  }
   // Never attach our bearer token to a pre-signed storage URL — the
   // signature IS the credential, and the token would leak to the host.
-  if (db->database_token && strlen(db->database_token) > 0 && !url_is_presigned(push_url)) {
+  if (rc == CURLE_OK && db->database_token && strlen(db->database_token) > 0 &&
+      !url_is_presigned(push_url)) {
     char auth[512];
     snprintf(auth, sizeof(auth), "Authorization: Bearer %s", db->database_token);
     headers = curl_slist_append(headers, auth);
+    if (!headers) rc = CURLE_OUT_OF_MEMORY;
   }
-  curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+  if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
 
-  CURLcode res = curl_easy_perform(curl);
-  long http_code = 0;
-  if (res == CURLE_OK) {
-    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+  if (rc != CURLE_OK) {
+    fprintf(stderr, "arkilian: ship_to_backup: request setup failed: %s\n",
+            curl_easy_strerror(rc));
+  } else {
+    CURLcode res = curl_easy_perform(curl);
+    long http_code = 0;
+    if (res == CURLE_OK) {
+      curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+    }
+    result = (res == CURLE_OK && (http_code == 200 || http_code == 201)) ? SHIP_OK : SHIP_RETRY;
   }
 
   curl_slist_free_all(headers);
   curl_easy_cleanup(curl);
 
-  return (res == CURLE_OK && (http_code == 200 || http_code == 201)) ? SHIP_OK : SHIP_RETRY;
+  return result;
 }
 
 static int drain_batch(arkilian *db, sqlite3_stmt *select_stmt, sqlite3_stmt *delete_stmt,
@@ -614,7 +634,11 @@ static int drain_batch(arkilian *db, sqlite3_stmt *select_stmt, sqlite3_stmt *de
   for (;;) {
     int rc = sqlite3_step(select_stmt);
     if (rc == SQLITE_DONE) break;
-    if (rc != SQLITE_ROW) break;
+    if (rc != SQLITE_ROW) {
+      fprintf(stderr, "arkilian: select from _pending_backup failed: %s\n",
+              sqlite3_errmsg(db->backup_db));
+      break;
+    }
 
     sqlite3_int64 id = sqlite3_column_int64(select_stmt, 0);
     const unsigned char *payload = sqlite3_column_text(select_stmt, 1);
@@ -622,7 +646,10 @@ static int drain_batch(arkilian *db, sqlite3_stmt *select_stmt, sqlite3_stmt *de
     if (!payload) continue;
 
     char *payload_copy = strdup((const char *)payload);
-    if (!payload_copy) break;
+    if (!payload_copy) {
+      fprintf(stderr, "arkilian: OOM copying payload id=%lld\n", (long long)id);
+      break;
+    }
 
     ship_result_t result = ship_to_backup(db, id, payload_copy);
     free(payload_copy);
@@ -631,7 +658,13 @@ static int drain_batch(arkilian *db, sqlite3_stmt *select_stmt, sqlite3_stmt *de
       sqlite3_reset(delete_stmt);
       sqlite3_clear_bindings(delete_stmt);
       sqlite3_bind_int64(delete_stmt, 1, id);
-      sqlite3_step(delete_stmt);
+      if (sqlite3_step(delete_stmt) != SQLITE_DONE) {
+        // The row shipped but the delete failed — it will ship again next
+        // pass. Safe: delivery is at-least-once, destination must dedupe.
+        fprintf(stderr, "arkilian: delete after ship failed id=%lld: %s\n",
+                (long long)id, sqlite3_errmsg(db->backup_db));
+        break;
+      }
       processed_any = 1;
       continue;
     }
@@ -653,7 +686,15 @@ static int drain_batch(arkilian *db, sqlite3_stmt *select_stmt, sqlite3_stmt *de
         sqlite3_reset(delete_stmt);
         sqlite3_clear_bindings(delete_stmt);
         sqlite3_bind_int64(delete_stmt, 1, id);
-        sqlite3_step(delete_stmt);
+        if (sqlite3_step(delete_stmt) != SQLITE_DONE) {
+          // The row is safe in _dead_backup; the _pending_backup copy is
+          // re-dead-lettered next pass (id-conflict is expected, harmless).
+          fprintf(stderr, "arkilian: delete after dead-letter failed id=%lld: %s\n",
+                  (long long)id, sqlite3_errmsg(db->backup_db));
+        }
+      } else {
+        fprintf(stderr, "arkilian: dead-letter insert failed id=%lld: %s\n",
+                (long long)id, sqlite3_errmsg(db->backup_db));
       }
       processed_any = 1;
       continue;
@@ -662,7 +703,10 @@ static int drain_batch(arkilian *db, sqlite3_stmt *select_stmt, sqlite3_stmt *de
       sqlite3_clear_bindings(update_attempts_stmt);
       sqlite3_bind_int(update_attempts_stmt, 1, new_attempts);
       sqlite3_bind_int64(update_attempts_stmt, 2, id);
-      sqlite3_step(update_attempts_stmt);
+      if (sqlite3_step(update_attempts_stmt) != SQLITE_DONE) {
+        fprintf(stderr, "arkilian: update attempts failed id=%lld: %s\n",
+                (long long)id, sqlite3_errmsg(db->backup_db));
+      }
       // Back off: report "no work drained" so the flush loop waits one
       // poll interval before retrying instead of hot-spinning on a
       // failing endpoint and burning through MAX_ATTEMPTS instantly.
@@ -672,6 +716,76 @@ static int drain_batch(arkilian *db, sqlite3_stmt *select_stmt, sqlite3_stmt *de
   }
 
   return processed_any;
+}
+
+// Prepare the four outbox statements on the backup connection. Returns 1
+// when all four prepared, 0 on any failure — finalizing whatever did
+// prepare so a retry starts clean. The caller logs and retries with
+// backoff: a transient failure here (schema lock, missing outbox table)
+// must not silently disable shipping, and a silently-dead flush thread is
+// worse than a loudly retrying one.
+static int prepare_outbox_statements(sqlite3 *db, sqlite3_stmt **select_stmt,
+                                     sqlite3_stmt **delete_stmt,
+                                     sqlite3_stmt **update_attempts_stmt,
+                                     sqlite3_stmt **dead_letter_stmt) {
+  *select_stmt = NULL;
+  *delete_stmt = NULL;
+  *update_attempts_stmt = NULL;
+  *dead_letter_stmt = NULL;
+
+  if (sqlite3_prepare_v2(db,
+        "SELECT id, payload, attempts FROM _pending_backup ORDER BY id LIMIT ?1",
+        -1, select_stmt, NULL) != SQLITE_OK) goto fail;
+  if (sqlite3_prepare_v2(db,
+        "DELETE FROM _pending_backup WHERE id = ?1",
+        -1, delete_stmt, NULL) != SQLITE_OK) goto fail;
+  if (sqlite3_prepare_v2(db,
+        "UPDATE _pending_backup SET attempts = ?1, last_attempt_at = strftime('%s','now') WHERE id = ?2",
+        -1, update_attempts_stmt, NULL) != SQLITE_OK) goto fail;
+  if (sqlite3_prepare_v2(db,
+        "INSERT INTO _dead_backup (id, payload, attempts, failed_reason, created_at) "
+        "SELECT id, payload, ?1, ?2, created_at FROM _pending_backup WHERE id = ?3",
+        -1, dead_letter_stmt, NULL) != SQLITE_OK) goto fail;
+  return 1;
+
+fail:
+  if (*select_stmt) { sqlite3_finalize(*select_stmt); *select_stmt = NULL; }
+  if (*delete_stmt) { sqlite3_finalize(*delete_stmt); *delete_stmt = NULL; }
+  if (*update_attempts_stmt) { sqlite3_finalize(*update_attempts_stmt); *update_attempts_stmt = NULL; }
+  if (*dead_letter_stmt) { sqlite3_finalize(*dead_letter_stmt); *dead_letter_stmt = NULL; }
+  return 0;
+}
+
+// Sleep for `seconds`, interruptible by shutdown (via the shared wake
+// condition variable). Returns 1 if shutdown was requested.
+static int sleep_interruptible(arkilian *db, int seconds) {
+  if (seconds < 1) seconds = 1;
+#ifndef _WIN32
+  pthread_mutex_lock(&db->wake_mutex);
+  struct timespec ts;
+  clock_gettime(CLOCK_REALTIME, &ts);
+  ts.tv_sec += seconds;
+  while (!db->shutdown_requested) {
+    pthread_cond_timedwait(&db->wake_cond, &db->wake_mutex, &ts);
+    time_t now = time(NULL);
+    if (now >= ts.tv_sec) break;
+  }
+  int shutdown = db->shutdown_requested;
+  pthread_mutex_unlock(&db->wake_mutex);
+  return shutdown;
+#else
+  EnterCriticalSection(&db->wake_mutex);
+  DWORD remaining_ms = (DWORD)seconds * 1000;
+  while (!db->shutdown_requested && remaining_ms > 0) {
+    DWORD start = GetTickCount();
+    SleepConditionVariableCS(&db->wake_cond, &db->wake_mutex, remaining_ms);
+    DWORD elapsed = GetTickCount() - start;
+    remaining_ms = (elapsed >= remaining_ms) ? 0 : remaining_ms - elapsed;
+  }
+  int shutdown = db->shutdown_requested;
+  LeaveCriticalSection(&db->wake_mutex);
+  return shutdown;
+#endif
 }
 
 #ifdef _WIN32
@@ -693,32 +807,30 @@ void *run_wal_flush(void *arg) {
   sqlite3_stmt *update_attempts_stmt = NULL;
   sqlite3_stmt *dead_letter_stmt = NULL;
 
-  sqlite3_prepare_v2(db->backup_db,
-      "SELECT id, payload, attempts FROM _pending_backup ORDER BY id LIMIT ?1",
-      -1, &select_stmt, NULL);
-  sqlite3_prepare_v2(db->backup_db,
-      "DELETE FROM _pending_backup WHERE id = ?1",
-      -1, &delete_stmt, NULL);
-  sqlite3_prepare_v2(db->backup_db,
-      "UPDATE _pending_backup SET attempts = ?1, last_attempt_at = strftime('%s','now') WHERE id = ?2",
-      -1, &update_attempts_stmt, NULL);
-  sqlite3_prepare_v2(db->backup_db,
-      "INSERT INTO _dead_backup (id, payload, attempts, failed_reason, created_at) "
-      "SELECT id, payload, ?1, ?2, created_at FROM _pending_backup WHERE id = ?3",
-      -1, &dead_letter_stmt, NULL);
-
-  int stmts_ok = select_stmt && delete_stmt && update_attempts_stmt && dead_letter_stmt;
-  if (!stmts_ok) {
-    fprintf(stderr, "arkilian: flush thread failed to prepare outbox statements "
-                    "(outbox tables missing or OOM) — shipping disabled\n");
+  // Prepare once, reuse via sqlite3_reset — avoids re-parsing SQL every
+  // loop. Every prepare below is checked. On failure (e.g. the outbox
+  // tables don't exist yet because trigger sync hasn't run, or a schema
+  // lock is held), log, back off, and retry instead of exiting — a
+  // silently-dead flush thread means writes never leave _pending_backup,
+  // discovered only from a growing queue days later.
+  int backoff_s = 1;
+  while (!db->shutdown_requested) {
+    if (prepare_outbox_statements(db->backup_db, &select_stmt, &delete_stmt,
+                                  &update_attempts_stmt, &dead_letter_stmt)) {
+      break;
+    }
+    fprintf(stderr,
+            "arkilian: flush thread: failed to prepare outbox statements: %s "
+            "(shipping paused; retrying in %ds)\n",
+            sqlite3_errmsg(db->backup_db), backoff_s);
+    if (sleep_interruptible(db, backoff_s)) break;
+    if (backoff_s < 60) backoff_s *= 2;
   }
 
-  while (!db->shutdown_requested) {
+  while (!db->shutdown_requested && select_stmt) {
     int drained = 0;
-    if (stmts_ok) {
-      drained = drain_batch(db, select_stmt, delete_stmt,
-                            update_attempts_stmt, dead_letter_stmt);
-    }
+    drained = drain_batch(db, select_stmt, delete_stmt,
+                          update_attempts_stmt, dead_letter_stmt);
 
     if (!drained) {
 #ifndef _WIN32
@@ -896,23 +1008,48 @@ int db_init(arkilian **db_ptr, const char *filename) {
     db->backup_interval = atoi(env_interval);
   }
 
-  // Start WAL flusher thread
+  // Start WAL flusher thread. This thread drains _pending_backup — without
+  // it, no write ever reaches the destination. A failure to create it is a
+  // hard initialization error, surfaced to the caller, so backup being
+  // silently absent is never mistaken for backup working.
 #ifndef _WIN32
   db->flush_thread_running = 0;
-  if (pthread_create(&db->flush_thread_id, NULL, run_wal_flush, db) == 0)
-    db->flush_thread_running = 1;
+  if (pthread_create(&db->flush_thread_id, NULL, run_wal_flush, db) != 0) {
+    snprintf(db->last_error_msg, sizeof(db->last_error_msg),
+             "failed to start WAL flush thread");
+    *db_ptr = db;
+    return 1;
+  }
+  db->flush_thread_running = 1;
 #else
   db->flush_thread_handle = CreateThread(NULL, 0, run_wal_flush, db, 0, NULL);
+  if (!db->flush_thread_handle) {
+    snprintf(db->last_error_msg, sizeof(db->last_error_msg),
+             "failed to start WAL flush thread");
+    *db_ptr = db;
+    return 1;
+  }
 #endif
 
   // Start backup thread
   if (db->backup_enabled) {
 #ifdef _WIN32
     db->backup_thread_handle = CreateThread(NULL, 0, run_hourly_backup, db, 0, NULL);
+    if (!db->backup_thread_handle) {
+      snprintf(db->last_error_msg, sizeof(db->last_error_msg),
+               "failed to start backup thread");
+      *db_ptr = db;
+      return 1;
+    }
 #else
     db->backup_thread_running = 0;
-    if (pthread_create(&db->backup_thread_id, NULL, run_hourly_backup, db) == 0)
-      db->backup_thread_running = 1;
+    if (pthread_create(&db->backup_thread_id, NULL, run_hourly_backup, db) != 0) {
+      snprintf(db->last_error_msg, sizeof(db->last_error_msg),
+               "failed to start backup thread");
+      *db_ptr = db;
+      return 1;
+    }
+    db->backup_thread_running = 1;
 #endif
   }
 
@@ -1358,53 +1495,64 @@ char *get_signed_url(const char *api_endpoint, const char *token, int *shutdown_
   chunk.shutdown_flag = shutdown_flag;
   if (!chunk.response) return NULL;
 
+  char *result = NULL;
   if (curl) {
-    curl_easy_setopt(curl, CURLOPT_URL, api_endpoint);
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_cb);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)&chunk);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
-    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5L);
+    CURLcode rc = CURLE_OK;
+    rc = curl_easy_setopt(curl, CURLOPT_URL, api_endpoint);
+    if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_cb);
+    if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)&chunk);
+    if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
+    if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5L);
 
     struct curl_slist *headers = NULL;
-    if (token && strlen(token) > 0) {
+    if (rc == CURLE_OK && token && strlen(token) > 0) {
       char auth_header[512];
       snprintf(auth_header, sizeof(auth_header), "Authorization: Bearer %s", token);
       headers = curl_slist_append(headers, auth_header);
-      curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+      if (!headers) rc = CURLE_OUT_OF_MEMORY;
     }
+    if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
 
-    CURLcode res = curl_easy_perform(curl);
-    long http_code = 0;
-    if (res == CURLE_OK) curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
-    if (headers) curl_slist_free_all(headers);
-    curl_easy_cleanup(curl);
+    if (rc != CURLE_OK) {
+      fprintf(stderr, "arkilian: get_signed_url: request setup failed: %s\n",
+              curl_easy_strerror(rc));
+    } else {
+      CURLcode res = curl_easy_perform(curl);
+      long http_code = 0;
+      if (res == CURLE_OK) curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
 
-    // Only a 200 response is a valid answer — an error body must never
-    // be mistaken for an upload URL.
-    if (res == CURLE_OK && http_code == 200 && chunk.response) {
-      char *url_key = strstr(chunk.response, "\"upload_url\":\"");
-      if (url_key) {
-        url_key += strlen("\"upload_url\":\"");
-        char *end_quote = strchr(url_key, '"');
-        if (end_quote) {
-          size_t url_len = end_quote - url_key;
-          char *clean_url = malloc(url_len + 1);
-          if (!clean_url) { free(chunk.response); return NULL; }
-          memcpy(clean_url, url_key, url_len);
-          clean_url[url_len] = '\0';
+      // Only a 200 response is a valid answer — an error body must never
+      // be mistaken for an upload URL.
+      if (res == CURLE_OK && http_code == 200 && chunk.response) {
+        char *url_key = strstr(chunk.response, "\"upload_url\":\"");
+        if (url_key) {
+          url_key += strlen("\"upload_url\":\"");
+          char *end_quote = strchr(url_key, '"');
+          if (end_quote) {
+            size_t url_len = (size_t)(end_quote - url_key);
+            result = malloc(url_len + 1);
+            if (result) {
+              memcpy(result, url_key, url_len);
+              result[url_len] = '\0';
+            }
+          }
           free(chunk.response);
-          return clean_url;
+          chunk.response = NULL;
+        } else {
+          // Fallback: some control planes return the URL as a plain-text body.
+          if (strncmp(chunk.response, "http://", 7) == 0 ||
+              strncmp(chunk.response, "https://", 8) == 0) {
+            result = chunk.response;
+            chunk.response = NULL;
+          }
         }
       }
-      // Fallback: some control planes return the URL as a plain-text body.
-      if (strncmp(chunk.response, "http://", 7) == 0 ||
-          strncmp(chunk.response, "https://", 8) == 0) {
-        return chunk.response;
-      }
     }
+    if (headers) curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
   }
   free(chunk.response);
-  return NULL;
+  return result;
 }
 
 int upload_to_s3(const char *signed_url, const char *file_path, const char *token) {
@@ -1416,45 +1564,67 @@ int upload_to_s3(const char *signed_url, const char *file_path, const char *toke
     return 1;
   }
 
-  fseek(fd, 0L, SEEK_END);
+  if (fseek(fd, 0L, SEEK_END) != 0) {
+    fclose(fd);
+    curl_easy_cleanup(curl);
+    return 1;
+  }
   long file_size = ftell(fd);
+  if (file_size < 0) {
+    fclose(fd);
+    curl_easy_cleanup(curl);
+    return 1;
+  }
   rewind(fd);
 
-  curl_easy_setopt(curl, CURLOPT_URL, signed_url);
-  curl_easy_setopt(curl, CURLOPT_UPLOAD, 1L);
-  curl_easy_setopt(curl, CURLOPT_READDATA, fd);
-  curl_easy_setopt(curl, CURLOPT_INFILESIZE_LARGE, (curl_off_t)file_size);
+  // Every curl_easy_setopt / curl_slist_append return code is checked —
+  // a misconfigured upload must be reported, not silently swallowed.
+  CURLcode rc = CURLE_OK;
+  rc = curl_easy_setopt(curl, CURLOPT_URL, signed_url);
+  if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_UPLOAD, 1L);
+  if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_READDATA, fd);
+  if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_INFILESIZE_LARGE, (curl_off_t)file_size);
+  if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
+  if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
 
   struct curl_slist *headers = NULL;
-  headers = curl_slist_append(headers, "Content-Type: application/x-sqlite3");
+  if (rc == CURLE_OK) {
+    headers = curl_slist_append(headers, "Content-Type: application/x-sqlite3");
+    if (!headers) rc = CURLE_OUT_OF_MEMORY;
+  }
   // Pre-signed URLs must NOT carry our bearer token — it leaks the
   // credential to the storage host and S3 rejects requests that mix
   // an Authorization header with a query-string signature.
-  if (token && strlen(token) > 0 && !url_is_presigned(signed_url)) {
+  if (rc == CURLE_OK && token && strlen(token) > 0 && !url_is_presigned(signed_url)) {
     char auth_header[512];
     snprintf(auth_header, sizeof(auth_header), "Authorization: Bearer %s", token);
     headers = curl_slist_append(headers, auth_header);
+    if (!headers) rc = CURLE_OUT_OF_MEMORY;
   }
-  curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+  if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
 
-  curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
-  curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
+  int ok = 0;
+  if (rc != CURLE_OK) {
+    fprintf(stderr, "arkilian: backup upload: request setup failed: %s\n",
+            curl_easy_strerror(rc));
+  } else {
+    CURLcode res = curl_easy_perform(curl);
+    long http_code = 0;
+    if (res == CURLE_OK) curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
 
-  CURLcode res = curl_easy_perform(curl);
-  long http_code = 0;
-  if (res == CURLE_OK) curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+    // A completed transfer is not success — check the HTTP status so
+    // rejected uploads (4xx/5xx) are reported rather than swallowed.
+    ok = (res == CURLE_OK && http_code >= 200 && http_code < 300);
+    if (!ok) {
+      fprintf(stderr, "arkilian: backup upload failed (curl_rc=%d http=%ld)\n",
+              (int)res, http_code);
+    }
+  }
 
   fclose(fd);
   curl_slist_free_all(headers);
   curl_easy_cleanup(curl);
 
-  // A completed transfer is not success — check the HTTP status so
-  // rejected uploads (4xx/5xx) are reported rather than swallowed.
-  int ok = (res == CURLE_OK && http_code >= 200 && http_code < 300);
-  if (!ok) {
-    fprintf(stderr, "arkilian: backup upload failed (curl_rc=%d http=%ld)\n",
-            (int)res, http_code);
-  }
   return ok ? 0 : 1;
 }
 
