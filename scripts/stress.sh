@@ -71,10 +71,12 @@ wait_for_http() {
 
 json_field() { python3 -c "import sys,json;print(json.load(sys.stdin)[\"$1\"])" 2>/dev/null || echo ""; }
 
+# The sqlite3 amalgamation is 9.4MB — compile it ONCE into an object and
+# link every test against it, otherwise the build phase takes ~20 minutes.
 build_c() {
   local out="$1" src="$2" extra="${3:-}"
   # shellcheck disable=SC2086
-  cc -O2 "$src" src/class.c src/deps/sqlite/sqlite3.c \
+  cc -O2 "$src" src/class.c "$BIN/sqlite3.o" \
      -Isrc -Isrc/deps/sqlite -lcurl -lpthread -lm $extra -o "$BIN/$out"
 }
 
@@ -86,6 +88,7 @@ run_in_work() { (cd "$WORK" && "$@"); }
 
 log "Phase 0: building binaries"
 cd "$ROOT"
+cc -O2 -c src/deps/sqlite/sqlite3.c -Isrc -Isrc/deps/sqlite -o "$BIN/sqlite3.o"
 build_c test_basic       tests/test_basic.c
 build_c test_interception tests/test_interception.c
 build_c test_regressions tests/test_regressions.c
@@ -110,32 +113,33 @@ for t in test_basic test_interception test_regressions test_deterministic \
   fi
 done
 
-# ── Phase 2: stack (docker, fallback local) ─────────────────────────
+# ── Phase 2: stack (MinIO via docker, control plane local) ──────────
 
 log "Phase 2: infrastructure stack"
 if docker_available && docker compose -f "$ROOT/docker-compose.stress.yml" \
-     up -d --build minio createbucket control-plane > "$WORK/compose.log" 2>&1; then
+     up -d --build minio createbucket > "$WORK/compose.log" 2>&1; then
   COMPOSE_UP=1
-  if wait_for_http "http://localhost:8080/health" 60; then
-    CP_URL="http://localhost:8080"
-    ok "docker stack up (MinIO :9000, control plane :8080)"
-  else
-    docker compose -f "$ROOT/docker-compose.stress.yml" logs control-plane 2>/dev/null | tail -30 || true
-    fail "control plane did not become healthy"
-  fi
+  ok "MinIO up (docker, :9000/:9001, bucket 'arkilian-backups')"
 else
-  log "Docker unavailable/failed — falling back to a local control plane (no MinIO)"
-  (cd "$ROOT/server" && go build -o "$BIN/arkilian-server" .)
-  ARKILIAN_DB_PATH="$WORK/cp.db" PORT=18080 \
-    "$BIN/arkilian-server" > "$WORK/cp.log" 2>&1 &
-  CP_PID=$!
-  if wait_for_http "http://localhost:18080/health" 30; then
-    CP_URL="http://localhost:18080"
-    ok "local control plane on :18080"
-  else
-    tail -30 "$WORK/cp.log"
-    fail "local control plane did not start"
-  fi
+  log "Docker unavailable/failed — running without MinIO (S3 mirror + snapshots will log errors, WAL path unaffected)"
+fi
+
+# Control plane always runs as a local binary: the compose image build
+# needs to download a full Go toolchain (go.mod requires go 1.25), which
+# is slow and network-fragile on first run.
+log "Building control plane (local Go binary)"
+(cd "$ROOT/server" && go build -o "$BIN/arkilian-server" .)
+ARKILIAN_DB_PATH="$WORK/cp.db" \
+S3_ENDPOINT="http://localhost:9000" S3_BUCKET="arkilian-backups" \
+S3_KEY="minioadmin" S3_SECRET="minioadmin" S3_REGION="us-east-1" \
+PORT=18080 "$BIN/arkilian-server" > "$WORK/cp.log" 2>&1 &
+CP_PID=$!
+if wait_for_http "http://localhost:18080/health" 30; then
+  CP_URL="http://localhost:18080"
+  ok "control plane on :18080 (MinIO at :9000)"
+else
+  tail -30 "$WORK/cp.log"
+  fail "control plane did not start"
 fi
 
 # ── Phase 3: tenant setup ───────────────────────────────────────────
