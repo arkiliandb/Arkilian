@@ -34,6 +34,7 @@ extern "C" {
 #define HYDRATION_ERR_DECOMP    -6   // decompression failure
 #define HYDRATION_ERR_EXPIRED   -7   // signed URL expired, caller should retry
 #define HYDRATION_ERR_NOTFOUND  -8   // snapshot not yet uploaded (cold start)
+#define HYDRATION_ERR_NEWER     -9   // local DB is AHEAD of the snapshot; refusing to clobber
 
 // ── Types ───────────────────────────────────────────────────────────
 

@@ -554,6 +554,35 @@ int arkilian_hydrate(const char *db_path,
     return HYDRATION_ERR_EXPIRED;
   }
 
+  // ── Phase 0.5: Local-vs-snapshot LSN guard (data-loss protection) ──
+  // The snapshot download REPLACES the local database file, so the
+  // comparison MUST happen before any file is touched. If the local
+  // database was hydrated further than the snapshot's baseline
+  // (incremental hydration to LSN 5000 while the control plane serves a
+  // snapshot at LSN 3000), installing the snapshot would silently roll
+  // back 2000 LSNs of data. Refuse instead. Reads the local meta
+  // read-only; a missing file or missing meta reads as LSN 0 (cold
+  // start / unhydrated local DB — the explicit hydrate() call opts
+  // those in).
+  {
+    int64_t pre_local_lsn = 0;
+    sqlite3 *ldb = NULL;
+    if (sqlite3_open_v2(db_path, &ldb, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK) {
+      pre_local_lsn = read_last_applied_lsn(ldb);
+      sqlite3_close(ldb);
+    }
+    if (pre_local_lsn > plan.baseline_lsn) {
+      fprintf(stderr,
+              "arkilian: hydration refused — local DB is at LSN %lld but the "
+              "snapshot baseline is %lld; installing it would destroy %lld "
+              "LSN(s) of local data (HYDRATION_ERR_NEWER)\n",
+              (long long)pre_local_lsn, (long long)plan.baseline_lsn,
+              (long long)(pre_local_lsn - plan.baseline_lsn));
+      hydrate_plan_free(&plan);
+      return HYDRATION_ERR_NEWER;
+    }
+  }
+
   // ── Phase 1: Download baseline snapshot ──
   rc = download_snapshot(plan.snapshot_url, auth_token, db_path,
                           progress, user_data);

@@ -293,6 +293,160 @@ static void test_hydration_integration(void) {
   remove(db_path);
 }
 
+// ── Local-vs-snapshot LSN guard (data-loss protection) ──────────────
+
+#ifdef __APPLE__
+#ifndef _DARWIN_C_SOURCE
+#define _DARWIN_C_SOURCE
+#endif
+#endif
+#ifndef _DEFAULT_SOURCE
+#define _DEFAULT_SOURCE
+#endif
+#include <pthread.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+
+typedef struct {
+  int fd;
+  int port;
+  pthread_t thread;
+  volatile int stop;
+  char snapshot_url[128]; // filled after bind; served in the plan
+} mock_plan_server;
+
+static void *mock_plan_run(void *arg) {
+  mock_plan_server *s = (mock_plan_server *)arg;
+  char plan[512];
+  int plan_len = snprintf(plan, sizeof(plan),
+      "{\"snapshot_url\":\"%s\",\"baseline_lsn\":3000,\"chunks\":[]}",
+      s->snapshot_url);
+  for (;;) {
+    int c = accept(s->fd, NULL, NULL);
+    if (c < 0) break;
+    char buf[8192];
+    ssize_t n = recv(c, buf, sizeof(buf) - 1, 0);
+    if (n > 0) {
+      buf[n] = '\0';
+      if (s->stop) { close(c); break; }
+      int is_plan = strstr(buf, "/hydrate/plan") != NULL;
+      if (is_plan) {
+        char resp[1024];
+        int rl = snprintf(resp, sizeof(resp),
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+            "Content-Length: %d\r\nConnection: close\r\n\r\n%s",
+            plan_len, plan);
+        send(c, resp, (size_t)rl, 0);
+      } else {
+        // Any other path (the snapshot download) → 404, exercising the
+        // cold-start path when the guard permits proceeding.
+        const char *nf = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        send(c, nf, strlen(nf), 0);
+      }
+    }
+    close(c);
+  }
+  return NULL;
+}
+
+static void mock_plan_start(mock_plan_server *s) {
+  memset(s, 0, sizeof(*s));
+  s->fd = socket(AF_INET, SOCK_STREAM, 0);
+  int one = 1;
+  setsockopt(s->fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+  struct sockaddr_in a;
+  memset(&a, 0, sizeof(a));
+  a.sin_family = AF_INET;
+  a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  a.sin_port = 0;
+  bind(s->fd, (struct sockaddr *)&a, sizeof(a));
+  socklen_t alen = sizeof(a);
+  getsockname(s->fd, (struct sockaddr *)&a, &alen);
+  s->port = ntohs(a.sin_port);
+  snprintf(s->snapshot_url, sizeof(s->snapshot_url),
+           "http://127.0.0.1:%d/snap", s->port);
+  listen(s->fd, 8);
+  pthread_create(&s->thread, NULL, mock_plan_run, s);
+}
+
+static void mock_plan_stop(mock_plan_server *s) {
+  s->stop = 1;
+  int fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (fd >= 0) {
+    struct sockaddr_in a;
+    memset(&a, 0, sizeof(a));
+    a.sin_family = AF_INET;
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    a.sin_port = htons((unsigned short)s->port);
+    connect(fd, (struct sockaddr *)&a, sizeof(a));
+    close(fd);
+  }
+  pthread_join(s->thread, NULL);
+  close(s->fd);
+}
+
+// A local DB hydrated to LSN 5000 must NOT be clobbered by a snapshot
+// whose baseline is 3000 — that would silently destroy 2000 LSNs.
+static void test_hydrate_refuses_when_local_is_newer(void) {
+  mock_plan_server srv;
+  mock_plan_start(&srv);
+
+  char base[64];
+  snprintf(base, sizeof(base), "http://127.0.0.1:%d/v1", srv.port);
+  const char *db_path = "/tmp/ark_hydrate_newer.db";
+  remove(db_path);
+
+  sqlite3 *db = NULL;
+  assert(sqlite3_open_v2(db_path, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, NULL) == SQLITE_OK);
+  assert(sqlite3_exec(db,
+      "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);"
+      "CREATE TABLE _arkilian_meta (k TEXT PRIMARY KEY, v TEXT);"
+      "INSERT INTO _arkilian_meta VALUES ('last_applied_lsn', '5000');"
+      "INSERT INTO t (v) VALUES ('precious-local-data');", NULL, NULL, NULL) == SQLITE_OK);
+  sqlite3_close(db);
+
+  int rc = arkilian_hydrate(db_path, base, "token", NULL, NULL);
+  assert(rc == HYDRATION_ERR_NEWER);
+
+  // The local file must be untouched — data still there.
+  assert(sqlite3_open_v2(db_path, &db, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
+  sqlite3_stmt *st = NULL;
+  sqlite3_prepare_v2(db, "SELECT v FROM t", -1, &st, NULL);
+  assert(sqlite3_step(st) == SQLITE_ROW);
+  assert(strcmp((const char *)sqlite3_column_text(st, 0), "precious-local-data") == 0);
+  sqlite3_finalize(st);
+  sqlite3_close(db);
+
+  remove(db_path);
+  mock_plan_stop(&srv);
+}
+
+// A local DB at or behind the baseline proceeds (chunks skipped by LSN).
+static void test_hydrate_proceeds_when_local_behind(void) {
+  mock_plan_server srv;
+  mock_plan_start(&srv);
+
+  char base[64];
+  snprintf(base, sizeof(base), "http://127.0.0.1:%d/v1", srv.port);
+  const char *db_path = "/tmp/ark_hydrate_behind.db";
+  remove(db_path);
+
+  sqlite3 *db = NULL;
+  assert(sqlite3_open_v2(db_path, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, NULL) == SQLITE_OK);
+  assert(sqlite3_exec(db,
+      "CREATE TABLE _arkilian_meta (k TEXT PRIMARY KEY, v TEXT);"
+      "INSERT INTO _arkilian_meta VALUES ('last_applied_lsn', '1500');", NULL, NULL, NULL) == SQLITE_OK);
+  sqlite3_close(db);
+
+  int rc = arkilian_hydrate(db_path, base, "token", NULL, NULL);
+  assert(rc == HYDRATION_OK);
+
+  remove(db_path);
+  mock_plan_stop(&srv);
+}
+
 // ── Main ────────────────────────────────────────────────────────────
 
 int main(int argc, char **argv) {
@@ -329,6 +483,10 @@ int main(int argc, char **argv) {
 
   printf("\n[Snapshot Install Hygiene]\n");
   RUN_TEST(test_hydration_remove_db_files);
+
+  printf("\n[LSN Clobber Guard]\n");
+  RUN_TEST(test_hydrate_refuses_when_local_is_newer);
+  RUN_TEST(test_hydrate_proceeds_when_local_behind);
 
   if (integration) {
     printf("\n[Integration]\n");
