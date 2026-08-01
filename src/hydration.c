@@ -455,7 +455,17 @@ static int download_snapshot(const char *snapshot_url, const char *token,
     }
     sqlite3 *db = NULL;
     if (sqlite3_open_v2(db_path, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX, NULL) == SQLITE_OK) {
-      sqlite3_exec(db, "CREATE TABLE IF NOT EXISTS _arkilian_meta (k TEXT PRIMARY KEY, v TEXT);", NULL, NULL, NULL);
+      char *perr = NULL;
+      int prc = sqlite3_exec(db,
+          "CREATE TABLE IF NOT EXISTS _arkilian_meta (k TEXT PRIMARY KEY, v TEXT);",
+          NULL, NULL, &perr);
+      if (prc != SQLITE_OK) {
+        fprintf(stderr, "arkilian: cold-start meta init failed: %s\n",
+                perr ? perr : sqlite3_errmsg(db));
+        sqlite3_free(perr);
+        sqlite3_close(db);
+        return HYDRATION_ERR_SQL;
+      }
       sqlite3_close(db);
       if (progress) progress(1, 1, 1, user);
       return 0;
@@ -555,10 +565,18 @@ int arkilian_hydrate(const char *db_path,
     SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX, NULL);
   if (rc != SQLITE_OK) { hydrate_plan_free(&plan); return HYDRATION_ERR_SQL; }
 
-  // Apply PRAGMAs for speed during hydration
-  sqlite3_exec(db, "PRAGMA journal_mode=WAL;", NULL, NULL, NULL);
-  sqlite3_exec(db, "PRAGMA synchronous=OFF;", NULL, NULL, NULL); // speed over safety during bulk load
-  sqlite3_exec(db, "PRAGMA foreign_keys=OFF;", NULL, NULL, NULL);
+  // Apply PRAGMAs for speed during hydration. Best-effort: a failure
+  // slows the bulk load but must never abort the restore.
+  {
+    char *perr = NULL;
+    if (sqlite3_exec(db, "PRAGMA journal_mode=WAL;", NULL, NULL, &perr) != SQLITE_OK ||
+        sqlite3_exec(db, "PRAGMA synchronous=OFF;", NULL, NULL, &perr) != SQLITE_OK ||
+        sqlite3_exec(db, "PRAGMA foreign_keys=OFF;", NULL, NULL, &perr) != SQLITE_OK) {
+      fprintf(stderr, "arkilian: hydration speed pragma warning: %s\n",
+              perr ? perr : "unknown error");
+      sqlite3_free(perr);
+    }
+  }
 
   int64_t local_lsn = read_last_applied_lsn(db);
   if (local_lsn < plan.baseline_lsn)
@@ -608,8 +626,15 @@ int arkilian_hydrate(const char *db_path,
   }
 
   // Restore safe PRAGMAs
-  sqlite3_exec(db, "PRAGMA synchronous=NORMAL;", NULL, NULL, NULL);
-  sqlite3_exec(db, "PRAGMA foreign_keys=ON;", NULL, NULL, NULL);
+  {
+    char *perr = NULL;
+    if (sqlite3_exec(db, "PRAGMA synchronous=NORMAL;", NULL, NULL, &perr) != SQLITE_OK ||
+        sqlite3_exec(db, "PRAGMA foreign_keys=ON;", NULL, NULL, &perr) != SQLITE_OK) {
+      fprintf(stderr, "arkilian: hydration restore pragma warning: %s\n",
+              perr ? perr : "unknown error");
+      sqlite3_free(perr);
+    }
+  }
 
   sqlite3_close(db);
   hydrate_plan_free(&plan);

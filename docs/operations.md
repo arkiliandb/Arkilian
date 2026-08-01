@@ -18,7 +18,8 @@ All four signals are exposed by the C API and the Node binding:
 | Dead letters | `db_backup_dead_letter_count()` | Any non-zero growth — every row is a change that failed to ship |
 | Thread liveness | `db_backup_thread_heartbeat_age_ms()` | Age > 10,000 ms (5 poll intervals) — thread died silently |
 | Trigger coverage | `db_backup_trigger_coverage()` | Any non-zero value — a table lost its capture triggers |
-| Health | `db_backup_is_healthy()` | Returns 0 — thread dead OR queue above `ARKILIAN_MAX_QUEUE_DEPTH` (default 100,000) |
+| Skipped tables | `db_backup_skipped_table_count()` | Any non-zero value — tables with no PRIMARY KEY are not captured (see §7) |
+| Health | `db_backup_is_healthy()` | Returns 0 — backup disabled, no destination configured, thread dead, OR queue above `ARKILIAN_MAX_QUEUE_DEPTH` (default 100,000) |
 
 Node.js:
 
@@ -219,3 +220,15 @@ Real environment variables always win over a `./.env` file.
   the subsystem into the kill-switch's disabled state — the game always
   starts. `db_backup_is_enabled()` + `db_backup_is_healthy()` + the
   monitoring signals make the outage visible.
+- **DDL is intercepted on every wrapper path** (spec §1): `db_exec` and
+  DDL run through `db_prepare`/`db_step` both re-sync capture triggers
+  and record the DDL itself in the outbox, so the destination mirror
+  applies the schema before the rows it creates. Only raw
+  `db_get_handle()` use bypasses this — treat hand-edited schema as an
+  incident, and repair with `db_resync_triggers()`.
+- **Bulk operations generate one outbox row per written row** (spec
+  §4.3). For known large bulk paths (imports, migrations), prefer:
+  flip the kill-switch off (`db_backup_set_enabled(0)`), run the bulk,
+  re-enable — the queue drains afterward and the hourly snapshot covers
+  the window. Never leave the kill-switch off for long; the skipped
+  tables / queue-depth / lag monitors will tell you if you do.

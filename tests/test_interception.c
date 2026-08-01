@@ -215,6 +215,34 @@ static void test_prepare_step_insert_pushes_to_ring(void) {
   cleanup_files();
 }
 
+// DDL through prepare/step must resync capture triggers AND capture the
+// DDL itself — a table created this way used to be invisible to backup
+// (spec §1: no write path may silently bypass capture). Backup is
+// disabled in this harness, so the outbox count is stable and exact.
+static void test_prepare_step_create_table_resyncs_capture(void) {
+  arkilian *db = open_test_db();
+  assert(db_backup_trigger_coverage(db) == 0);
+
+  int rc = db_prepare(db, "CREATE TABLE t_pd (id INTEGER PRIMARY KEY, v TEXT)");
+  assert(rc == SQLITE_OK);
+  int before = db_wal_pending(db);
+  rc = db_step(db);
+  assert(rc == SQLITE_DONE);
+  db_finalize(db);
+
+  // Trigger set now exists for the table created via prepare/step...
+  assert(db_backup_trigger_coverage(db) == 0);
+  // ...and the DDL itself was captured into the outbox.
+  assert(db_wal_pending(db) > before);
+
+  // Writes to the new table are captured (previously silently bypassed).
+  assert(db_exec(db, "INSERT INTO t_pd (v) VALUES ('via-prepare')") == SQLITE_OK);
+  assert(db_wal_pending(db) > before);
+
+  db_close(db);
+  cleanup_files();
+}
+
 // ── Reads must NOT push to ring buffer ──────────────────────────────
 
 static void test_exec_select_does_not_push(void) {
@@ -673,6 +701,7 @@ int main(void) {
 
   printf("\n[Write Logging — prepare/step/finalize pushes to ring]\n");
   RUN_TEST(test_prepare_step_insert_pushes_to_ring);
+  RUN_TEST(test_prepare_step_create_table_resyncs_capture);
 
   printf("\n[Reads — No Ring Push]\n");
   RUN_TEST(test_exec_select_does_not_push);

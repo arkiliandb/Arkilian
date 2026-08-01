@@ -67,6 +67,7 @@ struct arkilian {
 
   // Statement pool for caller
   sqlite3_stmt **stmts;
+  unsigned char *stmt_is_ddl;   // parallel to stmts[]: 1 = DDL statement
   int stmt_count;
   int stmt_capacity;
   int stmt_current;
@@ -760,7 +761,9 @@ static ship_result_t ship_to_backup(arkilian *db, sqlite3_int64 id, const char *
     if (res == CURLE_OK) {
       curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
     }
-    result = (res == CURLE_OK && (http_code == 200 || http_code == 201)) ? SHIP_OK : SHIP_RETRY;
+    // Any 2xx is a successful accept — a 202-Async destination must not
+    // be retried forever (same policy as upload_to_s3).
+    result = (res == CURLE_OK && http_code >= 200 && http_code < 300) ? SHIP_OK : SHIP_RETRY;
   }
 
   curl_slist_free_all(headers);
@@ -1396,6 +1399,7 @@ void db_close(arkilian *db) {
     if (db->stmts && db->stmts[i]) sqlite3_finalize(db->stmts[i]);
   }
   if (db->stmts) free(db->stmts);
+  if (db->stmt_is_ddl) free(db->stmt_is_ddl);
 
   if (db->begin_stmt) sqlite3_finalize(db->begin_stmt);
   if (db->commit_stmt) sqlite3_finalize(db->commit_stmt);
@@ -1436,6 +1440,36 @@ const char *db_errmsg(arkilian *db) {
 
 sqlite3 *db_get_handle(arkilian *db) { return db ? db->handle : NULL; }
 
+// Shared post-DDL path for every execution route (db_exec AND DDL run
+// through db_prepare/db_step): re-sync the capture triggers for the
+// (possibly new) schema, then record the DDL itself in the outbox so
+// the destination mirror applies it before the rows it creates. Without
+// this, a table created outside db_exec is never captured (spec §1:
+// no write path may silently bypass capture). Never fatal — failures
+// are logged loudly and capture of other tables keeps working.
+static void apply_ddl_capture(arkilian *db, const char *sql) {
+  char *terr = NULL;
+  int sync_rc = sync_backup_triggers(db->handle, &terr);
+  if (sync_rc != SQLITE_OK) {
+    snprintf(db->last_error_msg, sizeof(db->last_error_msg),
+             "backup trigger sync failed after DDL: %s", terr ? terr : "unknown error");
+    ark_log(db, ARK_LOG_ERROR, "%s", db->last_error_msg);
+  }
+  if (terr) sqlite3_free(terr);
+
+  sqlite3_stmt *ddl_stmt = NULL;
+  if (sqlite3_prepare_v2(db->handle, "INSERT INTO _pending_backup (payload) VALUES (?)", -1, &ddl_stmt, NULL) == SQLITE_OK) {
+    int bind_rc = sqlite3_bind_text(ddl_stmt, 1, sql, -1, SQLITE_TRANSIENT);
+    int step_rc = (bind_rc == SQLITE_OK) ? sqlite3_step(ddl_stmt) : bind_rc;
+    if (step_rc != SQLITE_DONE) {
+      ark_log(db, ARK_LOG_ERROR,
+              "DDL capture to _pending_backup failed (rc=%d): %s",
+              step_rc, sqlite3_errmsg(db->handle));
+    }
+    sqlite3_finalize(ddl_stmt);
+  }
+}
+
 int db_exec(arkilian *db, const char *sql) {
   if (!db || !db->handle || !sql) return SQLITE_ERROR;
 
@@ -1456,28 +1490,7 @@ int db_exec(arkilian *db, const char *sql) {
   if (strncasecmp(sql_verb, "CREATE", 6) == 0 ||
       strncasecmp(sql_verb, "ALTER", 5) == 0 ||
       strncasecmp(sql_verb, "DROP", 4) == 0) {
-    char *terr = NULL;
-    int sync_rc = sync_backup_triggers(db->handle, &terr);
-    if (sync_rc != SQLITE_OK) {
-      // The DDL succeeded but its table is not captured for backup —
-      // make the failure visible instead of silent.
-      snprintf(db->last_error_msg, sizeof(db->last_error_msg),
-               "backup trigger sync failed after DDL: %s", terr ? terr : "unknown error");
-      ark_log(db, ARK_LOG_ERROR, "%s", db->last_error_msg);
-    }
-    if (terr) sqlite3_free(terr);
-
-    sqlite3_stmt *ddl_stmt = NULL;
-    if (sqlite3_prepare_v2(db->handle, "INSERT INTO _pending_backup (payload) VALUES (?)", -1, &ddl_stmt, NULL) == SQLITE_OK) {
-      int bind_rc = sqlite3_bind_text(ddl_stmt, 1, sql, -1, SQLITE_TRANSIENT);
-      int step_rc = (bind_rc == SQLITE_OK) ? sqlite3_step(ddl_stmt) : bind_rc;
-      if (step_rc != SQLITE_DONE) {
-        ark_log(db, ARK_LOG_ERROR,
-                "DDL capture to _pending_backup failed (rc=%d): %s",
-                step_rc, sqlite3_errmsg(db->handle));
-      }
-      sqlite3_finalize(ddl_stmt);
-    }
+    apply_ddl_capture(db, sql);
   }
 
   // Public contract: SQLITE_OK (0) on success. sqlite3_exec returns
@@ -1491,9 +1504,18 @@ int db_prepare(arkilian *db, const char *sql) {
 
   if (db->stmt_count >= db->stmt_capacity) {
     int new_cap = (db->stmt_capacity == 0) ? 8 : db->stmt_capacity * 2;
+    // Grow the DDL-flag array first; if the statement array then fails
+    // to grow, the (larger) flag block is harmless — it is only ever
+    // indexed below stmt_capacity.
+    unsigned char *new_flags = realloc(db->stmt_is_ddl, (size_t)new_cap);
+    if (!new_flags) return SQLITE_NOMEM;
     sqlite3_stmt **new_arr = realloc(db->stmts, (size_t)new_cap * sizeof(sqlite3_stmt *));
-    if (!new_arr) return SQLITE_NOMEM;
+    if (!new_arr) {
+      db->stmt_is_ddl = new_flags;
+      return SQLITE_NOMEM;
+    }
     db->stmts = new_arr;
+    db->stmt_is_ddl = new_flags;
     db->stmt_capacity = new_cap;
   }
 
@@ -1511,6 +1533,17 @@ int db_prepare(arkilian *db, const char *sql) {
   }
 
   db->stmts[db->stmt_count] = stmt;
+  // Flag DDL statements at prepare time so db_step can resync capture
+  // triggers after they execute — DDL through this API must be as
+  // invisible-proof as db_exec (spec §1).
+  {
+    const char *raw = sqlite3_sql(stmt);
+    const char *verb = skip_sql_prefix(raw ? raw : "");
+    db->stmt_is_ddl[db->stmt_count] =
+        (strncasecmp(verb, "CREATE", 6) == 0 ||
+         strncasecmp(verb, "ALTER", 5) == 0 ||
+         strncasecmp(verb, "DROP", 4) == 0) ? 1 : 0;
+  }
   db->stmt_current = db->stmt_count;
   db->stmt_count++;
   return rc;
@@ -1535,7 +1568,18 @@ static sqlite3_stmt *get_current_stmt(arkilian *db) {
 int db_step(arkilian *db) {
   sqlite3_stmt *stmt = get_current_stmt(db);
   if (!stmt) return SQLITE_ERROR;
-  return sqlite3_step(stmt);
+  int rc = sqlite3_step(stmt);
+  // DDL executed through prepare/step used to bypass trigger resync —
+  // a table created this way was never captured (spec §1). Resync once
+  // the statement completes successfully. The flag check is one
+  // load-free branch on the non-DDL hot path.
+  if (rc == SQLITE_DONE && db->stmt_is_ddl &&
+      db->stmt_current >= 0 && db->stmt_current < db->stmt_count &&
+      db->stmt_is_ddl[db->stmt_current]) {
+    const char *raw = sqlite3_sql(stmt);
+    apply_ddl_capture(db, raw ? raw : "");
+  }
+  return rc;
 }
 
 int db_finalize(arkilian *db) {
@@ -1544,6 +1588,7 @@ int db_finalize(arkilian *db) {
   if (stmt) {
     sqlite3_finalize(stmt);
     db->stmts[db->stmt_current] = NULL;
+    if (db->stmt_is_ddl) db->stmt_is_ddl[db->stmt_current] = 0;
   }
   return SQLITE_OK;
 }
