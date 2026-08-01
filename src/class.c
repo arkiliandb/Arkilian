@@ -58,7 +58,8 @@
 
 struct arkilian {
   sqlite3 *handle;            // Primary connection (game / application thread)
-  sqlite3 *backup_db;         // Dedicated secondary connection (backup thread)
+  sqlite3 *backup_db;         // Dedicated connection (flush/shipping thread)
+  sqlite3 *snapshot_db;       // Dedicated connection (hourly snapshot thread)
   char *db_path;
   int is_open;
   int last_error_code;
@@ -99,8 +100,10 @@ struct arkilian {
   char wal_last_buf[1024];
 #ifdef _WIN32
   CRITICAL_SECTION payload_mutex;
+  CRITICAL_SECTION token_mutex;
 #else
   pthread_mutex_t payload_mutex;
+  pthread_mutex_t token_mutex; // guards database_token (read/write)
 #endif
 
   // Transaction state tracking
@@ -124,6 +127,7 @@ struct arkilian {
 static void load_env(void);
 static const char *get_env_default(const char *env_var, const char *default_val);
 static int get_env_int_default(const char *env_var, int default_val);
+static char *token_snapshot(arkilian *db);
 #ifdef _WIN32
 DWORD WINAPI run_hourly_backup(LPVOID arg);
 DWORD WINAPI run_wal_flush(LPVOID arg);
@@ -209,6 +213,34 @@ static long long now_ms_mono(void) {
   struct timespec ts;
   clock_gettime(CLOCK_MONOTONIC, &ts);
   return (long long)ts.tv_sec * 1000LL + ts.tv_nsec / 1000000LL;
+}
+
+// ── libcurl one-time global init ────────────────────────────────────
+// libcurl requires curl_global_init() before any thread calls
+// curl_easy_init(); concurrent first use from multiple threads is
+// undefined. The once-guard makes db_init idempotent-safe; cleanup is
+// deliberately never called (see the comment at the call site).
+
+static void curl_global_init_once(void) {
+  curl_global_init(CURL_GLOBAL_DEFAULT);
+}
+
+#ifdef _WIN32
+static BOOL CALLBACK curl_global_init_once_w(PINIT_ONCE once, PVOID param, PVOID *ctx) {
+  (void)once; (void)param; (void)ctx;
+  curl_global_init(CURL_GLOBAL_DEFAULT);
+  return TRUE;
+}
+#endif
+
+static void ensure_curl_global_init(void) {
+#ifndef _WIN32
+  static pthread_once_t once = PTHREAD_ONCE_INIT;
+  pthread_once(&once, curl_global_init_once);
+#else
+  static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
+  InitOnceExecuteOnce(&once, curl_global_init_once_w, NULL, NULL);
+#endif
 }
 
 static void load_env(void) {
@@ -302,22 +334,6 @@ static int is_reserved_table(const char *name) {
   return 0;
 }
 
-// Returns 1 if the named table is WITHOUT ROWID, 0 otherwise (including
-// when the check itself fails — older SQLite lacks pragma_table_list).
-static int table_is_without_rowid(sqlite3 *db, const char *table) {
-  int wr = 0;
-  char *q = sqlite3_mprintf(
-      "SELECT wr FROM pragma_table_list WHERE name = %Q", table);
-  if (!q) return 0;
-  sqlite3_stmt *st = NULL;
-  if (sqlite3_prepare_v2(db, q, -1, &st, NULL) == SQLITE_OK) {
-    if (sqlite3_step(st) == SQLITE_ROW) wr = sqlite3_column_int(st, 0);
-  }
-  sqlite3_finalize(st);
-  sqlite3_free(q);
-  return wr;
-}
-
 int sync_backup_triggers(sqlite3 *db, char **err_out) {
   if (!db) return SQLITE_ERROR;
   int rc;
@@ -394,8 +410,6 @@ int sync_backup_triggers(sqlite3 *db, char **err_out) {
   while ((rc = sqlite3_step(table_stmt)) == SQLITE_ROW) {
     const char *table = (const char *)sqlite3_column_text(table_stmt, 0);
     if (!table || is_reserved_table(table)) continue;
-
-    int without_rowid = table_is_without_rowid(db, table);
 
     char *pragma_sql = sqlite3_mprintf("PRAGMA table_xinfo(\"%w\");", table);
     if (!pragma_sql) { rc = SQLITE_NOMEM; goto oom; }
@@ -480,18 +494,38 @@ int sync_backup_triggers(sqlite3 *db, char **err_out) {
     sqlite3_free(replace_lit_raw); sqlite3_free(delete_prefix_raw);
     if (!replace_lit || !delete_prefix) { free(replace_lit); free(delete_prefix); goto oom; }
 
-    // WITHOUT ROWID tables have no rowid — the DELETE payload must
-    // match on primary-key columns instead of OLD.rowid.
+    // DELETE payloads are keyed on the PRIMARY KEY columns for every
+    // table that has one. Keying on OLD.rowid is NOT replay-faithful:
+    // REPLACE INTO deletes + reinserts, so rowids shift on the
+    // destination after any UPDATE — rowid tables without INTEGER
+    // PRIMARY KEY desynchronize and every later DELETE hits the wrong
+    // row (proven divergence). PK values survive REPLACE, so PK-keyed
+    // deletes stay correct for INTEGER, TEXT, and composite keys alike.
+    // Tables with NO key at all (plain rowid tables) are unreplayable —
+    // REPLACE appends and rowids drift — so they are skipped with a loud
+    // warning (spec §1: capture must not be silently bypassed).
+    int pk_seen = 0;
+    for (int i = 0; i < ncols; i++) {
+      if (pk_ranks[i] > 0) pk_seen++;
+    }
     char *delete_expr = NULL;
-    if (!without_rowid) {
-      delete_expr = sqlite3_mprintf("'%srowid = ' || OLD.rowid", delete_prefix);
-    } else {
-      int pk_seen = 0;
+    if (pk_seen == 0) {
+      ark_log(NULL, ARK_LOG_WARN,
+              "trigger sync: skipping table %s — it has no PRIMARY KEY, so "
+              "row-level replication would diverge on the destination "
+              "(REPLACE appends, rowids drift). It will not be captured",
+              table);
+      free(replace_lit); free(delete_prefix);
+      sqlite3_free(raw_cols); sqlite3_free(new_vals);
+      goto next_table;
+    }
+    {
       char *lit_accum = strdup(delete_prefix);
       if (!lit_accum) goto oom;
+      int pk_done = 0;
       for (int i = 0; i < ncols; i++) {
         if (pk_ranks[i] == 0) continue;
-        char *piece = sqlite3_mprintf(pk_seen == 0 ? "\"%w\" = " : " AND \"%w\" = ", cols[i]);
+        char *piece = sqlite3_mprintf(pk_done == 0 ? "\"%w\" = " : " AND \"%w\" = ", cols[i]);
         if (!piece) { free(lit_accum); goto oom; }
         char *new_accum = malloc(strlen(lit_accum) + strlen(piece) + 1);
         if (!new_accum) { sqlite3_free(piece); free(lit_accum); goto oom; }
@@ -511,21 +545,9 @@ int sync_backup_triggers(sqlite3 *db, char **err_out) {
         delete_expr = next_expr;
         if (!delete_expr) { free(lit_accum); goto oom; }
         lit_accum[0] = '\0';
-        pk_seen++;
+        pk_done++;
       }
       free(lit_accum);
-      if (pk_seen == 0) {
-        // Cannot happen through normal SQL (SQLite rejects WITHOUT ROWID
-        // without a PK) — but if it ever does, skip the table rather than
-        // taking the whole game down (spec §0/§1).
-        ark_log(NULL, ARK_LOG_WARN,
-                "trigger sync: skipping table %s (WITHOUT ROWID without PRIMARY KEY) — "
-                "it will not be captured for backup",
-                table);
-        free(replace_lit); free(delete_prefix);
-        sqlite3_free(raw_cols); sqlite3_free(new_vals);
-        goto next_table;
-      }
     }
     if (!delete_expr) { free(replace_lit); free(delete_prefix); sqlite3_free(raw_cols); sqlite3_free(new_vals); goto oom; }
 
@@ -677,9 +699,14 @@ static ship_result_t ship_to_backup(arkilian *db, sqlite3_int64 id, const char *
   // No push destination configured → nothing to ship. This is the
   // realtime WAL endpoint (ARKILIAN_WAL_PUSH_URL), independent of the
   // signed-URL endpoint used by the hourly snapshot thread.
+  // No push destination configured → nothing can be shipped. This MUST
+  // NOT report success: drain_batch deletes rows reported as shipped, so
+  // SHIP_OK here would quietly destroy captured data (spec §1). The
+  // flush loop additionally skips draining entirely when no URL is set,
+  // so rows accumulate with attempts=0 until a destination is configured.
   const char *push_url = db->push_url;
   if (!push_url || strlen(push_url) == 0) {
-    return SHIP_OK;
+    return SHIP_RETRY;
   }
 
   CURL *curl = curl_easy_init();
@@ -714,13 +741,14 @@ static ship_result_t ship_to_backup(arkilian *db, sqlite3_int64 id, const char *
   }
   // Never attach our bearer token to a pre-signed storage URL — the
   // signature IS the credential, and the token would leak to the host.
-  if (rc == CURLE_OK && db->database_token && strlen(db->database_token) > 0 &&
-      !url_is_presigned(push_url)) {
+  char *tok = token_snapshot(db);
+  if (rc == CURLE_OK && tok && !url_is_presigned(push_url)) {
     char auth[512];
-    snprintf(auth, sizeof(auth), "Authorization: Bearer %s", db->database_token);
+    snprintf(auth, sizeof(auth), "Authorization: Bearer %s", tok);
     headers = curl_slist_append(headers, auth);
     if (!headers) rc = CURLE_OUT_OF_MEMORY;
   }
+  free(tok);
   if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
 
   if (rc != CURLE_OK) {
@@ -983,11 +1011,15 @@ void *run_wal_flush(void *arg) {
     db->last_heartbeat_sec = (int)(now_ms_mono() / 1000);
 
     int drained = 0;
-    // Kill-switch check: when backup is disabled, do not ship (and
-    // critically, do not DELETE) anything — the queue just accumulates
-    // until re-enabled. Skipping drain_batch entirely keeps attempts at
-    // 0 so no row is ever dead-lettered while disabled.
-    if (db->backup_enabled) {
+    // Kill-switch check: when backup is disabled — or no destination is
+    // configured — do not ship (and critically, do not DELETE) anything;
+    // the queue just accumulates until re-enabled/configured. Skipping
+    // drain_batch entirely keeps attempts at 0 so no row is ever
+    // dead-lettered while disabled. Without this gate, ship_to_backup
+    // would still never report success, but the retry/attempts path
+    // would dead-letter rows after MAX_ATTEMPTS — which for a missing
+    // destination is data destruction, not a transient failure.
+    if (db->backup_enabled && db->push_url && strlen(db->push_url) > 0) {
       drained = drain_batch(db, select_stmt, delete_stmt,
                             update_attempts_stmt, dead_letter_stmt);
     }
@@ -1084,11 +1116,21 @@ int db_init(arkilian **db_ptr, const char *filename) {
   pthread_mutex_init(&db->wake_mutex, NULL);
   pthread_cond_init(&db->wake_cond, NULL);
   pthread_mutex_init(&db->payload_mutex, NULL);
+  pthread_mutex_init(&db->token_mutex, NULL);
 #else
   InitializeCriticalSection(&db->wake_mutex);
   InitializeConditionVariable(&db->wake_cond);
   InitializeCriticalSection(&db->payload_mutex);
+  InitializeCriticalSection(&db->token_mutex);
 #endif
+
+  // libcurl global init must happen before ANY thread calls
+  // curl_easy_init — concurrent first use is not thread-safe. The
+  // once-guard makes repeated db_init/db_close cycles safe; cleanup is
+  // intentionally never called (curl_global_cleanup while any other
+  // instance still uses libcurl is a use-after-free; a one-time leak at
+  // process exit is the accepted tradeoff).
+  ensure_curl_global_init();
 
   // Open primary connection
   int rc = sqlite3_open_v2(
@@ -1120,8 +1162,29 @@ int db_init(arkilian **db_ptr, const char *filename) {
     return 1;
   }
 
+  // Third connection: owned exclusively by the hourly snapshot thread.
+  // Spec §3.1 is "one connection per thread" — sharing backup_db between
+  // the flush and snapshot threads would make shipping contend with the
+  // file copy and stall the realtime path during large snapshots.
+  rc = sqlite3_open_v2(
+      path, &db->snapshot_db,
+      SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX, NULL);
+  if (rc != SQLITE_OK) {
+    snprintf(db->last_error_msg, sizeof(db->last_error_msg),
+             "snapshot connection: %s", sqlite3_errstr(rc));
+    if (db->snapshot_db) sqlite3_close(db->snapshot_db);
+    if (db->backup_db) sqlite3_close(db->backup_db);
+    sqlite3_close(db->handle);
+    db->handle = NULL;
+    db->backup_db = NULL;
+    db->snapshot_db = NULL;
+    *db_ptr = db;
+    return 1;
+  }
+
   sqlite3_busy_timeout(db->handle, 5000);
   sqlite3_busy_timeout(db->backup_db, 5000);
+  sqlite3_busy_timeout(db->snapshot_db, 5000);
 
   // ── Checked PRAGMA application (spec §0: no unchecked SQLite calls) ──
   // WAL is load-bearing for the entire design: if it silently failed
@@ -1171,6 +1234,14 @@ int db_init(arkilian **db_ptr, const char *filename) {
     if (sqlite3_exec(db->backup_db, "PRAGMA journal_mode=WAL;", NULL, NULL, &perr) != SQLITE_OK ||
         sqlite3_exec(db->backup_db, "PRAGMA synchronous=NORMAL;", NULL, NULL, &perr) != SQLITE_OK) {
       ark_log(db, ARK_LOG_WARN, "backup connection PRAGMA failed: %s",
+              perr ? perr : "unknown error");
+      sqlite3_free(perr);
+      perr = NULL;
+    }
+    // Snapshot connection: WAL mode needed for concurrent readers; the
+    // synchronous setting matters little (read-only workload).
+    if (sqlite3_exec(db->snapshot_db, "PRAGMA journal_mode=WAL;", NULL, NULL, &perr) != SQLITE_OK) {
+      ark_log(db, ARK_LOG_WARN, "snapshot connection PRAGMA failed: %s",
               perr ? perr : "unknown error");
       sqlite3_free(perr);
       perr = NULL;
@@ -1281,6 +1352,7 @@ void db_close(arkilian *db) {
   pthread_mutex_destroy(&db->wake_mutex);
   pthread_cond_destroy(&db->wake_cond);
   pthread_mutex_destroy(&db->payload_mutex);
+  pthread_mutex_destroy(&db->token_mutex);
 #else
   EnterCriticalSection(&db->wake_mutex);
   db->shutdown_requested = 1;
@@ -1300,6 +1372,7 @@ void db_close(arkilian *db) {
   }
   DeleteCriticalSection(&db->wake_mutex);
   DeleteCriticalSection(&db->payload_mutex);
+  DeleteCriticalSection(&db->token_mutex);
 #endif
 
   for (int i = 0; i < db->stmt_count; i++) {
@@ -1314,6 +1387,11 @@ void db_close(arkilian *db) {
   if (db->backup_db) {
     sqlite3_close(db->backup_db);
     db->backup_db = NULL;
+  }
+
+  if (db->snapshot_db) {
+    sqlite3_close(db->snapshot_db);
+    db->snapshot_db = NULL;
   }
 
   if (db->handle) {
@@ -1540,12 +1618,46 @@ sqlite3_int64 db_last_insert_rowid(arkilian *db) {
   return (db && db->handle) ? sqlite3_last_insert_rowid(db->handle) : 0;
 }
 
+// Snapshot the current token under the mutex; the caller frees the copy
+// once its curl setup is done. Readers must NEVER touch db->database_token
+// directly — db_set_token can swap/free it from the game thread while a
+// backup thread is mid-request (use-after-free).
+static char *token_snapshot(arkilian *db) {
+  if (!db) return NULL;
+  char *copy = NULL;
+#ifndef _WIN32
+  pthread_mutex_lock(&db->token_mutex);
+#else
+  EnterCriticalSection(&db->token_mutex);
+#endif
+  if (db->database_token && strlen(db->database_token) > 0) {
+    copy = strdup(db->database_token);
+  }
+#ifndef _WIN32
+  pthread_mutex_unlock(&db->token_mutex);
+#else
+  LeaveCriticalSection(&db->token_mutex);
+#endif
+  return copy;
+}
+
 int db_set_token(arkilian *db, const char *token) {
   if (!db || !token) return 1;
+  char *replacement = malloc(strlen(token) + 1);
+  if (!replacement) return 1;
+  strcpy(replacement, token);
+#ifndef _WIN32
+  pthread_mutex_lock(&db->token_mutex);
+#else
+  EnterCriticalSection(&db->token_mutex);
+#endif
   if (db->database_token) free(db->database_token);
-  db->database_token = malloc(strlen(token) + 1);
-  if (!db->database_token) return 1;
-  strcpy(db->database_token, token);
+  db->database_token = replacement;
+#ifndef _WIN32
+  pthread_mutex_unlock(&db->token_mutex);
+#else
+  LeaveCriticalSection(&db->token_mutex);
+#endif
   return 0;
 }
 
@@ -1762,9 +1874,11 @@ int db_backup_trigger_coverage(arkilian *db) {
 int db_backup_is_healthy(arkilian *db) {
   if (!db) return 0;
   long long hb_age = db_backup_thread_heartbeat_age_ms(db);
-  // The flush thread beats every loop iteration; an age beyond ~5 poll
-  // intervals means it died or is wedged.
-  if (hb_age < 0 || hb_age > 5LL * POLL_INTERVAL_MS) return 0;
+  // The flush thread beats once per loop iteration, but a single slow
+  // ship (curl timeout is 10s) legitimately ages the heartbeat past any
+  // 5×poll-interval bound. The dead-thread threshold must exceed the
+  // longest legitimate in-flight time: 30s = 10s ship + 20s margin.
+  if (hb_age < 0 || hb_age > 30000) return 0;
   int max_depth = get_env_int_default("ARKILIAN_MAX_QUEUE_DEPTH", DEFAULT_MAX_QUEUE_DEPTH);
   if (db_backup_queue_depth(db) >= max_depth) return 0;
   return 1;
@@ -1784,7 +1898,8 @@ int db_resync_triggers(arkilian *db) {
 
 // ── Hourly Backup Implementation ────────────────────────────────────
 
-int backup_database(sqlite3 *pSource, const char *zFilename) {
+int backup_database(sqlite3 *pSource, const char *zFilename,
+                    volatile int *shutdown_flag) {
   if (!pSource) return SQLITE_ERROR;
   sqlite3 *pDest = NULL;
   const char *actualPath = (zFilename != NULL) ? zFilename : DEFAULT_BACKUP_PATH;
@@ -1803,6 +1918,13 @@ int backup_database(sqlite3 *pSource, const char *zFilename) {
 
   int retry_count = 0;
   do {
+    // Abort promptly on shutdown: without this check, a persistent
+    // SQLITE_BUSY could hold db_close() for up to 6000×100ms (10
+    // minutes) waiting to join this thread.
+    if (shutdown_flag && *shutdown_flag) {
+      rc = SQLITE_ABORT;
+      break;
+    }
     rc = sqlite3_backup_step(pBackup, 5);
     if (rc == SQLITE_OK || rc == SQLITE_BUSY || rc == SQLITE_LOCKED) {
       if (rc != SQLITE_OK) sqlite3_sleep(100);
@@ -2032,12 +2154,14 @@ void *run_hourly_backup(void *arg) {
     // the normal schedule (the flush thread handles realtime resume).
     if (!db->backup_enabled) continue;
 
-    // Snapshot from the BACKUP connection, never the game connection:
-    // sqlite3_backup_step page I/O would otherwise hold the game
-    // connection's mutex for the whole copy (bounded only by 6000 retry
-    // steps), making game-thread writes wait on the backup thread — the
-    // exact §3.3 failure mode the spec forbids.
-    int status = backup_database(db->backup_db, db->backup_path);
+    // Snapshot from the SNAPSHOT connection (this thread's own, spec
+    // §3.1) — never the game connection: sqlite3_backup_step page I/O
+    // would otherwise hold the game connection's mutex for the whole
+    // copy, making game-thread writes wait on the backup thread (the
+    // exact §3.3 failure mode the spec forbids). Sharing the flush
+    // thread's connection would stall shipping during large snapshots.
+    int status = backup_database(db->snapshot_db, db->backup_path,
+                                 &db->shutdown_requested);
 
     // Skip the remote upload when no signed-URL endpoint has been
     // configured — nothing phones home unless explicitly enabled.
@@ -2045,13 +2169,17 @@ void *run_hourly_backup(void *arg) {
         strlen(db->signed_url_endpoint) > 0;
 
     if (status == SQLITE_OK && endpoint_configured) {
-      char *signed_url = get_signed_url(db, db->signed_url_endpoint, db->database_token,
+      // Token snapshot: db_set_token can swap the string from the game
+      // thread while this thread builds the request (use-after-free).
+      char *tok = token_snapshot(db);
+      char *signed_url = get_signed_url(db, db->signed_url_endpoint, tok,
                                         (int *)&db->shutdown_requested);
       if (signed_url && strlen(signed_url) > 5) {
-        if (upload_to_s3(db, signed_url, db->backup_path, db->database_token) != 0) {
+        if (upload_to_s3(db, signed_url, db->backup_path, tok) != 0) {
           ark_log(db, ARK_LOG_ERROR, "scheduled backup upload failed");
         }
       }
+      free(tok);
       free(signed_url);
     }
   }
