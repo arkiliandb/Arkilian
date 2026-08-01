@@ -21,6 +21,16 @@
                                                        -Isrc -Isrc/deps/sqlite -lcurl -lpthread -o test_kill_switch
  ./test_kill_switch
 
+ # Load-contention test (game-thread latency under backup pressure)
+ cc tests/test_load_contention.c src/class.c src/deps/sqlite/sqlite3.c \
+                                                       -Isrc -Isrc/deps/sqlite -lcurl -lpthread -lm -o test_load_contention
+ ./test_load_contention
+
+ # Kill-resilience tests (SIGKILL mid-write/drain/ship)
+ cc tests/test_kill_resilience.c src/class.c src/deps/sqlite/sqlite3.c \
+                                                       -Isrc -Isrc/deps/sqlite -lcurl -lpthread -o test_kill_resilience
+ ./test_kill_resilience
+
  # Test hydration
  cc tests/test_hydration.c src/hydration.c \
                                     -Isrc -Isrc/deps/sqlite -lcurl -lsqlite3 -o test_hydration
