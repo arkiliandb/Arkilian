@@ -79,3 +79,4 @@ test_kill_resilience
 test_kill_switch
 test_load_contention 
 test_monitoring
+test_virtual_tables
