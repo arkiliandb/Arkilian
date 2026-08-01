@@ -62,6 +62,51 @@ const char* db_wal_last_sql(arkilian *db);
 // Auto-generate SQL backup triggers for live tables
 int sync_backup_triggers(sqlite3 *db, char **err_out);
 
+// Re-run trigger generation on the live connection (call after external
+// schema migrations that bypass db_exec). Returns SQLITE_OK on success.
+int db_resync_triggers(arkilian *db);
+
+// ── Structured logging ──────────────────────────────────────────────
+// By default all diagnostics go to stderr. Applications can install a
+// callback (e.g. to route into their own logger / JSON formatter); the
+// callback is invoked from the thread that produced the message.
+
+typedef enum {
+  ARK_LOG_ERROR = 0,
+  ARK_LOG_WARN  = 1,
+  ARK_LOG_INFO  = 2,
+  ARK_LOG_DEBUG = 3
+} ark_log_level_t;
+
+typedef void (*ark_log_fn_t)(ark_log_level_t level, const char *msg, void *ctx);
+
+void db_set_log_callback(arkilian *db, ark_log_fn_t fn, void *ctx);
+
+// Global sink used for messages that fire before a handle exists (e.g.
+// configuration warnings inside db_init). Per-handle callbacks take
+// precedence once set.
+void db_set_default_log_callback(ark_log_fn_t fn, void *ctx);
+
+// ── Monitoring & health (spec §9) ───────────────────────────────────
+// Queue depth — rows in _pending_backup not yet delivered.
+int db_backup_queue_depth(arkilian *db);
+// Oldest pending row age in seconds — the realtime-lag metric. 0 when
+// the queue is empty.
+long long db_backup_oldest_pending_age_sec(arkilian *db);
+// Rows dead-lettered after MAX_ATTEMPTS — every one needs investigation
+// and replay (see tools/arkilian-dlq).
+int db_backup_dead_letter_count(arkilian *db);
+// Milliseconds since the flush thread's last heartbeat; -1 if the thread
+// never beat (not running). An age far above the poll interval means the
+// thread died silently.
+long long db_backup_thread_heartbeat_age_ms(arkilian *db);
+// Trigger coverage sanity check (spec §9): 0 = every non-reserved table
+// has its 3 capture triggers, N>0 = N triggers missing.
+int db_backup_trigger_coverage(arkilian *db);
+// 1 when the backup subsystem is healthy: flush thread alive AND queue
+// depth below ARKILIAN_MAX_QUEUE_DEPTH (default 100000). 0 otherwise.
+int db_backup_is_healthy(arkilian *db);
+
 #ifdef __cplusplus
 }
 #endif

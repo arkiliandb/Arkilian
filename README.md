@@ -167,6 +167,44 @@ Unlike complex distributed SQLite systems (e.g., LiteFS or rqlite), Arkilian emb
 * Virtual File System (VFS) complexities.
 * Multi-writer coordination overhead and distributed consensus mechanisms.
 
+## Guarantees, explicitly
+
+* **Ordering** — delivery is strictly in `_pending_backup` id order; a
+  retryable failure stops the drain so the first unshipped row is
+  retried first (never skip-and-continue). This is a reviewed decision
+  (spec §8.1): if your destination does not require ordering,
+  skip-and-continue is the higher-throughput alternative.
+* **Delivery** — at-least-once. A crash between destination ack and
+  local delete re-ships the row. The destination MUST dedupe on the
+  `X-Arkilian-Payload-Id` header (the bundled control plane does:
+  `ON CONFLICT(db_id, payload_id) DO NOTHING`).
+* **Durability** — `PRAGMA synchronous=NORMAL` (WAL): durable across
+  process crashes; the most recent transactions can be lost on OS
+  crash/power loss (spec §3.2). If that window is unacceptable for your
+  data, set `synchronous=FULL` on the game connection — the backup
+  connection's setting matters less since it only deletes already-durable
+  rows.
+
+## Monitoring & operations
+
+The client exposes spec §9 monitoring signals as C APIs and Node
+getters: `backupQueueDepth`, `backupOldestPendingAgeSec` (the realtime-lag
+metric), `backupDeadLetterCount`, `backupThreadHeartbeatAgeMs`,
+`backupTriggerCoverage`, and `backupHealthy`. Diagnostics are routed
+through `db_set_log_callback()` / `setLogCallback(fn)` (level, message).
+
+Dead-lettered rows are inspected and replayed with the bundled CLI:
+
+```sh
+cc tools/arkilian-dlq.c src/deps/sqlite/sqlite3.c -Isrc/deps/sqlite -o arkilian-dlq
+./arkilian-dlq app.sqlite --list
+./arkilian-dlq app.sqlite --replay --dry-run
+./arkilian-dlq app.sqlite --replay
+```
+
+See `docs/operations.md` for alert thresholds, the dead-letter runbook,
+the kill-switch procedure, and incident response.
+
 ## Running Tests
 
 ```bash

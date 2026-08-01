@@ -31,6 +31,11 @@
                                                        -Isrc -Isrc/deps/sqlite -lcurl -lpthread -o test_kill_resilience
  ./test_kill_resilience
 
+ # Monitoring tests (queue depth, lag, dead letters, heartbeat, health, logging)
+ cc tests/test_monitoring.c src/class.c src/deps/sqlite/sqlite3.c \
+                                                       -Isrc -Isrc/deps/sqlite -lcurl -lpthread -o test_monitoring
+ ./test_monitoring
+
  # Test hydration
  cc tests/test_hydration.c src/hydration.c \
                                     -Isrc -Isrc/deps/sqlite -lcurl -lsqlite3 -o test_hydration

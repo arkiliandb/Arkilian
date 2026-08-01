@@ -26,6 +26,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <stdarg.h>
 #include <ctype.h>
 #include <time.h>
 
@@ -107,6 +108,11 @@ struct arkilian {
   sqlite3_stmt *begin_stmt;
   sqlite3_stmt *commit_stmt;
   sqlite3_stmt *rollback_stmt;
+
+  // Monitoring (spec §9)
+  volatile long long last_heartbeat_ms; // flush thread liveness (monotonic)
+  ark_log_fn_t log_fn;                  // optional structured log sink
+  void *log_ctx;
 };
 
 // ── Helper Prototypes ───────────────────────────────────────────────
@@ -145,6 +151,60 @@ static int get_env_bool_default(const char *env_var, int default_val) {
   if (strcasecmp(val, "false") == 0 || strcasecmp(val, "no") == 0 ||
       strcmp(val, "0") == 0) return 0;
   return atoi(val) != 0;
+}
+
+// ── Structured logging ──────────────────────────────────────────────
+// Every diagnostic goes through ark_log: applications can install a
+// callback (db_set_log_callback) to route messages into their own logger;
+// the default sink is stderr, preserving the historical behavior.
+
+static void default_log_sink(ark_log_level_t level, const char *msg, void *ctx) {
+  (void)ctx;
+  const char *lvl = (level == ARK_LOG_ERROR) ? "error"
+                   : (level == ARK_LOG_WARN)  ? "warn"
+                   : (level == ARK_LOG_INFO)  ? "info" : "debug";
+  fprintf(stderr, "arkilian: [%s] %s\n", lvl, msg);
+}
+
+// Global sink for messages emitted before a handle exists (init-time
+// warnings). Reads are intentionally racy (init-time only); fine for
+// diagnostics.
+static ark_log_fn_t g_default_log_fn = NULL;
+static void *g_default_log_ctx = NULL;
+
+void db_set_default_log_callback(ark_log_fn_t fn, void *ctx) {
+  g_default_log_fn = fn;
+  g_default_log_ctx = ctx;
+}
+
+void db_set_log_callback(arkilian *db, ark_log_fn_t fn, void *ctx) {
+  if (!db) return;
+  db->log_fn = fn;
+  db->log_ctx = ctx;
+}
+
+void ark_log(arkilian *db, ark_log_level_t level, const char *fmt, ...) {
+  char buf[1024];
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(buf, sizeof(buf), fmt, ap);
+  va_end(ap);
+  buf[sizeof(buf) - 1] = '\0';
+
+  if (db && db->log_fn) {
+    db->log_fn(level, buf, db->log_ctx);
+  } else if (g_default_log_fn) {
+    g_default_log_fn(level, buf, g_default_log_ctx);
+  } else {
+    default_log_sink(level, buf, NULL);
+  }
+}
+
+// Monotonic milliseconds, for heartbeats and latency instrumentation.
+static long long now_ms_mono(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (long long)ts.tv_sec * 1000LL + ts.tv_nsec / 1000000LL;
 }
 
 static void load_env(void) {
@@ -629,8 +689,8 @@ static ship_result_t ship_to_backup(arkilian *db, sqlite3_int64 id, const char *
   if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
 
   if (rc != CURLE_OK) {
-    fprintf(stderr, "arkilian: ship_to_backup: request setup failed: %s\n",
-            curl_easy_strerror(rc));
+    ark_log(db, ARK_LOG_ERROR,
+             "ship_to_backup: request setup failed: %s", curl_easy_strerror(rc));
   } else {
     CURLcode res = curl_easy_perform(curl);
     long http_code = 0;
@@ -675,8 +735,8 @@ static int drain_batch(arkilian *db, sqlite3_stmt *select_stmt, sqlite3_stmt *de
     int rc = sqlite3_step(select_stmt);
     if (rc == SQLITE_DONE) break;
     if (rc != SQLITE_ROW) {
-      fprintf(stderr, "arkilian: select from _pending_backup failed: %s\n",
-              sqlite3_errmsg(db->backup_db));
+      ark_log(db, ARK_LOG_ERROR, "select from _pending_backup failed: %s",
+               sqlite3_errmsg(db->backup_db));
       break;
     }
     if (nrows >= BATCH_SIZE) break; // defensive; LIMIT already bounds it
@@ -684,7 +744,7 @@ static int drain_batch(arkilian *db, sqlite3_stmt *select_stmt, sqlite3_stmt *de
     if (!payload) continue;
     char *copy = strdup((const char *)payload);
     if (!copy) {
-      fprintf(stderr, "arkilian: OOM copying payload id=%lld\n",
+      ark_log(db, ARK_LOG_ERROR, "OOM copying payload id=%lld",
               (long long)sqlite3_column_int64(select_stmt, 0));
       break;
     }
@@ -715,9 +775,10 @@ static int drain_batch(arkilian *db, sqlite3_stmt *select_stmt, sqlite3_stmt *de
       if (del_rc != SQLITE_DONE) {
         // The row shipped but the delete failed — it will ship again next
         // pass. Safe: delivery is at-least-once, destination must dedupe.
-        fprintf(stderr, "arkilian: delete after ship failed id=%lld rc=%d ext=%d: %s\n",
-                (long long)id, del_rc, sqlite3_extended_errcode(db->backup_db),
-                sqlite3_errmsg(db->backup_db));
+        ark_log(db, ARK_LOG_ERROR,
+                 "delete after ship failed id=%lld rc=%d ext=%d: %s",
+                 (long long)id, del_rc, sqlite3_extended_errcode(db->backup_db),
+                 sqlite3_errmsg(db->backup_db));
         break;
       }
       processed_any = 1;
@@ -726,9 +787,9 @@ static int drain_batch(arkilian *db, sqlite3_stmt *select_stmt, sqlite3_stmt *de
 
     int new_attempts = rows[i].attempts + 1;
     if (new_attempts >= MAX_ATTEMPTS) {
-      fprintf(stderr,
-              "arkilian: payload id=%lld dead-lettered after %d attempts "
-              "(moved to _dead_backup): %.120s\n",
+      ark_log(db, ARK_LOG_ERROR,
+              "payload id=%lld dead-lettered after %d attempts "
+              "(moved to _dead_backup): %.120s",
               (long long)id, new_attempts, payload);
       sqlite3_reset(dead_letter_stmt);
       sqlite3_clear_bindings(dead_letter_stmt);
@@ -742,12 +803,12 @@ static int drain_batch(arkilian *db, sqlite3_stmt *select_stmt, sqlite3_stmt *de
         if (sqlite3_step(delete_stmt) != SQLITE_DONE) {
           // The row is safe in _dead_backup; the _pending_backup copy is
           // re-dead-lettered next pass (id-conflict is expected, harmless).
-          fprintf(stderr, "arkilian: delete after dead-letter failed id=%lld: %s\n",
-                  (long long)id, sqlite3_errmsg(db->backup_db));
+          ark_log(db, ARK_LOG_ERROR, "delete after dead-letter failed id=%lld: %s",
+                   (long long)id, sqlite3_errmsg(db->backup_db));
         }
       } else {
-        fprintf(stderr, "arkilian: dead-letter insert failed id=%lld: %s\n",
-                (long long)id, sqlite3_errmsg(db->backup_db));
+        ark_log(db, ARK_LOG_ERROR, "dead-letter insert failed id=%lld: %s",
+                 (long long)id, sqlite3_errmsg(db->backup_db));
       }
       processed_any = 1;
       continue;
@@ -757,8 +818,8 @@ static int drain_batch(arkilian *db, sqlite3_stmt *select_stmt, sqlite3_stmt *de
       sqlite3_bind_int(update_attempts_stmt, 1, new_attempts);
       sqlite3_bind_int64(update_attempts_stmt, 2, id);
       if (sqlite3_step(update_attempts_stmt) != SQLITE_DONE) {
-        fprintf(stderr, "arkilian: update attempts failed id=%lld: %s\n",
-                (long long)id, sqlite3_errmsg(db->backup_db));
+        ark_log(db, ARK_LOG_ERROR, "update attempts failed id=%lld: %s",
+                 (long long)id, sqlite3_errmsg(db->backup_db));
       }
       // Back off: report "no work drained" so the flush loop waits one
       // poll interval before retrying instead of hot-spinning on a
@@ -873,15 +934,19 @@ void *run_wal_flush(void *arg) {
                                   &update_attempts_stmt, &dead_letter_stmt)) {
       break;
     }
-    fprintf(stderr,
-            "arkilian: flush thread: failed to prepare outbox statements: %s "
-            "(shipping paused; retrying in %ds)\n",
+    ark_log(db, ARK_LOG_WARN,
+            "flush thread: failed to prepare outbox statements: %s "
+            "(shipping paused; retrying in %ds)",
             sqlite3_errmsg(db->backup_db), backoff_s);
     if (sleep_interruptible(db, backoff_s)) break;
     if (backoff_s < 60) backoff_s *= 2;
   }
 
   while (!db->shutdown_requested && select_stmt) {
+    // Liveness heartbeat (spec §9): the watchdog reads this from another
+    // thread; a stale age means the thread died silently.
+    db->last_heartbeat_ms = now_ms_mono();
+
     int drained = 0;
     // Kill-switch check: when backup is disabled, do not ship (and
     // critically, do not DELETE) anything — the queue just accumulates
@@ -969,6 +1034,17 @@ int db_init(arkilian **db_ptr, const char *filename) {
   if (db->backup_interval < 1) db->backup_interval = 1;
   db->backup_enabled = get_env_bool_default("ARKILIAN_ENABLE_BACKUP", 1);
 
+  // Config validation (spec §9's "fail loudly, never silently"): a
+  // kill-switch-ON install with no destination will capture rows forever
+  // without shipping them. Loud warning at startup — never a hard
+  // failure, per the §0 rule that the backup subsystem must not break
+  // the application.
+  if (db->backup_enabled && (!db->push_url || strlen(db->push_url) == 0)) {
+    ark_log(db, ARK_LOG_WARN,
+            "backup is enabled (ARKILIAN_ENABLE_BACKUP) but ARKILIAN_WAL_PUSH_URL "
+            "is not set — rows will accumulate in _pending_backup and never ship");
+  }
+
 #ifndef _WIN32
   pthread_mutex_init(&db->wake_mutex, NULL);
   pthread_cond_init(&db->wake_cond, NULL);
@@ -1031,7 +1107,7 @@ int db_init(arkilian **db_ptr, const char *filename) {
     snprintf(db->last_error_msg, sizeof(db->last_error_msg),
              "backup trigger sync failed: %s",
              trigger_err ? trigger_err : "unknown error");
-    fprintf(stderr, "arkilian error: %s\n", db->last_error_msg);
+    ark_log(db, ARK_LOG_ERROR, "%s", db->last_error_msg);
     if (trigger_err) sqlite3_free(trigger_err);
     if (db->backup_db) sqlite3_close(db->backup_db);
     sqlite3_close(db->handle);
@@ -1215,7 +1291,7 @@ int db_exec(arkilian *db, const char *sql) {
       // make the failure visible instead of silent.
       snprintf(db->last_error_msg, sizeof(db->last_error_msg),
                "backup trigger sync failed after DDL: %s", terr ? terr : "unknown error");
-      fprintf(stderr, "arkilian: %s\n", db->last_error_msg);
+      ark_log(db, ARK_LOG_ERROR, "%s", db->last_error_msg);
     }
     if (terr) sqlite3_free(terr);
 
@@ -1519,6 +1595,98 @@ int db_backup_is_enabled(arkilian *db) {
   return (db && db->backup_enabled) ? 1 : 0;
 }
 
+// ── Monitoring & health (spec §9) ───────────────────────────────────
+
+int db_backup_queue_depth(arkilian *db) {
+  return db_wal_pending(db);
+}
+
+long long db_backup_oldest_pending_age_sec(arkilian *db) {
+  if (!db || !db->handle) return 0;
+  sqlite3_stmt *stmt = NULL;
+  long long age = 0;
+  if (sqlite3_prepare_v2(db->handle,
+        "SELECT strftime('%s','now') - MIN(created_at) FROM _pending_backup",
+        -1, &stmt, NULL) == SQLITE_OK) {
+    if (sqlite3_step(stmt) == SQLITE_ROW && sqlite3_column_type(stmt, 0) != SQLITE_NULL) {
+      age = sqlite3_column_int64(stmt, 0);
+      if (age < 0) age = 0;
+    }
+    sqlite3_finalize(stmt);
+  }
+  return age;
+}
+
+int db_backup_dead_letter_count(arkilian *db) {
+  if (!db || !db->handle) return 0;
+  sqlite3_stmt *stmt = NULL;
+  int count = 0;
+  if (sqlite3_prepare_v2(db->handle, "SELECT COUNT(*) FROM _dead_backup",
+                         -1, &stmt, NULL) == SQLITE_OK) {
+    if (sqlite3_step(stmt) == SQLITE_ROW) count = sqlite3_column_int(stmt, 0);
+    sqlite3_finalize(stmt);
+  }
+  return count;
+}
+
+long long db_backup_thread_heartbeat_age_ms(arkilian *db) {
+  if (!db) return -1;
+  long long hb = db->last_heartbeat_ms;
+  if (hb == 0) return -1; // never beat — thread not (yet) running
+  long long now = now_ms_mono();
+  return (now >= hb) ? (now - hb) : 0;
+}
+
+int db_backup_trigger_coverage(arkilian *db) {
+  if (!db || !db->handle) return -1;
+  sqlite3_stmt *stmt = NULL;
+  int expect = 0, have = 0;
+  // Expected: 3 triggers per non-reserved, non-sqlite_ table.
+  if (sqlite3_prepare_v2(db->handle,
+        "SELECT COUNT(*) FROM sqlite_master "
+        "WHERE type = 'table' AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\' "
+        "AND name NOT IN ('_pending_backup', '_dead_backup', '_arkilian_meta')",
+        -1, &stmt, NULL) == SQLITE_OK) {
+    if (sqlite3_step(stmt) == SQLITE_ROW) expect = 3 * sqlite3_column_int(stmt, 0);
+    sqlite3_finalize(stmt);
+  }
+  if (sqlite3_prepare_v2(db->handle,
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'trg\\_%' ESCAPE '\\'",
+        -1, &stmt, NULL) == SQLITE_OK) {
+    if (sqlite3_step(stmt) == SQLITE_ROW) have = sqlite3_column_int(stmt, 0);
+    sqlite3_finalize(stmt);
+  }
+  int deficit = expect - have;
+  return deficit < 0 ? 0 : deficit;
+}
+
+// Default queue-depth ceiling for db_backup_is_healthy; override with
+// ARKILIAN_MAX_QUEUE_DEPTH.
+#define DEFAULT_MAX_QUEUE_DEPTH 100000
+
+int db_backup_is_healthy(arkilian *db) {
+  if (!db) return 0;
+  long long hb_age = db_backup_thread_heartbeat_age_ms(db);
+  // The flush thread beats every loop iteration; an age beyond ~5 poll
+  // intervals means it died or is wedged.
+  if (hb_age < 0 || hb_age > 5LL * POLL_INTERVAL_MS) return 0;
+  int max_depth = get_env_int_default("ARKILIAN_MAX_QUEUE_DEPTH", DEFAULT_MAX_QUEUE_DEPTH);
+  if (db_backup_queue_depth(db) >= max_depth) return 0;
+  return 1;
+}
+
+int db_resync_triggers(arkilian *db) {
+  if (!db || !db->handle) return SQLITE_ERROR;
+  char *err = NULL;
+  int rc = sync_backup_triggers(db->handle, &err);
+  if (rc != SQLITE_OK) {
+    ark_log(db, ARK_LOG_ERROR, "trigger resync failed: %s",
+            err ? err : "unknown error");
+  }
+  if (err) sqlite3_free(err);
+  return rc;
+}
+
 // ── Hourly Backup Implementation ────────────────────────────────────
 
 int backup_database(sqlite3 *pSource, const char *zFilename) {
@@ -1572,7 +1740,8 @@ static size_t write_cb(void *data, size_t size, size_t nmemb, void *userp) {
   return realsize;
 }
 
-char *get_signed_url(const char *api_endpoint, const char *token, int *shutdown_flag) {
+static char *get_signed_url(arkilian *db, const char *api_endpoint,
+                           const char *token, int *shutdown_flag) {
   CURL *curl = curl_easy_init();
   struct Memory chunk;
   chunk.response = malloc(1);
@@ -1603,8 +1772,8 @@ char *get_signed_url(const char *api_endpoint, const char *token, int *shutdown_
     if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
 
     if (rc != CURLE_OK) {
-      fprintf(stderr, "arkilian: get_signed_url: request setup failed: %s\n",
-              curl_easy_strerror(rc));
+      ark_log(db, ARK_LOG_ERROR, "get_signed_url: request setup failed: %s",
+               curl_easy_strerror(rc));
     } else {
       CURLcode res = curl_easy_perform(curl);
       long http_code = 0;
@@ -1644,7 +1813,8 @@ char *get_signed_url(const char *api_endpoint, const char *token, int *shutdown_
   return result;
 }
 
-int upload_to_s3(const char *signed_url, const char *file_path, const char *token) {
+static int upload_to_s3(arkilian *db, const char *signed_url,
+                       const char *file_path, const char *token) {
   CURL *curl = curl_easy_init();
   if (!curl) return 1;
   FILE *fd = fopen(file_path, "rb");
@@ -1694,8 +1864,8 @@ int upload_to_s3(const char *signed_url, const char *file_path, const char *toke
 
   int ok = 0;
   if (rc != CURLE_OK) {
-    fprintf(stderr, "arkilian: backup upload: request setup failed: %s\n",
-            curl_easy_strerror(rc));
+    ark_log(db, ARK_LOG_ERROR, "backup upload: request setup failed: %s",
+             curl_easy_strerror(rc));
   } else {
     CURLcode res = curl_easy_perform(curl);
     long http_code = 0;
@@ -1705,8 +1875,8 @@ int upload_to_s3(const char *signed_url, const char *file_path, const char *toke
     // rejected uploads (4xx/5xx) are reported rather than swallowed.
     ok = (res == CURLE_OK && http_code >= 200 && http_code < 300);
     if (!ok) {
-      fprintf(stderr, "arkilian: backup upload failed (curl_rc=%d http=%ld)\n",
-              (int)res, http_code);
+      ark_log(db, ARK_LOG_ERROR, "backup upload failed (curl_rc=%d http=%ld)",
+               (int)res, http_code);
     }
   }
 
@@ -1769,10 +1939,11 @@ void *run_hourly_backup(void *arg) {
         strlen(db->signed_url_endpoint) > 0;
 
     if (status == SQLITE_OK && endpoint_configured) {
-      char *signed_url = get_signed_url(db->signed_url_endpoint, db->database_token, (int *)&db->shutdown_requested);
+      char *signed_url = get_signed_url(db, db->signed_url_endpoint, db->database_token,
+                                        (int *)&db->shutdown_requested);
       if (signed_url && strlen(signed_url) > 5) {
-        if (upload_to_s3(signed_url, db->backup_path, db->database_token) != 0) {
-          fprintf(stderr, "arkilian: scheduled backup upload failed\n");
+        if (upload_to_s3(db, signed_url, db->backup_path, db->database_token) != 0) {
+          ark_log(db, ARK_LOG_ERROR, "scheduled backup upload failed");
         }
       }
       free(signed_url);

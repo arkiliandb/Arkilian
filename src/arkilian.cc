@@ -13,6 +13,36 @@
 static std::mutex g_registry_mutex;
 static std::unordered_set<arkilian*> g_registry;
 
+// ── Log callback bridge ─────────────────────────────────────────────
+// ark_log can fire from the backup threads, so the JS callback is
+// marshalled through a thread-safe function.
+static std::mutex g_log_mutex;
+static std::unordered_map<arkilian*, Napi::ThreadSafeFunction> g_log_tsfns;
+
+static void log_bridge(ark_log_level_t level, const char* msg, void* ctx) {
+  arkilian* db = (arkilian*)ctx;
+  Napi::ThreadSafeFunction tsfn;
+  {
+    std::lock_guard<std::mutex> lock(g_log_mutex);
+    auto it = g_log_tsfns.find(db);
+    if (it == g_log_tsfns.end()) return; // callback removed or closing
+    tsfn = it->second;
+  }
+  std::string copy = msg ? msg : "";
+  tsfn.BlockingCall([level, copy](Napi::Env env, Napi::Function jsFn) {
+    jsFn.Call({Napi::Number::New(env, (double)level), Napi::String::New(env, copy)});
+  });
+}
+
+static void releaseLogTsfn(arkilian* db) {
+  std::lock_guard<std::mutex> lock(g_log_mutex);
+  auto it = g_log_tsfns.find(db);
+  if (it != g_log_tsfns.end()) {
+    it->second.Release();
+    g_log_tsfns.erase(it);
+  }
+}
+
 static void registerDb(arkilian* db) {
   std::lock_guard<std::mutex> lock(g_registry_mutex);
   g_registry.insert(db);
@@ -62,7 +92,8 @@ Napi::Value db_close(const Napi::CallbackInfo& info) {
   arkilian* db = reinterpret_cast<arkilian*>(id);
   // Close only live handles — double-close / stale-id is a no-op.
   if (unregisterDb(db)) {
-    db_close(db);
+    db_close(db); // joins the backup threads — no more logs can fire
+    releaseLogTsfn(db); // safe now that no thread may be mid-BlockingCall
   }
   return env.Null();
 }
@@ -298,6 +329,70 @@ Napi::Value db_backup_is_enabled(const Napi::CallbackInfo& info) {
   return Napi::Boolean::New(env, db_backup_is_enabled(db) != 0);
 }
 
+Napi::Value db_set_log_callback(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  arkilian* db = getDbFromArg(info);
+  if (!db) {
+    Napi::TypeError::New(env, "Invalid database id").ThrowAsJavaScriptException();
+    return env.Null();
+  }
+  releaseLogTsfn(db);
+  bool hasFn = info.Length() >= 2 && info[1].IsFunction();
+  if (hasFn) {
+    auto fn = info[1].As<Napi::Function>();
+    g_log_tsfns[db] =
+        Napi::ThreadSafeFunction::New(env, fn, "arkilianLog", 0, 1);
+  }
+  db_set_log_callback(db, hasFn ? log_bridge : NULL, hasFn ? (void*)db : NULL);
+  return env.Null();
+}
+
+Napi::Value db_backup_queue_depth(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  arkilian* db = getDbFromArg(info);
+  return Napi::Number::New(env, db ? db_backup_queue_depth(db) : 0);
+}
+
+Napi::Value db_backup_oldest_pending_age_sec(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  arkilian* db = getDbFromArg(info);
+  return Napi::Number::New(env, (double)(db ? db_backup_oldest_pending_age_sec(db) : 0));
+}
+
+Napi::Value db_backup_dead_letter_count(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  arkilian* db = getDbFromArg(info);
+  return Napi::Number::New(env, db ? db_backup_dead_letter_count(db) : 0);
+}
+
+Napi::Value db_backup_thread_heartbeat_age_ms(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  arkilian* db = getDbFromArg(info);
+  return Napi::Number::New(env, (double)(db ? db_backup_thread_heartbeat_age_ms(db) : -1));
+}
+
+Napi::Value db_backup_trigger_coverage(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  arkilian* db = getDbFromArg(info);
+  return Napi::Number::New(env, db ? db_backup_trigger_coverage(db) : -1);
+}
+
+Napi::Value db_backup_is_healthy(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  arkilian* db = getDbFromArg(info);
+  return Napi::Boolean::New(env, db ? db_backup_is_healthy(db) != 0 : false);
+}
+
+Napi::Value db_resync_triggers(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  arkilian* db = getDbFromArg(info);
+  if (!db) {
+    Napi::TypeError::New(env, "Invalid database id").ThrowAsJavaScriptException();
+    return env.Null();
+  }
+  return Napi::Number::New(env, db_resync_triggers(db));
+}
+
 Napi::Value db_set_token(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   arkilian* db = getDbFromArg(info);
@@ -414,6 +509,14 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
   exports.Set("db_errmsg", Napi::Function::New<db_errmsg>(env));
   exports.Set("db_backup_set_enabled", Napi::Function::New<db_backup_set_enabled>(env));
   exports.Set("db_backup_is_enabled", Napi::Function::New<db_backup_is_enabled>(env));
+  exports.Set("db_set_log_callback", Napi::Function::New<db_set_log_callback>(env));
+  exports.Set("db_backup_queue_depth", Napi::Function::New<db_backup_queue_depth>(env));
+  exports.Set("db_backup_oldest_pending_age_sec", Napi::Function::New<db_backup_oldest_pending_age_sec>(env));
+  exports.Set("db_backup_dead_letter_count", Napi::Function::New<db_backup_dead_letter_count>(env));
+  exports.Set("db_backup_thread_heartbeat_age_ms", Napi::Function::New<db_backup_thread_heartbeat_age_ms>(env));
+  exports.Set("db_backup_trigger_coverage", Napi::Function::New<db_backup_trigger_coverage>(env));
+  exports.Set("db_backup_is_healthy", Napi::Function::New<db_backup_is_healthy>(env));
+  exports.Set("db_resync_triggers", Napi::Function::New<db_resync_triggers>(env));
   exports.Set("db_set_token", Napi::Function::New<db_set_token>(env));
   exports.Set("db_changes", Napi::Function::New<db_changes>(env));
   exports.Set("db_last_insert_rowid", Napi::Function::New<db_last_insert_rowid>(env));

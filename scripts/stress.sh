@@ -96,15 +96,17 @@ build_c test_deterministic tests/test_deterministic.c "-DSQLITE_ENABLE_PREUPDATE
 build_c test_kill_switch tests/test_kill_switch.c
 build_c test_load_contention tests/test_load_contention.c
 build_c test_kill_resilience tests/test_kill_resilience.c
+build_c test_monitoring    tests/test_monitoring.c
 build_c test_e2e_stress tests/test_e2e_stress.c
 build_c stress_200m      tests/stress_200m.c
-ok "9 binaries built"
+cc -O2 tools/arkilian-dlq.c "$BIN/sqlite3.o" -Isrc -Isrc/deps/sqlite -o "$BIN/arkilian-dlq"
+ok "10 binaries built"
 
 # ── Phase 1: local test suites ──────────────────────────────────────
 
 log "Phase 1: local C test suites"
 for t in test_basic test_interception test_regressions test_deterministic \
-         test_kill_switch test_load_contention test_kill_resilience; do
+         test_kill_switch test_load_contention test_kill_resilience test_monitoring; do
   if run_in_work "$BIN/$t" > "$WORK/$t.log" 2>&1; then
     ok "$t"
   else
@@ -112,6 +114,24 @@ for t in test_basic test_interception test_regressions test_deterministic \
     fail "$t"
   fi
 done
+
+# Dead-letter tool smoke: craft an outbox db, replay, verify.
+log "Phase 1.5: dead-letter tool (arkilian-dlq)"
+DLQ_DB="$WORK/dlq-smoke.db"
+sqlite3 "$DLQ_DB" "
+  CREATE TABLE _pending_backup (id INTEGER PRIMARY KEY AUTOINCREMENT, payload TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')), last_attempt_at INTEGER);
+  CREATE TABLE _dead_backup (id INTEGER PRIMARY KEY, payload TEXT NOT NULL, attempts INTEGER NOT NULL, failed_reason TEXT, created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')), dead_lettered_at INTEGER NOT NULL DEFAULT (strftime('%s','now')));
+  INSERT INTO _dead_backup (id, payload, attempts, failed_reason) VALUES (7, 'REPLACE INTO \"t\" (\"a\") VALUES (1)', 10, 'max attempts exceeded');
+  INSERT INTO _dead_backup (id, payload, attempts, failed_reason) VALUES (8, 'DELETE FROM \"t\" WHERE rowid = 3', 10, 'max attempts exceeded');
+"
+CNT="$(run_in_work "$BIN/arkilian-dlq" "$DLQ_DB" --count)"
+[ "$CNT" = "2" ] || fail "dlq count=$CNT (expected 2)"
+run_in_work "$BIN/arkilian-dlq" "$DLQ_DB" --replay > /dev/null
+CNT="$(run_in_work "$BIN/arkilian-dlq" "$DLQ_DB" --count)"
+[ "$CNT" = "0" ] || fail "dlq replay left $CNT rows"
+PN="$(sqlite3 "$DLQ_DB" "SELECT COUNT(*) FROM _pending_backup;")"
+[ "$PN" = "2" ] || fail "dlq replay queued $PN rows (expected 2)"
+ok "arkilian-dlq count/list/replay verified"
 
 # ── Phase 2: stack (MinIO via docker, control plane local) ──────────
 

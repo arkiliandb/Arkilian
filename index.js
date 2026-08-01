@@ -42,6 +42,45 @@ class Arkilian {
     return native.db_backup_is_enabled(this.id);
   }
 
+  // Route diagnostics through a JS callback (level, message). Logs can
+  // fire from the backup threads — this is marshalled thread-safely.
+  setLogCallback(fn) {
+    native.db_set_log_callback(this.id, fn || null);
+    return this;
+  }
+
+  get backupQueueDepth() {
+    return native.db_backup_queue_depth(this.id);
+  }
+
+  get backupOldestPendingAgeSec() {
+    return native.db_backup_oldest_pending_age_sec(this.id);
+  }
+
+  get backupDeadLetterCount() {
+    return native.db_backup_dead_letter_count(this.id);
+  }
+
+  get backupThreadHeartbeatAgeMs() {
+    return native.db_backup_thread_heartbeat_age_ms(this.id);
+  }
+
+  get backupTriggerCoverage() {
+    return native.db_backup_trigger_coverage(this.id);
+  }
+
+  get backupHealthy() {
+    return native.db_backup_is_healthy(this.id);
+  }
+
+  resyncTriggers() {
+    const rc = native.db_resync_triggers(this.id);
+    if (rc !== SQLITE_OK) {
+      throw new Error(native.db_errmsg(this.id));
+    }
+    return this;
+  }
+
   close() {
     if (this.id) {
       native.db_close(this.id);
