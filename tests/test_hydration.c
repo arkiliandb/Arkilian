@@ -315,14 +315,16 @@ typedef struct {
   pthread_t thread;
   volatile int stop;
   char snapshot_url[128]; // filled after bind; served in the plan
+  long baseline_lsn;      // configurable; faithful control plane serves
+                          // baseline_lsn == the snapshot's recorded LSN.
 } mock_plan_server;
 
 static void *mock_plan_run(void *arg) {
   mock_plan_server *s = (mock_plan_server *)arg;
   char plan[512];
   int plan_len = snprintf(plan, sizeof(plan),
-      "{\"snapshot_url\":\"%s\",\"baseline_lsn\":3000,\"chunks\":[]}",
-      s->snapshot_url);
+      "{\"snapshot_url\":\"%s\",\"baseline_lsn\":%ld,\"chunks\":[]}",
+      s->snapshot_url, s->baseline_lsn);
   for (;;) {
     int c = accept(s->fd, NULL, NULL);
     if (c < 0) break;
@@ -353,6 +355,7 @@ static void *mock_plan_run(void *arg) {
 
 static void mock_plan_start(mock_plan_server *s) {
   memset(s, 0, sizeof(*s));
+  s->baseline_lsn = 3000; // historical default
   s->fd = socket(AF_INET, SOCK_STREAM, 0);
   int one = 1;
   setsockopt(s->fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
@@ -424,9 +427,14 @@ static void test_hydrate_refuses_when_local_is_newer(void) {
 }
 
 // A local DB at or behind the baseline proceeds (chunks skipped by LSN).
+// The snapshot download 404s in the mock (cold start), so the LOCAL db
+// is what's actually opened — its last_applied_lsn is the authority.
+// baseline_lsn == local_lsn means "the snapshot would have been at this
+// same point": no chunks to apply, no clamp, no refusal — hydration OK.
 static void test_hydrate_proceeds_when_local_behind(void) {
   mock_plan_server srv;
   mock_plan_start(&srv);
+  srv.baseline_lsn = 1500; // faithful: snapshot would be at the same LSN
 
   char base[64];
   snprintf(base, sizeof(base), "http://127.0.0.1:%d/v1", srv.port);
