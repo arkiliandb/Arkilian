@@ -30,10 +30,20 @@ find_package(Threads REQUIRED)
 # Common source files
 set(ARKILIAN_SOURCES src/class.c src/deps/sqlite/sqlite3.c)
 
+# Compile-time SQLite options required by Arkilian. The preupdate hook
+# drives deterministic-capture tests; FTS5 must be enabled in the
+# amalgamation itself (not only the test TU) so virtual-table schemas
+# actually compile on the resulting library.
+set(ARKILIAN_SQLITE_DEFS
+    SQLITE_ENABLE_PREUPDATE_HOOK
+    SQLITE_ENABLE_FTS5
+    SQLITE_ENABLE_RTREE
+    SQLITE_ENABLE_DBSTAT_VTAB)
+
 # Shared Library
 if(ARKILIAN_BUILD_SHARED)
     add_library(arkilian SHARED ${ARKILIAN_SOURCES})
-    target_compile_definitions(arkilian PRIVATE SQLITE_ENABLE_PREUPDATE_HOOK)
+    target_compile_definitions(arkilian PRIVATE ${ARKILIAN_SQLITE_DEFS})
     target_include_directories(arkilian PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/deps/sqlite>
@@ -50,7 +60,7 @@ endif()
 # Static Library
 if(ARKILIAN_BUILD_STATIC)
     add_library(arkilian_static STATIC ${ARKILIAN_SOURCES})
-    target_compile_definitions(arkilian_static PRIVATE SQLITE_ENABLE_PREUPDATE_HOOK)
+    target_compile_definitions(arkilian_static PRIVATE ${ARKILIAN_SQLITE_DEFS})
     target_include_directories(arkilian_static PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/deps/sqlite>
@@ -89,7 +99,7 @@ if(CMAKE_JS_VERSION OR ARKILIAN_BUILD_NAPI)
         ${ARKILIAN_SOURCES}
         ${CMAKE_JS_SRC_FILES}
     )
-    target_compile_definitions(arkilian_napi PRIVATE SQLITE_ENABLE_PREUPDATE_HOOK)
+    target_compile_definitions(arkilian_napi PRIVATE ${ARKILIAN_SQLITE_DEFS})
 
     set_target_properties(arkilian_napi PROPERTIES
         PREFIX ""
@@ -169,12 +179,67 @@ install(FILES
 )
 
 # Tests
+# Every test file in tests/ is wired as its own executable + ctest entry,
+# so a regression in any one of them is visible individually rather than
+# hidden behind a single runner. enable_testing() makes `ctest` discover
+# them; ARKILIAN_BUILD_TESTS=ON is required (OFF by default to keep the
+# default build lean). The bench/stress programs are NOT registered as
+# ctest entries — they are correctness-asserting benchmarks but not part
+# of the pass/fail gate (see their own assertions).
 if(ARKILIAN_BUILD_TESTS)
+    enable_testing()
     if(ARKILIAN_BUILD_STATIC)
-        add_executable(test_basic tests/test_basic.c)
-        target_link_libraries(test_basic PRIVATE arkilian_static)
-        add_test(NAME BasicTests COMMAND test_basic)
+        # Common link flags: pthreads + libcurl + libm. hydration tests also
+        # need the standalone sha256 + hydration sources (they don't link
+        # the static lib because hydration ships as its own TU).
+        set(ARK_TEST_LIBS arkilian_static ${CMAKE_THREAD_LIBS_INIT} ${CURL_LIBRARIES} m)
+
+        # ── Tests that link the static lib (class.c is in arkilian_static) ──
+        foreach(t test_basic test_interception test_regressions test_kill_switch
+                 test_kill_resilience test_load_contention test_monitoring
+                 test_deterministic test_virtual_tables)
+            add_executable(${t} tests/${t}.c)
+            target_link_libraries(${t} PRIVATE ${ARK_TEST_LIBS})
+            add_test(NAME ${t} COMMAND ${t})
+        endforeach()
+
+        # FTS5 is already compiled into the static lib via
+        # ARKILIAN_SQLITE_DEFS; the test needs no extra define.
+
+        # ── Hydration tests: build hydration.c + sha256.c + sqlite3.c ──
+        add_executable(test_hydration tests/test_hydration.c
+                       src/hydration.c src/sha256.c src/deps/sqlite/sqlite3.c)
+        target_include_directories(test_hydration PRIVATE src src/deps/sqlite)
+        target_link_libraries(test_hydration PRIVATE ${CMAKE_THREAD_LIBS_INIT}
+                              ${CURL_LIBRARIES})
+        add_test(NAME test_hydration COMMAND test_hydration)
+
+        # ── e2e/stress tests that need a live control plane: built but NOT
+        # registered with ctest (they require external services). Compile
+        # them so a build breakage is caught; run them out-of-band via
+        # ARKILIAN_HYDRATION_URL=… ctest -R e2e — or just invoke manually. ──
+        add_executable(test_e2e_stress tests/test_e2e_stress.c
+                       src/class.c src/deps/sqlite/sqlite3.c)
+        target_include_directories(test_e2e_stress PRIVATE src src/deps/sqlite)
+        target_link_libraries(test_e2e_stress PRIVATE ${CMAKE_THREAD_LIBS_INIT}
+                              ${CURL_LIBRARIES})
+
+        add_executable(test_minio_hydrate tests/test_minio_hydrate.c
+                       src/hydration.c src/sha256.c src/deps/sqlite/sqlite3.c)
+        target_include_directories(test_minio_hydrate PRIVATE src src/deps/sqlite)
+        target_link_libraries(test_minio_hydrate PRIVATE ${CMAKE_THREAD_LIBS_INIT}
+                              ${CURL_LIBRARIES})
+
+        # ── Benchmarks / stress (built, NOT ctest-registered): assert
+        # correctness internally but are too long-running for the gate. ──
         add_executable(bench_1m tests/bench_1m.c)
-        target_link_libraries(bench_1m PRIVATE arkilian_static ${CMAKE_THREAD_LIBS_INIT} ${CURL_LIBRARIES} m)
+        target_link_libraries(bench_1m PRIVATE ${ARK_TEST_LIBS})
+        target_compile_definitions(bench_1m PRIVATE ${ARKILIAN_SQLITE_DEFS})
+
+        add_executable(stress_200m tests/stress_200m.c
+                       src/class.c src/deps/sqlite/sqlite3.c)
+        target_include_directories(stress_200m PRIVATE src src/deps/sqlite)
+        target_link_libraries(stress_200m PRIVATE ${CMAKE_THREAD_LIBS_INIT}
+                              ${CURL_LIBRARIES} m)
     endif()
 endif()

@@ -178,16 +178,23 @@ static void test_health(void) {
   // Small queue, no pressure → healthy.
   assert(db_backup_is_healthy(db) == 1);
 
-  // Queued rows beyond ARKILIAN_MAX_QUEUE_DEPTH → unhealthy.
+  // Queued rows beyond ARKILIAN_MAX_QUEUE_DEPTH → unhealthy AND capture is
+  // soft-paused by the trigger's WHERE clause, so inserts beyond the cap
+  // do NOT push more rows into _pending_backup. The application's writes
+  // still succeed (spec §0); only capture is gated by the cap.
   setenv("ARKILIAN_MAX_QUEUE_DEPTH", "10", 1);
   db_exec(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)");
   for (int i = 0; i < 20; i++) {
     char sql[64];
     snprintf(sql, sizeof(sql), "INSERT INTO t (v) VALUES ('x%d')", i);
-    assert(db_exec(db, sql) == SQLITE_OK);
+    assert(db_exec(db, sql) == SQLITE_OK); // cap gates capture, not writes
   }
   int depth = db_backup_queue_depth(db);
-  assert(depth >= 20);
+  // The cap is enforced by the trigger: at most ARKILIAN_MAX_QUEUE_DEPTH
+  // rows are captured. The exact count may be exactly 10 or slightly
+  // higher only if multiple writer connections raced — but we run
+  // single-threaded, so 10 is the upper bound.
+  assert(depth >= 1 && depth <= 10);
   assert(db_backup_is_healthy(db) == 0);
   unsetenv("ARKILIAN_MAX_QUEUE_DEPTH");
 

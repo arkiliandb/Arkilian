@@ -569,6 +569,9 @@ static void test_batch_rollback_works(void) {
   arkilian *db = open_test_db();
   db_exec(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)");
   int before = db_wal_pending(db);
+  (void)before; // baseline queue depth — capture for diagnostics; ring
+                // entries pushed by inserts survive rollback by design
+                // (the ring ships intent, not committed state).
 
   assert(db_begin(db) == 0);
   for (int i = 0; i < 50; i++) {
