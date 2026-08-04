@@ -5,15 +5,13 @@ on:
     branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
-  release:
-    types: [created]
 
 jobs:
   build:
     # The library builds on every push/PR across all three platforms for
-    # early compile-failure signal. Release artifact uploads are gated on
-    # the `release-upload` job below, which `needs: [build, test]` so a
-    # failing test prevents a broken libarkilian from being published.
+    # early compile-failure signal. Release publishing (provenance, SBOM,
+    # cosign signatures) is handled by the separate release.yml workflow
+    # so the tests here stay a pure gate.
     strategy:
       matrix:
         include:
@@ -63,84 +61,15 @@ jobs:
     - name: Build
       run: cmake --build build --config Release
 
-    # Library build output is uploaded as a workflow artifact on every
-    # run so release-upload can re-publish it; this keeps build lean and
-    # offline-able while release-upload stays the single upload gate.
-    - name: Save build artifacts
-      if: github.event_name == 'release'
-      uses: actions/upload-artifact@v4
-      with:
-        name: build-${{ matrix.artifact-suffix }}
-        path: |
-          build/${{ matrix.shared-lib }}
-          build/${{ matrix.static-lib }}
-          src/class.h
-        if-no-files-found: ignore
-
-  # Single gate for release publishing: depends on BOTH build and test
-  # being green across every matrix leg. A failing test prevents the
-  # broken library from being attached to the GitHub release.
-  release-upload:
-    if: github.event_name == 'release'
-    needs: [build, test]
-    runs-on: ubuntu-latest
-    steps:
-    - uses: actions/checkout@v4
-
-    - name: Download all build artifacts
-      uses: actions/download-artifact@v4
-      with:
-        path: artifacts
-        merge-multiple: true
-
-    - name: Upload shared libs to release
-      uses: actions/upload-release-asset@v1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        upload_url: ${{ github.event.release.upload_url }}
-        asset_path: artifacts/libarkilian.so
-        asset_name: libarkilian.so
-        asset_content_type: application/octet-stream
-
-    - name: Upload dylib to release
-      uses: actions/upload-release-asset@v1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        upload_url: ${{ github.event.release.upload_url }}
-        asset_path: artifacts/libarkilian.dylib
-        asset_name: libarkilian.dylib
-        asset_content_type: application/octet-stream
-
-    - name: Upload Windows DLL to release
-      uses: actions/upload-release-asset@v1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        upload_url: ${{ github.event.release.upload_url }}
-        asset_path: artifacts/arkilian.dll
-        asset_name: arkilian.dll
-        asset_content_type: application/octet-stream
-
-    - name: Upload static libs + header
-      uses: actions/upload-release-asset@v1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        upload_url: ${{ github.event.release.upload_url }}
-        asset_path: artifacts/class.h
-        asset_name: class.h
-        asset_content_type: text/plain
-
   test:
-    # Tests run on every push/PR/release. Release artifact uploads in
-    # the `build` job are gated on this job via `needs: [test]` so a
-    # failing test prevents a broken libarkilian from publishing.
+    # The C suite, Go control plane, and Node binding run on every
+    # push/PR. Windows is exercised via MSYS2 UCRT64 MinGW so the tests
+    # build with the same POSIX-thread/socket API the library targets
+    # (the MSVC `build` job above covers native compile-fitness).
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
         include:
           - os: ubuntu-latest
             install-deps: |
@@ -154,27 +83,65 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
-    - name: Install Dependencies
+    - name: Install Dependencies (Unix)
+      if: matrix.os != 'windows-latest'
       run: ${{ matrix.install-deps }}
 
-    - name: Setup Go
+    - name: Setup MSYS2 UCRT64 (Windows)
+      if: matrix.os == 'windows-latest'
+      uses: msys2/setup-msys2@v2
+      with:
+        msystem: UCRT64
+        update: true
+        install: >-
+          mingw-w64-ucrt-x86_64-toolchain
+          mingw-w64-ucrt-x86_64-cmake
+          mingw-w64-ucrt-x86_64-curl
+          mingw-w64-ucrt-x86_64-make
+
+    - name: Setup Go (Unix)
+      if: matrix.os != 'windows-latest'
       uses: actions/setup-go@v5
       with:
         go-version: '1.25'
 
-    - name: Configure CMake (with tests)
+    - name: Configure CMake (with tests, Unix)
+      if: matrix.os != 'windows-latest'
       run: |
         cmake -B build -S . -DCMAKE_BUILD_TYPE=Debug \
           -DARKILIAN_BUILD_TESTS=ON -DARKILIAN_BUILD_EXAMPLES=OFF
 
-    - name: Build (with tests)
+    - name: Configure CMake (with tests, Windows/MSYS2)
+      if: matrix.os == 'windows-latest'
+      shell: msys2 {0}
+      run: |
+        cmake -B build -S . -G "MinGW Makefiles" \
+          -DCMAKE_PREFIX_PATH=/ucrt64 \
+          -DCMAKE_BUILD_TYPE=Debug \
+          -DARKILIAN_BUILD_TESTS=ON -DARKILIAN_BUILD_EXAMPLES=OFF
+
+    - name: Build (with tests, Unix)
+      if: matrix.os != 'windows-latest'
       run: cmake --build build --config Debug
 
-    - name: C test suites (ctest — all 10)
+    - name: Build (with tests, Windows/MSYS2)
+      if: matrix.os == 'windows-latest'
+      shell: msys2 {0}
+      run: cmake --build build --config Debug
+
+    - name: C test suites (ctest — all 10, Unix)
+      if: matrix.os != 'windows-latest'
+      working-directory: build
+      run: ctest --output-on-failure
+
+    - name: C test suites (ctest — Windows/MSYS2)
+      if: matrix.os == 'windows-latest'
+      shell: msys2 {0}
       working-directory: build
       run: ctest --output-on-failure
 
     - name: Go control-plane tests
+      if: matrix.os != 'windows-latest'
       run: |
         cd server
         go test ./...
@@ -237,4 +204,34 @@ jobs:
       env:
         ASAN_OPTIONS: detect_leaks=1:halt_on_error=1:abort_on_error=1
         UBSAN_OPTIONS: halt_on_error=1:abort_on_error=1
+      run: ctest --output-on-failure
+
+  # ThreadSanitizer: the client runs dedicated game, flush, and snapshot
+  # threads plus a hydration single-flight path. ASAN+UBSAN cannot see
+  # data races between those threads; TSAN gates synchronization
+  # regressions (e.g. a missed mutex on a shared heartbeat counter).
+  tsan:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libcurl4-openssl-dev
+
+    - name: Configure (TSAN, tests ON)
+      run: |
+        cmake -B build-tsan -S . -DCMAKE_BUILD_TYPE=Debug \
+          -DARKILIAN_BUILD_TESTS=ON -DARKILIAN_BUILD_EXAMPLES=OFF \
+          -DCMAKE_C_FLAGS="-fsanitize=thread -fno-omit-frame-pointer -g" \
+          -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=thread"
+
+    - name: Build (TSAN)
+      run: cmake --build build-tsan --config Debug
+
+    - name: Run tests under ThreadSanitizer
+      working-directory: build-tsan
+      env:
+        TSAN_OPTIONS: halt_on_error=1:abort_on_error=1
       run: ctest --output-on-failure

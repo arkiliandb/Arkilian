@@ -14,7 +14,14 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#ifndef __MINGW32__
+#define strcasecmp _stricmp
 #define strncasecmp _strnicmp
+/* MSVC: strtok_s has the same (str, delim, *ctx) signature as strtok_r. */
+#define strtok_r strtok_s
+#else
+#include <strings.h>
+#endif
 #define strdup _strdup
 #else
 #include <pthread.h>

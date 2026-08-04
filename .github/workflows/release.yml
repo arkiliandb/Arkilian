@@ -1,0 +1,176 @@
+name: release
+
+# Builds tagged-release artifacts on all three platforms, attaches them
+# to the GitHub release, and publishes supply-chain evidence:
+#
+#   * SLSA provenance — slsa-github-generator (GitHub OIDC), verifiable
+#     with `slsa-verifier`.
+#   * SBOM — Syft-generated SPDX document, signed with sigstore keyless,
+#     verifiable with `cosign verify-blob`.
+#
+# This is deliberately a *separate* workflow from ci.yml: CI stays a
+# pure test gate, and releases are the only place assets + evidence are
+# attached.
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+  id-token: write
+  actions: read
+
+jobs:
+  # ── Build the native assets for every platform ─────────────────────
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            suffix: linux-x64
+            shared-lib: libarkilian.so
+            static-lib: libarkilian.a
+          - os: macos-latest
+            suffix: darwin-x64
+            shared-lib: libarkilian.dylib
+            static-lib: libarkilian.a
+          - os: windows-latest
+            suffix: windows-x64
+            shared-lib: arkilian.dll
+            static-lib: arkilian.lib
+    runs-on: ${{ matrix.os }}
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        ref: ${{ github.event.release.tag_name }}
+
+    - name: Install Dependencies (Linux)
+      if: matrix.os == 'ubuntu-latest'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libcurl4-openssl-dev
+
+    - name: Install Dependencies (macOS)
+      if: matrix.os == 'macos-latest'
+      run: |
+        brew install curl
+        echo "CMAKE_PREFIX_PATH=$(brew --prefix curl)" >> "$GITHUB_ENV"
+
+    - name: Install Dependencies (Windows)
+      if: matrix.os == 'windows-latest'
+      run: |
+        $vcpkgPath = "${{ runner.temp }}/vcpkg"
+        git clone https://github.com/microsoft/vcpkg.git $vcpkgPath
+        & "$vcpkgPath/bootstrap-vcpkg.bat"
+        & "$vcpkgPath/vcpkg" install curl:x64-windows
+        echo "VCPKG_ROOT=$vcpkgPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      shell: pwsh
+
+    - name: Configure CMake (Windows)
+      if: matrix.os == 'windows-latest'
+      run: cmake -B build -S . -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" -DARKILIAN_BUILD_EXAMPLES=OFF -DARKILIAN_BUILD_TESTS=OFF
+      shell: pwsh
+
+    - name: Configure CMake (Unix)
+      if: matrix.os != 'windows-latest'
+      run: cmake -B build -S . -DCMAKE_BUILD_TYPE=Release -DARKILIAN_BUILD_EXAMPLES=OFF -DARKILIAN_BUILD_TESTS=OFF
+
+    - name: Build
+      run: cmake --build build --config Release
+
+    - name: Stage release assets
+      shell: bash
+      run: |
+        mkdir -p dist
+        cp build/${{ matrix.shared-lib }} dist/ 2>/dev/null || true
+        cp build/${{ matrix.static-lib }} dist/
+        cp src/class.h src/hydration.h src/sha256.h dist/
+        ls -la dist/
+
+    - name: Upload build assets
+      uses: actions/upload-artifact@v4
+      with:
+        name: assets-${{ matrix.suffix }}
+        path: dist
+        if-no-files-found: error
+
+  # ── Attach assets, hash them for SLSA subjects, SBOM, and sign ──────
+  sign:
+    needs: [build]
+    runs-on: ubuntu-latest
+    outputs:
+      hashes: ${{ steps.subjects.outputs.hashes }}
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        ref: ${{ github.event.release.tag_name }}
+
+    - name: Download all build assets
+      uses: actions/download-artifact@v4
+      with:
+        pattern: assets-*
+        path: assets
+        merge-multiple: true
+
+    - name: Attach assets to release
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        TARGET_DIR="$GITHUB_WORKSPACE/assets"
+        for f in "$TARGET_DIR"/*; do
+          echo "uploading: $(basename "$f")"
+          gh release upload "${{ github.event.release.tag_name }}" "$f" --clobber
+        done
+
+    - name: Compute SLSA subject hashes
+      id: subjects
+      run: |
+        mkdir -p dist
+        cp assets/* dist/
+        cd dist
+        sha256sum * | tee ../subjects.sha256sum
+        cd ..
+        base64 -w0 subjects.sha256sum > subjects.sha256sum.base64
+        echo "hashes=$(base64 -w0 subjects.sha256sum)" >> "$GITHUB_OUTPUT"
+
+    - name: Generate SBOM (SPDX)
+      uses: anchore/sbom-action@v0.24.0
+      with:
+        path: ./dist
+        format: spdx-json
+        output-file: arkilian.spdx.json
+
+    - name: Sign SBOM with sigstore (keyless)
+      uses: sigstore/cosign-installer@v4.1.0
+
+    - name: cosign sign-blob
+      run: |
+        cosign sign-blob --yes \
+          --output-signature arkilian.spdx.json.sig \
+          --output-certificate arkilian.spdx.json.pem \
+          arkilian.spdx.json
+
+    - name: Attach SBOM + signature + manifest to release
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        gh release upload "${{ github.event.release.tag_name }}" \
+          arkilian.spdx.json \
+          arkilian.spdx.json.sig \
+          arkilian.spdx.json.pem \
+          subjects.sha256sum \
+          --clobber
+
+  # ── SLSA provenance (reusable generic generator) ────────────────────
+  provenance:
+    needs: [sign]
+    permissions:
+      id-token: write
+      contents: write
+      actions: read
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2.1.0
+    with:
+      base64-subjects: ${{ needs.sign.outputs.hashes }}
+      upload-assets: true

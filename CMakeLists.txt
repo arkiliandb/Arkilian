@@ -198,8 +198,13 @@ if(ARKILIAN_BUILD_TESTS)
     if(ARKILIAN_BUILD_STATIC)
         # Common link flags: pthreads + libcurl + libm. hydration tests also
         # need the standalone sha256 + hydration sources (they don't link
-        # the static lib because hydration ships as its own TU).
-        set(ARK_TEST_LIBS arkilian_static ${CMAKE_THREAD_LIBS_INIT} ${CURL_LIBRARIES} m)
+        # the static lib because hydration ships as its own TU). On MinGW
+        # the math functions are already in the default CRT — no -lm needed.
+        if(WIN32)
+            set(ARK_TEST_LIBS arkilian_static ${CMAKE_THREAD_LIBS_INIT} ${CURL_LIBRARIES})
+        else()
+            set(ARK_TEST_LIBS arkilian_static ${CMAKE_THREAD_LIBS_INIT} ${CURL_LIBRARIES} m)
+        endif()
 
         # Helper: compile a test with NDEBUG removed so asserts stay live.
         function(ark_add_test name src)
@@ -211,23 +216,37 @@ if(ARKILIAN_BUILD_TESTS)
         endfunction()
 
         # ── Tests that link the static lib (class.c is in arkilian_static) ──
-        foreach(t test_basic test_interception test_regressions test_kill_switch
-                 test_kill_resilience test_load_contention test_monitoring
+        # The first group is portable: it exercises triggers, the outbox,
+        # interception, retries, and monitoring through class.c's libcurl
+        # path only. The second group spins up raw BSD-socket mock servers
+        # (sys/socket.h, arpa/inet.h, posix_spawn); MinGW-w64 has no BSD
+        # socket headers, so those stay on the POSIX CI legs.
+        foreach(t test_basic test_interception test_regressions test_monitoring
                  test_deterministic test_virtual_tables test_hardening)
             ark_add_test(${t} tests/${t}.c)
         endforeach()
+
+        if(NOT WIN32)
+            foreach(t test_kill_switch test_kill_resilience test_load_contention)
+                ark_add_test(${t} tests/${t}.c)
+            endforeach()
+        endif()
 
         # FTS5 is already compiled into the static lib via
         # ARKILIAN_SQLITE_DEFS; the test needs no extra define.
 
         # ── Hydration tests: build hydration.c + sha256.c + sqlite3.c ──
-        add_executable(test_hydration tests/test_hydration.c
-                       src/hydration.c src/sha256.c src/deps/sqlite/sqlite3.c)
-        target_include_directories(test_hydration PRIVATE src src/deps/sqlite)
-        target_link_libraries(test_hydration PRIVATE ${CMAKE_THREAD_LIBS_INIT}
-                              ${CURL_LIBRARIES})
-        target_compile_options(test_hydration PRIVATE -UNDEBUG)
-        add_test(NAME test_hydration COMMAND test_hydration)
+        # Requires the raw-socket mock server (test_hydration.c), so it is
+        # POSIX-only — MinGW-w64 provides no <sys/socket.h>.
+        if(NOT WIN32)
+            add_executable(test_hydration tests/test_hydration.c
+                           src/hydration.c src/sha256.c src/deps/sqlite/sqlite3.c)
+            target_include_directories(test_hydration PRIVATE src src/deps/sqlite)
+            target_link_libraries(test_hydration PRIVATE ${CMAKE_THREAD_LIBS_INIT}
+                                  ${CURL_LIBRARIES})
+            target_compile_options(test_hydration PRIVATE -UNDEBUG)
+            add_test(NAME test_hydration COMMAND test_hydration)
+        endif()
 
         # ── SHA-256 NIST vectors ──
         add_executable(test_sha256 tests/test_sha256.c src/sha256.c)
@@ -239,32 +258,38 @@ if(ARKILIAN_BUILD_TESTS)
         # registered with ctest (they require external services). Compile
         # them so a build breakage is caught; run them out-of-band via
         # ARKILIAN_HYDRATION_URL=… ctest -R e2e — or just invoke manually. ──
-        add_executable(test_e2e_stress tests/test_e2e_stress.c
-                       src/class.c src/deps/sqlite/sqlite3.c)
-        target_include_directories(test_e2e_stress PRIVATE src src/deps/sqlite)
-        target_link_libraries(test_e2e_stress PRIVATE ${CMAKE_THREAD_LIBS_INIT}
-                              ${CURL_LIBRARIES})
-        target_compile_options(test_e2e_stress PRIVATE -UNDEBUG)
+        if(NOT WIN32)
+            add_executable(test_e2e_stress tests/test_e2e_stress.c
+                           src/class.c src/deps/sqlite/sqlite3.c)
+            target_include_directories(test_e2e_stress PRIVATE src src/deps/sqlite)
+            target_link_libraries(test_e2e_stress PRIVATE ${CMAKE_THREAD_LIBS_INIT}
+                                  ${CURL_LIBRARIES})
+            target_compile_options(test_e2e_stress PRIVATE -UNDEBUG)
 
-        add_executable(test_minio_hydrate tests/test_minio_hydrate.c
-                       src/hydration.c src/sha256.c src/deps/sqlite/sqlite3.c)
-        target_include_directories(test_minio_hydrate PRIVATE src src/deps/sqlite)
-        target_link_libraries(test_minio_hydrate PRIVATE ${CMAKE_THREAD_LIBS_INIT}
-                              ${CURL_LIBRARIES})
-        target_compile_options(test_minio_hydrate PRIVATE -UNDEBUG)
+            add_executable(test_minio_hydrate tests/test_minio_hydrate.c
+                           src/hydration.c src/sha256.c src/deps/sqlite/sqlite3.c)
+            target_include_directories(test_minio_hydrate PRIVATE src src/deps/sqlite)
+            target_link_libraries(test_minio_hydrate PRIVATE ${CMAKE_THREAD_LIBS_INIT}
+                                  ${CURL_LIBRARIES})
+            target_compile_options(test_minio_hydrate PRIVATE -UNDEBUG)
+        endif()
 
         # ── Benchmarks / stress (built, NOT ctest-registered): assert
-        # correctness internally but are too long-running for the gate. ──
-        add_executable(bench_1m tests/bench_1m.c)
-        target_link_libraries(bench_1m PRIVATE ${ARK_TEST_LIBS})
-        target_compile_definitions(bench_1m PRIVATE ${ARKILIAN_SQLITE_DEFS})
-        target_compile_options(bench_1m PRIVATE -UNDEBUG)
+        # correctness internally but are too long-running for the gate.
+        # bench_1m needs <sys/resource.h> and <mach/mach.h>, so the
+        # long-running stress/bench targets are POSIX-only too. ──
+        if(NOT WIN32)
+            add_executable(bench_1m tests/bench_1m.c)
+            target_link_libraries(bench_1m PRIVATE ${ARK_TEST_LIBS})
+            target_compile_definitions(bench_1m PRIVATE ${ARKILIAN_SQLITE_DEFS})
+            target_compile_options(bench_1m PRIVATE -UNDEBUG)
 
-        add_executable(stress_200m tests/stress_200m.c
-                       src/class.c src/deps/sqlite/sqlite3.c)
-        target_include_directories(stress_200m PRIVATE src src/deps/sqlite)
-        target_link_libraries(stress_200m PRIVATE ${CMAKE_THREAD_LIBS_INIT}
-                              ${CURL_LIBRARIES} m)
-        target_compile_options(stress_200m PRIVATE -UNDEBUG)
+            add_executable(stress_200m tests/stress_200m.c
+                           src/class.c src/deps/sqlite/sqlite3.c)
+            target_include_directories(stress_200m PRIVATE src src/deps/sqlite)
+            target_link_libraries(stress_200m PRIVATE ${CMAKE_THREAD_LIBS_INIT}
+                                  ${CURL_LIBRARIES} m)
+            target_compile_options(stress_200m PRIVATE -UNDEBUG)
+        endif()
     endif()
 endif()

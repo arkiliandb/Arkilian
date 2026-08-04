@@ -32,6 +32,24 @@ In order to keep Arkilian legally secure and technically robust, we place a barr
      cmake --build build_asan
      cd build_asan && ASAN_OPTIONS=detect_leaks=1 ctest --output-on-failure
      ```
+   - ThreadSanitizer must also be clean for synchronization changes — the
+     client runs dedicated game, flush, and snapshot threads that share
+     heartbeat counters and the outbox, so the CI `tsan` job gates data
+     races. Run locally:
+     ```bash
+     cmake -B build_tsan -S . -DCMAKE_BUILD_TYPE=Debug \
+       -DARKILIAN_BUILD_TESTS=ON \
+       -DCMAKE_C_FLAGS="-fsanitize=thread -fno-omit-frame-pointer -g" \
+       -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=thread"
+     cmake --build build_tsan
+     cd build_tsan && TSAN_OPTIONS=halt_on_error=1 ctest --output-on-failure
+     ```
+   - The test matrix includes `windows-latest` via MSYS2 UCRT64 MinGW.
+     The BSD-socket mock-server tests (`test_kill_switch`,
+     `test_kill_resilience`, `test_load_contention`, `test_hydration`)
+     are intentionally POSIX-only (MinGW-w64 ships no `<sys/socket.h>`);
+     never silently compile them in on Windows. The MSVC `build` job
+     covers native compile-fitness of the library itself.
 4. **Atomic, Clean History:** Commits must be squashed and logically separated.
 
 ## Bug Reports
