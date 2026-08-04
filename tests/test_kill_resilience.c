@@ -284,7 +284,9 @@ static int child_entrypoint(int argc, char **argv) {
   snprintf(url, sizeof(url), "http://127.0.0.1:%d/push", port);
 
   setenv("ARKILIAN_ENABLE_BACKUP", "1", 1);
-  setenv("ARKILIAN_WAL_PUSH_URL", url, 1);
+  setenv("ARKILIAN_API_KEY", "test-key", 1);
+  setenv("ARKILIAN_SKIP_STARTUP_AUTH", "1", 1);
+  setenv("ARKILIAN_CONTROL_URL", url, 1);
   setenv("ARKILIAN_BACKUP_INTERVAL", "3600", 1);
 
   arkilian *db = NULL;
@@ -399,7 +401,7 @@ static void run_kill_scenario(int kill_mode) {
   char purl[128];
   snprintf(purl, sizeof(purl), "http://127.0.0.1:%d/push", srv.port);
   setenv("ARKILIAN_ENABLE_BACKUP", "1", 1);
-  setenv("ARKILIAN_WAL_PUSH_URL", purl, 1);
+  setenv("ARKILIAN_CONTROL_URL", purl, 1);
   setenv("ARKILIAN_BACKUP_INTERVAL", "3600", 1);
   arkilian *db = NULL;
   assert(db_init(&db, db_path) == 0);
@@ -432,6 +434,9 @@ static void test_kill_mid_ship(void)     { run_kill_scenario(2); }
 
 int main(int argc, char **argv) {
   signal(SIGPIPE, SIG_IGN);
+  setenv("ARKILIAN_API_KEY", "test-key", 1);
+  setenv("ARKILIAN_SKIP_STARTUP_AUTH", "1", 1);
+  setenv("ARKILIAN_MAX_ATTEMPTS", "3", 1);
 
   if (argc >= 2 && strcmp(argv[1], "--child") == 0) {
     return child_entrypoint(argc, argv);

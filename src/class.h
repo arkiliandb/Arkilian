@@ -38,7 +38,7 @@ int db_init(arkilian **db, const char *connection_url);
 void db_close(arkilian *db);
 const char* db_errmsg(arkilian *db);
 sqlite3* db_get_handle(arkilian *db);
-int db_set_token(arkilian *db, const char *token);
+int db_set_api_key(arkilian *db, const char *api_key);
 
 int db_exec(arkilian *db, const char *sql);
 int db_begin(arkilian *db);
@@ -123,6 +123,10 @@ int db_backup_dead_letter_count(arkilian *db);
 // never beat (not running). An age far above the poll interval means the
 // thread died silently.
 long long db_backup_thread_heartbeat_age_ms(arkilian *db);
+// Milliseconds since the hourly snapshot thread's last heartbeat; -1 if
+// the thread never beat. A silent death of the snapshot thread (leaving
+// hourly uploads quietly stopped) is detectable here.
+long long db_backup_snapshot_heartbeat_age_ms(arkilian *db);
 // Trigger coverage sanity check (spec §9): 0 = every PK-capable table
 // has its 3 capture triggers, N>0 = N triggers missing.
 int db_backup_trigger_coverage(arkilian *db);

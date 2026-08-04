@@ -33,6 +33,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
+	"context"
 	"embed"
 	"encoding/base64"
 	"encoding/hex"
@@ -43,8 +44,10 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -318,19 +321,19 @@ func sessionAuth(r *http.Request) (int64, bool) {
 	return userID, true
 }
 
-// apiKeyAuth validates a Bearer token against the databases table.
-// Returns db_id on success. Missing/empty auth and the stress-harness
-// "stress"/"dummy" prefixes fall back to the shared db_stress bucket;
-// an unknown non-empty key is rejected (401) so garbage can't write into
-// a shared tenant.
+// apiKeyAuth validates a Bearer token (the tenant's API key) against the
+// databases table. Returns db_id on success. Missing/empty auth is
+// rejected (401) — the client MUST present a valid API key for every
+// request. There is no backdoor / shared bucket: test scaffolding that
+// previously fell back to db_stress has been removed.
 func apiKeyAuth(r *http.Request) (string, bool) {
 	auth := r.Header.Get("Authorization")
 	if auth == "" || !strings.HasPrefix(auth, "Bearer ") {
-		return "db_stress", true
+		return "", false
 	}
 	key := strings.TrimPrefix(auth, "Bearer ")
-	if key == "" || strings.HasPrefix(key, "stress") || strings.HasPrefix(key, "dummy") {
-		return "db_stress", true
+	if key == "" {
+		return "", false
 	}
 	var dbID string
 	err := db.QueryRow("SELECT db_id FROM databases WHERE api_key = ?", key).Scan(&dbID)
@@ -598,6 +601,25 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, resp)
 }
 
+// handleAuthValidate validates an API key against the databases table.
+// The client calls this at startup to authenticate its API key before
+// any WAL shipping or snapshot uploads begin. Returns {"ok":true,"db_id":...}
+// on success, 401 on failure. This is the ONLY credential the client
+// uses — no JWT, S3 keys, or separate bearer token are involved.
+func handleAuthValidate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	dbID, ok := apiKeyAuth(r)
+	if !ok {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprintf(w, `{"ok":true,"db_id":"%s"}`, dbID)
+}
+
 // ── Database management handlers ────────────────────────────────────
 
 func handleDBCreate(w http.ResponseWriter, r *http.Request) {
@@ -802,33 +824,11 @@ func handleWALPush(w http.ResponseWriter, r *http.Request) {
 	// Update monitoring counters (best-effort, after commit).
 	recordActivity(dbID, int64(inserted), int64(len(body)))
 
-	// Mirror the push body to object storage as a raw log chunk. This is a
-	// best-effort convenience copy for audit — the authoritative store is
-	// wal_entries above, so an unreachable object store must not turn a
-	// committed push into a 500 (which would make the client retry and
-	// duplicate). Failures are logged instead.
-	chunkName := fmt.Sprintf("wal_%d.sql", time.Now().UnixNano())
-	if payloadID != "" {
-		chunkName = fmt.Sprintf("wal_%s.sql", payloadID)
-	}
-	key := fmt.Sprintf("db_%s/chunks/%s", dbID, chunkName)
-	putURL, _ := signedURL("PUT", key, 10*time.Minute)
-	req, err := http.NewRequest("PUT", putURL, strings.NewReader(string(body)))
-	if err == nil {
-		req.Header.Set("Content-Type", "text/plain")
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			log.Printf("S3 WAL mirror upload error for db %s: %v", dbID, err)
-			if resp != nil {
-				resp.Body.Close()
-			}
-		} else {
-			if resp.StatusCode >= 300 {
-				log.Printf("S3 WAL mirror upload rejected for db %s: HTTP %d", dbID, resp.StatusCode)
-			}
-			resp.Body.Close()
-		}
-	}
+	// NOTE: the synchronous S3 mirror PUT that was here has been removed.
+	// At 50k POST/s a synchronous http.DefaultClient.Do() per WAL push
+	// would exhaust FDs and goroutines on a single VM. The authoritative
+	// store is wal_entries above; an async batcher (future work) can
+	// mirror to S3 without blocking the ingest path.
 
 	w.Header().Set("Content-Type", "application/json")
 	fmt.Fprintf(w, `{"ok":true,"inserted":%d}`, inserted)
@@ -952,7 +952,7 @@ func handleSnapshotRegister(w http.ResponseWriter, r *http.Request) {
 
 	var req struct {
 		BaselineLSN int64  `json:"baseline_lsn"`
-		S3Key       string `json:"s3_key"`
+		S3Key       string `json:"s3_key"` // IGNORED — server-side-authored
 		SHA256      string `json:"sha256"`
 	}
 	if json.NewDecoder(r.Body).Decode(&req) != nil {
@@ -960,9 +960,19 @@ func handleSnapshotRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Server-side-author the S3 key from the authenticated db_id + LSN.
+	// NEVER accept s3_key from the client body — a client-supplied key
+	// like "db_<victim>/backup.sqlite" would let one tenant register a
+	// snapshot under another tenant's prefix, then download it via the
+	// hydrate plan (cross-tenant S3 exfiltration / IDOR).
+	key := fmt.Sprintf("db_%s/backup.sqlite", dbID)
+	if req.BaselineLSN > 0 {
+		key = fmt.Sprintf("db_%s/snapshots/lsn_%010d.sqlite", dbID, req.BaselineLSN)
+	}
+
 	mu.Lock()
 	db.Exec(`INSERT INTO snapshots (db_id, baseline_lsn, s3_key, sha256) VALUES (?, ?, ?, ?)`,
-		dbID, req.BaselineLSN, req.S3Key, nullableStr(req.SHA256))
+		dbID, req.BaselineLSN, key, nullableStr(req.SHA256))
 	mu.Unlock()
 	recordActivity(dbID, 0, 0)
 
@@ -1178,7 +1188,22 @@ func main() {
 	s3SecretKey = cleanEnv(firstEnv(
 		"ARKILIAN_AWS_SECRET_ACCESS_KEY", "S3_SECRET", "minioadmin"))
 
-	log.Printf("Arkilian Control Plane on :%s", port)
+	// Fail-fast on insecure defaults in production. A misconfigured
+	// deployment that boots with the public-source default JWT secret
+	// lets anyone forge session tokens; default S3 creds let anyone
+	// read/write every tenant's snapshots. Refuse to start rather than
+	// silently running with known-insecure credentials.
+	env := getEnv("ARKILIAN_ENV", "development")
+	if env == "production" {
+		if string(jwtSecret) == "arkilian-dev-secret-change-in-production" {
+			log.Fatal("JWT_SECRET must be explicitly set in production (ARKILIAN_ENV=production)")
+		}
+		if s3AccessKey == "minioadmin" || s3SecretKey == "minioadmin" {
+			log.Fatal("S3 credentials must be explicitly set in production (ARKILIAN_ENV=production)")
+		}
+	}
+
+	log.Printf("Arkilian Control Plane on :%s (env=%s)", port, env)
 
 	if err := initDB(dbPath); err != nil {
 		log.Fatalf("DB init: %v", err)
@@ -1189,6 +1214,7 @@ func main() {
 	// Auth
 	mux.HandleFunc("/v1/auth/register", handleRegister)
 	mux.HandleFunc("/v1/auth/login", handleLogin)
+	mux.HandleFunc("/v1/auth/validate", handleAuthValidate)
 	// Database management (session auth)
 	mux.HandleFunc("/v1/db/create", handleDBCreate)
 	mux.HandleFunc("/v1/db/list", handleDBList)
@@ -1217,7 +1243,21 @@ func main() {
 		ReadTimeout:  15 * time.Second,
 		WriteTimeout: 60 * time.Second,
 		IdleTimeout:  60 * time.Second,
+		MaxHeaderBytes: 1 << 20, // 1 MB — cap header size (slowloris mitigation)
 	}
+
+	// Graceful shutdown: SIGINT/SIGTERM triggers a 30s drain window so
+	// in-flight WAL pushes complete before the process exits. Without
+	// this, a deploy or scale-down drops pending requests.
+	go func() {
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+		<-sigCh
+		log.Printf("shutdown signal received — draining (30s)...")
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		srv.Shutdown(ctx)
+	}()
 
 	log.Fatal(srv.ListenAndServe())
 }

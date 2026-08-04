@@ -53,7 +53,9 @@ static void cleanup(const char *path) {
 static arkilian *open_db(const char *path) {
   cleanup(path); // idempotent across re-runs
   setenv("ARKILIAN_ENABLE_BACKUP", "0", 1);
-  setenv("ARKILIAN_WAL_PUSH_URL", "http://127.0.0.1:1", 1);
+  setenv("ARKILIAN_API_KEY", "test-key", 1);
+  setenv("ARKILIAN_SKIP_STARTUP_AUTH", "1", 1);
+  setenv("ARKILIAN_CONTROL_URL", "http://127.0.0.1:1", 1);
   arkilian *db = NULL;
   int rc = db_init(&db, path);
   assert(rc == 0 && "db_init failed");
@@ -318,13 +320,13 @@ static void test_sync_success_leaves_errmsg_clean(void) {
 
 // ── No destination configured → rows must survive ───────────────────
 // Regression for a proven data-loss bug: ship_to_backup reported
-// SHIP_OK when ARKILIAN_WAL_PUSH_URL was unset, so the drain loop
+// SHIP_OK when ARKILIAN_CONTROL_URL was unset, so the drain loop
 // DELETED every captured row. Backup is enabled by default — the
 // default configuration was quietly destroying data.
 
 static void test_no_destination_rows_survive(void) {
   cleanup("test_reg_nodest.db");
-  unsetenv("ARKILIAN_WAL_PUSH_URL");
+  unsetenv("ARKILIAN_CONTROL_URL");
   setenv("ARKILIAN_ENABLE_BACKUP", "1", 1);
   setenv("ARKILIAN_BACKUP_INTERVAL", "3600", 1);
   arkilian *db = NULL;
@@ -355,7 +357,7 @@ static void test_no_destination_rows_survive(void) {
 static void test_text_pk_replay_fidelity(void) {
   cleanup("test_reg_fid.db");
   setenv("ARKILIAN_ENABLE_BACKUP", "1", 1);
-  setenv("ARKILIAN_WAL_PUSH_URL", "http://127.0.0.1:1", 1); // keep rows in outbox
+  setenv("ARKILIAN_CONTROL_URL", "http://127.0.0.1:1", 1); // keep rows in outbox
   setenv("ARKILIAN_BACKUP_INTERVAL", "3600", 1);
   arkilian *db = NULL;
   assert(db_init(&db, "test_reg_fid.db") == 0);
@@ -409,7 +411,7 @@ static void test_text_pk_replay_fidelity(void) {
 static void test_keyless_table_skipped(void) {
   cleanup("test_reg_keyless.db");
   setenv("ARKILIAN_ENABLE_BACKUP", "1", 1);
-  setenv("ARKILIAN_WAL_PUSH_URL", "http://127.0.0.1:1", 1);
+  setenv("ARKILIAN_CONTROL_URL", "http://127.0.0.1:1", 1);
   setenv("ARKILIAN_BACKUP_INTERVAL", "3600", 1);
   arkilian *db = NULL;
   assert(db_init(&db, "test_reg_keyless.db") == 0);
@@ -445,7 +447,7 @@ static void test_keyless_table_skipped(void) {
 static void test_dead_letter_zombie_cleared(void) {
   cleanup("test_reg_zombie.db");
   setenv("ARKILIAN_ENABLE_BACKUP", "1", 1);
-  setenv("ARKILIAN_WAL_PUSH_URL", "http://127.0.0.1:1", 1);
+  setenv("ARKILIAN_CONTROL_URL", "http://127.0.0.1:1", 1);
   setenv("ARKILIAN_BACKUP_INTERVAL", "3600", 1);
   arkilian *db = NULL;
   assert(db_init(&db, "test_reg_zombie.db") == 0);
@@ -486,6 +488,7 @@ static void test_dead_letter_zombie_cleared(void) {
 // ── Main ────────────────────────────────────────────────────────────
 
 int main(void) {
+  setenv("ARKILIAN_MAX_ATTEMPTS", "3", 1); // fast dead-lettering for tests
   printf("=== Arkilian Audit Regression Tests ===\n\n");
 
   printf("[WITHOUT ROWID]\n");

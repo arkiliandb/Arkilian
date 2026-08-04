@@ -8,23 +8,35 @@ const SQLITE_ROW = 100;
 const SQLITE_DONE = 101;
 
 class Arkilian {
-  constructor(token, dbPath = "app.sqlite") {
-    if (!token) throw new Error("Your database token is required");
+  constructor(apiKey, dbPath = "app.sqlite") {
+    if (!apiKey) throw new Error("Your API key is required");
     this.id = native.db_init(dbPath);
     if (!this.id) {
       throw new Error("Failed to initialize database");
     }
-    this.setToken(token);
+    this.setApiKey(apiKey);
   }
 
-  static async open(token, dbPath = "app.sqlite") {
-    return new Arkilian(token, dbPath);
+  static async open(apiKey, dbPath = "app.sqlite") {
+    return new Arkilian(apiKey, dbPath);
   }
 
-  setToken(token) {
-    const result = native.db_set_token(this.id, token);
+  // Cold-start restore from the control plane. MUST be called from a
+  // cold process (before db_init opens the database). Downloads the
+  // latest snapshot + replays incremental chunks via pre-signed URLs.
+  //   dbPath     — local database file path
+  //   controlUrl — control plane base URL (e.g. "https://api.arkilian.com")
+  //   apiKey     — the tenant's API key
+  static hydrate(dbPath, controlUrl, apiKey) {
+    const rc = native.db_hydrate(dbPath, controlUrl, apiKey);
+    if (rc !== true) throw new Error(`Hydration failed (see logs for error code)`);
+    return true;
+  }
+
+  setApiKey(apiKey) {
+    const result = native.db_set_api_key(this.id, apiKey);
     if (result !== SQLITE_OK) {
-      throw new Error("Failed to set account token");
+      throw new Error("Failed to set API key");
     }
     return this;
   }
@@ -63,6 +75,10 @@ class Arkilian {
 
   get backupThreadHeartbeatAgeMs() {
     return native.db_backup_thread_heartbeat_age_ms(this.id);
+  }
+
+  get backupSnapshotHeartbeatAgeMs() {
+    return native.db_backup_snapshot_heartbeat_age_ms(this.id);
   }
 
   get backupTriggerCoverage() {

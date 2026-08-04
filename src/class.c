@@ -39,19 +39,21 @@
 // No endpoint defaults to a vendor URL — nothing phones home unless
 // explicitly configured:
 //
-//   ARKILIAN_WAL_PUSH_URL          realtime destination for _pending_backup
-//                                  payloads (e.g. control plane /v1/wal/push)
-//   ARKILIAN_SIGNED_URL_ENDPOINT   signed-URL issuer for hourly snapshot
-//                                  uploads (e.g. control plane
-//                                  /v1/upload/request). Independent of the
-//                                  push URL — they are different endpoints.
+//   ARKILIAN_CONTROL_URL   Base URL of the Arkilian control plane
+//                          (e.g. https://api.arkilian.com). The client
+//                          derives /v1/wal/push, /v1/upload/request,
+//                          and /v1/auth/validate from this base.
+//   ARKILIAN_API_KEY       The tenant's API key — the ONLY credential
+//                          the client holds. Sent as
+//                          "Authorization: Bearer <api_key>" to every
+//                          control-plane endpoint. No S3 credentials,
+//                          JWT, or separate bearer token are used.
 
 #define DEFAULT_DB_PATH "app.sqlite"
 #define DEFAULT_BACKUP_PATH "backup.sqlite"
 #define DEFAULT_BACKUP_INTERVAL 3600
 
 #define BATCH_SIZE 100
-#define MAX_ATTEMPTS 10
 #define POLL_INTERVAL_MS 2000
 
 // Internal outbox schema version (see _arkilian_meta.schema_version).
@@ -90,9 +92,10 @@ struct arkilian {
 
   // Configuration
   char *backup_path;
-  char *push_url;              // realtime WAL payload destination
-  char *signed_url_endpoint;   // signed-URL issuer for hourly snapshots
-  char *database_token;
+  char *control_url;           // Base URL of the control plane (e.g. https://api.arkilian.com)
+  char *push_url;              // Derived: <control_url>/v1/wal/push
+  char *signed_url_endpoint;   // Derived: <control_url>/v1/upload/request
+  char *api_key;               // The ONLY credential — sent as Bearer to all control-plane endpoints
   int backup_interval;
   volatile int backup_enabled; // runtime kill-switch (written under wake_mutex)
 
@@ -117,10 +120,10 @@ struct arkilian {
   char wal_last_buf[1024];
 #ifdef _WIN32
   CRITICAL_SECTION payload_mutex;
-  CRITICAL_SECTION token_mutex;
+  CRITICAL_SECTION api_key_mutex;
 #else
   pthread_mutex_t payload_mutex;
-  pthread_mutex_t token_mutex; // guards database_token (read/write)
+  pthread_mutex_t api_key_mutex; // guards api_key (read/write)
 #endif
 
   // Transaction state tracking
@@ -135,6 +138,7 @@ struct arkilian {
   // other shared flags are always done under wake_mutex; reads are
   // volatile int, which is atomic on every supported target.
   volatile int last_heartbeat_sec;      // flush thread liveness (monotonic)
+  volatile int last_snapshot_heartbeat_sec; // hourly snapshot thread liveness
   ark_log_fn_t log_fn;                  // optional structured log sink
   void *log_ctx;
 };
@@ -145,7 +149,7 @@ static void load_env(void);
 static const char *get_env_default(const char *env_var, const char *default_val);
 static int get_env_int_default(const char *env_var, int default_val);
 static long outbox_cap(void);
-static char *token_snapshot(arkilian *db);
+static char *api_key_snapshot(arkilian *db);
 #ifdef _WIN32
 DWORD WINAPI run_hourly_backup(LPVOID arg);
 DWORD WINAPI run_wal_flush(LPVOID arg);
@@ -166,6 +170,15 @@ static int get_env_int_default(const char *env_var, int default_val) {
   const char *val = getenv(env_var);
   if (val && strlen(val) > 0) return atoi(val);
   return default_val;
+}
+
+// Configurable via ARKILIAN_MAX_ATTEMPTS env var. Default 20 with
+// exponential backoff gives ~1 hour of retrying before dead-lettering.
+// Tests set a lower value (e.g. 3) to dead-letter quickly.
+static int max_attempts(void) {
+  int v = get_env_int_default("ARKILIAN_MAX_ATTEMPTS", 20);
+  if (v < 1) v = 1;
+  return v;
 }
 
 // Boolean env var accepting 1/0/true/false/yes/no.
@@ -378,6 +391,10 @@ static int url_is_https(const char *url) {
 // 127.0.0.1 / 10.x / 192.168.x / 172.16-31.x is legitimate even over plain
 // http://. These are the ONLY non-HTTPS hosts allowed without an explicit
 // opt-in. Everything else over http:// leaks the bearer token in cleartext.
+// NOTE: link-local (169.254.x / fe80::) is included here for cleartext
+// transport safety (dev MinIO on a link-local address), but is EXCLUDED
+// from the storage destination allowlist (host_is_storage_safe) because
+// 169.254.169.254 is the AWS/GCP/Azure instance-metadata endpoint.
 static int host_is_local(const char *host) {
   if (!host || !*host) return 0;
   // IPv6 [::1] form
@@ -394,6 +411,36 @@ static int host_is_local(const char *host) {
   if (strncmp(host, "169.254.", 8) == 0) return 1; // link-local
   if (strncmp(host, "fe80", 4) == 0) return 1;     // IPv6 link-local
   if (strncmp(host, "::1", 3) == 0) return 1;      // IPv6 loopback
+  if (strncmp(host, "fc", 2) == 0 || strncmp(host, "fd", 2) == 0) return 1; // ULA
+  if (strncmp(host, "172.", 4) == 0) {
+    unsigned second = 0;
+    if (sscanf(host, "172.%u.", &second) == 1 && second >= 16 && second <= 31)
+      return 1;
+  }
+  return 0;
+}
+
+// Storage-safe host check: same as host_is_local but EXCLUDES link-local
+// (169.254.0.0/16 and IPv6 fe80::) because that range hosts the cloud
+// instance-metadata service (IMDS at 169.254.169.254 on AWS/GCP/Azure).
+// A compromised control plane returning a presigned URL pointing at IMDS
+// would otherwise have the client upload the full database (and, for
+// non-presigned URLs, the bearer token) to the metadata service.
+static int host_is_storage_safe(const char *host) {
+  if (!host || !*host) return 0;
+  if (host[0] == '[') {
+    if (strncmp(host, "[::1]", 5) == 0) return 1;
+    if (strncmp(host, "[fc", 3) == 0 || strncmp(host, "[fd", 3) == 0) return 1; // ULA
+    // NO [fe80 — link-local excluded
+    return 0;
+  }
+  if (strcmp(host, "localhost") == 0) return 1;
+  if (strncmp(host, "127.", 4) == 0) return 1;
+  if (strncmp(host, "10.", 3) == 0) return 1;
+  if (strncmp(host, "192.168.", 8) == 0) return 1;
+  // NO 169.254. — IMDS excluded
+  // NO fe80 — IPv6 link-local excluded
+  if (strncmp(host, "::1", 3) == 0) return 1;
   if (strncmp(host, "fc", 2) == 0 || strncmp(host, "fd", 2) == 0) return 1; // ULA
   if (strncmp(host, "172.", 4) == 0) {
     unsigned second = 0;
@@ -444,8 +491,9 @@ static int host_is_known_storage(const char *host) {
 }
 
 // Returns 1 (and parses `extra_hosts`) when a URL's host is an allowed
-// storage destination: a well-known provider, a local address (MinIO on
-// 127.0.0.1 / RFC1918), or a host in the operator-provided allowlist.
+// storage destination: a well-known provider, a storage-safe local address
+// (loopback / RFC1918 — but NOT link-local 169.254.x which hosts IMDS),
+// or a host in the operator-provided allowlist.
 // Guards against SSRF: a compromised/buggy control plane that returns an
 // upload_url pointing at cloud metadata (169.254.169.254) or an internal
 // service is refused here, so the customer's snapshot is never exfiltrated.
@@ -454,7 +502,7 @@ static int url_is_allowed_storage(const char *url) {
   char host[256];
   if (url_host(url, host, sizeof(host)) == 0) return 0;
   if (host_is_known_storage(host)) return 1;
-  if (host_is_local(host)) return 1;
+  if (host_is_storage_safe(host)) return 1;
   // Operator allowlist (comma-separated, exact-or-suffix match)
   const char *extra = getenv("ARKILIAN_STORAGE_HOSTS");
   if (extra && *extra) {
@@ -877,6 +925,89 @@ static int curl_abort_cb(void *clientp, curl_off_t dltotal, curl_off_t dlnow,
 
 typedef enum { SHIP_OK = 0, SHIP_RETRY = 1 } ship_result_t;
 
+// Exponential backoff: seconds to wait before retrying a row that has
+// failed `attempts` times. Caps at 5 minutes so a prolonged outage
+// retries for ~1 hour (20 attempts) instead of dead-lettering after 20s.
+static long backoff_seconds(int attempts) {
+  if (attempts <= 0) return 0;
+  if (attempts > 20) attempts = 20;
+  long b = 1L << attempts; // 2^attempts
+  if (b > 300) b = 300;
+  return b;
+}
+
+// Join a control-plane base URL with a path suffix. Handles the case
+// where the base URL has a trailing slash. Caller frees the result.
+static char *join_url(const char *base, const char *suffix) {
+  if (!base || !suffix) return NULL;
+  size_t blen = strlen(base);
+  int need_strip = (blen > 0 && base[blen - 1] == '/');
+  size_t len = blen - (need_strip ? 1 : 0) + strlen(suffix) + 1;
+  char *out = malloc(len);
+  if (!out) return NULL;
+  if (need_strip) snprintf(out, len, "%.*s%s", (int)(blen - 1), base, suffix);
+  else snprintf(out, len, "%s%s", base, suffix);
+  return out;
+}
+
+// At startup, validate the API key against the control plane by POSTing
+// to <control_url>/v1/auth/validate. Returns 1 on success (200), 0 on
+// failure (401, network error, etc.). This is best-effort per spec §0:
+// a failure disables backup (the app keeps running) and surfaces via
+// db_backup_is_healthy(). The API key is the only credential sent.
+static int validate_api_key(arkilian *db, const char *control_url,
+                            const char *api_key) {
+  if (!control_url || strlen(control_url) == 0 || !api_key || strlen(api_key) == 0)
+    return 0;
+
+  char *validate_url = join_url(control_url, "/v1/auth/validate");
+  if (!validate_url) return 0;
+
+  CURL *curl = curl_easy_init();
+  int ok = 0;
+  if (curl) {
+    CURLcode rc = CURLE_OK;
+    rc = curl_easy_setopt(curl, CURLOPT_URL, validate_url);
+    if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_POSTFIELDS, "");
+    if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_discard_cb);
+    if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_MAXFILESIZE_LARGE, (curl_off_t)1048576);
+    if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
+    if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5L);
+    if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
+    if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
+
+    struct curl_slist *headers = NULL;
+    if (rc == CURLE_OK) {
+      headers = curl_slist_append(headers, "Content-Type: application/json");
+      if (!headers) rc = CURLE_OUT_OF_MEMORY;
+    }
+    if (rc == CURLE_OK && strlen(api_key) > 0) {
+      char auth[512];
+      snprintf(auth, sizeof(auth), "Authorization: Bearer %s", api_key);
+      headers = curl_slist_append(headers, auth);
+      if (!headers) rc = CURLE_OUT_OF_MEMORY;
+    }
+    if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+
+    if (rc == CURLE_OK) {
+      CURLcode res = curl_easy_perform(curl);
+      long http_code = 0;
+      if (res == CURLE_OK) curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+      ok = (res == CURLE_OK && http_code >= 200 && http_code < 300) ? 1 : 0;
+      if (!ok) {
+        ark_log(db, ARK_LOG_ERROR,
+                "API key validation failed (http_code=%ld curl_rc=%d) — "
+                "backup will be disabled; check ARKILIAN_API_KEY and "
+                "ARKILIAN_CONTROL_URL", http_code, (int)res);
+      }
+    }
+    if (headers) curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+  }
+  free(validate_url);
+  return ok;
+}
+
 // Adaptive request timeout: base seconds plus ~10s per MB of payload, so
 // large rows/snapshots aren't dead-lettered by a fixed short window.
 static long curl_timeout_sec(size_t bytes, long base) {
@@ -958,9 +1089,9 @@ static ship_result_t ship_to_backup(arkilian *db, CURL *curl,
     headers = curl_slist_append(headers, id_header);
     if (!headers) rc = CURLE_OUT_OF_MEMORY;
   }
-  // Never attach our bearer token to a pre-signed storage URL — the
-  // signature IS the credential, and the token would leak to the host.
-  char *tok = token_snapshot(db);
+  // Never attach our API key to a pre-signed storage URL — the
+  // signature IS the credential, and the key would leak to the host.
+  char *tok = api_key_snapshot(db);
   if (rc == CURLE_OK && tok && !url_is_presigned(push_url)) {
     char auth[512];
     snprintf(auth, sizeof(auth), "Authorization: Bearer %s", tok);
@@ -1000,6 +1131,7 @@ typedef struct {
   sqlite3_int64 id;
   char *payload; // heap copy, valid for the whole pass
   int attempts;
+  sqlite3_int64 last_attempt_at; // unix seconds, 0 = never attempted
 } outbox_row;
 
 static int drain_batch(arkilian *db, CURL *ship_curl, sqlite3_stmt *select_stmt,
@@ -1034,6 +1166,7 @@ static int drain_batch(arkilian *db, CURL *ship_curl, sqlite3_stmt *select_stmt,
     }
     rows[nrows].id = sqlite3_column_int64(select_stmt, 0);
     rows[nrows].attempts = sqlite3_column_int(select_stmt, 2);
+    rows[nrows].last_attempt_at = sqlite3_column_int64(select_stmt, 3);
     rows[nrows].payload = copy;
     nrows++;
   }
@@ -1048,6 +1181,20 @@ static int drain_batch(arkilian *db, CURL *ship_curl, sqlite3_stmt *select_stmt,
   for (int i = 0; i < nrows; i++) {
     sqlite3_int64 id = rows[i].id;
     const char *payload = rows[i].payload;
+
+    // Exponential backoff: if this row recently failed, wait before
+    // retrying. Rows are ordered by id (oldest first); the oldest row
+    // has the most attempts, so if IT isn't ready, the younger rows
+    // behind it aren't either. Stop the pass and let the loop sleep.
+    if (rows[i].last_attempt_at > 0) {
+      long long now = (long long)time(NULL);
+      long long ready_at = (long long)rows[i].last_attempt_at +
+                           backoff_seconds(rows[i].attempts);
+      if (now < ready_at) {
+        processed_any = 0;
+        break;
+      }
+    }
 
     ship_result_t result = ship_to_backup(db, ship_curl, id, payload);
 
@@ -1070,7 +1217,7 @@ static int drain_batch(arkilian *db, CURL *ship_curl, sqlite3_stmt *select_stmt,
     }
 
     int new_attempts = rows[i].attempts + 1;
-    if (new_attempts >= MAX_ATTEMPTS) {
+    if (new_attempts >= max_attempts()) {
       ark_log(db, ARK_LOG_ERROR,
               "payload id=%lld dead-lettered after %d attempts "
               "(moved to _dead_backup): %.120s",
@@ -1149,7 +1296,7 @@ static int prepare_outbox_statements(sqlite3 *db, sqlite3_stmt **select_stmt,
   *dead_letter_stmt = NULL;
 
   if (sqlite3_prepare_v2(db,
-        "SELECT id, payload, attempts FROM _pending_backup ORDER BY id LIMIT ?1",
+        "SELECT id, payload, attempts, COALESCE(last_attempt_at, 0) FROM _pending_backup ORDER BY id LIMIT ?1",
         -1, select_stmt, NULL) != SQLITE_OK) goto fail;
   if (sqlite3_prepare_v2(db,
         "DELETE FROM _pending_backup WHERE id = ?1",
@@ -1328,31 +1475,37 @@ int db_init(arkilian **db_ptr, const char *filename) {
   db->backup_path = malloc(strlen(backup_path_tmp) + 1);
   if (db->backup_path) strcpy(db->backup_path, backup_path_tmp);
 
-  // Realtime WAL destination: where _pending_backup payloads are shipped.
-  const char *push_url_tmp = get_env_default("ARKILIAN_WAL_PUSH_URL", "");
-  db->push_url = malloc(strlen(push_url_tmp) + 1);
-  if (db->push_url) strcpy(db->push_url, push_url_tmp);
+  // Control-plane base URL (e.g. https://api.arkilian.com). The client
+  // derives /v1/wal/push and /v1/upload/request from this base — the
+  // ONLY credential is the API key, sent as Bearer to every endpoint.
+  const char *control_url_tmp = get_env_default("ARKILIAN_CONTROL_URL", "");
+  db->control_url = malloc(strlen(control_url_tmp) + 1);
+  if (db->control_url) strcpy(db->control_url, control_url_tmp);
 
-  // Signed-URL issuer for hourly snapshot uploads (e.g. control plane
-  // /v1/upload/request). Deliberately independent from the push URL —
-  // they are different endpoints serving different purposes.
-  const char *signed_url_tmp = get_env_default("ARKILIAN_SIGNED_URL_ENDPOINT", "");
-  db->signed_url_endpoint = malloc(strlen(signed_url_tmp) + 1);
-  if (db->signed_url_endpoint) strcpy(db->signed_url_endpoint, signed_url_tmp);
+  // Derive the two endpoint URLs from the control-plane base.
+  if (db->control_url && strlen(db->control_url) > 0) {
+    db->push_url = join_url(db->control_url, "/v1/wal/push");
+    db->signed_url_endpoint = join_url(db->control_url, "/v1/upload/request");
+  } else {
+    db->push_url = strdup("");
+    db->signed_url_endpoint = strdup("");
+  }
 
-  const char *token_tmp = get_env_default("ARKILIAN_DATABASE_TOKEN", "");
-  db->database_token = malloc(strlen(token_tmp) + 1);
-  if (db->database_token) strcpy(db->database_token, token_tmp);
-  // The bearer token is sent as "Authorization: Bearer <token>" in a
-  // 512-byte stack buffer; a token longer than ~490 bytes would be
-  // silently truncated and the control plane would reject every request
-  // as unauthorized — surface it loudly instead.
-  if (db->database_token && strlen(db->database_token) > 490) {
+  // The API key is the ONLY credential the client holds. Sent as
+  // "Authorization: Bearer <api_key>" to every control-plane endpoint.
+  // No S3 credentials, JWT, or separate bearer token are ever used.
+  const char *api_key_tmp = get_env_default("ARKILIAN_API_KEY", "");
+  db->api_key = malloc(strlen(api_key_tmp) + 1);
+  if (db->api_key) strcpy(db->api_key, api_key_tmp);
+  // The API key is sent in a 512-byte stack buffer; a key longer than
+  // ~490 bytes would be silently truncated and the control plane would
+  // reject every request as unauthorized — surface it loudly instead.
+  if (db->api_key && strlen(db->api_key) > 490) {
     ark_log(db, ARK_LOG_WARN,
-            "ARKILIAN_DATABASE_TOKEN is %zu bytes — exceeding the 490-byte "
+            "ARKILIAN_API_KEY is %zu bytes — exceeding the 490-byte "
             "header budget; it will be truncated and requests will be "
-            "rejected. Rotate to a shorter token",
-            strlen(db->database_token));
+            "rejected. Rotate to a shorter key",
+            strlen(db->api_key));
   }
 
   db->backup_interval = get_env_int_default("ARKILIAN_BACKUP_INTERVAL", DEFAULT_BACKUP_INTERVAL);
@@ -1370,51 +1523,70 @@ int db_init(arkilian **db_ptr, const char *filename) {
   // without shipping them. Loud warning at startup — never a hard
   // failure, per the §0 rule that the backup subsystem must not break
   // the application.
-  if (db->backup_enabled && (!db->push_url || strlen(db->push_url) == 0)) {
+  if (db->backup_enabled && (!db->control_url || strlen(db->control_url) == 0)) {
     ark_log(db, ARK_LOG_WARN,
-            "backup is enabled (ARKILIAN_ENABLE_BACKUP) but ARKILIAN_WAL_PUSH_URL "
+            "backup is enabled (ARKILIAN_ENABLE_BACKUP) but ARKILIAN_CONTROL_URL "
             "is not set — rows will accumulate in _pending_backup and never ship");
   }
+  if (db->backup_enabled && (!db->api_key || strlen(db->api_key) == 0)) {
+    ark_log(db, ARK_LOG_WARN,
+            "backup is enabled but ARKILIAN_API_KEY is not set — the "
+            "control plane will reject every request; backup DISABLED");
+    db->backup_enabled = 0;
+  }
 
-  // Credential transport hygiene: over http:// the bearer token and every
+  // Credential transport hygiene: over http:// the API key and every
   // payload cross the wire in cleartext. HTTPS is enforced by default —
   // only loopback/RFC1918 (local dev) or an explicit ARKILIAN_ALLOW_INSECURE
   // opt-in permit cleartext. A misconfigured cleartext endpoint is refused
-  // at startup rather than silently leaking the token; backup is disabled
+  // at startup rather than silently leaking the key; backup is disabled
   // (per spec §0, never a hard db_init failure) so the application keeps
   // running while the operator fixes the configuration.
-  if (db->backup_enabled && db->push_url && strlen(db->push_url) > 0 &&
-      !url_transport_is_safe(db->push_url, allow_insecure)) {
+  if (db->backup_enabled && db->control_url && strlen(db->control_url) > 0 &&
+      !url_transport_is_safe(db->control_url, allow_insecure)) {
     ark_log(db, ARK_LOG_ERROR,
-            "ARKILIAN_WAL_PUSH_URL is not https and not a local address — the "
-            "bearer token would be sent in cleartext; backup DISABLED. Set "
+            "ARKILIAN_CONTROL_URL is not https and not a local address — the "
+            "API key would be sent in cleartext; backup DISABLED. Set "
             "https://, point at a loopback/RFC1918 host, or opt-in with "
             "ARKILIAN_ALLOW_INSECURE=1");
     db->backup_enabled = 0;
   }
-  if (db->backup_enabled && db->signed_url_endpoint && strlen(db->signed_url_endpoint) > 0 &&
-      !url_transport_is_safe(db->signed_url_endpoint, allow_insecure)) {
-    ark_log(db, ARK_LOG_ERROR,
-            "ARKILIAN_SIGNED_URL_ENDPOINT is not https and not a local "
-            "address — the bearer token would be sent in cleartext; snapshot "
-            "upload DISABLED. Set https://, point at a loopback/RFC1918 host, "
-            "or opt-in with ARKILIAN_ALLOW_INSECURE=1");
-    // Snapshot upload only is disabled; realtime shipping keeps running.
-    // Clear the endpoint so run_hourly_backup skips the upload branch.
-    free(db->signed_url_endpoint);
-    db->signed_url_endpoint = strdup("");
+
+  // Startup API-key validation: the client connects to the control plane
+  // to authenticate the API key before any shipping begins. A failed
+  // validation disables backup (per §0, never a hard failure) and
+  // surfaces via db_backup_is_healthy(). If the control plane is
+  // temporarily unreachable, backup is still disabled — the operator
+  // can re-enable via db_backup_set_enabled(1) once the control plane
+  // is back.
+  //
+  // ARKILIAN_SKIP_STARTUP_AUTH=1 bypasses the validation for test
+  // environments that have no running control plane. In production this
+  // MUST NOT be set — the validation is the client's only guarantee
+  // that the API key is accepted before it starts shipping data.
+  int skip_auth = get_env_bool_default("ARKILIAN_SKIP_STARTUP_AUTH", 0);
+  if (db->backup_enabled && !skip_auth) {
+    if (!validate_api_key(db, db->control_url, db->api_key)) {
+      ark_log(db, ARK_LOG_ERROR,
+              "startup API key validation failed — backup DISABLED. "
+              "Verify ARKILIAN_API_KEY is correct and ARKILIAN_CONTROL_URL "
+              "is reachable");
+      db->backup_enabled = 0;
+    } else {
+      ark_log(db, ARK_LOG_INFO, "API key validated against control plane");
+    }
   }
 
 #ifndef _WIN32
   pthread_mutex_init(&db->wake_mutex, NULL);
   pthread_cond_init(&db->wake_cond, NULL);
   pthread_mutex_init(&db->payload_mutex, NULL);
-  pthread_mutex_init(&db->token_mutex, NULL);
+  pthread_mutex_init(&db->api_key_mutex, NULL);
 #else
   InitializeCriticalSection(&db->wake_mutex);
   InitializeConditionVariable(&db->wake_cond);
   InitializeCriticalSection(&db->payload_mutex);
-  InitializeCriticalSection(&db->token_mutex);
+  InitializeCriticalSection(&db->api_key_mutex);
 #endif
 
   // libcurl global init must happen before ANY thread calls
@@ -1510,8 +1682,22 @@ int db_init(arkilian **db_ptr, const char *filename) {
     }
   }
   {
+    // The game connection hosts the _pending_backup outbox (capture
+    // triggers write to it on every row change). synchronous=NORMAL
+    // (the SQLite default for WAL) fsyncs WAL pages at checkpoint, not
+    // at commit — committed outbox rows can be lost on power loss
+    // before the next checkpoint. For a backup product, losing the
+    // very rows the subsystem exists to ship is unacceptable.
+    // ARKILIAN_OUTBOX_DURABLE=1 (default) sets synchronous=FULL on
+    // the game connection so the outbox is durable at commit. The
+    // ~15% write-latency cost is the price of not silently losing
+    // captured data on power loss. Operators who prioritize throughput
+    // over power-loss durability can set ARKILIAN_OUTBOX_DURABLE=0.
+    int outbox_durable = get_env_bool_default("ARKILIAN_OUTBOX_DURABLE", 1);
+    const char *sync_pragma = outbox_durable ? "PRAGMA synchronous=FULL;"
+                                              : "PRAGMA synchronous=NORMAL;";
     const struct { const char *sql; const char *what; } pragmas[] = {
-      { "PRAGMA synchronous=NORMAL;", "synchronous=NORMAL" },
+      { sync_pragma,                  "synchronous" },
       { "PRAGMA foreign_keys=ON;",    "foreign_keys=ON" },
       { "PRAGMA cache_size=-64000;",  "cache_size" },
       { NULL, NULL }
@@ -1716,18 +1902,19 @@ void db_close(arkilian *db) {
   pthread_mutex_destroy(&db->wake_mutex);
   pthread_cond_destroy(&db->wake_cond);
   pthread_mutex_destroy(&db->payload_mutex);
-  pthread_mutex_destroy(&db->token_mutex);
+  pthread_mutex_destroy(&db->api_key_mutex);
 #else
   DeleteCriticalSection(&db->wake_mutex);
   DeleteCriticalSection(&db->payload_mutex);
-  DeleteCriticalSection(&db->token_mutex);
+  DeleteCriticalSection(&db->api_key_mutex);
 #endif
 
   if (db->db_path) free(db->db_path);
   if (db->backup_path) free(db->backup_path);
+  if (db->control_url) free(db->control_url);
   if (db->push_url) free(db->push_url);
   if (db->signed_url_endpoint) free(db->signed_url_endpoint);
-  if (db->database_token) free(db->database_token);
+  if (db->api_key) free(db->api_key);
 
   free(db);
 }
@@ -1988,45 +2175,45 @@ sqlite3_int64 db_last_insert_rowid(arkilian *db) {
   return (db && db->handle) ? sqlite3_last_insert_rowid(db->handle) : 0;
 }
 
-// Snapshot the current token under the mutex; the caller frees the copy
-// once its curl setup is done. Readers must NEVER touch db->database_token
-// directly — db_set_token can swap/free it from the game thread while a
+// Snapshot the current API key under the mutex; the caller frees the copy
+// once its curl setup is done. Readers must NEVER touch db->api_key
+// directly — db_set_api_key can swap/free it from the game thread while a
 // backup thread is mid-request (use-after-free).
-static char *token_snapshot(arkilian *db) {
+static char *api_key_snapshot(arkilian *db) {
   if (!db) return NULL;
   char *copy = NULL;
 #ifndef _WIN32
-  pthread_mutex_lock(&db->token_mutex);
+  pthread_mutex_lock(&db->api_key_mutex);
 #else
-  EnterCriticalSection(&db->token_mutex);
+  EnterCriticalSection(&db->api_key_mutex);
 #endif
-  if (db->database_token && strlen(db->database_token) > 0) {
-    copy = strdup(db->database_token);
+  if (db->api_key && strlen(db->api_key) > 0) {
+    copy = strdup(db->api_key);
   }
 #ifndef _WIN32
-  pthread_mutex_unlock(&db->token_mutex);
+  pthread_mutex_unlock(&db->api_key_mutex);
 #else
-  LeaveCriticalSection(&db->token_mutex);
+  LeaveCriticalSection(&db->api_key_mutex);
 #endif
   return copy;
 }
 
-int db_set_token(arkilian *db, const char *token) {
-  if (!db || !token) return 1;
-  char *replacement = malloc(strlen(token) + 1);
+int db_set_api_key(arkilian *db, const char *api_key) {
+  if (!db || !api_key) return 1;
+  char *replacement = malloc(strlen(api_key) + 1);
   if (!replacement) return 1;
-  strcpy(replacement, token);
+  strcpy(replacement, api_key);
 #ifndef _WIN32
-  pthread_mutex_lock(&db->token_mutex);
+  pthread_mutex_lock(&db->api_key_mutex);
 #else
-  EnterCriticalSection(&db->token_mutex);
+  EnterCriticalSection(&db->api_key_mutex);
 #endif
-  if (db->database_token) free(db->database_token);
-  db->database_token = replacement;
+  if (db->api_key) free(db->api_key);
+  db->api_key = replacement;
 #ifndef _WIN32
-  pthread_mutex_unlock(&db->token_mutex);
+  pthread_mutex_unlock(&db->api_key_mutex);
 #else
-  LeaveCriticalSection(&db->token_mutex);
+  LeaveCriticalSection(&db->api_key_mutex);
 #endif
   return 0;
 }
@@ -2210,6 +2397,15 @@ long long db_backup_thread_heartbeat_age_ms(arkilian *db) {
   return (now >= hb_ms) ? (now - hb_ms) : 0;
 }
 
+long long db_backup_snapshot_heartbeat_age_ms(arkilian *db) {
+  if (!db) return -1;
+  int hb = db->last_snapshot_heartbeat_sec;
+  if (hb == 0) return -1; // never beat — thread not (yet) running
+  long long now = now_ms_mono();
+  long long hb_ms = (long long)hb * 1000LL;
+  return (now >= hb_ms) ? (now - hb_ms) : 0;
+}
+
 int db_backup_trigger_coverage(arkilian *db) {
   if (!db || !db->handle) return -1;
   sqlite3_stmt *stmt = NULL;
@@ -2248,13 +2444,19 @@ int db_backup_is_healthy(arkilian *db) {
   // destination. A green light while nothing is shipping is exactly the
   // silent failure monitoring exists to catch.
   if (!db->backup_enabled) return 0;
-  if (!db->push_url || strlen(db->push_url) == 0) return 0;
+  if (!db->control_url || strlen(db->control_url) == 0) return 0;
+  // Flush thread liveness: a 30s threshold covers a 10s ship + margin.
   long long hb_age = db_backup_thread_heartbeat_age_ms(db);
-  // The flush thread beats once per loop iteration, but a single slow
-  // ship (curl timeout is 10s) legitimately ages the heartbeat past any
-  // 5×poll-interval bound. The dead-thread threshold must exceed the
-  // longest legitimate in-flight time: 30s = 10s ship + 20s margin.
   if (hb_age < 0 || hb_age > 30000) return 0;
+  // Snapshot thread liveness: the hourly thread beats once per backup
+  // interval (default 3600s). The threshold must be generous —
+  // backup_interval + margin for the snapshot+upload work. A stale
+  // snapshot heartbeat (e.g. 2× the interval) means the thread died.
+  if (db->backup_interval > 0) {
+    long long snap_age = db_backup_snapshot_heartbeat_age_ms(db);
+    long long snap_threshold = (long long)db->backup_interval * 1000LL * 2 + 60000LL;
+    if (snap_age < 0 || snap_age > snap_threshold) return 0;
+  }
   if (db_backup_queue_depth(db) >= outbox_cap()) return 0;
   return 1;
 }
@@ -2597,6 +2799,12 @@ void *run_hourly_backup(void *arg) {
     // the normal schedule (the flush thread handles realtime resume).
     if (!db->backup_enabled) continue;
 
+    // Snapshot-thread heartbeat (spec §9): so a silent death of this
+    // thread (unhandled condition, thread cancellation) is visible via
+    // db_backup_snapshot_heartbeat_age_ms() instead of quietly stopping
+    // hourly uploads with no signal.
+    db->last_snapshot_heartbeat_sec = (int)(now_ms_mono() / 1000);
+
     // Snapshot from the SNAPSHOT connection (this thread's own, spec
     // §3.1) — never the game connection: sqlite3_backup_step page I/O
     // would otherwise hold the game connection's mutex for the whole
@@ -2612,9 +2820,9 @@ void *run_hourly_backup(void *arg) {
         strlen(db->signed_url_endpoint) > 0;
 
     if (status == SQLITE_OK && endpoint_configured) {
-      // Token snapshot: db_set_token can swap the string from the game
+      // API key snapshot: db_set_api_key can swap the string from the game
       // thread while this thread builds the request (use-after-free).
-      char *tok = token_snapshot(db);
+      char *tok = api_key_snapshot(db);
       char *signed_url = get_signed_url(db, db->signed_url_endpoint, tok,
                                         (int *)&db->shutdown_requested);
       if (signed_url && strlen(signed_url) > 5) {

@@ -95,8 +95,10 @@ if(CMAKE_JS_VERSION OR ARKILIAN_BUILD_NAPI)
     endif()
 
     add_library(arkilian_napi SHARED
-        bindings/node/addon.c
+        src/arkilian.cc
         ${ARKILIAN_SOURCES}
+        src/hydration.c
+        src/sha256.c
         ${CMAKE_JS_SRC_FILES}
     )
     target_compile_definitions(arkilian_napi PRIVATE ${ARKILIAN_SQLITE_DEFS})

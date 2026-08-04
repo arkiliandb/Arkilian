@@ -4,6 +4,8 @@
       "target_name": "arkilian",
       "sources": [
         "src/class.c",
+        "src/hydration.c",
+        "src/sha256.c",
         "src/deps/sqlite/sqlite3.c",
         "src/arkilian.cc"
       ],

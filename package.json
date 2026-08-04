@@ -40,6 +40,8 @@
     "src/class.c",
     "src/class.h",
     "src/arkilian.cc",
+    "src/hydration.c",
+    "src/hydration.h",
     "src/sha256.c",
     "src/sha256.h",
     "src/deps/sqlite/sqlite3.c",

@@ -654,20 +654,20 @@ static void test_bind_double_null_db(void) {
 
 static void test_set_token(void) {
   arkilian *db = open_test_db();
-  int rc = db_set_token(db, "my-secret-token");
+  int rc = db_set_api_key(db, "my-secret-api-key");
   assert(rc == 0);
   db_close(db);
   cleanup_files();
 }
 
 static void test_set_token_null_db(void) {
-  int rc = db_set_token(NULL, "token");
+  int rc = db_set_api_key(NULL, "api_key");
   assert(rc == 1);
 }
 
 static void test_set_token_null_token(void) {
   arkilian *db = open_test_db();
-  int rc = db_set_token(db, NULL);
+  int rc = db_set_api_key(db, NULL);
   assert(rc == 1);
   db_close(db);
   cleanup_files();
@@ -675,9 +675,9 @@ static void test_set_token_null_token(void) {
 
 static void test_set_token_replaces_previous(void) {
   arkilian *db = open_test_db();
-  int rc = db_set_token(db, "first-token");
+  int rc = db_set_api_key(db, "first-key");
   assert(rc == 0);
-  rc = db_set_token(db, "second-token");
+  rc = db_set_api_key(db, "second-key");
   assert(rc == 0);
   db_close(db);
   cleanup_files();

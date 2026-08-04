@@ -7,10 +7,14 @@ import { fileURLToPath } from "url";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = join(__filename, "..");
 
+// Skip startup auth validation — this test has no running control plane.
+process.env.ARKILIAN_SKIP_STARTUP_AUTH = "1";
+process.env.ARKILIAN_API_KEY = "test-key";
+
 console.log("Testing Arkilian Node.js bindings...\n");
 
 const dbPath = join(__dirname, "test.db");
-const db = new Arkilian("dummy-test-token-00000000-0000-0000-0000-000000000000", dbPath);
+const db = new Arkilian("test-key", dbPath);
 
 console.log("1. Drop old table if exists and recreate...");
 await db.exec("DROP TABLE IF EXISTS users");
@@ -100,7 +104,7 @@ const { Worker } = await import("worker_threads");
 const workerCode = `
   const { parentPort } = require("worker_threads");
   const Arkilian = require(${JSON.stringify(join(__dirname, "index.js"))}).default;
-  const db = new Arkilian("dummy-test-token-00000000-0000-0000-0000-000000000000",
+  const db = new Arkilian("test-key",
     ${JSON.stringify(dbPath)});
   try {
     for (let i = 0; i < 500; i++) {

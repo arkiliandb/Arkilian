@@ -78,8 +78,10 @@ char   *json_array_get(const char *json, const char *key, int index);
 
 // Run the full two-phase hydration protocol.
 //   db_path      Local target database path (e.g. "mydb.db")
-//   server_url   Control Plane base URL (e.g. "https://api.arkilian.com/v1")
-//   auth_token   Bearer token for authentication (may be NULL)
+//   server_url   Control Plane base URL (e.g. "https://api.arkilian.com")
+//   api_key      The tenant's API key — sent as "Authorization: Bearer
+//                <api_key>" to the control plane. This is the ONLY
+//                credential; no S3 keys or JWT are used.
 //   progress     Optional progress callback (may be NULL)
 //
 // DANGER — must not be called while the application has the database
@@ -89,18 +91,22 @@ char   *json_array_get(const char *json, const char *key, int index);
 // before db_init(). A best-effort probe refuses when another connection
 // is actively writing, but an idle-but-open application connection can
 // start writing immediately after the probe passes — the caller owns
-// this contract.
+// this contract. Concurrent calls are serialized by a process-global
+// mutex (single-flight).
 //
 // Safety guards (all enforced before any file is touched):
 //   - HYDRATION_ERR_NEWER: local DB is further along than the snapshot
 //   - HYDRATION_ERR_BUSY:  another connection is actively writing
 //   - the downloaded snapshot is fsync'd and validated (opens as a
 //     clean SQLite database, PRAGMA quick_check) before install
+//   - SHA-256 digest is verified on every snapshot and chunk; a missing
+//     digest is a HARD refusal (no unauthenticated content is ever
+//     installed or replayed)
 //
 // Returns HYDRATION_OK on success, or a negative error code.
 int arkilian_hydrate(const char *db_path,
                      const char *server_url,
-                     const char *auth_token,
+                     const char *api_key,
                      hydration_progress_cb progress,
                      void *user_data);
 

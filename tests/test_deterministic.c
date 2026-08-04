@@ -40,7 +40,9 @@ static int tests_passed = 0;
 
 static arkilian *open_test_db(void) {
   setenv("ARKILIAN_ENABLE_BACKUP", "0", 1);
-  setenv("ARKILIAN_WAL_PUSH_URL", "http://127.0.0.1:9", 1);
+  setenv("ARKILIAN_API_KEY", "test-key", 1);
+  setenv("ARKILIAN_SKIP_STARTUP_AUTH", "1", 1);
+  setenv("ARKILIAN_CONTROL_URL", "http://127.0.0.1:9", 1);
   arkilian *db = NULL;
   int rc = db_init(&db, TEST_DB);
   ASSERT(rc == 0);

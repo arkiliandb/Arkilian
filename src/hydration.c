@@ -3,6 +3,11 @@
 // Logical replay: downloads snapshot binary + incremental SQL chunks
 // via Pre-Signed URLs, plays them back with sqlite3_exec() inside
 // explicit transactions.  No binary WAL frame manipulation needed.
+//
+// Auth model: the client uses ONLY the API key (ARKILIAN_API_KEY) as
+// "Authorization: Bearer <api_key>" to the control plane. No other
+// credential is used. The control plane issues pre-signed S3 GET URLs
+// for snapshot/chunk downloads — the API key is never sent to S3.
 
 #include "hydration.h"
 #include "sha256.h"
@@ -10,6 +15,7 @@
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -47,20 +53,26 @@ static size_t url_host(const char *url, char *out, size_t out_cap) {
   return hlen;
 }
 
-static int host_is_local(const char *host) {
+// Storage-safe host: excludes link-local (169.254.0.0/16 and IPv6
+// fe80::) because that range hosts the cloud instance-metadata service
+// (IMDS at 169.254.169.254 on AWS/GCP/Azure). A compromised control
+// plane returning a snapshot/chunk URL pointing at IMDS would otherwise
+// have the client download from (or, for non-presigned URLs, send the
+// API key to) the metadata service.
+static int host_is_storage_safe(const char *host) {
   if (!host || !*host) return 0;
   if (host[0] == '[') {
     if (strncmp(host, "[::1]", 5) == 0) return 1;
-    if (strncmp(host, "[fe80", 5) == 0) return 1;
     if (strncmp(host, "[fc", 3) == 0 || strncmp(host, "[fd", 3) == 0) return 1;
+    // NO [fe80 — link-local / IMDS excluded
     return 0;
   }
   if (strcmp(host, "localhost") == 0) return 1;
   if (strncmp(host, "127.", 4) == 0) return 1;
   if (strncmp(host, "10.", 3) == 0) return 1;
   if (strncmp(host, "192.168.", 8) == 0) return 1;
-  if (strncmp(host, "169.254.", 8) == 0) return 1;
-  if (strncmp(host, "fe80", 4) == 0) return 1;
+  // NO 169.254. — IMDS excluded
+  // NO fe80 — IPv6 link-local excluded
   if (strncmp(host, "::1", 3) == 0) return 1;
   if (strncmp(host, "fc", 2) == 0 || strncmp(host, "fd", 2) == 0) return 1;
   if (strncmp(host, "172.", 4) == 0) {
@@ -96,7 +108,9 @@ static int url_is_allowed_storage(const char *url) {
   char host[256];
   if (url_host(url, host, sizeof(host)) == 0) return 0;
   if (host_is_known_storage(host)) return 1;
-  if (host_is_local(host)) return 1;
+  // host_is_storage_safe EXCLUDES link-local (169.254.x / fe80::) so
+  // 169.254.169.254 (IMDS) is never an accepted storage destination.
+  if (host_is_storage_safe(host)) return 1;
   const char *extra = getenv("ARKILIAN_STORAGE_HOSTS");
   if (extra && *extra) {
     char buf[1024];
@@ -176,6 +190,13 @@ static void fsync_parent_dir(const char *path) {
 
 // ── libcurl response buffer ─────────────────────────────────────────
 
+// Single-flight guard: arkilian_hydrate replaces the database file on
+// disk (remove + rename). Two concurrent hydrates on the same db_path
+// would truncate each other's temp file and race on rename(). A process-
+// global mutex serializes all hydration calls — acceptable for a cold-
+// restore path (the application must not have the DB open during hydrate).
+static pthread_mutex_t g_hydrate_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 struct curl_buf {
   uint8_t *data;
   size_t   len;
@@ -214,6 +235,14 @@ static int http_init(HttpReq *r, const char *url, const char *token) {
   curl_easy_setopt(r->handle, CURLOPT_TIMEOUT, 120L);
   curl_easy_setopt(r->handle, CURLOPT_CONNECTTIMEOUT, 15L);
   curl_easy_setopt(r->handle, CURLOPT_FOLLOWLOCATION, 1L);
+  // Restrict redirect targets to HTTP/HTTPS so a 302 from an allowed host
+  // to file://, gopher://, etc. is never followed. The SSRF guard only
+  // inspects the INITIAL URL host — redirects must not bypass it to an
+  // arbitrary scheme.
+  curl_easy_setopt(r->handle, CURLOPT_REDIR_PROTOCOLS,
+                   (long)(CURLPROTO_HTTP | CURLPROTO_HTTPS));
+  curl_easy_setopt(r->handle, CURLOPT_PROTOCOLS,
+                   (long)(CURLPROTO_HTTP | CURLPROTO_HTTPS));
   // Explicit TLS posture: system defaults are 1/2; setting them explicitly
   // documents intent and protects against a regression patch disabling
   // verification. Hydration URLs come from the (trusted) control plane,
@@ -242,6 +271,10 @@ static char *http_get_string(const char *url, const char *token, int *err_out) {
 
   struct curl_buf buf = {NULL, 0, 0};
   curl_easy_setopt(r.handle, CURLOPT_WRITEDATA, &buf);
+  // Cap the response size: a chunk is replayable SQL text bounded by the
+  // control plane's chunking. A compromised/buggy control plane streaming
+  // gigabytes would otherwise OOM this process before the SQL is parsed.
+  curl_easy_setopt(r.handle, CURLOPT_MAXFILESIZE_LARGE, (curl_off_t)(256LL * 1024 * 1024));
 
   CURLcode rc = curl_easy_perform(r.handle);
   long http_code = 0;
@@ -333,9 +366,9 @@ static int http_download_file(const char *url, const char *token,
   // still pass it. Verifying the downloaded bytes against the control
   // plane's recorded digest is the strongest available content guarantee,
   // so it runs BEFORE the structural quick_check — a tampered-but-valid
-  // SQLite file is refused here. A missing digest (older control plane)
-  // is logged and skipped — accept-by-default for back-compat; flip to
-  // refuse once all planes ship digests.
+  // SQLite file is refused here. A missing digest is a HARD refusal: for
+  // a cloud product, silently installing unauthenticated content is a
+  // downgradeattack surface, not a back-compat feature.
   if (expected_sha256 && expected_sha256[0]) {
     char digest[65];
     if (ark_sha256_hex_file(tmp_path, digest) != 0) {
@@ -356,9 +389,12 @@ static int http_download_file(const char *url, const char *token,
     }
   } else {
     fprintf(stderr,
-            "arkilian: WARNING — snapshot_sha256 not provided by control "
-            "plane; content authenticity cannot be verified (installing "
-            "unverified snapshot)\n");
+            "arkilian: snapshot SHA-256 digest NOT provided by control "
+            "plane — refusing to install unauthenticated content "
+            "(HYDRATION_ERR_PROTO)\n");
+    remove(tmp_path);
+    *err_out = HYDRATION_ERR_PROTO;
+    return -1;
   }
 
   // ── Structural validation ────────────────────────────────────────
@@ -613,15 +649,21 @@ char *json_array_get(const char *json, const char *key, int index) {
 
 // ── Control Plane: request hydration plan ───────────────────────────
 
-static int request_hydrate_plan(const char *server_url, const char *token,
+static int request_hydrate_plan(const char *server_url, const char *api_key,
                                  HydratePlan *plan) {
-  size_t url_len = strlen(server_url) + strlen("/hydrate/plan") + 1;
+  // The control URL is the base (e.g. https://api.arkilian.com); the
+  // hydrate plan endpoint is /v1/hydrate/plan under that base.
+  size_t url_len = strlen(server_url) + strlen("/v1/hydrate/plan") + 1;
   char *url = malloc(url_len);
   if (!url) return HYDRATION_ERR_MEM;
-  snprintf(url, url_len, "%s/hydrate/plan", server_url);
+  // Strip trailing slash from base to avoid doubles.
+  size_t blen = strlen(server_url);
+  int strip = (blen > 0 && server_url[blen - 1] == '/');
+  if (strip) snprintf(url, url_len, "%.*s/v1/hydrate/plan", (int)(blen - 1), server_url);
+  else snprintf(url, url_len, "%s/v1/hydrate/plan", server_url);
 
   int err = 0;
-  char *json = http_get_string(url, token, &err);
+  char *json = http_get_string(url, api_key, &err);
   free(url);
   if (!json) return err;
 
@@ -780,20 +822,29 @@ int hydrate_replay_chunk(sqlite3 *db, const char *raw_sql, int64_t chunk_lsn) {
 
 int arkilian_hydrate(const char *db_path,
                      const char *server_url,
-                     const char *auth_token,
+                     const char *api_key,
                      hydration_progress_cb progress,
                      void *user_data) {
   if (!db_path || !server_url) return HYDRATION_ERR_PROTO;
 
+  // Single-flight: serialize concurrent hydration calls so two
+  // hydrates on the same db_path can't race on the temp file or
+  // rename(). The application must not have the DB open during
+  // hydrate (documented in hydration.h) — this guard protects against
+  // two cold-start processes racing, not against a live application.
+  pthread_mutex_lock(&g_hydrate_mutex);
+  int hydrate_result = 0;
+
   // ── Phase 0: Request hydration plan ──
   HydratePlan plan;
-  int rc = request_hydrate_plan(server_url, auth_token, &plan);
-  if (rc != 0) return rc;
+  int rc = request_hydrate_plan(server_url, api_key, &plan);
+  if (rc != 0) { hydrate_result = rc; goto hydrate_done; }
 
   // A snapshot URL that is already expired can only fail — say so.
   if (plan.expires_at > 0 && (int64_t)time(NULL) > plan.expires_at) {
     hydrate_plan_free(&plan);
-    return HYDRATION_ERR_EXPIRED;
+    hydrate_result = HYDRATION_ERR_EXPIRED;
+    goto hydrate_done;
   }
 
   // ── Phase 0.5: Local-vs-snapshot LSN guard (data-loss protection) ──
@@ -821,7 +872,8 @@ int arkilian_hydrate(const char *db_path,
               (long long)pre_local_lsn, (long long)plan.baseline_lsn,
               (long long)(pre_local_lsn - plan.baseline_lsn));
       hydrate_plan_free(&plan);
-      return HYDRATION_ERR_NEWER;
+      hydrate_result = HYDRATION_ERR_NEWER;
+      goto hydrate_done;
     }
   }
 
@@ -847,7 +899,8 @@ int arkilian_hydrate(const char *db_path,
         sqlite3_free(perr);
         sqlite3_close(ldb);
         hydrate_plan_free(&plan);
-        return HYDRATION_ERR_BUSY;
+        hydrate_result = HYDRATION_ERR_BUSY;
+        goto hydrate_done;
       }
       sqlite3_exec(ldb, "ROLLBACK;", NULL, NULL, NULL);
       sqlite3_close(ldb);
@@ -855,15 +908,15 @@ int arkilian_hydrate(const char *db_path,
   }
 
   // ── Phase 1: Download baseline snapshot ──
-  rc = download_snapshot(plan.snapshot_url, auth_token, db_path,
+  rc = download_snapshot(plan.snapshot_url, api_key, db_path,
                           plan.snapshot_sha256, progress, user_data);
-  if (rc != 0) { hydrate_plan_free(&plan); return rc; }
+  if (rc != 0) { hydrate_plan_free(&plan); hydrate_result = rc; goto hydrate_done; }
 
   // ── Phase 2: Open database, check LSN, replay chunks ──
   sqlite3 *db = NULL;
   rc = sqlite3_open_v2(db_path, &db,
     SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX, NULL);
-  if (rc != SQLITE_OK) { hydrate_plan_free(&plan); return HYDRATION_ERR_SQL; }
+  if (rc != SQLITE_OK) { hydrate_plan_free(&plan); hydrate_result = HYDRATION_ERR_SQL; goto hydrate_done; }
 
   // Apply PRAGMAs for the replay. synchronous=NORMAL (NOT OFF) keeps the
   // WAL durable on commit even during replay — a power loss mid-replay
@@ -902,7 +955,8 @@ int arkilian_hydrate(const char *db_path,
             (long long)local_lsn, (long long)plan.baseline_lsn);
     sqlite3_close(db);
     hydrate_plan_free(&plan);
-    return HYDRATION_ERR_PROTO;
+    hydrate_result = HYDRATION_ERR_PROTO;
+    goto hydrate_done;
   }
 
   int chunk_total = 0;
@@ -922,14 +976,16 @@ int arkilian_hydrate(const char *db_path,
               (long long)(ch->lsn_start - local_lsn - 1));
       sqlite3_close(db);
       hydrate_plan_free(&plan);
-      return HYDRATION_ERR_PROTO;
+      hydrate_result = HYDRATION_ERR_PROTO;
+      goto hydrate_done;
     }
 
     // Check URL expiry
     if (ch->expires_at > 0 && (int64_t)time(NULL) > ch->expires_at) {
       sqlite3_close(db);
       hydrate_plan_free(&plan);
-      return HYDRATION_ERR_EXPIRED;
+      hydrate_result = HYDRATION_ERR_EXPIRED;
+      goto hydrate_done;
     }
 
     // Download chunk. SSRF-guarded: never fetch a chunk from a host that
@@ -943,17 +999,19 @@ int arkilian_hydrate(const char *db_path,
               i, ch->url);
       sqlite3_close(db);
       hydrate_plan_free(&plan);
-      return HYDRATION_ERR_PROTO;
+      hydrate_result = HYDRATION_ERR_PROTO;
+      goto hydrate_done;
     }
     int err = 0;
-    char *sql_text = http_get_string(ch->url, auth_token, &err);
-    if (!sql_text) { sqlite3_close(db); hydrate_plan_free(&plan); return err; }
+    char *sql_text = http_get_string(ch->url, api_key, &err);
+    if (!sql_text) { sqlite3_close(db); hydrate_plan_free(&plan); hydrate_result = err; goto hydrate_done; }
 
     // Content authentication: verify the chunk's SHA-256 against the
     // control plane's recorded digest BEFORE replaying it as raw SQL
     // against the local database. A mismatch is a tampered/broken chunk
-    // and must never reach sqlite3_exec. NULL/empty digest skips with a
-    // warning (back-compat with older control planes).
+    // and must never reach sqlite3_exec. A missing digest is a HARD
+    // refusal — silently replaying unauthenticated content is a
+    // downgrade-attack surface, not a back-compat feature.
     if (ch->sha256 && ch->sha256[0]) {
       char digest[65];
       ark_sha256_hex(sql_text, strlen(sql_text), digest);
@@ -965,19 +1023,26 @@ int arkilian_hydrate(const char *db_path,
         free(sql_text);
         sqlite3_close(db);
         hydrate_plan_free(&plan);
-        return HYDRATION_ERR_PROTO;
+        hydrate_result = HYDRATION_ERR_PROTO;
+        goto hydrate_done;
       }
     } else {
       fprintf(stderr,
-              "arkilian: WARNING — chunk %d sha256 not provided by control "
-              "plane; content authenticity unverified (replaying)\n", i);
+              "arkilian: chunk %d sha256 NOT provided by control plane — "
+              "refusing to replay unauthenticated content (HYDRATION_ERR_PROTO)\n",
+              i);
+      free(sql_text);
+      sqlite3_close(db);
+      hydrate_plan_free(&plan);
+      hydrate_result = HYDRATION_ERR_PROTO;
+      goto hydrate_done;
     }
 
     // Replay
     rc = hydrate_replay_chunk(db, sql_text, ch->lsn_end);
     free(sql_text);
 
-    if (rc != 0) { sqlite3_close(db); hydrate_plan_free(&plan); return rc; }
+    if (rc != 0) { sqlite3_close(db); hydrate_plan_free(&plan); hydrate_result = rc; goto hydrate_done; }
 
     local_lsn = ch->lsn_end;
     chunk_total++;
@@ -997,5 +1062,8 @@ int arkilian_hydrate(const char *db_path,
 
   sqlite3_close(db);
   hydrate_plan_free(&plan);
-  return 0;
+
+hydrate_done:
+  pthread_mutex_unlock(&g_hydrate_mutex);
+  return hydrate_result;
 }

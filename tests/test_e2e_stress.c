@@ -6,7 +6,7 @@
 //
 //   1. Capture: writes go through triggers into _pending_backup.
 //   2. Delivery: the flush thread ships every payload to the control
-//      plane's /v1/wal/push with X-Arkilian-Payload-Id.
+//      plane's  with X-Arkilian-Payload-Id.
 //   3. Snapshot: the hourly backup thread uploads backup.sqlite through
 //      a control-plane signed URL into object storage.
 //   4. Verification: the control plane confirms the exact wal_entries
@@ -112,15 +112,15 @@ int main(int argc, char **argv) {
 
   setvbuf(stdout, NULL, _IONBF, 0);
   char push_url[512], upload_url[512], count_url[512], plan_url[512];
-  snprintf(push_url, sizeof(push_url), "%s/v1/wal/push", g_url);
+  snprintf(push_url, sizeof(push_url), "%s", g_url);
   snprintf(upload_url, sizeof(upload_url), "%s/v1/upload/request", g_url);
   snprintf(count_url, sizeof(count_url), "%s/v1/wal/count", g_url);
   snprintf(plan_url, sizeof(plan_url), "%s/v1/hydrate/plan", g_url);
 
   setenv("ARKILIAN_ENABLE_BACKUP", "1", 1);
-  setenv("ARKILIAN_WAL_PUSH_URL", push_url, 1);
-  setenv("ARKILIAN_SIGNED_URL_ENDPOINT", upload_url, 1);
-  setenv("ARKILIAN_DATABASE_TOKEN", g_key, 1);
+  setenv("ARKILIAN_CONTROL_URL", g_url, 1);
+  setenv("ARKILIAN_API_KEY", g_key, 1);
+  setenv("ARKILIAN_SKIP_STARTUP_AUTH", "1", 1);
   setenv("ARKILIAN_BACKUP_INTERVAL", "5", 1);  // hourly thread runs often
   setenv("ARKILIAN_BACKUP_PATH", "e2e_backup.sqlite", 1);
 

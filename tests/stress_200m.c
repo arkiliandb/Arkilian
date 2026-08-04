@@ -51,7 +51,7 @@ int main(int argc, char **argv) {
   printf("  Backup Interval    : %s seconds (4 Hours)\n",
          getenv("ARKILIAN_BACKUP_INTERVAL") ? getenv("ARKILIAN_BACKUP_INTERVAL") : "14400");
   printf("  WAL Push Endpoint  : %s\n",
-         getenv("ARKILIAN_WAL_PUSH_URL") ? getenv("ARKILIAN_WAL_PUSH_URL") : "Disabled");
+         getenv("ARKILIAN_CONTROL_URL") ? getenv("ARKILIAN_CONTROL_URL") : "Disabled");
   printf("===============================================================\n\n");
 
   arkilian *db = NULL;
