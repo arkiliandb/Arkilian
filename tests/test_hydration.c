@@ -447,6 +447,40 @@ static void test_hydrate_proceeds_when_local_behind(void) {
   mock_plan_stop(&srv);
 }
 
+// A live writer on the local DB must block the restore (clobber guard).
+static void test_hydrate_refuses_when_db_locked(void) {
+  mock_plan_server srv;
+  mock_plan_start(&srv);
+
+  char base[64];
+  snprintf(base, sizeof(base), "http://127.0.0.1:%d/v1", srv.port);
+  const char *db_path = "/tmp/ark_hydrate_locked.db";
+  remove(db_path);
+
+  sqlite3 *db = NULL;
+  assert(sqlite3_open_v2(db_path, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, NULL) == SQLITE_OK);
+  assert(sqlite3_exec(db,
+      "CREATE TABLE _arkilian_meta (k TEXT PRIMARY KEY, v TEXT);"
+      "INSERT INTO _arkilian_meta VALUES ('last_applied_lsn', '500');", NULL, NULL, NULL) == SQLITE_OK);
+  // Simulate a live application: hold the write lock.
+  assert(sqlite3_exec(db, "BEGIN IMMEDIATE;", NULL, NULL, NULL) == SQLITE_OK);
+
+  int rc = arkilian_hydrate(db_path, base, "token", NULL, NULL);
+  assert(rc == HYDRATION_ERR_BUSY);
+
+  // The lock holder is untouched; release and clean up.
+  assert(sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL) == SQLITE_OK);
+  sqlite3_stmt *st = NULL;
+  sqlite3_prepare_v2(db, "SELECT v FROM _arkilian_meta WHERE k='last_applied_lsn'", -1, &st, NULL);
+  assert(sqlite3_step(st) == SQLITE_ROW);
+  assert(strcmp((const char *)sqlite3_column_text(st, 0), "500") == 0);
+  sqlite3_finalize(st);
+  sqlite3_close(db);
+
+  remove(db_path);
+  mock_plan_stop(&srv);
+}
+
 // ── Main ────────────────────────────────────────────────────────────
 
 int main(int argc, char **argv) {
@@ -487,6 +521,7 @@ int main(int argc, char **argv) {
   printf("\n[LSN Clobber Guard]\n");
   RUN_TEST(test_hydrate_refuses_when_local_is_newer);
   RUN_TEST(test_hydrate_proceeds_when_local_behind);
+  RUN_TEST(test_hydrate_refuses_when_db_locked);
 
   if (integration) {
     printf("\n[Integration]\n");

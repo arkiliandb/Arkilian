@@ -890,19 +890,35 @@ static int drain_batch(arkilian *db, CURL *ship_curl, sqlite3_stmt *select_stmt,
       sqlite3_bind_int(dead_letter_stmt, 1, new_attempts);
       sqlite3_bind_text(dead_letter_stmt, 2, "max attempts exceeded", -1, SQLITE_STATIC);
       sqlite3_bind_int64(dead_letter_stmt, 3, id);
-      if (sqlite3_step(dead_letter_stmt) == SQLITE_DONE) {
-        sqlite3_reset(delete_stmt);
-        sqlite3_clear_bindings(delete_stmt);
-        sqlite3_bind_int64(delete_stmt, 1, id);
-        if (sqlite3_step(delete_stmt) != SQLITE_DONE) {
-          // The row is safe in _dead_backup; the _pending_backup copy is
-          // re-dead-lettered next pass (id-conflict is expected, harmless).
-          ark_log(db, ARK_LOG_ERROR, "delete after dead-letter failed id=%lld: %s",
-                   (long long)id, sqlite3_errmsg(db->backup_db));
-        }
-      } else {
+      // INSERT OR IGNORE: if a previous pass already dead-lettered this
+      // id but failed to delete the pending copy (SQLITE_BUSY), the
+      // insert would hit a PK conflict. That conflict previously left a
+      // permanent zombie row AND — because the failure path reported
+      // "work drained" — the flush loop never slept, hot-spinning on the
+      // conflict forever. OR IGNORE makes a repeat dead-letter a no-op.
+      int dl_rc = sqlite3_step(dead_letter_stmt);
+      if (dl_rc != SQLITE_DONE) {
+        // A real (non-conflict) error: leave the row pending and back
+        // off — do not spin.
         ark_log(db, ARK_LOG_ERROR, "dead-letter insert failed id=%lld: %s",
-                 (long long)id, sqlite3_errmsg(db->backup_db));
+                (long long)id, sqlite3_errmsg(db->backup_db));
+        processed_any = 0;
+        break;
+      }
+      // The row is in _dead_backup (inserted now, or already there from
+      // a partial earlier pass). The _pending_backup copy is redundant —
+      // remove it unconditionally so no zombie row can ever loop.
+      sqlite3_reset(delete_stmt);
+      sqlite3_clear_bindings(delete_stmt);
+      sqlite3_bind_int64(delete_stmt, 1, id);
+      if (sqlite3_step(delete_stmt) != SQLITE_DONE) {
+        ark_log(db, ARK_LOG_ERROR, "delete after dead-letter failed id=%lld: %s",
+                (long long)id, sqlite3_errmsg(db->backup_db));
+        // Row stays pending this pass; the next pass dead-letters it
+        // again (OR IGNORE no-op) and retries the delete. Reporting "no
+        // work drained" makes the loop sleep instead of spinning.
+        processed_any = 0;
+        break;
       }
       processed_any = 1;
       continue;
@@ -952,7 +968,7 @@ static int prepare_outbox_statements(sqlite3 *db, sqlite3_stmt **select_stmt,
         "UPDATE _pending_backup SET attempts = ?1, last_attempt_at = strftime('%s','now') WHERE id = ?2",
         -1, update_attempts_stmt, NULL) != SQLITE_OK) goto fail;
   if (sqlite3_prepare_v2(db,
-        "INSERT INTO _dead_backup (id, payload, attempts, failed_reason, created_at) "
+        "INSERT OR IGNORE INTO _dead_backup (id, payload, attempts, failed_reason, created_at) "
         "SELECT id, payload, ?1, ?2, created_at FROM _pending_backup WHERE id = ?3",
         -1, dead_letter_stmt, NULL) != SQLITE_OK) goto fail;
   return 1;

@@ -81,6 +81,70 @@ console.log(`   Got Bob's name: ${bobName}`);
 await db.finalize();
 console.log("   OK - statements not lost");
 
-await db.close();
+console.log("\n9. BigInt bind round-trip (regression)...");
+await db.exec("DROP TABLE IF EXISTS bigints");
+await db.exec("CREATE TABLE bigints (v INTEGER)");
+const big = 1718400000123456789n; // > 2^53, must survive exactly
+await db.run("INSERT INTO bigints (v) VALUES (?)", [big]);
+const bigRow = await db.all("SELECT v FROM bigints");
+console.log(`   bigint round-trip: ${bigRow[0].v} (${typeof bigRow[0].v})`);
+if (typeof bigRow[0].v !== "bigint" || bigRow[0].v !== big) {
+  console.error("   FAIL: bigint did not round-trip exactly");
+  process.exit(1);
+}
+await db.exec("DROP TABLE bigints");
+console.log("   OK");
 
+console.log("\n10. Worker-thread concurrent cursor use (regression)...");
+const { Worker } = await import("worker_threads");
+const workerCode = `
+  const { parentPort } = require("worker_threads");
+  const Arkilian = require(${JSON.stringify(join(__dirname, "index.js"))}).default;
+  const db = new Arkilian("dummy-test-token-00000000-0000-0000-0000-000000000000",
+    ${JSON.stringify(dbPath)});
+  try {
+    for (let i = 0; i < 500; i++) {
+      db.exec("INSERT INTO thrash (v) VALUES (" + i + ")");
+      const rows = db.all("SELECT COUNT(*) AS c FROM thrash");
+      if (!rows || rows[0].c === undefined) throw new Error("bad result");
+    }
+    parentPort.postMessage("ok");
+  } catch (e) {
+    parentPort.postMessage("fail: " + e.message);
+  } finally {
+    db.close();
+  }
+`;
+await db.exec("DROP TABLE IF EXISTS thrash");
+await db.exec("CREATE TABLE thrash (v INTEGER)");
+const workers = [];
+for (let w = 0; w < 4; w++) {
+  workers.push(
+    new Promise((resolve) => {
+      const worker = new Worker(workerCode, { eval: true });
+      worker.on("message", (m) => {
+        if (m !== "ok") {
+          console.error(`   worker ${w} FAIL: ${m}`);
+          process.exit(1);
+        }
+        resolve();
+      });
+      worker.on("error", (e) => {
+        console.error(`   worker ${w} crashed: ${e.message}`);
+        process.exit(1);
+      });
+    }),
+  );
+}
+await Promise.all(workers);
+const thrashCount = await db.all("SELECT COUNT(*) AS c FROM thrash");
+if (thrashCount[0].c !== 2000) {
+  console.error(`   FAIL: expected 2000 rows, got ${thrashCount[0].c}`);
+  process.exit(1);
+}
+console.log("   4 workers x 500 concurrent ops: all rows intact (2000)");
+await db.exec("DROP TABLE thrash");
+console.log("   OK");
+
+await db.close();
 console.log("\nAll tests passed!");

@@ -12,6 +12,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <time.h>
+#include <unistd.h>
 
 // Pre-signed object-storage URLs carry their own credentials in the
 // query string — attaching our bearer token both leaks the credential
@@ -152,6 +153,8 @@ static int http_download_file(const char *url, const char *token,
   http_free(&r);
 
   int io_failed = ferror(f);
+  if (fflush(f) != 0) io_failed = 1;
+  if (fsync(fileno(f)) != 0) io_failed = 1;
   if (fclose(f) != 0) io_failed = 1;
 
   if (rc != CURLE_OK || http_code != 200 || io_failed) {
@@ -161,6 +164,35 @@ static int http_download_file(const char *url, const char *token,
     else if (http_code == 401 || http_code == 403) *err_out = HYDRATION_ERR_PROTO;
     else *err_out = HYDRATION_ERR_NET;
     return -1;
+  }
+
+  // ── Validate the downloaded body before it can destroy anything ──
+  // A 200 body is not proof of a valid snapshot: a proxy mangling, a
+  // server bug, or a truncated disk write would otherwise be installed
+  // over the live database as silent total data loss. The temp file
+  // must open as a real SQLite database AND pass PRAGMA quick_check
+  // (page-level corruption scan) before rename() is allowed.
+  {
+    sqlite3 *chk = NULL;
+    int ok = 0;
+    if (sqlite3_open_v2(tmp_path, &chk, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK) {
+      sqlite3_stmt *q = NULL;
+      if (sqlite3_prepare_v2(chk, "PRAGMA quick_check", -1, &q, NULL) == SQLITE_OK &&
+          sqlite3_step(q) == SQLITE_ROW) {
+        const char *r = (const char *)sqlite3_column_text(q, 0);
+        ok = r && strcmp(r, "ok") == 0;
+      }
+      sqlite3_finalize(q);
+      sqlite3_close(chk);
+    }
+    if (!ok) {
+      fprintf(stderr,
+              "arkilian: snapshot failed validation (not a clean SQLite "
+              "database) — restore aborted, local database untouched\n");
+      remove(tmp_path);
+      *err_out = HYDRATION_ERR_DISK;
+      return -1;
+    }
   }
 
   // Success: drop the previous database and its stale WAL/SHM frames
@@ -580,6 +612,35 @@ int arkilian_hydrate(const char *db_path,
               (long long)(pre_local_lsn - plan.baseline_lsn));
       hydrate_plan_free(&plan);
       return HYDRATION_ERR_NEWER;
+    }
+  }
+
+  // ── Phase 0.6: Live-writer probe (footgun guard) ───────────────────
+  // Installing the snapshot remove()+rename()s the file; if the
+  // application is actively writing through another connection, its
+  // writes keep landing on the orphaned inode and diverge from the
+  // restored file. A BEGIN IMMEDIATE with no busy wait detects an
+  // actively-writing connection. Best-effort: an idle-but-open
+  // connection can start writing right after the probe — callers must
+  // not hydrate a live database (documented in hydration.h).
+  {
+    sqlite3 *ldb = NULL;
+    if (sqlite3_open_v2(db_path, &ldb,
+                        SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX, NULL) == SQLITE_OK) {
+      char *perr = NULL;
+      int prc = sqlite3_exec(ldb, "BEGIN IMMEDIATE;", NULL, NULL, &perr);
+      if (prc != SQLITE_OK) {
+        fprintf(stderr,
+                "arkilian: hydration refused — the local database is locked by "
+                "another connection (application running?); refusing to clobber "
+                "a live database (HYDRATION_ERR_BUSY)\n");
+        sqlite3_free(perr);
+        sqlite3_close(ldb);
+        hydrate_plan_free(&plan);
+        return HYDRATION_ERR_BUSY;
+      }
+      sqlite3_exec(ldb, "ROLLBACK;", NULL, NULL, NULL);
+      sqlite3_close(ldb);
     }
   }
 

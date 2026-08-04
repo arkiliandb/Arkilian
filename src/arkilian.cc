@@ -1,7 +1,9 @@
 #include <napi.h>
 #include <cstring>
 #include <cstdio>
+#include <cmath>
 #include <mutex>
+#include <unordered_map>
 #include <unordered_set>
 #include "class.h"
 
@@ -12,6 +14,23 @@
 // validate membership before the pointer is ever dereferenced.
 static std::mutex g_registry_mutex;
 static std::unordered_set<arkilian*> g_registry;
+
+// ── Per-handle statement cursor mutex ───────────────────────────────
+// The C layer keeps ONE "current statement" cursor per handle
+// (stmt_current). Node worker_threads / Bun workers can call db_step /
+// db_bind_* / db_column_* on the SAME handle concurrently — without
+// serialization they race stmt_current/stmts (memory corruption). Every
+// cursor-touching binding locks the handle's mutex for the duration of
+// the call. Entries are intentionally never erased: an in-flight call
+// that already resolved the handle could otherwise lock a destroyed
+// mutex during db_close (the leak is one mutex per closed handle).
+static std::mutex g_stmt_map_mutex;
+static std::unordered_map<arkilian*, std::mutex> g_stmt_mutexes;
+
+static std::mutex& stmtMutex(arkilian* db) {
+  std::lock_guard<std::mutex> lock(g_stmt_map_mutex);
+  return g_stmt_mutexes[db];
+}
 
 // ── Log callback bridge ─────────────────────────────────────────────
 // ark_log can fire from the backup threads, so the JS callback is
@@ -92,6 +111,9 @@ Napi::Value db_close(const Napi::CallbackInfo& info) {
   arkilian* db = reinterpret_cast<arkilian*>(id);
   // Close only live handles — double-close / stale-id is a no-op.
   if (unregisterDb(db)) {
+    // Wait for any in-flight cursor operation on this handle to finish
+    // before tearing the C state down.
+    std::lock_guard<std::mutex> lock(stmtMutex(db));
     db_close(db); // joins the backup threads — no more logs can fire
     releaseLogTsfn(db); // safe now that no thread may be mid-BlockingCall
   }
@@ -101,6 +123,7 @@ Napi::Value db_close(const Napi::CallbackInfo& info) {
 Napi::Value db_exec(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   arkilian* db = getDbFromArg(info);
+  std::lock_guard<std::mutex> lock(stmtMutex(db));
   if (!db) {
     Napi::Error::New(env, "Invalid database id").ThrowAsJavaScriptException();
     return env.Null();
@@ -118,6 +141,7 @@ Napi::Value db_exec(const Napi::CallbackInfo& info) {
 Napi::Value db_prepare(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   arkilian* db = getDbFromArg(info);
+  std::lock_guard<std::mutex> lock(stmtMutex(db));
   if (!db) {
     Napi::Error::New(env, "Invalid database id").ThrowAsJavaScriptException();
     return env.Null();
@@ -135,6 +159,7 @@ Napi::Value db_prepare(const Napi::CallbackInfo& info) {
 Napi::Value db_use_stmt(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   arkilian* db = getDbFromArg(info);
+  std::lock_guard<std::mutex> lock(stmtMutex(db));
   if (!db || info.Length() < 2 || !info[1].IsNumber()) {
     Napi::Error::New(env, "Invalid database id or index").ThrowAsJavaScriptException();
     return env.Null();
@@ -146,12 +171,14 @@ Napi::Value db_use_stmt(const Napi::CallbackInfo& info) {
 Napi::Value db_stmt_count(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   arkilian* db = getDbFromArg(info);
+  std::lock_guard<std::mutex> lock(stmtMutex(db));
   return Napi::Number::New(env, db ? db_stmt_count(db) : 0);
 }
 
 Napi::Value db_step(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   arkilian* db = getDbFromArg(info);
+  std::lock_guard<std::mutex> lock(stmtMutex(db));
   if (!db) {
     Napi::Error::New(env, "Invalid database id").ThrowAsJavaScriptException();
     return env.Null();
@@ -162,6 +189,7 @@ Napi::Value db_step(const Napi::CallbackInfo& info) {
 Napi::Value db_finalize(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   arkilian* db = getDbFromArg(info);
+  std::lock_guard<std::mutex> lock(stmtMutex(db));
   if (!db) {
     Napi::Error::New(env, "Invalid database id").ThrowAsJavaScriptException();
     return env.Null();
@@ -172,6 +200,7 @@ Napi::Value db_finalize(const Napi::CallbackInfo& info) {
 Napi::Value db_reset(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   arkilian* db = getDbFromArg(info);
+  std::lock_guard<std::mutex> lock(stmtMutex(db));
   if (!db) {
     Napi::Error::New(env, "Invalid database id").ThrowAsJavaScriptException();
     return env.Null();
@@ -182,6 +211,7 @@ Napi::Value db_reset(const Napi::CallbackInfo& info) {
 Napi::Value db_column_count(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   arkilian* db = getDbFromArg(info);
+  std::lock_guard<std::mutex> lock(stmtMutex(db));
   if (!db) return Napi::Number::New(env, 0);
   return Napi::Number::New(env, db_column_count(db));
 }
@@ -189,6 +219,7 @@ Napi::Value db_column_count(const Napi::CallbackInfo& info) {
 Napi::Value db_column_name(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   arkilian* db = getDbFromArg(info);
+  std::lock_guard<std::mutex> lock(stmtMutex(db));
   if (!db || info.Length() < 2 || !info[1].IsNumber()) return env.Null();
   int col = info[1].As<Napi::Number>().Int32Value();
   const char* name = db_column_name(db, col);
@@ -198,6 +229,7 @@ Napi::Value db_column_name(const Napi::CallbackInfo& info) {
 Napi::Value db_column_text(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   arkilian* db = getDbFromArg(info);
+  std::lock_guard<std::mutex> lock(stmtMutex(db));
   if (!db || info.Length() < 2 || !info[1].IsNumber()) return env.Null();
   int col = info[1].As<Napi::Number>().Int32Value();
   const char* text = db_column_text(db, col);
@@ -207,6 +239,7 @@ Napi::Value db_column_text(const Napi::CallbackInfo& info) {
 Napi::Value db_column_int(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   arkilian* db = getDbFromArg(info);
+  std::lock_guard<std::mutex> lock(stmtMutex(db));
   if (!db || info.Length() < 2 || !info[1].IsNumber()) return Napi::Number::New(env, 0);
   int col = info[1].As<Napi::Number>().Int32Value();
   return Napi::Number::New(env, db_column_int(db, col));
@@ -215,6 +248,7 @@ Napi::Value db_column_int(const Napi::CallbackInfo& info) {
 Napi::Value db_column_double(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   arkilian* db = getDbFromArg(info);
+  std::lock_guard<std::mutex> lock(stmtMutex(db));
   if (!db || info.Length() < 2 || !info[1].IsNumber()) return Napi::Number::New(env, 0.0);
   int col = info[1].As<Napi::Number>().Int32Value();
   return Napi::Number::New(env, db_column_double(db, col));
@@ -223,6 +257,7 @@ Napi::Value db_column_double(const Napi::CallbackInfo& info) {
 Napi::Value db_column_type(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   arkilian* db = getDbFromArg(info);
+  std::lock_guard<std::mutex> lock(stmtMutex(db));
   if (!db || info.Length() < 2 || !info[1].IsNumber()) return Napi::Number::New(env, 5); // SQLITE_NULL
   int col = info[1].As<Napi::Number>().Int32Value();
   return Napi::Number::New(env, db_column_type(db, col));
@@ -231,6 +266,7 @@ Napi::Value db_column_type(const Napi::CallbackInfo& info) {
 Napi::Value db_bind_text(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   arkilian* db = getDbFromArg(info);
+  std::lock_guard<std::mutex> lock(stmtMutex(db));
   if (!db || info.Length() < 3 || !info[1].IsNumber() || !info[2].IsString()) return env.Null();
   int idx = info[1].As<Napi::Number>().Int32Value();
   std::string val = info[2].As<Napi::String>().Utf8Value();
@@ -240,6 +276,7 @@ Napi::Value db_bind_text(const Napi::CallbackInfo& info) {
 Napi::Value db_bind_int(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   arkilian* db = getDbFromArg(info);
+  std::lock_guard<std::mutex> lock(stmtMutex(db));
   if (!db || info.Length() < 3 || !info[1].IsNumber() || !info[2].IsNumber()) return env.Null();
   int idx = info[1].As<Napi::Number>().Int32Value();
   int val = info[2].As<Napi::Number>().Int32Value();
@@ -249,16 +286,37 @@ Napi::Value db_bind_int(const Napi::CallbackInfo& info) {
 Napi::Value db_bind_int64(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   arkilian* db = getDbFromArg(info);
-  if (!db || info.Length() < 3 || !info[1].IsNumber() || !info[2].IsNumber()) return env.Null();
+  std::lock_guard<std::mutex> lock(stmtMutex(db));
+  if (!db || info.Length() < 3 || !info[1].IsNumber()) return env.Null();
   int idx = info[1].As<Napi::Number>().Int32Value();
-  // JS callers must only route safe integers here (|v| <= 2^53-1).
-  double d = info[2].As<Napi::Number>().DoubleValue();
-  return Napi::Number::New(env, db_bind_int64(db, idx, (sqlite3_int64)d));
+  sqlite3_int64 v;
+  if (info[2].IsBigInt()) {
+    // JS BigInts MUST be read via napi_get_value_int64 — coercing
+    // through Number silently no-ops (IsNumber is false) or reads
+    // uninitialized memory under NAPI_DISABLE_CPP_EXCEPTIONS.
+    bool lossless = false;
+    v = (sqlite3_int64)info[2].As<Napi::BigInt>().Int64Value(&lossless);
+    if (!lossless) {
+      Napi::RangeError::New(env, "BigInt parameter out of int64 range").ThrowAsJavaScriptException();
+      return env.Null();
+    }
+  } else if (info[2].IsNumber()) {
+    double d = info[2].As<Napi::Number>().DoubleValue();
+    if (!std::isfinite(d) || d > 9223372036854775807.0 || d < -9223372036854775808.0) {
+      Napi::RangeError::New(env, "Integer parameter out of int64 range").ThrowAsJavaScriptException();
+      return env.Null();
+    }
+    v = (sqlite3_int64)d;
+  } else {
+    return env.Null();
+  }
+  return Napi::Number::New(env, db_bind_int64(db, idx, v));
 }
 
 Napi::Value db_column_int64(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   arkilian* db = getDbFromArg(info);
+  std::lock_guard<std::mutex> lock(stmtMutex(db));
   if (!db || info.Length() < 2 || !info[1].IsNumber()) return Napi::Number::New(env, 0);
   int col = info[1].As<Napi::Number>().Int32Value();
   sqlite3_int64 v = db_column_int64(db, col);
@@ -270,6 +328,7 @@ Napi::Value db_column_int64(const Napi::CallbackInfo& info) {
 Napi::Value db_bind_double(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   arkilian* db = getDbFromArg(info);
+  std::lock_guard<std::mutex> lock(stmtMutex(db));
   if (!db || info.Length() < 3 || !info[1].IsNumber() || !info[2].IsNumber()) return env.Null();
   int idx = info[1].As<Napi::Number>().Int32Value();
   double val = info[2].As<Napi::Number>().DoubleValue();
@@ -279,6 +338,7 @@ Napi::Value db_bind_double(const Napi::CallbackInfo& info) {
 Napi::Value db_bind_null(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   arkilian* db = getDbFromArg(info);
+  std::lock_guard<std::mutex> lock(stmtMutex(db));
   if (!db || info.Length() < 2 || !info[1].IsNumber()) return env.Null();
   int idx = info[1].As<Napi::Number>().Int32Value();
   return Napi::Number::New(env, db_bind_null(db, idx));
@@ -287,24 +347,28 @@ Napi::Value db_bind_null(const Napi::CallbackInfo& info) {
 Napi::Value db_begin(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   arkilian* db = getDbFromArg(info);
+  std::lock_guard<std::mutex> lock(stmtMutex(db));
   return Napi::Number::New(env, db ? db_begin(db) : SQLITE_ERROR);
 }
 
 Napi::Value db_commit(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   arkilian* db = getDbFromArg(info);
+  std::lock_guard<std::mutex> lock(stmtMutex(db));
   return Napi::Number::New(env, db ? db_commit(db) : SQLITE_ERROR);
 }
 
 Napi::Value db_rollback(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   arkilian* db = getDbFromArg(info);
+  std::lock_guard<std::mutex> lock(stmtMutex(db));
   return Napi::Number::New(env, db ? db_rollback(db) : SQLITE_ERROR);
 }
 
 Napi::Value db_errmsg(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   arkilian* db = getDbFromArg(info);
+  std::lock_guard<std::mutex> lock(stmtMutex(db));
   if (!db) return env.Null();
   const char* msg = db_errmsg(db);
   return msg ? Napi::String::New(env, msg) : env.Null();
@@ -392,6 +456,7 @@ Napi::Value db_backup_is_healthy(const Napi::CallbackInfo& info) {
 Napi::Value db_resync_triggers(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   arkilian* db = getDbFromArg(info);
+  std::lock_guard<std::mutex> lock(stmtMutex(db));
   if (!db) {
     Napi::TypeError::New(env, "Invalid database id").ThrowAsJavaScriptException();
     return env.Null();
@@ -410,12 +475,14 @@ Napi::Value db_set_token(const Napi::CallbackInfo& info) {
 Napi::Value db_changes(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   arkilian* db = getDbFromArg(info);
+  std::lock_guard<std::mutex> lock(stmtMutex(db));
   return Napi::Number::New(env, db ? db_changes(db) : 0);
 }
 
 Napi::Value db_last_insert_rowid(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   arkilian* db = getDbFromArg(info);
+  std::lock_guard<std::mutex> lock(stmtMutex(db));
   return Napi::Number::New(env, db ? db_last_insert_rowid(db) : 0);
 }
 
@@ -426,6 +493,7 @@ Napi::Value db_last_insert_rowid(const Napi::CallbackInfo& info) {
 Napi::Value db_all_native(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   arkilian* db = getDbFromArg(info);
+  std::lock_guard<std::mutex> lock(stmtMutex(db));
   if (!db) {
     Napi::Error::New(env, "Invalid database id").ThrowAsJavaScriptException();
     return env.Null();

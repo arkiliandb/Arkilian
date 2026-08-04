@@ -435,6 +435,54 @@ static void test_keyless_table_skipped(void) {
   cleanup("test_reg_keyless.db");
 }
 
+// ── Dead-letter zombie row must be cleared, not spun on ─────────────
+// If a dead-letter INSERT succeeds but the pending DELETE fails (BUSY),
+// the row exists in BOTH tables with attempts >= MAX_ATTEMPTS. The next
+// pass must (OR IGNORE) absorb the id-conflict and remove the pending
+// copy — previously the PK conflict left the row forever and, reporting
+// "work drained", hot-spun the flush loop with no sleep.
+
+static void test_dead_letter_zombie_cleared(void) {
+  cleanup("test_reg_zombie.db");
+  setenv("ARKILIAN_ENABLE_BACKUP", "1", 1);
+  setenv("ARKILIAN_WAL_PUSH_URL", "http://127.0.0.1:1", 1);
+  setenv("ARKILIAN_BACKUP_INTERVAL", "3600", 1);
+  arkilian *db = NULL;
+  assert(db_init(&db, "test_reg_zombie.db") == 0);
+
+  // Craft the zombie state directly: pending row at MAX_ATTEMPTS AND an
+  // already-dead-lettered copy (the "insert succeeded, delete failed"
+  // residue). Make the zombie the queue head (drop the DDL capture row)
+  // so strict stop-on-retry ordering doesn't hide it behind other rows.
+  assert(db_exec(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)") == SQLITE_OK);
+  assert(db_exec(db, "DELETE FROM _pending_backup") == SQLITE_OK);
+  assert(db_exec(db,
+      "INSERT INTO _pending_backup (id, payload, attempts, created_at) "
+      "VALUES (42, 'REPLACE INTO \"t\" (\"id\", \"v\") VALUES (1, 1)', 10, 0)") == SQLITE_OK);
+  assert(db_exec(db,
+      "INSERT INTO _dead_backup (id, payload, attempts, failed_reason, created_at) "
+      "VALUES (42, 'REPLACE INTO \"t\" (\"id\", \"v\") VALUES (1, 1)', 10, "
+      "'max attempts exceeded', 0)") == SQLITE_OK);
+
+  // Wake the flush thread and give it one pass (poll interval).
+  db_wal_flush(db);
+  sleep(3);
+
+  // The zombie must be GONE from _pending_backup (moved to dead once),
+  // and _dead_backup holds exactly one copy.
+  db_prepare(db, "SELECT COUNT(*) FROM _pending_backup WHERE id = 42");
+  assert(db_step(db) == SQLITE_ROW);
+  assert(db_column_int(db, 0) == 0);
+  db_finalize(db);
+  db_prepare(db, "SELECT COUNT(*) FROM _dead_backup WHERE id = 42");
+  assert(db_step(db) == SQLITE_ROW);
+  assert(db_column_int(db, 0) == 1);
+  db_finalize(db);
+
+  db_close(db);
+  cleanup("test_reg_zombie.db");
+}
+
 // ── Main ────────────────────────────────────────────────────────────
 
 int main(void) {
@@ -472,6 +520,9 @@ int main(void) {
   RUN_TEST(test_no_destination_rows_survive);
   RUN_TEST(test_text_pk_replay_fidelity);
   RUN_TEST(test_keyless_table_skipped);
+
+  printf("\n[Dead-Letter Hygiene]\n");
+  RUN_TEST(test_dead_letter_zombie_cleared);
 
   printf("\n=== Results: %d/%d passed ===\n", tests_passed, tests_run);
   return (tests_passed == tests_run) ? 0 : 1;

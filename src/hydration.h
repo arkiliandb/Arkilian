@@ -35,6 +35,7 @@ extern "C" {
 #define HYDRATION_ERR_EXPIRED   -7   // signed URL expired, caller should retry
 #define HYDRATION_ERR_NOTFOUND  -8   // snapshot not yet uploaded (cold start)
 #define HYDRATION_ERR_NEWER     -9   // local DB is AHEAD of the snapshot; refusing to clobber
+#define HYDRATION_ERR_BUSY      -10  // another connection is actively writing the local DB
 
 // ── Types ───────────────────────────────────────────────────────────
 
@@ -75,6 +76,21 @@ char   *json_array_get(const char *json, const char *key, int index);
 //   server_url   Control Plane base URL (e.g. "https://api.arkilian.com/v1")
 //   auth_token   Bearer token for authentication (may be NULL)
 //   progress     Optional progress callback (may be NULL)
+//
+// DANGER — must not be called while the application has the database
+// open. Hydration replaces the database file on disk (remove + rename);
+// a live process would keep writing to the orphaned inode and diverge
+// from the restored file. Call hydrate() only from a cold process,
+// before db_init(). A best-effort probe refuses when another connection
+// is actively writing, but an idle-but-open application connection can
+// start writing immediately after the probe passes — the caller owns
+// this contract.
+//
+// Safety guards (all enforced before any file is touched):
+//   - HYDRATION_ERR_NEWER: local DB is further along than the snapshot
+//   - HYDRATION_ERR_BUSY:  another connection is actively writing
+//   - the downloaded snapshot is fsync'd and validated (opens as a
+//     clean SQLite database, PRAGMA quick_check) before install
 //
 // Returns HYDRATION_OK on success, or a negative error code.
 int arkilian_hydrate(const char *db_path,

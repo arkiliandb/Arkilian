@@ -9,6 +9,14 @@ extern "C" {
 #endif
 
 // Public C API for Arkilian Managed SQLite Database Engine
+//
+// Thread-safety: the backup subsystem is fully thread-safe by design.
+// The statement cursor (db_prepare/db_step/db_bind_*/db_column_*) is a
+// single per-handle cursor: C callers using the cursor from multiple
+// threads must serialize those calls themselves. The N-API bindings
+// (src/arkilian.cc) do this automatically with a per-handle mutex, so
+// Node.js worker_threads/Bun workers are safe. db_close must not race
+// with any in-flight statement on the same handle (UB by contract).
 typedef struct arkilian arkilian;
 
 int db_init(arkilian **db, const char *connection_url);
