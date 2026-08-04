@@ -14,7 +14,24 @@ In order to keep Arkilian legally secure and technically robust, we place a barr
 3. **Comprehensive Testing:** Every logic change must include tests and undergo rigorous memory safety verification. Memory leaks or undefined behavior are automatic grounds for rejection.
    - Tests should be placed in the `tests/` directory
    - Enable tests with: `cmake -B build -S . -DARKILIAN_BUILD_TESTS=ON`
-   - Run tests: `./build/test_basic`
+   - Build and run tests:
+     ```bash
+     cmake --build build
+     cd build && ctest --output-on-failure
+     ```
+     This runs every `tests/*.c` as its own ctest entry — a regression
+     in any one of them is visible individually. `tests/run_all.sh`
+     is kept as a POSIX-portable fallback but `ctest` is canonical.
+   - ASAN+UBSAN must be clean (`-fsanitize=address,undefined`); the CI
+     `sanitizer` job enforces this. Run locally:
+     ```bash
+     cmake -B build_asan -S . -DCMAKE_BUILD_TYPE=Debug \
+       -DARKILIAN_BUILD_TESTS=ON \
+       -DCMAKE_C_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g" \
+       -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
+     cmake --build build_asan
+     cd build_asan && ASAN_OPTIONS=detect_leaks=1 ctest --output-on-failure
+     ```
 4. **Atomic, Clean History:** Commits must be squashed and logically separated.
 
 ## Bug Reports
@@ -48,8 +65,8 @@ cmake -B build -S . -DCMAKE_BUILD_TYPE=Debug -DARKILIAN_BUILD_TESTS=ON -DARKILIA
 # Compile
 cmake --build build --config Debug
 
-# Run tests
-./build/test_basic
+# Run tests (canonical — every tests/*.c is its own ctest entry)
+cd build && ctest --output-on-failure
 
 # Run example
 ./build/arkilian_example

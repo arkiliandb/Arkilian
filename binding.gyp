@@ -14,7 +14,15 @@
       ],
       "cflags!": ["-fno-exceptions"],
       "cflags_cc!": ["-fno-exceptions"],
-      "defines": ["NAPI_DISABLE_CPP_EXCEPTIONS", "SQLITE_ENABLE_PREUPDATE_HOOK"],
+      "cflags": ["-Wall", "-Wextra", "-Wpedantic", "-Werror"],
+      "cflags_cc": ["-Wall", "-Wextra", "-Wpedantic", "-Werror"],
+      "defines": [
+        "NAPI_DISABLE_CPP_EXCEPTIONS",
+        "SQLITE_ENABLE_PREUPDATE_HOOK",
+        "SQLITE_ENABLE_FTS5",
+        "SQLITE_ENABLE_RTREE",
+        "SQLITE_ENABLE_DBSTAT_VTAB"
+      ],
       "conditions": [
         ["OS=='mac'", {
           "xcode_settings": {

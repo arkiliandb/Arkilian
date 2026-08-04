@@ -1,6 +1,6 @@
 {
   "name": "arkilian",
-  "version": "1.0.6",
+  "version": "1.1.0",
   "description": "Arkilian - SQLite wrapper with automated cloud backup for Node.js/Bun",
   "main": "index.js",
   "type": "module",
@@ -40,6 +40,8 @@
     "src/class.c",
     "src/class.h",
     "src/arkilian.cc",
+    "src/sha256.c",
+    "src/sha256.h",
     "src/deps/sqlite/sqlite3.c",
     "src/deps/sqlite/sqlite3.h",
     "src/deps/sqlite/sqlite3ext.h"

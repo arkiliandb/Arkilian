@@ -36,12 +36,18 @@ static void test_plan_free_empty(void) {
 static void test_plan_free_populated(void) {
   HydratePlan p = {0};
   p.snapshot_url = strdup("http://example.com/snap");
+  p.snapshot_sha256 = strdup("abc123");
   p.chunk_count = 2;
-  p.chunks = malloc(2 * sizeof(HydrateChunk));
+  // calloc so the new sha256 field is zero-initialized (NULL) — a real
+  // partial parse leaves chunks calloc'd too, and hydrate_plan_free
+  // NULL-safes the free.
+  p.chunks = calloc(2, sizeof(HydrateChunk));
   p.chunks[0].url = strdup("http://example.com/chunk1");
+  p.chunks[0].sha256 = strdup("deadbeef");
   p.chunks[1].url = strdup("http://example.com/chunk2");
   hydrate_plan_free(&p);
   assert(p.snapshot_url == NULL);
+  assert(p.snapshot_sha256 == NULL);
   assert(p.chunks == NULL);
   assert(p.chunk_count == 0);
 }

@@ -10,6 +10,10 @@ on:
 
 jobs:
   build:
+    # The library builds on every push/PR across all three platforms for
+    # early compile-failure signal. Release artifact uploads are gated on
+    # the `release-upload` job below, which `needs: [build, test]` so a
+    # failing test prevents a broken libarkilian from being published.
     strategy:
       matrix:
         include:
@@ -59,56 +63,116 @@ jobs:
     - name: Build
       run: cmake --build build --config Release
 
-    - name: Upload Build Artifacts (Shared)
+    # Library build output is uploaded as a workflow artifact on every
+    # run so release-upload can re-publish it; this keeps build lean and
+    # offline-able while release-upload stays the single upload gate.
+    - name: Save build artifacts
       if: github.event_name == 'release'
-      uses: actions/upload-release-asset@v1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      uses: actions/upload-artifact@v4
       with:
-        upload_url: ${{ github.event.release.upload_url }}
-        asset_path: ./build/${{ matrix.shared-lib }}
-        asset_name: ${{ matrix.shared-lib }}
-        asset_content_type: application/octet-stream
+        name: build-${{ matrix.artifact-suffix }}
+        path: |
+          build/${{ matrix.shared-lib }}
+          build/${{ matrix.static-lib }}
+          src/class.h
+        if-no-files-found: ignore
 
-    - name: Upload Build Artifacts (Static)
-      if: github.event_name == 'release'
-      uses: actions/upload-release-asset@v1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        upload_url: ${{ github.event.release.upload_url }}
-        asset_path: ./build/${{ matrix.static-lib }}
-        asset_name: ${{ matrix.static-lib }}
-        asset_content_type: application/octet-stream
-
-    - name: Upload Header
-      if: github.event_name == 'release' && matrix.os == 'ubuntu-latest'
-      uses: actions/upload-release-asset@v1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        upload_url: ${{ github.event.release.upload_url }}
-        asset_path: ./src/class.h
-        asset_name: class.h
-        asset_content_type: text/plain
-
-  test:
+  # Single gate for release publishing: depends on BOTH build and test
+  # being green across every matrix leg. A failing test prevents the
+  # broken library from being attached to the GitHub release.
+  release-upload:
+    if: github.event_name == 'release'
+    needs: [build, test]
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
 
+    - name: Download all build artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: artifacts
+        merge-multiple: true
+
+    - name: Upload shared libs to release
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ github.event.release.upload_url }}
+        asset_path: artifacts/libarkilian.so
+        asset_name: libarkilian.so
+        asset_content_type: application/octet-stream
+
+    - name: Upload dylib to release
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ github.event.release.upload_url }}
+        asset_path: artifacts/libarkilian.dylib
+        asset_name: libarkilian.dylib
+        asset_content_type: application/octet-stream
+
+    - name: Upload Windows DLL to release
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ github.event.release.upload_url }}
+        asset_path: artifacts/arkilian.dll
+        asset_name: arkilian.dll
+        asset_content_type: application/octet-stream
+
+    - name: Upload static libs + header
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ github.event.release.upload_url }}
+        asset_path: artifacts/class.h
+        asset_name: class.h
+        asset_content_type: text/plain
+
+  test:
+    # Tests run on every push/PR/release. Release artifact uploads in
+    # the `build` job are gated on this job via `needs: [test]` so a
+    # failing test prevents a broken libarkilian from publishing.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        include:
+          - os: ubuntu-latest
+            install-deps: |
+              sudo apt-get update
+              sudo apt-get install -y libcurl4-openssl-dev
+          - os: macos-latest
+            install-deps: |
+              brew install curl
+              echo "CMAKE_PREFIX_PATH=$(brew --prefix curl)" >> "$GITHUB_ENV"
+    runs-on: ${{ matrix.os }}
+    steps:
+    - uses: actions/checkout@v4
+
     - name: Install Dependencies
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y libcurl4-openssl-dev
+      run: ${{ matrix.install-deps }}
 
     - name: Setup Go
       uses: actions/setup-go@v5
       with:
         go-version: '1.25'
 
-    - name: C test suites (all 10)
-      run: bash tests/run_all.sh
+    - name: Configure CMake (with tests)
+      run: |
+        cmake -B build -S . -DCMAKE_BUILD_TYPE=Debug \
+          -DARKILIAN_BUILD_TESTS=ON -DARKILIAN_BUILD_EXAMPLES=OFF
+
+    - name: Build (with tests)
+      run: cmake --build build --config Debug
+
+    - name: C test suites (ctest — all 10)
+      working-directory: build
+      run: ctest --output-on-failure
 
     - name: Go control-plane tests
       run: |
@@ -116,6 +180,10 @@ jobs:
         go test ./...
 
     - name: Node binding build + tests
+      # Node binding is platform-portable; only exercise it on Linux to
+      # avoid redundant node-gyp toolchain setup on macOS (the build job
+      # already builds the lib on both).
+      if: matrix.os == 'ubuntu-latest'
       run: |
         npm ci
         npm test
@@ -138,3 +206,35 @@ jobs:
 
     - name: Run Example
       run: ./build/arkilian_example
+
+  # Sanitizers: the backup subsystem is a multi-threaded C library that
+  # ships durability guarantees. ASAN+UBSAN catch the memory and UB
+  # regressions that -Wall cannot (use-after-free, OOB read, signed
+  # overflow, NULL-deref through freed memory). CONTRIBUTING.md mandates
+  # "rigorous memory safety verification"; this job makes it real.
+  sanitizer:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libcurl4-openssl-dev
+
+    - name: Configure (ASAN + UBSAN, tests ON)
+      run: |
+        cmake -B build -S . -DCMAKE_BUILD_TYPE=Debug \
+          -DARKILIAN_BUILD_TESTS=ON -DARKILIAN_BUILD_EXAMPLES=OFF \
+          -DCMAKE_C_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g" \
+          -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
+
+    - name: Build
+      run: cmake --build build --config Debug
+
+    - name: Run tests under sanitizer
+      working-directory: build
+      env:
+        ASAN_OPTIONS: detect_leaks=1:halt_on_error=1:abort_on_error=1
+        UBSAN_OPTIONS: halt_on_error=1:abort_on_error=1
+      run: ctest --output-on-failure

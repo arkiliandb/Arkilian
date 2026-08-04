@@ -46,11 +46,12 @@ run      test_basic           tests/test_basic.c
 run      test_interception    tests/test_interception.c
 run      test_regressions     tests/test_regressions.c
 run      test_kill_switch     tests/test_kill_switch.c
-run      test_load_contention tests/test_load_contention.c -lm
+run      test_load_contention tests/test_load_contention.c
 run      test_kill_resilience tests/test_kill_resilience.c
 run      test_monitoring      tests/test_monitoring.c
 run      test_virtual_tables  tests/test_virtual_tables.c
 run      test_deterministic   tests/test_deterministic.c
+run      test_hardening       tests/test_hardening.c
 run_hydration
 
 # Benchmarks: built + run, but they assert correctness internally. Not

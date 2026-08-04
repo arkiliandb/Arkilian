@@ -51,7 +51,7 @@ if(ARKILIAN_BUILD_SHARED)
     )
     target_link_libraries(arkilian PRIVATE CURL::libcurl Threads::Threads)
     set_target_properties(arkilian PROPERTIES
-        VERSION 1.0.0
+        VERSION 1.1.0
         SOVERSION 1
         PUBLIC_HEADER "src/class.h;src/deps/sqlite/sqlite3.h"
     )
@@ -161,7 +161,7 @@ file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/arkilianConfig.cmake
 "include(\${CMAKE_CURRENT_LIST_DIR}/arkilianTargets.cmake)
 ")
 file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/arkilianConfigVersion.cmake
-"set(PACKAGE_VERSION \"1.0.0\")
+"set(PACKAGE_VERSION \"1.1.0\")
 if(\"\${PACKAGE_FIND_VERSION}\" VERSION_LESS_EQUAL \"\${PACKAGE_VERSION}\")
   set(PACKAGE_VERSION_COMPATIBLE TRUE)
 else()
@@ -197,7 +197,7 @@ if(ARKILIAN_BUILD_TESTS)
         # ── Tests that link the static lib (class.c is in arkilian_static) ──
         foreach(t test_basic test_interception test_regressions test_kill_switch
                  test_kill_resilience test_load_contention test_monitoring
-                 test_deterministic test_virtual_tables)
+                 test_deterministic test_virtual_tables test_hardening)
             add_executable(${t} tests/${t}.c)
             target_link_libraries(${t} PRIVATE ${ARK_TEST_LIBS})
             add_test(NAME ${t} COMMAND ${t})
@@ -213,6 +213,11 @@ if(ARKILIAN_BUILD_TESTS)
         target_link_libraries(test_hydration PRIVATE ${CMAKE_THREAD_LIBS_INIT}
                               ${CURL_LIBRARIES})
         add_test(NAME test_hydration COMMAND test_hydration)
+
+        # ── SHA-256 NIST vectors ──
+        add_executable(test_sha256 tests/test_sha256.c src/sha256.c)
+        target_include_directories(test_sha256 PRIVATE src)
+        add_test(NAME test_sha256 COMMAND test_sha256)
 
         # ── e2e/stress tests that need a live control plane: built but NOT
         # registered with ctest (they require external services). Compile

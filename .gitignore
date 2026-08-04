@@ -66,6 +66,9 @@ expressions/
 *.sqlite-shm
 *.sqlite-shm
 server/arkilian-server
+# Compiled Go server binary — built in CI, never committed. A 13.7 MB
+# binary in the repo bloats clones and makes git blame noisy.
+server/server
 *.mp4
 *.jpg
 *.gif
