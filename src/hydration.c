@@ -29,10 +29,6 @@ static int url_is_presigned(const char *url) {
          strstr(url, "sig=") != NULL; /* Azure SAS */
 }
 
-static int url_is_https(const char *url) {
-  return url && strncmp(url, "https://", 8) == 0;
-}
-
 static size_t url_host(const char *url, char *out, size_t out_cap) {
   if (!url || !out || out_cap == 0) return 0;
   const char *p = strstr(url, "://");
