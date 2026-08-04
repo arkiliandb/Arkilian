@@ -325,45 +325,17 @@ static int http_download_file(const char *url, const char *token,
     return -1;
   }
 
-  // ── Validate the downloaded body before it can destroy anything ──
-  // A 200 body is not proof of a valid snapshot: a proxy mangling, a
-  // server bug, or a truncated disk write would otherwise be installed
-  // over the live database as silent total data loss. The temp file
-  // must open as a real SQLite database AND pass PRAGMA quick_check
-  // (page-level corruption scan) before rename() is allowed.
-  {
-    sqlite3 *chk = NULL;
-    int ok = 0;
-    if (sqlite3_open_v2(tmp_path, &chk, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK) {
-      sqlite3_stmt *q = NULL;
-      if (sqlite3_prepare_v2(chk, "PRAGMA quick_check", -1, &q, NULL) == SQLITE_OK &&
-          sqlite3_step(q) == SQLITE_ROW) {
-        const char *r = (const char *)sqlite3_column_text(q, 0);
-        ok = r && strcmp(r, "ok") == 0;
-      }
-      sqlite3_finalize(q);
-      sqlite3_close(chk);
-    }
-    if (!ok) {
-      fprintf(stderr,
-              "arkilian: snapshot failed validation (not a clean SQLite "
-              "database) — restore aborted, local database untouched\n");
-      remove(tmp_path);
-      *err_out = HYDRATION_ERR_DISK;
-      return -1;
-    }
-  }
-
-  // ── Content authentication (SHA-256) ────────────────────────────
+  // ── Content authentication (SHA-256) — run FIRST ─────────────────
   // A pre-signed GET URL authorizes WHO can read but not WHAT was stored
   // there: a leaked bucket-write credential lets an attacker swap the
   // object body. quick_check catches a malformed SQLite file, but a
   // valid-looking SQLite file with a different schema/contents would
-  // still pass. The control plane records the SHA-256 of what it
-  // uploaded; verifying the downloaded bytes against it closes the gap
-  // BEFORE the snapshot is installed over the live database. A missing
-  // digest (older control plane) is logged and skipped — accept-by-
-  // default for back-compat; flip to refuse once all planes ship digests.
+  // still pass it. Verifying the downloaded bytes against the control
+  // plane's recorded digest is the strongest available content guarantee,
+  // so it runs BEFORE the structural quick_check — a tampered-but-valid
+  // SQLite file is refused here. A missing digest (older control plane)
+  // is logged and skipped — accept-by-default for back-compat; flip to
+  // refuse once all planes ship digests.
   if (expected_sha256 && expected_sha256[0]) {
     char digest[65];
     if (ark_sha256_hex_file(tmp_path, digest) != 0) {
@@ -387,6 +359,34 @@ static int http_download_file(const char *url, const char *token,
             "arkilian: WARNING — snapshot_sha256 not provided by control "
             "plane; content authenticity cannot be verified (installing "
             "unverified snapshot)\n");
+  }
+
+  // ── Structural validation ────────────────────────────────────────
+  // A 200 body that matches its declared digest can still be a non-SQLite
+  // or corrupt file (a buggy uploader, a truncated write). The temp file
+  // must open as a real SQLite database AND pass PRAGMA quick_check
+  // (page-level corruption scan) before rename() is allowed.
+  {
+    sqlite3 *chk = NULL;
+    int ok = 0;
+    if (sqlite3_open_v2(tmp_path, &chk, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK) {
+      sqlite3_stmt *q = NULL;
+      if (sqlite3_prepare_v2(chk, "PRAGMA quick_check", -1, &q, NULL) == SQLITE_OK &&
+          sqlite3_step(q) == SQLITE_ROW) {
+        const char *r = (const char *)sqlite3_column_text(q, 0);
+        ok = r && strcmp(r, "ok") == 0;
+      }
+      sqlite3_finalize(q);
+      sqlite3_close(chk);
+    }
+    if (!ok) {
+      fprintf(stderr,
+              "arkilian: snapshot failed validation (not a clean SQLite "
+              "database) — restore aborted, local database untouched\n");
+      remove(tmp_path);
+      *err_out = HYDRATION_ERR_DISK;
+      return -1;
+    }
   }
 
   // Success: install the validated snapshot atomically. POSIX rename()

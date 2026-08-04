@@ -63,16 +63,18 @@ type WALEntry struct {
 
 type ChunkInfo struct {
 	URL       string `json:"url"`
+	SHA256    string `json:"sha256,omitempty"`
 	LSNStart  int64  `json:"lsn_start"`
 	LSNEnd    int64  `json:"lsn_end"`
 	ExpiresAt int64  `json:"expires_at"`
 }
 
 type HydratePlanResponse struct {
-	SnapshotURL string      `json:"snapshot_url"`
-	BaselineLSN int64       `json:"baseline_lsn"`
-	ExpiresAt   int64       `json:"expires_at"`
-	Chunks      []ChunkInfo `json:"chunks"`
+	SnapshotURL    string `json:"snapshot_url"`
+	SnapshotSHA256 string `json:"snapshot_sha256,omitempty"`
+	BaselineLSN    int64  `json:"baseline_lsn"`
+	ExpiresAt      int64  `json:"expires_at"`
+	Chunks         []ChunkInfo `json:"chunks"`
 }
 
 type UploadRequest struct {
@@ -80,6 +82,10 @@ type UploadRequest struct {
 	EventCount int    `json:"event_count"`
 	LSNStart   int64  `json:"lsn_start"`
 	LSNEnd     int64  `json:"lsn_end"`
+	SHA256     string `json:"sha256"` // optional content digest (hex) the client
+	                             // computed over the body it will PUT; recorded so
+	                             // the hydrate plan can carry it to downloaders
+	                             // for content authentication.
 }
 
 type UploadResponse struct {
@@ -267,6 +273,18 @@ func writeJSON(w http.ResponseWriter, v any) {
 	enc := json.NewEncoder(w)
 	enc.SetEscapeHTML(false)
 	enc.Encode(v)
+}
+
+// nullableStr returns the trimmed string or nil so SQLite stores NULL
+// (not an empty string) when the client did not provide a value — keeps
+// the column semantics honest and lets the hydrate plan omit the field
+// via omitempty.
+func nullableStr(s string) any {
+	t := strings.TrimSpace(s)
+	if t == "" {
+		return nil
+	}
+	return t
 }
 
 // sessionAuth extracts user_id from a JWT session token.
@@ -834,11 +852,13 @@ func handleUploadRequest(w http.ResponseWriter, r *http.Request) {
 	if json.NewDecoder(r.Body).Decode(&req) == nil && req.LSNEnd > 0 {
 		key = fmt.Sprintf("db_%s/chunks/lsn_%010d_%010d.sql.zst", dbID, req.LSNStart, req.LSNEnd)
 		mu.Lock()
-		db.Exec(`INSERT INTO chunks (db_id, lsn_start, lsn_end, s3_key) VALUES (?, ?, ?, ?)`, dbID, req.LSNStart, req.LSNEnd, key)
+		db.Exec(`INSERT INTO chunks (db_id, lsn_start, lsn_end, s3_key, sha256) VALUES (?, ?, ?, ?, ?)`,
+			dbID, req.LSNStart, req.LSNEnd, key, nullableStr(req.SHA256))
 		mu.Unlock()
 	} else {
 		mu.Lock()
-		db.Exec(`INSERT INTO snapshots (db_id, baseline_lsn, s3_key) VALUES (?, 0, ?)`, dbID, key)
+		db.Exec(`INSERT INTO snapshots (db_id, baseline_lsn, s3_key, sha256) VALUES (?, 0, ?, ?)`,
+			dbID, key, nullableStr(req.SHA256))
 		mu.Unlock()
 	}
 
@@ -864,20 +884,24 @@ func handleHydratePlan(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var snapLSN int64
-	var snapKey string
+	var snapKey, snapSHA string
+	var snapSHAPtr *string
 	err := db.QueryRow(
-		`SELECT baseline_lsn, s3_key FROM snapshots
+		`SELECT baseline_lsn, s3_key, sha256 FROM snapshots
 		 WHERE db_id = ? ORDER BY baseline_lsn DESC LIMIT 1`,
-		dbID).Scan(&snapLSN, &snapKey)
+		dbID).Scan(&snapLSN, &snapKey, &snapSHAPtr)
 	if err != nil {
 		snapLSN = 0
 		snapKey = fmt.Sprintf("db_%s/backup.sqlite", dbID)
+	}
+	if snapSHAPtr != nil {
+		snapSHA = *snapSHAPtr
 	}
 
 	snapURL, snapExpires := signedURL("GET", snapKey, 1*time.Hour)
 
 	rows, err := db.Query(
-		`SELECT lsn_start, lsn_end, s3_key FROM chunks
+		`SELECT lsn_start, lsn_end, s3_key, sha256 FROM chunks
 		 WHERE db_id = ? AND lsn_start > ?
 		 ORDER BY lsn_start ASC LIMIT 1000`,
 		dbID, snapLSN)
@@ -891,17 +915,22 @@ func handleHydratePlan(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var ci ChunkInfo
 		var key string
-		if rows.Scan(&ci.LSNStart, &ci.LSNEnd, &key) == nil {
+		var shaPtr *string
+		if rows.Scan(&ci.LSNStart, &ci.LSNEnd, &key, &shaPtr) == nil {
 			ci.URL, ci.ExpiresAt = signedURL("GET", key, 1*time.Hour)
+			if shaPtr != nil {
+				ci.SHA256 = *shaPtr
+			}
 			chunks = append(chunks, ci)
 		}
 	}
 
 	resp := HydratePlanResponse{
-		SnapshotURL: snapURL,
-		BaselineLSN: snapLSN,
-		ExpiresAt:   snapExpires,
-		Chunks:      chunks,
+		SnapshotURL:    snapURL,
+		SnapshotSHA256: snapSHA,
+		BaselineLSN:    snapLSN,
+		ExpiresAt:      snapExpires,
+		Chunks:         chunks,
 	}
 	recordActivity(dbID, 0, 0)
 	w.Header().Set("Content-Type", "application/json")

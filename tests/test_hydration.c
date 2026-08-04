@@ -491,162 +491,113 @@ static void test_hydrate_refuses_when_db_locked(void) {
 
 // ── SHA-256 content authentication ───────────────────────────────────
 
+typedef struct {
+  int fd;
+  volatile int stop;
+  char *plan;
+  int plan_len;
+  const char *snap_body;
+  size_t snap_len;
+} sha_mock_ctx;
+
+static void *sha_mock_run(void *arg) {
+  sha_mock_ctx *m = (sha_mock_ctx *)arg;
+  for (;;) {
+    int c = accept(m->fd, NULL, NULL);
+    if (c < 0) break;
+    char buf[8192];
+    ssize_t n = recv(c, buf, sizeof(buf) - 1, 0);
+    if (m->stop) { close(c); break; }
+    if (n > 0) {
+      buf[n] = '\0';
+      if (strstr(buf, "/hydrate/plan")) {
+        char resp[2048];
+        int rl = snprintf(resp, sizeof(resp),
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+            "Content-Length: %d\r\nConnection: close\r\n\r\n%s",
+            m->plan_len, m->plan);
+        send(c, resp, (size_t)rl, 0);
+      } else {
+        // Snapshot download: serve a body whose SHA-256 differs from
+        // the (wrong) digest declared in the plan so the mismatch check
+        // fires BEFORE the snapshot is installed.
+        char resp[512];
+        int rl = snprintf(resp, sizeof(resp),
+            "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n"
+            "Content-Length: %zu\r\nConnection: close\r\n\r\n",
+            m->snap_len);
+        send(c, resp, (size_t)rl, 0);
+        send(c, m->snap_body, m->snap_len, 0);
+      }
+    }
+    close(c);
+  }
+  return NULL;
+}
+
 // A control plane that serves a plan whose `snapshot_sha256` does NOT
 // match the downloaded snapshot's contents must be refused — the
 // snapshot is untrusted (storage tampering / wrong object served).
 static void test_hydrate_refuses_on_sha_mismatch(void) {
-  mock_plan_server srv;
-  mock_plan_start(&srv);
-  srv.baseline_lsn = 0; // fresh cold start; no local DB to clobber
-
-  char base[64];
-  snprintf(base, sizeof(base), "http://127.0.0.1:%d/v1", srv.port);
-  const char *db_path = "/tmp/ark_hydrate_sha_mismatch.db";
-  remove(db_path);
-
-  // Override the plan the mock serves to include a deliberately wrong
-  // snapshot_sha256. Re-doing the plan string here keeps the test
-  // self-contained.
-  char plan[512];
-  snprintf(plan, sizeof(plan),
-      "{\"snapshot_url\":\"%s\",\"snapshot_sha256\":\"%s\",\"baseline_lsn\":0,\"chunks\":[]}",
-      srv.snapshot_url,
-      "0000000000000000000000000000000000000000000000000000000000000000");
-  // Restart the mock thread-equivalent: stash the plan via a side channel.
-  // Simpler approach: stop srv, then start a fresh mock that serves the
-  // crafted plan AND a real (empty) snapshot body so the SHA check fires.
-  mock_plan_stop(&srv);
-
-  // Build a mock that serves a real snapshot body alongside the plan.
-  // Reuse mock_plan_server fields.
-  memset(&srv, 0, sizeof(srv));
-  srv.baseline_lsn = 0;
-  // stash the crafted plan in snapshot_url's slot temporarily is messy;
-  // instead use a second server struct.
-  mock_plan_server s2;
-  memset(&s2, 0, sizeof(s2));
-  s2.baseline_lsn = 0;
-  s2.fd = socket(AF_INET, SOCK_STREAM, 0);
+  // Bind a mock server so we know the port, then craft the plan with
+  // the snapshot_url pointing at it. The plan declares a deliberately
+  // wrong snapshot_sha256; the mock serves a non-empty snapshot body
+  // so the SHA mismatch check fires BEFORE any snapshot install.
+  sha_mock_ctx mc;
+  memset(&mc, 0, sizeof(mc));
+  const char *snap_body = "not-a-real-snapshot-but-fails-sha-first";
+  mc.snap_body = snap_body;
+  mc.snap_len = strlen(snap_body);
+  mc.fd = socket(AF_INET, SOCK_STREAM, 0);
   int one = 1;
-  setsockopt(s2.fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+  setsockopt(mc.fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
   struct sockaddr_in a;
   memset(&a, 0, sizeof(a));
   a.sin_family = AF_INET;
   a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
   a.sin_port = 0;
-  bind(s2.fd, (struct sockaddr *)&a, sizeof(a));
+  if (bind(mc.fd, (struct sockaddr *)&a, sizeof(a)) != 0) { assert(0); }
   socklen_t alen = sizeof(a);
-  getsockname(s2.fd, (struct sockaddr *)&a, &alen);
-  s2.port = ntohs(a.sin_port);
-  snprintf(s2.snapshot_url, sizeof(s2.snapshot_url),
-           "http://127.0.0.1:%d/snap", s2.port);
-  listen(s2.fd, 8);
+  getsockname(mc.fd, (struct sockaddr *)&a, &alen);
+  int port = ntohs(a.sin_port);
+  listen(mc.fd, 8);
 
-  // Crafted plan with a wrong digest.
-  char crafted_plan[512];
-  int crafted_len = snprintf(crafted_plan, sizeof(crafted_plan),
+  char snap_url[128], plan[512];
+  snprintf(snap_url, sizeof(snap_url), "http://127.0.0.1:%d/snap", port);
+  snprintf(plan, sizeof(plan),
       "{\"snapshot_url\":\"%s\",\"snapshot_sha256\":"
       "\"0000000000000000000000000000000000000000000000000000000000000000\","
       "\"baseline_lsn\":0,\"chunks\":[]}",
-      s2.snapshot_url);
+      snap_url);
+  mc.plan = plan;
+  mc.plan_len = (int)strlen(plan);
 
-  // Empty but valid SQLite database bytes (smallest valid SQLite: header
-  // "SQLite format 3\0" + 100-byte header padded to a 4096 page). We
-  // can't easily synthesize one inline; the mock serves a 200 with an
-  // arbitrary body. The SHA mismatch is detected BEFORE the quick_check
-  // would have to validate it as SQLite — so any non-empty body works
-  // as long as it differs from the (wrong) declared digest. We use a
-  // fixed short string.
-  const char *snap_body = "not-a-real-snapshot-but-fails-sha-first";
+  pthread_t t;
+  pthread_create(&t, NULL, sha_mock_run, &mc);
 
-  pthread_t t2;
-  struct {
-    int fd;
-    volatile int stop;
-    char *plan;
-    int plan_len;
-    const char *snap_body;
-    size_t snap_len;
-  } ctx = { s2.fd, 0, crafted_plan, crafted_len, snap_body, strlen(snap_body) };
-  (void)t2;
+  char base[64];
+  snprintf(base, sizeof(base), "http://127.0.0.1:%d/v1", port);
+  const char *db_path = "/tmp/ark_hydrate_sha_mismatch.db";
+  remove(db_path);
 
-  // Inline server loop on the current thread is awkward; instead, reuse
-  // mock_plan_run via a wrapper. Simplest: spawn a dedicated thread.
-  // To avoid restructuring mock_plan_server, define a small lambda-like
-  // thread function here.
-  // (We keep the test self-contained: this exercises the SHA mismatch on
-  // the snapshot download path specifically.)
-  // The crafted plan and snapshot body are handled by overriding the
-  // mock's behavior via a thread we spawn manually.
-
-  typedef struct {
-    int fd;
-    volatile int stop;
-    char *plan;
-    int plan_len;
-    const char *snap_body;
-    size_t snap_len;
-  } sha_mock_ctx;
-
-  sha_mock_ctx mc = { s2.fd, 0, crafted_plan, crafted_len, snap_body, strlen(snap_body) };
-
-  void *sha_mock_run(void *arg) {
-    sha_mock_ctx *m = (sha_mock_ctx *)arg;
-    for (;;) {
-      int c = accept(m->fd, NULL, NULL);
-      if (c < 0) break;
-      char buf[8192];
-      ssize_t n = recv(c, buf, sizeof(buf) - 1, 0);
-      if (m->stop) { close(c); break; }
-      if (n > 0) {
-        buf[n] = '\0';
-        if (strstr(buf, "/hydrate/plan")) {
-          char resp[2048];
-          int rl = snprintf(resp, sizeof(resp),
-              "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
-              "Content-Length: %d\r\nConnection: close\r\n\r\n%s",
-              m->plan_len, m->plan);
-          send(c, resp, (size_t)rl, 0);
-        } else {
-          // Snapshot download: serve the (wrong) body so the SHA check
-          // fires before the snapshot is installed.
-          char resp[512];
-          int rl = snprintf(resp, sizeof(resp),
-              "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n"
-              "Content-Length: %zu\r\nConnection: close\r\n\r\n",
-              m->snap_len);
-          send(c, resp, (size_t)rl, 0);
-          send(c, m->snap_body, m->snap_len, 0);
-        }
-      }
-      close(c);
-    }
-    return NULL;
-  }
-
-  pthread_create(&t2, sha_mock_run, &mc);
-
-  snprintf(base, sizeof(base), "http://127.0.0.1:%d/v1", s2.port);
   int rc = arkilian_hydrate(db_path, base, "token", NULL, NULL);
-  // Expect HYDRATION_ERR_PROTO (SHA mismatch) — NOT OK; the snapshot
-  // must not be installed over the would-be-cold-start empty db.
   printf("rc=%d ", rc);
   assert(rc == HYDRATION_ERR_PROTO);
 
+  // Teardown: kick the accept loop, join the thread, close the socket.
   mc.stop = 1;
-  // kick the accept loop
   int kick = socket(AF_INET, SOCK_STREAM, 0);
   if (kick >= 0) {
     struct sockaddr_in ka;
     memset(&ka, 0, sizeof(ka));
     ka.sin_family = AF_INET;
     ka.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    ka.sin_port = htons((unsigned short)s2.port);
+    ka.sin_port = htons((unsigned short)port);
     connect(kick, (struct sockaddr *)&ka, sizeof(ka));
     close(kick);
   }
-  pthread_join(t2, NULL);
-  close(s2.fd);
+  pthread_join(t, NULL);
+  close(mc.fd);
 
   remove(db_path);
 }
@@ -692,6 +643,9 @@ int main(int argc, char **argv) {
   RUN_TEST(test_hydrate_refuses_when_local_is_newer);
   RUN_TEST(test_hydrate_proceeds_when_local_behind);
   RUN_TEST(test_hydrate_refuses_when_db_locked);
+
+  printf("\n[SHA-256 Content Authentication]\n");
+  RUN_TEST(test_hydrate_refuses_on_sha_mismatch);
 
   if (integration) {
     printf("\n[Integration]\n");

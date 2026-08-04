@@ -43,6 +43,7 @@ CREATE TABLE IF NOT EXISTS snapshots (
 	db_id        TEXT NOT NULL REFERENCES databases(db_id),
 	baseline_lsn INTEGER NOT NULL,
 	s3_key       TEXT NOT NULL,
+	sha256       TEXT,
 	created_at   INTEGER DEFAULT (unixepoch())
 );
 CREATE TABLE IF NOT EXISTS chunks (
@@ -51,6 +52,7 @@ CREATE TABLE IF NOT EXISTS chunks (
 	lsn_start  INTEGER NOT NULL,
 	lsn_end    INTEGER NOT NULL,
 	s3_key     TEXT NOT NULL,
+	sha256     TEXT,
 	created_at  INTEGER DEFAULT (unixepoch())
 );
 CREATE TABLE IF NOT EXISTS db_stats (
