@@ -1,2 +1,0 @@
-# Empty dependencies file for test_minio_hydrate.
-# This may be replaced when dependencies are built.

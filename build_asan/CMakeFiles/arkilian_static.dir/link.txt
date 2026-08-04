@@ -1,2 +1,0 @@
-/usr/bin/ar qc libarkilian.a CMakeFiles/arkilian_static.dir/src/class.c.o CMakeFiles/arkilian_static.dir/src/deps/sqlite/sqlite3.c.o
-/usr/bin/ranlib libarkilian.a
