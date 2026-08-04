@@ -953,6 +953,7 @@ func handleSnapshotRegister(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		BaselineLSN int64  `json:"baseline_lsn"`
 		S3Key       string `json:"s3_key"`
+		SHA256      string `json:"sha256"`
 	}
 	if json.NewDecoder(r.Body).Decode(&req) != nil {
 		http.Error(w, "invalid json", http.StatusBadRequest)
@@ -960,8 +961,8 @@ func handleSnapshotRegister(w http.ResponseWriter, r *http.Request) {
 	}
 
 	mu.Lock()
-	db.Exec(`INSERT INTO snapshots (db_id, baseline_lsn, s3_key) VALUES (?, ?, ?)`,
-		dbID, req.BaselineLSN, req.S3Key)
+	db.Exec(`INSERT INTO snapshots (db_id, baseline_lsn, s3_key, sha256) VALUES (?, ?, ?, ?)`,
+		dbID, req.BaselineLSN, req.S3Key, nullableStr(req.SHA256))
 	mu.Unlock()
 	recordActivity(dbID, 0, 0)
 
