@@ -71,6 +71,14 @@ if(ARKILIAN_BUILD_STATIC)
         OUTPUT_NAME arkilian
         PUBLIC_HEADER "src/class.h;src/deps/sqlite/sqlite3.h"
     )
+    # On Windows the shared target's import library is also named
+    # arkilian.lib. Give the static archive a distinct name so a release
+    # asset is never ambiguous between "static lib" and "DLL import stub".
+    if(WIN32)
+        set_target_properties(arkilian_static PROPERTIES
+            OUTPUT_NAME arkilian_static
+        )
+    endif()
 endif()
 
 # Examples

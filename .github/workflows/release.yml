@@ -30,16 +30,23 @@ jobs:
         include:
           - os: ubuntu-latest
             suffix: linux-x64
+            artifact-dir: build
             shared-lib: libarkilian.so
             static-lib: libarkilian.a
           - os: macos-latest
             suffix: darwin-x64
+            artifact-dir: build
             shared-lib: libarkilian.dylib
             static-lib: libarkilian.a
           - os: windows-latest
             suffix: windows-x64
+            # MSVC uses a multi-config generator: Release outputs land in
+            # build/Release/, NOT build/.
+            artifact-dir: build/Release
             shared-lib: arkilian.dll
-            static-lib: arkilian.lib
+            # Renamed in CMakeLists.txt to avoid clashing with the DLL's
+            # import library (which is also arkilian.lib).
+            static-lib: arkilian_static.lib
     runs-on: ${{ matrix.os }}
     steps:
     - uses: actions/checkout@v4
@@ -84,8 +91,8 @@ jobs:
       shell: bash
       run: |
         mkdir -p dist
-        cp build/${{ matrix.shared-lib }} dist/ 2>/dev/null || true
-        cp build/${{ matrix.static-lib }} dist/
+        cp "${{ matrix.artifact-dir }}/${{ matrix.shared-lib }}" dist/ 2>/dev/null || true
+        cp "${{ matrix.artifact-dir }}/${{ matrix.static-lib }}" dist/
         cp src/class.h src/hydration.h src/sha256.h dist/
         ls -la dist/
 
