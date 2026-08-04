@@ -19,6 +19,21 @@ extern "C" {
 // with any in-flight statement on the same handle (UB by contract).
 typedef struct arkilian arkilian;
 
+// Open a database and start the background backup subsystem.
+//
+// Returns 0 on success. On failure returns non-zero AND, when the
+// failure occurred after the struct was allocated, still sets *db to a
+// partially-initialized handle the caller MUST release with db_close()
+// (to free the connections/mutexes/config that were set up before the
+// failing step). A caller that does `if (db_init(&db, ...) != 0) return;`
+// without closing leaks those resources. The Node binding honors this;
+// C callers must too. Check the return code AND free *db on failure.
+//
+// `connection_url` is the on-disk database path (or NULL to use
+// ARKILIAN_DB_PATH / the default). Backup is auto-disabled (not a hard
+// failure) when WAL/trigger setup fails, the configured push endpoint is
+// not HTTPS and not a local address, or the bearer token is malformed —
+// the application keeps running; db_backup_is_healthy() surfaces the gap.
 int db_init(arkilian **db, const char *connection_url);
 void db_close(arkilian *db);
 const char* db_errmsg(arkilian *db);

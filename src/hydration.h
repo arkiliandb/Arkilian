@@ -42,6 +42,10 @@ extern "C" {
 // A single signed URL with its LSN range.
 typedef struct {
   char   *url;          // Pre-Signed GET URL (caller frees)
+  char   *sha256;       // Optional content digest (hex, no dashes) authored by
+                        // the uploader + control plane; verified by the client
+                        // after download. NULL/empty => not provided (older
+                        // control plane); verification is skipped with a warn.
   int64_t lsn_start;    // first LSN in this chunk (inclusive)
   int64_t lsn_end;      // last  LSN in this chunk (inclusive)
   int64_t expires_at;   // unix timestamp when URL expires (0 = no expiry)
@@ -49,9 +53,10 @@ typedef struct {
 
 // The complete hydration plan returned by the Control Plane.
 typedef struct {
-  char   *snapshot_url;   // Pre-Signed GET URL for the baseline .snapshot
-  int64_t baseline_lsn;   // LSN embedded in the snapshot
-  int64_t expires_at;     // when snapshot URL expires (0 = no expiry)
+  char   *snapshot_url;    // Pre-Signed GET URL for the baseline .snapshot
+  char   *snapshot_sha256; // Optional content digest of the snapshot (hex)
+  int64_t baseline_lsn;    // LSN embedded in the snapshot
+  int64_t expires_at;      // when snapshot URL expires (0 = no expiry)
 
   HydrateChunk *chunks;   // ordered list of incremental chunks (caller frees)
   int           chunk_count;

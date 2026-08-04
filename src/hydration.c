@@ -5,8 +5,11 @@
 // explicit transactions.  No binary WAL frame manipulation needed.
 
 #include "hydration.h"
+#include "sha256.h"
 #include <curl/curl.h>
 #include <ctype.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -26,6 +29,100 @@ static int url_is_presigned(const char *url) {
          strstr(url, "sig=") != NULL; /* Azure SAS */
 }
 
+static int url_is_https(const char *url) {
+  return url && strncmp(url, "https://", 8) == 0;
+}
+
+static size_t url_host(const char *url, char *out, size_t out_cap) {
+  if (!url || !out || out_cap == 0) return 0;
+  const char *p = strstr(url, "://");
+  if (!p) return 0;
+  p += 3;
+  const char *end = p;
+  while (*end && *end != '/' && *end != ':' && *end != '@' &&
+         *end != '?' && *end != '#') end++;
+  const char *at = NULL;
+  for (const char *q = p; q < end; q++) if (*q == '@') at = q;
+  const char *hstart = at ? at + 1 : p;
+  size_t hlen = (size_t)(end - hstart);
+  if (hlen >= out_cap) hlen = out_cap - 1;
+  memcpy(out, hstart, hlen);
+  out[hlen] = '\0';
+  return hlen;
+}
+
+static int host_is_local(const char *host) {
+  if (!host || !*host) return 0;
+  if (host[0] == '[') {
+    if (strncmp(host, "[::1]", 5) == 0) return 1;
+    if (strncmp(host, "[fe80", 5) == 0) return 1;
+    if (strncmp(host, "[fc", 3) == 0 || strncmp(host, "[fd", 3) == 0) return 1;
+    return 0;
+  }
+  if (strcmp(host, "localhost") == 0) return 1;
+  if (strncmp(host, "127.", 4) == 0) return 1;
+  if (strncmp(host, "10.", 3) == 0) return 1;
+  if (strncmp(host, "192.168.", 8) == 0) return 1;
+  if (strncmp(host, "169.254.", 8) == 0) return 1;
+  if (strncmp(host, "fe80", 4) == 0) return 1;
+  if (strncmp(host, "::1", 3) == 0) return 1;
+  if (strncmp(host, "fc", 2) == 0 || strncmp(host, "fd", 2) == 0) return 1;
+  if (strncmp(host, "172.", 4) == 0) {
+    unsigned second = 0;
+    if (sscanf(host, "172.%u.", &second) == 1 && second >= 16 && second <= 31)
+      return 1;
+  }
+  return 0;
+}
+
+static int host_is_known_storage(const char *host) {
+  if (!host || !*host) return 0;
+  if (strstr(host, ".amazonaws.com")) return 1;
+  if (strcmp(host, "storage.googleapis.com") == 0) return 1;
+  if (strstr(host, ".storage.googleapis.com")) return 1;
+  if (strstr(host, ".blob.core.windows.net")) return 1;
+  if (strstr(host, ".backblazeb2.com")) return 1;
+  if (strstr(host, ".r2.cloudflarestorage.com")) return 1;
+  if (strstr(host, ".wasabisys.com")) return 1;
+  if (strstr(host, ".digitaloceanspaces.com")) return 1;
+  return 0;
+}
+
+// SSRF guard: a control plane (compromised or buggy) returning a snapshot
+// or chunk URL pointing at cloud metadata or an internal service would
+// otherwise have the client download the wrong content over a valid
+// pre-signed URL. Even though SHA-256 catches tampered CONTENT, refusing
+// the host is the right posture — never let the client fetch from an
+// untrusted storage host in the first place. Local addresses (MinIO on
+// 127.0.0.1 / RFC1918) are allowed for dev/test.
+static int url_is_allowed_storage(const char *url) {
+  if (!url) return 0;
+  char host[256];
+  if (url_host(url, host, sizeof(host)) == 0) return 0;
+  if (host_is_known_storage(host)) return 1;
+  if (host_is_local(host)) return 1;
+  const char *extra = getenv("ARKILIAN_STORAGE_HOSTS");
+  if (extra && *extra) {
+    char buf[1024];
+    strncpy(buf, extra, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+    char *save = NULL;
+    char *tok = strtok_r(buf, ",", &save);
+    while (tok) {
+      while (*tok == ' ') tok++;
+      size_t tlen = strlen(tok);
+      if (tlen && tok[tlen - 1] == ' ') tok[--tlen] = '\0';
+      if (tlen == 0) { tok = strtok_r(NULL, ",", &save); continue; }
+      size_t hlen = strlen(host);
+      if (strcmp(host, tok) == 0) return 1;
+      if (hlen > tlen + 1 && host[hlen - tlen - 1] == '.' &&
+          strcmp(host + hlen - tlen, tok) == 0) return 1;
+      tok = strtok_r(NULL, ",", &save);
+    }
+  }
+  return 0;
+}
+
 void hydration_remove_db_files(const char *db_path) {
   if (!db_path) return;
   char side[4096];
@@ -35,6 +132,50 @@ void hydration_remove_db_files(const char *db_path) {
     int n = snprintf(side, sizeof(side), "%s%s", db_path, suffixes[i]);
     if (n > 0 && (size_t)n < sizeof(side)) remove(side);
   }
+}
+
+// Remove ONLY the -wal/-shm/-journal sidecars of a database, leaving the
+// main db file intact. Stale sidecars from the previous database must be
+// cleared before installing a downloaded snapshot: replaying them into the
+// new snapshot (which has a different page structure) silently corrupts
+// it. Unlike hydration_remove_db_files, this preserves the main file so an
+// atomic rename() can replace it — if the rename fails, the old database
+// is still there and the local data is not destroyed.
+static void hydration_remove_sidecars(const char *db_path) {
+  if (!db_path) return;
+  char side[4096];
+  static const char *const suffixes[] = {"-wal", "-shm", "-journal", NULL};
+  for (int i = 0; suffixes[i]; i++) {
+    int n = snprintf(side, sizeof(side), "%s%s", db_path, suffixes[i]);
+    if (n > 0 && (size_t)n < sizeof(side)) remove(side);
+  }
+}
+
+// fsync the parent directory of `path` so the rename() that installed a
+// snapshot is durable across a power loss. No-op on platforms without
+// directory fsync. Best-effort: a failure is logged but does not abort,
+// since the data is already written; only the rename's directory entry
+// metadata could be at risk on an immediately-following crash.
+static void fsync_parent_dir(const char *path) {
+  if (!path) return;
+  char dir[4096];
+  strncpy(dir, path, sizeof(dir) - 1);
+  dir[sizeof(dir) - 1] = '\0';
+  char *slash = strrchr(dir, '/');
+  if (!slash) return; // relative path in cwd — no directory to fsync
+  if (slash == dir) slash[1] = '\0';
+  else *slash = '\0';
+#ifndef _WIN32
+  int fd = open(dir, O_RDONLY | O_DIRECTORY);
+  if (fd >= 0) {
+    if (fsync(fd) != 0)
+      fprintf(stderr, "arkilian: hydration directory fsync warning (%s): %s\n",
+              dir, strerror(errno));
+    close(fd);
+  }
+#else
+  (void)0; // Windows fsync semantics differ; rename is atomic + durable
+#endif
 }
 
 // ── libcurl response buffer ─────────────────────────────────────────
@@ -77,6 +218,12 @@ static int http_init(HttpReq *r, const char *url, const char *token) {
   curl_easy_setopt(r->handle, CURLOPT_TIMEOUT, 120L);
   curl_easy_setopt(r->handle, CURLOPT_CONNECTTIMEOUT, 15L);
   curl_easy_setopt(r->handle, CURLOPT_FOLLOWLOCATION, 1L);
+  // Explicit TLS posture: system defaults are 1/2; setting them explicitly
+  // documents intent and protects against a regression patch disabling
+  // verification. Hydration URLs come from the (trusted) control plane,
+  // but the storage backend body is content-authenticated via SHA-256.
+  curl_easy_setopt(r->handle, CURLOPT_SSL_VERIFYPEER, 1L);
+  curl_easy_setopt(r->handle, CURLOPT_SSL_VERIFYHOST, 2L);
   r->headers = NULL;
   if (token && strlen(token) > 0 && !url_is_presigned(url)) {
     char auth[512];
@@ -127,11 +274,27 @@ static size_t file_write_cb(void *ptr, size_t sz, size_t nmemb, void *user) {
 
 // Download a binary file from a URL and atomically install it at
 // local_path.  Streams to a temp file first; only on a complete 200
-// response are the old database AND its stale -wal/-shm sidecars
-// replaced.  A 404 maps to HYDRATION_ERR_NOTFOUND (cold start); any
-// other failure leaves the existing local database untouched.
+// response + (optional) SHA-256 verification + SQLite quick_check are the
+// old database's stale -wal/-shm sidecars replaced and the snapshot
+// atomically installed.  A 404 maps to HYDRATION_ERR_NOTFOUND (cold
+// start); any other failure leaves the existing local database untouched.
+// `expected_sha256` is an optional lowercase hex digest (64 chars, no
+// dashes) authored by the uploader + control plane; NULL/empty skips
+// content verification with a warning (back-compat with older planes).
 static int http_download_file(const char *url, const char *token,
-                               const char *local_path, int *err_out) {
+                               const char *local_path, const char *expected_sha256,
+                               int *err_out) {
+  // SSRF guard: never fetch a snapshot from a host that isn't an allowed
+  // storage destination. A compromised control plane returning a
+  // metadata-service URL has no path to the local DB even before content
+  // auth runs.
+  if (!url_is_allowed_storage(url)) {
+    fprintf(stderr,
+            "arkilian: snapshot download refused — host is not an allowed "
+            "storage destination (SSRF guard): %.200s\n", url);
+    *err_out = HYDRATION_ERR_PROTO;
+    return -1;
+  }
   HttpReq r;
   if (http_init(&r, url, token) != 0) { *err_out = HYDRATION_ERR_NET; return -1; }
 
@@ -195,15 +358,61 @@ static int http_download_file(const char *url, const char *token,
     }
   }
 
-  // Success: drop the previous database and its stale WAL/SHM frames
-  // (replaying them into the new snapshot would corrupt it), then
-  // atomically move the snapshot into place.
-  hydration_remove_db_files(local_path);
+  // ── Content authentication (SHA-256) ────────────────────────────
+  // A pre-signed GET URL authorizes WHO can read but not WHAT was stored
+  // there: a leaked bucket-write credential lets an attacker swap the
+  // object body. quick_check catches a malformed SQLite file, but a
+  // valid-looking SQLite file with a different schema/contents would
+  // still pass. The control plane records the SHA-256 of what it
+  // uploaded; verifying the downloaded bytes against it closes the gap
+  // BEFORE the snapshot is installed over the live database. A missing
+  // digest (older control plane) is logged and skipped — accept-by-
+  // default for back-compat; flip to refuse once all planes ship digests.
+  if (expected_sha256 && expected_sha256[0]) {
+    char digest[65];
+    if (ark_sha256_hex_file(tmp_path, digest) != 0) {
+      fprintf(stderr, "arkilian: snapshot SHA-256 read failed — aborting\n");
+      remove(tmp_path);
+      *err_out = HYDRATION_ERR_DISK;
+      return -1;
+    }
+    if (strcasecmp(digest, expected_sha256) != 0) {
+      fprintf(stderr,
+              "arkilian: snapshot SHA-256 MISMATCH — refusing to install "
+              "(expected %.16s…, got %.16s…). Storage tampering or wrong "
+              "snapshot served; local database untouched\n",
+              expected_sha256, digest);
+      remove(tmp_path);
+      *err_out = HYDRATION_ERR_PROTO;
+      return -1;
+    }
+  } else {
+    fprintf(stderr,
+            "arkilian: WARNING — snapshot_sha256 not provided by control "
+            "plane; content authenticity cannot be verified (installing "
+            "unverified snapshot)\n");
+  }
+
+  // Success: install the validated snapshot atomically. POSIX rename()
+  // atomically overwrites the existing db file, so the local database is
+  // never in a half-installed state — either the old DB or the new one
+  // exists at local_path at every instant. Stale -wal/-shm/-journal
+  // sidecars from the PREVIOUS database are removed first (replaying them
+  // into the new snapshot, which has a different page structure, would
+  // corrupt it silently); the main file is left for the atomic replace.
+  // If rename fails, the previous database is still intact (unlike the
+  // previous remove-db-then-rename which destroyed it before the rename).
+  hydration_remove_sidecars(local_path);
   if (rename(tmp_path, local_path) != 0) {
+    fprintf(stderr,
+            "arkilian: snapshot install rename failed (%s -> %s): %s; "
+            "local database untouched\n",
+            tmp_path, local_path, strerror(errno));
     remove(tmp_path);
     *err_out = HYDRATION_ERR_DISK;
     return -1;
   }
+  fsync_parent_dir(local_path);
 
   *err_out = 0;
   return 0;
@@ -422,7 +631,8 @@ static int request_hydrate_plan(const char *server_url, const char *token,
 
   // Parse plan
   memset(plan, 0, sizeof(*plan));
-  plan->snapshot_url  = json_get_string(json, "snapshot_url");
+  plan->snapshot_url    = json_get_string(json, "snapshot_url");
+  plan->snapshot_sha256 = json_get_string(json, "snapshot_sha256");
   plan->baseline_lsn  = json_get_int64(json, "baseline_lsn");
   plan->expires_at    = json_get_int64(json, "expires_at");
   plan->chunk_count   = json_array_count(json, "chunks");
@@ -437,6 +647,7 @@ static int request_hydrate_plan(const char *server_url, const char *token,
       char *elem = json_array_get(json, "chunks", i);
       if (!elem) { free(json); hydrate_plan_free(plan); return HYDRATION_ERR_PROTO; }
       plan->chunks[i].url        = json_get_string(elem, "url");
+      plan->chunks[i].sha256     = json_get_string(elem, "sha256");
       plan->chunks[i].lsn_start  = json_get_int64(elem, "lsn_start");
       plan->chunks[i].lsn_end    = json_get_int64(elem, "lsn_end");
       plan->chunks[i].expires_at = json_get_int64(elem, "expires_at");
@@ -454,8 +665,11 @@ static int request_hydrate_plan(const char *server_url, const char *token,
 void hydrate_plan_free(HydratePlan *plan) {
   if (!plan) return;
   free(plan->snapshot_url);
-  for (int i = 0; i < plan->chunk_count; i++)
+  free(plan->snapshot_sha256);
+  for (int i = 0; i < plan->chunk_count; i++) {
     free(plan->chunks[i].url);
+    free(plan->chunks[i].sha256);
+  }
   free(plan->chunks);
   memset(plan, 0, sizeof(*plan));
 }
@@ -463,12 +677,12 @@ void hydrate_plan_free(HydratePlan *plan) {
 // ── Step 1: Download & decompress snapshot ──────────────────────────
 
 static int download_snapshot(const char *snapshot_url, const char *token,
-                              const char *db_path,
+                              const char *db_path, const char *expected_sha256,
                               hydration_progress_cb progress, void *user) {
   if (progress) progress(1, 0, 1, user);
 
   int err = 0;
-  int rc = http_download_file(snapshot_url, token, db_path, &err);
+  int rc = http_download_file(snapshot_url, token, db_path, expected_sha256, &err);
   if (rc != 0) {
     // Only a genuine 404 means "no baseline snapshot uploaded yet"
     // (cold start).  Every other failure — network blip, expired URL,
@@ -646,7 +860,7 @@ int arkilian_hydrate(const char *db_path,
 
   // ── Phase 1: Download baseline snapshot ──
   rc = download_snapshot(plan.snapshot_url, auth_token, db_path,
-                          progress, user_data);
+                          plan.snapshot_sha256, progress, user_data);
   if (rc != 0) { hydrate_plan_free(&plan); return rc; }
 
   // ── Phase 2: Open database, check LSN, replay chunks ──
@@ -655,12 +869,15 @@ int arkilian_hydrate(const char *db_path,
     SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX, NULL);
   if (rc != SQLITE_OK) { hydrate_plan_free(&plan); return HYDRATION_ERR_SQL; }
 
-  // Apply PRAGMAs for speed during hydration. Best-effort: a failure
-  // slows the bulk load but must never abort the restore.
+  // Apply PRAGMAs for the replay. synchronous=NORMAL (NOT OFF) keeps the
+  // WAL durable on commit even during replay — a power loss mid-replay
+  // with synchronous=OFF can corrupt the local DB, unacceptable for a
+  // data-durability product. Best-effort: a failure slows the bulk load
+  // but must never abort the restore.
   {
     char *perr = NULL;
     if (sqlite3_exec(db, "PRAGMA journal_mode=WAL;", NULL, NULL, &perr) != SQLITE_OK ||
-        sqlite3_exec(db, "PRAGMA synchronous=OFF;", NULL, NULL, &perr) != SQLITE_OK ||
+        sqlite3_exec(db, "PRAGMA synchronous=NORMAL;", NULL, NULL, &perr) != SQLITE_OK ||
         sqlite3_exec(db, "PRAGMA foreign_keys=OFF;", NULL, NULL, &perr) != SQLITE_OK) {
       fprintf(stderr, "arkilian: hydration speed pragma warning: %s\n",
               perr ? perr : "unknown error");
@@ -668,9 +885,29 @@ int arkilian_hydrate(const char *db_path,
     }
   }
 
+  // Read the snapshot's ACTUAL recorded LSN (it was just installed as the
+  // local db). The control plane's baseline_lsn is the authority for the
+  // EXPECTED LSN; a mismatch means the served snapshot is not the one the
+  // plan was built against.
   int64_t local_lsn = read_last_applied_lsn(db);
-  if (local_lsn < plan.baseline_lsn)
+  if (local_lsn == 0) {
+    // Fresh snapshot with no recorded LSN (cold-start baseline): trust the
+    // control plane's declared baseline.
     local_lsn = plan.baseline_lsn;
+  } else if (local_lsn < plan.baseline_lsn) {
+    // The downloaded snapshot is STALER than the control plane claims.
+    // Previously the code clamped local_lsn UP to baseline and silently
+    // skipped chunks [local_lsn+1 .. baseline] → silent data loss reported
+    // as OK. Refuse instead: the control plane or storage is inconsistent.
+    fprintf(stderr,
+            "arkilian: hydration refused — downloaded snapshot's recorded "
+            "LSN %lld is less than the plan's baseline %lld (served a stale "
+            "snapshot; control-plane or storage inconsistency)\n",
+            (long long)local_lsn, (long long)plan.baseline_lsn);
+    sqlite3_close(db);
+    hydrate_plan_free(&plan);
+    return HYDRATION_ERR_PROTO;
+  }
 
   int chunk_total = 0;
   for (int i = 0; i < plan.chunk_count; i++) {
@@ -699,10 +936,46 @@ int arkilian_hydrate(const char *db_path,
       return HYDRATION_ERR_EXPIRED;
     }
 
-    // Download chunk
+    // Download chunk. SSRF-guarded: never fetch a chunk from a host that
+    // isn't an allowed storage destination (a compromised control plane
+    // could otherwise point the client at cloud metadata or an internal
+    // service to read the auth header or exfiltrate state).
+    if (!url_is_allowed_storage(ch->url)) {
+      fprintf(stderr,
+              "arkilian: chunk %d download refused — host is not an "
+              "allowed storage destination (SSRF guard): %.200s\n",
+              i, ch->url);
+      sqlite3_close(db);
+      hydrate_plan_free(&plan);
+      return HYDRATION_ERR_PROTO;
+    }
     int err = 0;
     char *sql_text = http_get_string(ch->url, auth_token, &err);
     if (!sql_text) { sqlite3_close(db); hydrate_plan_free(&plan); return err; }
+
+    // Content authentication: verify the chunk's SHA-256 against the
+    // control plane's recorded digest BEFORE replaying it as raw SQL
+    // against the local database. A mismatch is a tampered/broken chunk
+    // and must never reach sqlite3_exec. NULL/empty digest skips with a
+    // warning (back-compat with older control planes).
+    if (ch->sha256 && ch->sha256[0]) {
+      char digest[65];
+      ark_sha256_hex(sql_text, strlen(sql_text), digest);
+      if (strcasecmp(digest, ch->sha256) != 0) {
+        fprintf(stderr,
+                "arkilian: chunk %d SHA-256 MISMATCH — refusing to replay "
+                "(expected %.16s…, got %.16s…). Storage tampering\n",
+                i, ch->sha256, digest);
+        free(sql_text);
+        sqlite3_close(db);
+        hydrate_plan_free(&plan);
+        return HYDRATION_ERR_PROTO;
+      }
+    } else {
+      fprintf(stderr,
+              "arkilian: WARNING — chunk %d sha256 not provided by control "
+              "plane; content authenticity unverified (replaying)\n", i);
+    }
 
     // Replay
     rc = hydrate_replay_chunk(db, sql_text, ch->lsn_end);

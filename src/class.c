@@ -57,6 +57,19 @@
 // Internal outbox schema version (see _arkilian_meta.schema_version).
 #define ARKILIAN_SCHEMA_VERSION 1
 
+// Default soft ceiling on _pending_backup rows. Capture pauses (skips the
+// INSERT) once the queue reaches this depth so the outbox can never grow
+// without bound and exhaust the disk the primary database lives on —
+// keeping spec §0 ("backup must never break the application") intact even
+// during a prolonged push-endpoint outage. Shipping drains the queue and
+// capture resumes automatically when the depth drops back below the cap.
+// db_backup_is_healthy() flips to 0 at this depth so the loss of capture
+// is visible via monitoring, not silent. Override with
+// ARKILIAN_MAX_QUEUE_DEPTH. The cap is baked into the capture triggers at
+// sync time; changing the env requires a restart (or db_resync_triggers)
+// to take effect.
+#define ARKILIAN_DEFAULT_MAX_QUEUE_DEPTH 100000
+
 // ── Struct Definitions ──────────────────────────────────────────────
 
 struct arkilian {
@@ -131,6 +144,7 @@ struct arkilian {
 static void load_env(void);
 static const char *get_env_default(const char *env_var, const char *default_val);
 static int get_env_int_default(const char *env_var, int default_val);
+static long outbox_cap(void);
 static char *token_snapshot(arkilian *db);
 #ifdef _WIN32
 DWORD WINAPI run_hourly_backup(LPVOID arg);
@@ -163,6 +177,17 @@ static int get_env_bool_default(const char *env_var, int default_val) {
   if (strcasecmp(val, "false") == 0 || strcasecmp(val, "no") == 0 ||
       strcmp(val, "0") == 0) return 0;
   return atoi(val) != 0;
+}
+
+// Soft ceiling on _pending_backup rows — see ARKILIAN_DEFAULT_MAX_QUEUE_DEPTH.
+// Read fresh so db_resync_triggers (which re-runs sync_backup_triggers)
+// and db_backup_is_healthy observe env changes without a restart for the
+// health gate; the trigger-baked literal takes effect on the next sync.
+static long outbox_cap(void) {
+  long cap = (long)get_env_int_default("ARKILIAN_MAX_QUEUE_DEPTH",
+                                       ARKILIAN_DEFAULT_MAX_QUEUE_DEPTH);
+  if (cap < 1) cap = 1;
+  return cap;
 }
 
 // ── Structured logging ──────────────────────────────────────────────
@@ -259,8 +284,9 @@ static void load_env(void) {
       int c;
       while ((c = fgetc(fp)) != EOF && c != '\n') { /* drain */ }
     }
-    char *key = strtok(line, "=");
-    char *val = strtok(NULL, "\n\r");
+    char *save = NULL;
+    char *key = strtok_r(line, "=", &save);
+    char *val = strtok_r(NULL, "\n\r", &save);
     // A real environment variable always wins over a ./.env value —
     // a stray .env in the working directory must never override the
     // deployment's explicit configuration.
@@ -321,6 +347,136 @@ static int url_is_presigned(const char *url) {
          strstr(url, "X-Goog-Signature=") != NULL ||
          strstr(url, "X-Goog-Credential=") != NULL ||
          strstr(url, "sig=") != NULL; /* Azure SAS */
+}
+
+// Extract the host component of a URL into a caller-provided buffer.
+// Strips any user@info and :port. Returns the host length, or 0 on
+// failure / parse error. e.g. "http://user@127.0.0.1:9000/x" -> "127.0.0.1".
+static size_t url_host(const char *url, char *out, size_t out_cap) {
+  if (!url || !out || out_cap == 0) return 0;
+  const char *p = strstr(url, "://");
+  if (!p) return 0;
+  p += 3;
+  const char *end = p;
+  while (*end && *end != '/' && *end != ':' && *end != '@' &&
+         *end != '?' && *end != '#') end++;
+  const char *at = NULL;
+  for (const char *q = p; q < end; q++) if (*q == '@') at = q;
+  const char *hstart = at ? at + 1 : p;
+  size_t hlen = (size_t)(end - hstart);
+  if (hlen >= out_cap) hlen = out_cap - 1;
+  memcpy(out, hstart, hlen);
+  out[hlen] = '\0';
+  return hlen;
+}
+
+static int url_is_https(const char *url) {
+  return url && strncmp(url, "https://", 8) == 0;
+}
+
+// Loopback / RFC1918 / link-local — local dev against a control plane on
+// 127.0.0.1 / 10.x / 192.168.x / 172.16-31.x is legitimate even over plain
+// http://. These are the ONLY non-HTTPS hosts allowed without an explicit
+// opt-in. Everything else over http:// leaks the bearer token in cleartext.
+static int host_is_local(const char *host) {
+  if (!host || !*host) return 0;
+  // IPv6 [::1] form
+  if (host[0] == '[') {
+    if (strncmp(host, "[::1]", 5) == 0) return 1;
+    if (strncmp(host, "[fe80", 5) == 0) return 1;
+    if (strncmp(host, "[fc", 3) == 0 || strncmp(host, "[fd", 3) == 0) return 1; // ULA
+    return 0;
+  }
+  if (strcmp(host, "localhost") == 0) return 1;
+  if (strncmp(host, "127.", 4) == 0) return 1;
+  if (strncmp(host, "10.", 3) == 0) return 1;
+  if (strncmp(host, "192.168.", 8) == 0) return 1;
+  if (strncmp(host, "169.254.", 8) == 0) return 1; // link-local
+  if (strncmp(host, "fe80", 4) == 0) return 1;     // IPv6 link-local
+  if (strncmp(host, "::1", 3) == 0) return 1;      // IPv6 loopback
+  if (strncmp(host, "fc", 2) == 0 || strncmp(host, "fd", 2) == 0) return 1; // ULA
+  if (strncmp(host, "172.", 4) == 0) {
+    unsigned second = 0;
+    if (sscanf(host, "172.%u.", &second) == 1 && second >= 16 && second <= 31)
+      return 1;
+  }
+  return 0;
+}
+
+// A URL is "transport-safe" iff it is HTTPS, OR it points at a local
+// address (loopback / RFC1918 / link-local) for dev. Operators with an
+// internal-but-non-RFC1918 cleartext control plane may opt in with
+// ARKILIAN_ALLOW_INSECURE=1 — the loud-failure default keeps a
+// misconfiguration from leaking the bearer token.
+static int url_transport_is_safe(const char *url, int allow_insecure) {
+  if (!url || !*url) return 1; // empty endpoint => nothing to ship
+  if (url_is_https(url)) return 1;
+  if (allow_insecure) return 1;
+  char host[256];
+  if (url_host(url, host, sizeof(host)) == 0) return 0; // unparseable
+  return host_is_local(host);
+}
+
+// Well-known object-storage providers, matched on host SUFFIX so regional
+// variants (bucket.s3.us-east-2.amazonaws.com) are covered. A pre-signed
+// URL whose host matches one of these is treated as a legitimate storage
+// destination. Operators with a self-hosted MinIO or other custom storage
+// add its host via ARKILIAN_STORAGE_HOSTS="host1,host2" (comma-separated,
+// suffix-matched).
+static int host_is_known_storage(const char *host) {
+  if (!host || !*host) return 0;
+  // AWS S3 (and s3-website, s3-accelerate, dualstack)
+  if (strstr(host, ".amazonaws.com")) return 1;
+  // Google Cloud Storage
+  if (strcmp(host, "storage.googleapis.com") == 0) return 1;
+  if (strstr(host, ".storage.googleapis.com")) return 1;
+  // Azure Blob
+  if (strstr(host, ".blob.core.windows.net")) return 1;
+  // Backblaze B2
+  if (strstr(host, ".backblazeb2.com")) return 1;
+  // Cloudflare R2
+  if (strstr(host, ".r2.cloudflarestorage.com")) return 1;
+  // Wasabi
+  if (strstr(host, ".wasabisys.com")) return 1;
+  // DigitalOcean Spaces
+  if (strstr(host, ".digitaloceanspaces.com")) return 1;
+  return 0;
+}
+
+// Returns 1 (and parses `extra_hosts`) when a URL's host is an allowed
+// storage destination: a well-known provider, a local address (MinIO on
+// 127.0.0.1 / RFC1918), or a host in the operator-provided allowlist.
+// Guards against SSRF: a compromised/buggy control plane that returns an
+// upload_url pointing at cloud metadata (169.254.169.254) or an internal
+// service is refused here, so the customer's snapshot is never exfiltrated.
+static int url_is_allowed_storage(const char *url) {
+  if (!url) return 0;
+  char host[256];
+  if (url_host(url, host, sizeof(host)) == 0) return 0;
+  if (host_is_known_storage(host)) return 1;
+  if (host_is_local(host)) return 1;
+  // Operator allowlist (comma-separated, exact-or-suffix match)
+  const char *extra = getenv("ARKILIAN_STORAGE_HOSTS");
+  if (extra && *extra) {
+    char buf[1024];
+    strncpy(buf, extra, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+    char *save = NULL;
+    char *tok = strtok_r(buf, ",", &save);
+    while (tok) {
+      while (*tok == ' ') tok++;
+      size_t tlen = strlen(tok);
+      if (tlen && tok[tlen - 1] == ' ') tok[--tlen] = '\0';
+      if (tlen == 0) { tok = strtok_r(NULL, ",", &save); continue; }
+      size_t hlen = strlen(host);
+      // exact match, or host ends with ".<allowed>" (subdomain), or equals
+      if (strcmp(host, tok) == 0) return 1;
+      if (hlen > tlen + 1 && host[hlen - tlen - 1] == '.' &&
+          strcmp(host + hlen - tlen, tok) == 0) return 1;
+      tok = strtok_r(NULL, ",", &save);
+    }
+  }
+  return 0;
 }
 
 // ── Trigger Auto-Generator ──────────────────────────────────────────
@@ -425,25 +581,39 @@ int sync_backup_triggers(sqlite3 *db, char **err_out) {
     const char *table = (const char *)sqlite3_column_text(table_stmt, 0);
     if (!table || is_reserved_table(table)) continue;
 
-    char *pragma_sql = sqlite3_mprintf("PRAGMA table_xinfo(\"%w\");", table);
-    if (!pragma_sql) { rc = SQLITE_NOMEM; goto oom; }
+    // Per-table allocations declared up-front and NULL-initialized so that
+    // EVERY OOM/error path (including ones reached before they are
+    // assigned) can free them safely (NULL-free is a no-op) — instead of
+    // either leaking them or using indeterminate values after a forward
+    // jump over their declaration (which is UB in C).
+    char **cols = NULL;
+    int *pk_ranks = NULL;
+    int ncols = 0, cap = 0;
+    char *raw_cols = NULL;
+    char *new_vals = NULL;
+    char *replace_lit = NULL;
+    char *delete_prefix = NULL;
+    char *delete_expr = NULL;
+    char *pragma_sql = NULL;
     sqlite3_stmt *col_stmt = NULL;
+
+    pragma_sql = sqlite3_mprintf("PRAGMA table_xinfo(\"%w\");", table);
+    if (!pragma_sql) { rc = SQLITE_NOMEM; goto oom; }
     rc = sqlite3_prepare_v2(db, pragma_sql, -1, &col_stmt, NULL);
     sqlite3_free(pragma_sql);
+    pragma_sql = NULL;
 
     if (rc != SQLITE_OK) {
       // Build the message BEFORE finalizing table_stmt — `table` points
       // into table_stmt's row buffer and is invalid after finalize.
       if (err_out) *err_out = sqlite3_mprintf("prepare table_info(%s): %s", table, sqlite3_errmsg(db));
+      sqlite3_finalize(col_stmt);
       sqlite3_finalize(table_stmt);
       if (began) sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
       return rc;
     }
 
     // Column collection (names + primary-key ranks)
-    char **cols = NULL;
-    int *pk_ranks = NULL;
-    int ncols = 0, cap = 0;
 
     while ((rc = sqlite3_step(col_stmt)) == SQLITE_ROW) {
       const char *col = (const char *)sqlite3_column_text(col_stmt, 1);
@@ -479,8 +649,6 @@ int sync_backup_triggers(sqlite3 *db, char **err_out) {
 
     // Raw identifier list: "c1", "c2"  and  NEW-value expression:
     // quote(NEW."c1") || ', ' || quote(NEW."c2")
-    char *raw_cols = NULL;
-    char *new_vals = NULL;
     for (int i = 0; i < ncols; i++) {
       char *next_cols, *next_vals;
       if (i == 0) {
@@ -503,10 +671,10 @@ int sync_backup_triggers(sqlite3 *db, char **err_out) {
     // string literal; expressions stay raw.
     char *replace_lit_raw = sqlite3_mprintf("REPLACE INTO \"%w\" (%s) VALUES (", table, raw_cols);
     char *delete_prefix_raw = sqlite3_mprintf("DELETE FROM \"%w\" WHERE ", table);
-    char *replace_lit = sql_literal_escape(replace_lit_raw ? replace_lit_raw : "");
-    char *delete_prefix = sql_literal_escape(delete_prefix_raw ? delete_prefix_raw : "");
+    replace_lit = sql_literal_escape(replace_lit_raw ? replace_lit_raw : "");
+    delete_prefix = sql_literal_escape(delete_prefix_raw ? delete_prefix_raw : "");
     sqlite3_free(replace_lit_raw); sqlite3_free(delete_prefix_raw);
-    if (!replace_lit || !delete_prefix) { free(replace_lit); free(delete_prefix); goto oom; }
+    if (!replace_lit || !delete_prefix) goto oom;
 
     // DELETE payloads are keyed on the PRIMARY KEY columns for every
     // table that has one. Keying on OLD.rowid is NOT replay-faithful:
@@ -522,7 +690,6 @@ int sync_backup_triggers(sqlite3 *db, char **err_out) {
     for (int i = 0; i < ncols; i++) {
       if (pk_ranks[i] > 0) pk_seen++;
     }
-    char *delete_expr = NULL;
     if (pk_seen == 0) {
       ark_log(NULL, ARK_LOG_WARN,
               "trigger sync: skipping table %s — it has no PRIMARY KEY, so "
@@ -531,6 +698,8 @@ int sync_backup_triggers(sqlite3 *db, char **err_out) {
               table);
       free(replace_lit); free(delete_prefix);
       sqlite3_free(raw_cols); sqlite3_free(new_vals);
+      replace_lit = delete_prefix = NULL;
+      raw_cols = new_vals = NULL;
       goto next_table;
     }
     {
@@ -563,7 +732,7 @@ int sync_backup_triggers(sqlite3 *db, char **err_out) {
       }
       free(lit_accum);
     }
-    if (!delete_expr) { free(replace_lit); free(delete_prefix); sqlite3_free(raw_cols); sqlite3_free(new_vals); goto oom; }
+    if (!delete_expr) goto oom;
 
     {
       const char *ops[3][2] = {
@@ -581,14 +750,15 @@ int sync_backup_triggers(sqlite3 *db, char **err_out) {
         if (i == 2) {
           create_sql = sqlite3_mprintf(
               "CREATE TRIGGER \"trg_%w_ad\" AFTER DELETE ON \"%w\" BEGIN "
-              "INSERT INTO _pending_backup (payload) VALUES (%s); END;",
-              table, table, delete_expr);
+              "INSERT INTO _pending_backup (payload) SELECT (%s) "
+              "WHERE (SELECT COUNT(*) FROM _pending_backup) < %ld; END;",
+              table, table, delete_expr, outbox_cap());
         } else {
           create_sql = sqlite3_mprintf(
               "CREATE TRIGGER \"trg_%w_%s\" AFTER %s ON \"%w\" BEGIN "
-              "INSERT INTO _pending_backup (payload) VALUES ("
-              "'%s' || %s || ')'); END;",
-              table, ops[i][0], ops[i][1], table, replace_lit, new_vals);
+              "INSERT INTO _pending_backup (payload) SELECT ("
+              "'%s' || %s || ')') WHERE (SELECT COUNT(*) FROM _pending_backup) < %ld; END;",
+              table, ops[i][0], ops[i][1], table, replace_lit, new_vals, outbox_cap());
         }
         if (!create_sql) goto trigger_oom;
 
@@ -600,9 +770,11 @@ int sync_backup_triggers(sqlite3 *db, char **err_out) {
 
 trigger_oom:
       rc = SQLITE_NOMEM;
-trigger_fail:
-      free(replace_lit); free(delete_prefix); sqlite3_free(delete_expr);
-      sqlite3_free(raw_cols); sqlite3_free(new_vals);
+    trigger_fail:
+      // All per-table allocations are released by fail_with_errmsg below
+      // (NULL-safe frees), so no inline frees here — a single owner
+      // prevents the double-free that the previous inline-free-then-goto
+      // pattern incurred.
       goto fail;
     }
 
@@ -623,8 +795,19 @@ oom:
 fail:
     if (!errmsg) errmsg = sqlite3_mprintf("trigger sync failed (rc=%d)", rc);
 fail_with_errmsg:
+    // Single owner of every per-table allocation: NULL-safe frees so that
+    // any entry path (oom before partial assignment, oom mid-build,
+    // trigger_fail after assignment, or normal fail) releases exactly the
+    // live set once. Fixes the OOM leak where raw_cols/new_vals/
+    // replace_lit/delete_prefix/delete_expr were leaked on the OOM paths.
+    free(replace_lit);
+    free(delete_prefix);
+    sqlite3_free(delete_expr);
+    sqlite3_free(raw_cols);
+    sqlite3_free(new_vals);
     for (int i = 0; i < ncols; i++) free(cols[i]);
     free(cols); free(pk_ranks);
+    sqlite3_finalize(col_stmt);
     sqlite3_finalize(table_stmt);
     if (began) sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
     if (err_out) *err_out = errmsg;
@@ -751,6 +934,13 @@ static ship_result_t ship_to_backup(arkilian *db, CURL *curl,
   if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_POSTFIELDS, payload);
   if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_TIMEOUT, curl_timeout_sec(strlen(payload), 10));
   if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5L);
+  // The destination's control-plane response body is small and discarded;
+  // cap it so a compromised endpoint cannot stream-gigabytes OOM this
+  // process. payload sizes are bounded by row size; responses are bounded
+  // by the cap.
+  if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_MAXFILESIZE_LARGE, (curl_off_t)16777216);
+  if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
+  if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
   if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_discard_cb);
   if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
   if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, curl_abort_cb);
@@ -1153,12 +1343,27 @@ int db_init(arkilian **db_ptr, const char *filename) {
   const char *token_tmp = get_env_default("ARKILIAN_DATABASE_TOKEN", "");
   db->database_token = malloc(strlen(token_tmp) + 1);
   if (db->database_token) strcpy(db->database_token, token_tmp);
+  // The bearer token is sent as "Authorization: Bearer <token>" in a
+  // 512-byte stack buffer; a token longer than ~490 bytes would be
+  // silently truncated and the control plane would reject every request
+  // as unauthorized — surface it loudly instead.
+  if (db->database_token && strlen(db->database_token) > 490) {
+    ark_log(db, ARK_LOG_WARN,
+            "ARKILIAN_DATABASE_TOKEN is %zu bytes — exceeding the 490-byte "
+            "header budget; it will be truncated and requests will be "
+            "rejected. Rotate to a shorter token",
+            strlen(db->database_token));
+  }
 
   db->backup_interval = get_env_int_default("ARKILIAN_BACKUP_INTERVAL", DEFAULT_BACKUP_INTERVAL);
   // A 0 or negative interval would make the hourly thread hot-loop
   // (backup + signed-URL request with no sleep in between). Clamp it.
   if (db->backup_interval < 1) db->backup_interval = 1;
   db->backup_enabled = get_env_bool_default("ARKILIAN_ENABLE_BACKUP", 1);
+  // ARKILIAN_ALLOW_INSECURE=1 opts into cleartext http:// endpoints that
+  // are NOT loopback/RFC1918 (e.g. an internal-but-public corporate
+  // aggregator). Default 0: anything non-https and non-local is refused.
+  int allow_insecure = get_env_bool_default("ARKILIAN_ALLOW_INSECURE", 0);
 
   // Config validation (spec §9's "fail loudly, never silently"): a
   // kill-switch-ON install with no destination will capture rows forever
@@ -1172,20 +1377,32 @@ int db_init(arkilian **db_ptr, const char *filename) {
   }
 
   // Credential transport hygiene: over http:// the bearer token and every
-  // payload cross the wire in cleartext. Never a hard failure (internal
-  // networks are legitimate) — but loud, so a misconfiguration is visible
-  // before the first token goes over the wire.
-  if (db->push_url && strlen(db->push_url) > 0 &&
-      strncmp(db->push_url, "https://", 8) != 0) {
-    ark_log(db, ARK_LOG_WARN,
-            "ARKILIAN_WAL_PUSH_URL is not https — the bearer token and every "
-            "backup payload will be sent in cleartext");
+  // payload cross the wire in cleartext. HTTPS is enforced by default —
+  // only loopback/RFC1918 (local dev) or an explicit ARKILIAN_ALLOW_INSECURE
+  // opt-in permit cleartext. A misconfigured cleartext endpoint is refused
+  // at startup rather than silently leaking the token; backup is disabled
+  // (per spec §0, never a hard db_init failure) so the application keeps
+  // running while the operator fixes the configuration.
+  if (db->backup_enabled && db->push_url && strlen(db->push_url) > 0 &&
+      !url_transport_is_safe(db->push_url, allow_insecure)) {
+    ark_log(db, ARK_LOG_ERROR,
+            "ARKILIAN_WAL_PUSH_URL is not https and not a local address — the "
+            "bearer token would be sent in cleartext; backup DISABLED. Set "
+            "https://, point at a loopback/RFC1918 host, or opt-in with "
+            "ARKILIAN_ALLOW_INSECURE=1");
+    db->backup_enabled = 0;
   }
-  if (db->signed_url_endpoint && strlen(db->signed_url_endpoint) > 0 &&
-      strncmp(db->signed_url_endpoint, "https://", 8) != 0) {
-    ark_log(db, ARK_LOG_WARN,
-            "ARKILIAN_SIGNED_URL_ENDPOINT is not https — the bearer token will "
-            "be sent in cleartext");
+  if (db->backup_enabled && db->signed_url_endpoint && strlen(db->signed_url_endpoint) > 0 &&
+      !url_transport_is_safe(db->signed_url_endpoint, allow_insecure)) {
+    ark_log(db, ARK_LOG_ERROR,
+            "ARKILIAN_SIGNED_URL_ENDPOINT is not https and not a local "
+            "address — the bearer token would be sent in cleartext; snapshot "
+            "upload DISABLED. Set https://, point at a loopback/RFC1918 host, "
+            "or opt-in with ARKILIAN_ALLOW_INSECURE=1");
+    // Snapshot upload only is disabled; realtime shipping keeps running.
+    // Clear the endpoint so run_hourly_backup skips the upload branch.
+    free(db->signed_url_endpoint);
+    db->signed_url_endpoint = strdup("");
   }
 
 #ifndef _WIN32
@@ -1544,7 +1761,12 @@ static void apply_ddl_capture(arkilian *db, const char *sql) {
   if (terr) sqlite3_free(terr);
 
   sqlite3_stmt *ddl_stmt = NULL;
-  if (sqlite3_prepare_v2(db->handle, "INSERT INTO _pending_backup (payload) VALUES (?)", -1, &ddl_stmt, NULL) == SQLITE_OK) {
+  char ddl_insert_sql[160];
+  snprintf(ddl_insert_sql, sizeof(ddl_insert_sql),
+    "INSERT INTO _pending_backup (payload) SELECT ? "
+    "WHERE (SELECT COUNT(*) FROM _pending_backup) < %ld",
+    outbox_cap());
+  if (sqlite3_prepare_v2(db->handle, ddl_insert_sql, -1, &ddl_stmt, NULL) == SQLITE_OK) {
     int bind_rc = sqlite3_bind_text(ddl_stmt, 1, sql, -1, SQLITE_TRANSIENT);
     int step_rc = (bind_rc == SQLITE_OK) ? sqlite3_step(ddl_stmt) : bind_rc;
     if (step_rc != SQLITE_DONE) {
@@ -2017,9 +2239,8 @@ int db_backup_trigger_coverage(arkilian *db) {
 }
 
 // Default queue-depth ceiling for db_backup_is_healthy; override with
-// ARKILIAN_MAX_QUEUE_DEPTH.
-#define DEFAULT_MAX_QUEUE_DEPTH 100000
-
+// ARKILIAN_MAX_QUEUE_DEPTH. Kept in sync with the cap baked into the
+// capture triggers via outbox_cap().
 int db_backup_is_healthy(arkilian *db) {
   if (!db) return 0;
   // A disabled subsystem is NOT healthy — whether kill-switched, forced
@@ -2034,8 +2255,7 @@ int db_backup_is_healthy(arkilian *db) {
   // 5×poll-interval bound. The dead-thread threshold must exceed the
   // longest legitimate in-flight time: 30s = 10s ship + 20s margin.
   if (hb_age < 0 || hb_age > 30000) return 0;
-  int max_depth = get_env_int_default("ARKILIAN_MAX_QUEUE_DEPTH", DEFAULT_MAX_QUEUE_DEPTH);
-  if (db_backup_queue_depth(db) >= max_depth) return 0;
+  if (db_backup_queue_depth(db) >= outbox_cap()) return 0;
   return 1;
 }
 
@@ -2152,8 +2372,16 @@ static char *get_signed_url(arkilian *db, const char *api_endpoint,
     if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_POSTFIELDS, "");
     if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_cb);
     if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)&chunk);
+    // Cap the response: a signed-URL plan is a few hundred bytes. A
+    // misbehaving/compromised control plane streaming gigabytes would
+    // otherwise OOM this process before the JSON is ever parsed.
+    if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_MAXFILESIZE_LARGE, (curl_off_t)1048576);
     if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
     if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5L);
+    // Fail loudly on a TLS verification problem rather than silently
+    // degrading to an unauthenticated/insecure connection.
+    if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
+    if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
     if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
     if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, curl_abort_cb);
     if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_XFERINFODATA, (void *)shutdown_flag);
@@ -2184,10 +2412,26 @@ static char *get_signed_url(arkilian *db, const char *api_endpoint,
           char *end_quote = strchr(url_key, '"');
           if (end_quote) {
             size_t url_len = (size_t)(end_quote - url_key);
-            result = malloc(url_len + 1);
-            if (result) {
-              memcpy(result, url_key, url_len);
-              result[url_len] = '\0';
+            char *cand = malloc(url_len + 1);
+            if (cand) {
+              memcpy(cand, url_key, url_len);
+              cand[url_len] = '\0';
+              // SSRF guard: a compromised/buggy control plane can return an
+              // upload_url pointing at cloud metadata (169.254.169.254) or
+              // an internal service; uploading the full DB there is a
+              // customer-data exfiltration. Refuse any host that is not a
+              // known storage provider, a local address, or in the
+              // operator's ARKILIAN_STORAGE_HOSTS allowlist.
+              if (!url_is_allowed_storage(cand)) {
+                ark_log(db, ARK_LOG_ERROR,
+                        "control plane returned upload_url host that is not an "
+                        "allowed storage destination (SSRF refused): %.200s — "
+                        "add it to ARKILIAN_STORAGE_HOSTS if legitimate", cand);
+                free(cand);
+                cand = NULL;
+              } else {
+                result = cand;
+              }
             }
           }
           free(chunk.response);
@@ -2196,8 +2440,15 @@ static char *get_signed_url(arkilian *db, const char *api_endpoint,
           // Fallback: some control planes return the URL as a plain-text body.
           if (strncmp(chunk.response, "http://", 7) == 0 ||
               strncmp(chunk.response, "https://", 8) == 0) {
-            result = chunk.response;
-            chunk.response = NULL;
+            if (url_is_allowed_storage(chunk.response)) {
+              result = chunk.response;
+              chunk.response = NULL;
+            } else {
+              ark_log(db, ARK_LOG_ERROR,
+                      "control plane returned plain-text upload_url that is not "
+                      "an allowed storage destination (SSRF refused): %.200s",
+                      chunk.response);
+            }
           }
         }
       }
@@ -2211,6 +2462,15 @@ static char *get_signed_url(arkilian *db, const char *api_endpoint,
 
 static int upload_to_s3(arkilian *db, const char *signed_url,
                        const char *file_path, const char *token) {
+  // Defense-in-depth SSRF guard: even if get_signed_url's check regressed,
+  // never upload the database to a host that is not an allowed storage
+  // destination. The signed_url is attacker-influenceable (control plane).
+  if (!url_is_allowed_storage(signed_url)) {
+    ark_log(db, ARK_LOG_ERROR,
+            "upload_to_s3 refused: signed_url host is not an allowed "
+            "storage destination (SSRF guard): %.200s", signed_url);
+    return 1;
+  }
   CURL *curl = curl_easy_init();
   if (!curl) return 1;
   FILE *fd = fopen(file_path, "rb");
@@ -2243,6 +2503,11 @@ static int upload_to_s3(arkilian *db, const char *signed_url,
   // multi-hundred-MB snapshots aren't guaranteed failures on a WAN.
   if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_TIMEOUT, curl_timeout_sec((size_t)file_size, 30));
   if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
+  // Explicit TLS verification posture — system defaults are 1/2; setting
+  // them explicitly documents intent and protects against a future patch
+  // accidentally disabling verification.
+  if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
+  if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
   if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
   if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, curl_abort_cb);
   if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_XFERINFODATA, (void *)&db->shutdown_requested);
