@@ -12,8 +12,7 @@
 //   - db_wal_last_sql is per-instance (no cross-instance leakage)
 //
 // Compile (macOS/Linux):
-//   cc tests/test_regressions.c src/class.c src/deps/sqlite/sqlite3.c \
-//      -Isrc -Isrc/deps/sqlite -lcurl -lpthread -o test_regressions
+//   cc tests/test_regressions.c src/class.c src/deps/sqlite/sqlite3.c -Isrc -Isrc/deps/sqlite -lcurl -lpthread -o test_regressions
 
 #include "class.h"
 #include <assert.h>
@@ -52,10 +51,12 @@ static void cleanup(const char *path) {
 // Failing push endpoint keeps payloads in _pending_backup for inspection.
 static arkilian *open_db(const char *path) {
   cleanup(path); // idempotent across re-runs
+#ifndef _WIN32
   setenv("ARKILIAN_ENABLE_BACKUP", "0", 1);
   setenv("ARKILIAN_API_KEY", "test-key", 1);
   setenv("ARKILIAN_SKIP_STARTUP_AUTH", "1", 1);
   setenv("ARKILIAN_CONTROL_URL", "http://127.0.0.1:1", 1);
+#endif
   arkilian *db = NULL;
   int rc = db_init(&db, path);
   assert(rc == 0 && "db_init failed");
