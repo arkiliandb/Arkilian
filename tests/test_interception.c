@@ -1,8 +1,7 @@
 // Arkilian Write Interception Tests — ring buffer architecture
 //
 // Compile (macOS/Linux):
-//   cc tests/test_interception.c src/class.c src/deps/sqlite/sqlite3.c \
-//      -Isrc -Isrc/deps/sqlite -lcurl -lpthread -o test_interception
+//   cc tests/test_interception.c src/class.c src/deps/sqlite/sqlite3.c -Isrc -Isrc/deps/sqlite -lcurl -lpthread -o test_interception
 
 #include "class.h"
 #include <assert.h>
