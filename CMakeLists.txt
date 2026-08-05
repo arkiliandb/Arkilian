@@ -245,7 +245,8 @@ if(ARKILIAN_BUILD_TESTS)
         endforeach()
 
         if(NOT WIN32)
-            foreach(t test_kill_switch test_kill_resilience test_load_contention)
+            foreach(t test_kill_switch test_kill_resilience test_load_contention
+                     test_dst_backpressure)
                 ark_add_test(${t} tests/${t}.c)
             endforeach()
         endif()
