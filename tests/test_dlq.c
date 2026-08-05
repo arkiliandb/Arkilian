@@ -39,7 +39,11 @@ static void cleanup_db(void) {
 // Invoke the dlq binary; returns the process exit status (0 = success).
 static int run_dlq(const char *args) {
   char cmd[4096];
-  snprintf(cmd, sizeof cmd, "\"%s\" \"%s\" %s", ARKILIAN_DLQ_BIN, DB, args);
+  // ARKILIAN_DLQ_BIN is a string literal that already includes quotes
+  // (from CMake or the fallback #define), so we use %s directly for it.
+  // DB and args need shell quoting on POSIX; on Windows cmd.exe handles
+  // the embedded quotes from ARKILIAN_DLQ_BIN.
+  snprintf(cmd, sizeof cmd, "%s \"%s\" %s", ARKILIAN_DLQ_BIN, DB, args);
   // On POSIX system() returns a wait status whose exit code is WEXITSTATUS;
   // on Windows it returns the exit code directly. A successful tool run
   // exits 0 in both, which is all we assert on.

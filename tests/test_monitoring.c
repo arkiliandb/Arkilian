@@ -207,6 +207,8 @@ static void test_health(void) {
   db_backup_set_enabled(db, 1);
   // Re-enabled with a live destination → healthy again (queue is far
   // below the default ceiling and the flush thread beats continuously).
+  // Allow the thread to start and send its first heartbeat.
+  usleep(200000);
   assert(db_backup_is_healthy(db) == 1);
 
   db_close(db);

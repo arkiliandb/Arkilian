@@ -63,7 +63,11 @@ static void test_one_million_a(void) {
 // file through ark_sha256_hex_file. Verify it matches the in-memory
 // digest of the same bytes.
 static void test_file_matches_memory(void) {
+#ifdef _WIN32
+  const char *path = "ark_sha256_test.bin";
+#else
   const char *path = "/tmp/ark_sha256_test.bin";
+#endif
   const char *body = "the quick brown fox jumps over the lazy dog";
   FILE *f = fopen(path, "wb");
   assert(f);
