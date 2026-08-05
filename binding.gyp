@@ -16,8 +16,10 @@
       ],
       "cflags!": ["-fno-exceptions"],
       "cflags_cc!": ["-fno-exceptions"],
-      "cflags": ["-Wall", "-Wextra", "-Wpedantic", "-Werror"],
-      "cflags_cc": ["-Wall", "-Wextra", "-Wpedantic", "-Werror"],
+      "cflags": ["-Wall", "-Wextra", "-Wpedantic", "-Werror",
+                  "-Wno-implicit-fallthrough"],
+      "cflags_cc": ["-Wall", "-Wextra", "-Wpedantic", "-Werror",
+                    "-Wno-implicit-fallthrough"],
       "defines": [
         "NAPI_DISABLE_CPP_EXCEPTIONS",
         "SQLITE_ENABLE_PREUPDATE_HOOK",

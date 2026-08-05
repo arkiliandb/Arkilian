@@ -40,6 +40,19 @@ set(ARKILIAN_SQLITE_DEFS
     SQLITE_ENABLE_RTREE
     SQLITE_ENABLE_DBSTAT_VTAB)
 
+# The SQLite amalgamation is vendored third-party code (200k+ lines,
+# upstream-vetted by the SQLite team). Suppress compiler warnings on it
+# ONLY — our own code (src/class.c, src/hydration.c, etc.) stays at
+# -Wall -Wextra -Wpedantic -Werror. This fixes the GCC CI build where
+# -Wimplicit-fallthrough (part of -Wextra) flags the intentional R*Tree
+# case-label fall-throughs (cellArea, rtreeCallbackConstraint) as errors.
+# MSVC /W4 does NOT have this warning; Linux GCC fails only. Standard
+# practice for vendored amalgamations; future-proofs against
+# SQLite-version-bump warning breakage.
+if(NOT CMAKE_C_COMPILER_ID MATCHES "MSVC")
+    set_source_files_properties(src/deps/sqlite/sqlite3.c PROPERTIES COMPILE_FLAGS -w)
+endif()
+
 # Shared Library
 if(ARKILIAN_BUILD_SHARED)
     add_library(arkilian SHARED ${ARKILIAN_SOURCES})
