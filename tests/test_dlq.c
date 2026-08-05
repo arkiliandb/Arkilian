@@ -13,8 +13,7 @@
 // runs on the MSYS2/MinGW CI leg alongside the rest of the suite.
 //
 // Compile (manual, macOS/Linux):
-//   cc -O2 -Wall -Wextra tests/test_dlq.c src/deps/sqlite/sqlite3.c \
-//      -Isrc/deps/sqlite -DARKILIAN_DLQ_BIN='"./arkilian-dlq"' -o test_dlq
+//   cc -O2 -Wall -Wextra tests/test_dlq.c src/deps/sqlite/sqlite3.c -Isrc/deps/sqlite -DARKILIAN_DLQ_BIN='"./arkilian-dlq"' -o test_dlq
 // Assumes ./arkilian-dlq is already built next to the test.
 
 #include "sqlite3.h"

@@ -1,8 +1,7 @@
 // Arkilian vs Raw SQLite — Production-Grade Side-by-Side Benchmark
 //
 // Compile:
-//   cc -O2 tests/bench_1m.c src/class.c src/deps/sqlite/sqlite3.c \
-//      -Isrc -Isrc/deps/sqlite -lcurl -lpthread -lm -o bench_1m
+//   cc -O2 tests/bench_1m.c src/class.c src/deps/sqlite/sqlite3.c -Isrc -Isrc/deps/sqlite -lcurl -lpthread -lm -o bench_1m
 //
 // Run:
 //   ./bench_1m                    (full: ~5-10 min)

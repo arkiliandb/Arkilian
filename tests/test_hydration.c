@@ -1,8 +1,7 @@
 // Arkilian Hydration Engine v2 — tests
 //
 // Compile:
-//   cc tests/test_hydration.c src/hydration.c \
-//      -Isrc -Isrc/deps/sqlite -lcurl -lsqlite3 -o test_hydration
+//   cc tests/test_hydration.c src/hydration.c -Isrc -Isrc/deps/sqlite -lcurl -lsqlite3 -o test_hydration
 
 #include "hydration.h"
 #include <assert.h>

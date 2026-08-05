@@ -21,8 +21,7 @@
 // test_kill_resilience.c). Not compiled on MinGW (no <sys/socket.h>).
 //
 // Compile (macOS/Linux):
-//   cc tests/test_dst_backpressure.c src/class.c src/deps/sqlite/sqlite3.c \
-//      -Isrc -Isrc/deps/sqlite -lcurl -lpthread -o test_dst_backpressure
+//   cc tests/test_dst_backpressure.c src/class.c src/deps/sqlite/sqlite3.c -Isrc -Isrc/deps/sqlite -lcurl -lpthread -o test_dst_backpressure
 
 #ifndef _POSIX_C_SOURCE
 #define _POSIX_C_SOURCE 200809L

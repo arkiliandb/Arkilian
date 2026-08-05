@@ -17,8 +17,7 @@
 //   - All writes land in _pending_backup (capture never lost).
 //
 // Compile (macOS/Linux):
-//   cc tests/test_load_contention.c src/class.c src/deps/sqlite/sqlite3.c \
-//      -Isrc -Isrc/deps/sqlite -lcurl -lpthread -lm -o test_load_contention
+//   cc tests/test_load_contention.c src/class.c src/deps/sqlite/sqlite3.c -Isrc -Isrc/deps/sqlite -lcurl -lpthread -lm -o test_load_contention
 
 #include "class.h"
 #include <assert.h>

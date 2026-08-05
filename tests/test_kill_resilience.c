@@ -20,8 +20,7 @@
 // union of all deliveries equals the exact set of captured rows.
 //
 // Compile (macOS/Linux):
-//   cc tests/test_kill_resilience.c src/class.c src/deps/sqlite/sqlite3.c \
-//      -Isrc -Isrc/deps/sqlite -lcurl -lpthread -o test_kill_resilience
+//   cc tests/test_kill_resilience.c src/class.c src/deps/sqlite/sqlite3.c -Isrc -Isrc/deps/sqlite -lcurl -lpthread -o test_kill_resilience
 
 #ifndef _POSIX_C_SOURCE
 #define _POSIX_C_SOURCE 200809L

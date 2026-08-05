@@ -13,12 +13,10 @@
 //      count and returns a hydrate plan with a snapshot URL.
 //
 // Usage:
-//   test_e2e_stress --url http://localhost:8080 --key <api_key> \
-//                   --db <db_id> [--writes N]
+//   test_e2e_stress --url http://localhost:8080 --key <api_key> --db <db_id> [--writes N]
 //
 // Compile (macOS/Linux):
-//   cc tests/test_e2e_stress.c src/class.c src/deps/sqlite/sqlite3.c \
-//      -Isrc -Isrc/deps/sqlite -lcurl -lpthread -lm -o test_e2e_stress
+//   cc tests/test_e2e_stress.c src/class.c src/deps/sqlite/sqlite3.c -Isrc -Isrc/deps/sqlite -lcurl -lpthread -lm -o test_e2e_stress
 
 #ifndef _POSIX_C_SOURCE
 #define _POSIX_C_SOURCE 200809L

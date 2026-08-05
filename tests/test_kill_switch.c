@@ -10,8 +10,7 @@
 //     0); re-enabling resumes exactly where the queue left off.
 //
 // Compile (macOS/Linux):
-//   cc tests/test_kill_switch.c src/class.c src/deps/sqlite/sqlite3.c \
-//      -Isrc -Isrc/deps/sqlite -lcurl -lpthread -o test_kill_switch
+//   cc tests/test_kill_switch.c src/class.c src/deps/sqlite/sqlite3.c -Isrc -Isrc/deps/sqlite -lcurl -lpthread -o test_kill_switch
 
 #include "class.h"
 #include <assert.h>
