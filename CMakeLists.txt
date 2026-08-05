@@ -237,20 +237,29 @@ if(ARKILIAN_BUILD_TESTS)
             set(ARK_TEST_LIBS arkilian_static ${CMAKE_THREAD_LIBS_INIT} ${CURL_LIBRARIES} m)
         endif()
 
+        # POSIX feature macros for setenv/unsetenv/clock_gettime (and the
+        # BSD types macOS headers need: u_int, u_short, etc). _DARWIN_C_SOURCE
+        # on Apple re-exposes BSD types that _POSIX_C_SOURCE alone hides;
+        # _DEFAULT_SOURCE on glibc exposes setenv/unsetenv. On MSVC these are
+        # meaningless (the CRT provides them differently).
+        if(CMAKE_C_COMPILER_ID MATCHES "MSVC")
+            set(ARK_POSIX_DEFS "")
+        elseif(APPLE)
+            set(ARK_POSIX_DEFS _POSIX_C_SOURCE=200809L _DARWIN_C_SOURCE _DEFAULT_SOURCE)
+        else()
+            set(ARK_POSIX_DEFS _POSIX_C_SOURCE=200809L _DEFAULT_SOURCE)
+        endif()
+
         # Helper: compile a test with NDEBUG removed so asserts stay live.
         function(ark_add_test name src)
             add_executable(${name} ${src})
             target_link_libraries(${name} PRIVATE ${ARK_TEST_LIBS})
             # Remove -DNDEBUG so assert() stays live even in Release builds.
             target_compile_options(${name} PRIVATE -UNDEBUG)
-            # POSIX feature macros for setenv/unsetenv/clock_gettime under
-            # -Wpedantic -Werror. Test files that already define these in
-            # source (guarded by #ifndef) are unaffected — same value is a
-            # no-op redefinition on GCC/Clang. MSVC doesn't use them.
-            if(NOT CMAKE_C_COMPILER_ID MATCHES "MSVC")
-                target_compile_definitions(${name} PRIVATE
-                    _POSIX_C_SOURCE=200809L _DEFAULT_SOURCE)
-            endif()
+            # POSIX feature macros (see ARK_POSIX_DEFS above). Test files
+            # that already define these #ifndef-guarded in source are
+            # unaffected — the #ifndef skips the (identicial-value) #define.
+            target_compile_definitions(${name} PRIVATE ${ARK_POSIX_DEFS})
             add_test(NAME ${name} COMMAND ${name})
         endfunction()
 
@@ -285,8 +294,7 @@ if(ARKILIAN_BUILD_TESTS)
             target_link_libraries(test_hydration PRIVATE ${CMAKE_THREAD_LIBS_INIT}
                                   ${CURL_LIBRARIES})
             target_compile_options(test_hydration PRIVATE -UNDEBUG)
-            target_compile_definitions(test_hydration PRIVATE
-                _POSIX_C_SOURCE=200809L _DEFAULT_SOURCE)
+            target_compile_definitions(test_hydration PRIVATE ${ARK_POSIX_DEFS})
             add_test(NAME test_hydration COMMAND test_hydration)
         endif()
 
@@ -307,9 +315,8 @@ if(ARKILIAN_BUILD_TESTS)
         target_compile_definitions(test_dlq PRIVATE
             ARKILIAN_DLQ_BIN="$<TARGET_FILE:arkilian-dlq>")
         target_compile_options(test_dlq PRIVATE -UNDEBUG)
-        if(NOT CMAKE_C_COMPILER_ID MATCHES "MSVC")
-            target_compile_definitions(test_dlq PRIVATE
-                _POSIX_C_SOURCE=200809L _DEFAULT_SOURCE)
+        if(ARK_POSIX_DEFS)
+            target_compile_definitions(test_dlq PRIVATE ${ARK_POSIX_DEFS})
         endif()
         add_test(NAME test_dlq COMMAND test_dlq)
 
@@ -324,8 +331,7 @@ if(ARKILIAN_BUILD_TESTS)
             target_link_libraries(test_e2e_stress PRIVATE ${CMAKE_THREAD_LIBS_INIT}
                                   ${CURL_LIBRARIES})
             target_compile_options(test_e2e_stress PRIVATE -UNDEBUG)
-            target_compile_definitions(test_e2e_stress PRIVATE
-                _POSIX_C_SOURCE=200809L _DEFAULT_SOURCE)
+            target_compile_definitions(test_e2e_stress PRIVATE ${ARK_POSIX_DEFS})
 
             add_executable(test_minio_hydrate tests/test_minio_hydrate.c
                            src/hydration.c src/sha256.c src/deps/sqlite/sqlite3.c)
@@ -333,8 +339,7 @@ if(ARKILIAN_BUILD_TESTS)
             target_link_libraries(test_minio_hydrate PRIVATE ${CMAKE_THREAD_LIBS_INIT}
                                   ${CURL_LIBRARIES})
             target_compile_options(test_minio_hydrate PRIVATE -UNDEBUG)
-            target_compile_definitions(test_minio_hydrate PRIVATE
-                _POSIX_C_SOURCE=200809L _DEFAULT_SOURCE)
+            target_compile_definitions(test_minio_hydrate PRIVATE ${ARK_POSIX_DEFS})
         endif()
 
         # ── Benchmarks / stress (built, NOT ctest-registered): assert
@@ -346,12 +351,16 @@ if(ARKILIAN_BUILD_TESTS)
             target_link_libraries(bench_1m PRIVATE ${ARK_TEST_LIBS})
             target_compile_definitions(bench_1m PRIVATE ${ARKILIAN_SQLITE_DEFS})
             target_compile_options(bench_1m PRIVATE -UNDEBUG)
+            target_compile_definitions(bench_1m PRIVATE
+                _POSIX_C_SOURCE=200809L _DEFAULT_SOURCE)
 
             add_executable(stress_200m tests/stress_200m.c
                            src/class.c src/deps/sqlite/sqlite3.c)
             target_include_directories(stress_200m PRIVATE src src/deps/sqlite)
             target_link_libraries(stress_200m PRIVATE ${CMAKE_THREAD_LIBS_INIT}
                                   ${CURL_LIBRARIES} m)
+            target_compile_definitions(stress_200m PRIVATE
+                _POSIX_C_SOURCE=200809L _DEFAULT_SOURCE)
             target_compile_options(stress_200m PRIVATE -UNDEBUG)
         endif()
     endif()
