@@ -220,7 +220,7 @@ static int get_env_int_default(const char *env_var, int default_val) {
 // exponential backoff gives ~1 hour of retrying before dead-lettering.
 // Tests set a lower value (e.g. 3) to dead-letter quickly.
 static int max_attempts(void) {
-  int v = get_env_int_default("ARKILIAN_MAX_ATTEMPTS", 20);
+  int v = get_env_int_default("ARKILIAN_MAX_ATTEMPTS", 100);
   if (v < 1) v = 1;
   return v;
 }

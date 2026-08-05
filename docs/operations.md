@@ -58,7 +58,7 @@ Without a callback, messages go to stderr (unchanged behavior).
 
 ## 3. Dead-letter queue (DLQ)
 
-A row lands in `_dead_backup` after `MAX_ATTEMPTS` (default 20, override
+A row lands in `_dead_backup` after `MAX_ATTEMPTS` (default 100, override
 with `ARKILIAN_MAX_ATTEMPTS`) failed deliveries. **Every dead-lettered row
 is customer data that did not reach the backup destination.**
 
