@@ -40,6 +40,20 @@ set(ARKILIAN_SQLITE_DEFS
     SQLITE_ENABLE_RTREE
     SQLITE_ENABLE_DBSTAT_VTAB)
 
+# FTS5 (SQLITE_ENABLE_FTS5 above) compiles the amalgamation's BM25 IDF
+# code, which calls log()/log10()/log2(). On glibc those live in libm,
+# which is NOT part of the default link set — without it Linux consumers
+# of libarkilian.so fail at link time with "undefined reference to `log'"
+# (arkilian_example on Ubuntu CI). macOS links libm into libSystem and
+# Windows has the math functions in the CRT, so no extra library there.
+# The test targets already pass m explicitly in ARK_TEST_LIBS; the library
+# targets need it so every consumer (examples, dlq, tests) links cleanly.
+if(WIN32)
+    set(ARK_LIBM "")
+else()
+    set(ARK_LIBM m)
+endif()
+
 # The SQLite amalgamation is vendored third-party code (200k+ lines,
 # upstream-vetted by the SQLite team). Suppress compiler warnings on it
 # ONLY — our own code (src/class.c, src/hydration.c, etc.) stays at
@@ -62,7 +76,7 @@ if(ARKILIAN_BUILD_SHARED)
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/deps/sqlite>
         $<INSTALL_INTERFACE:include/arkilian>
     )
-    target_link_libraries(arkilian PRIVATE CURL::libcurl Threads::Threads)
+    target_link_libraries(arkilian PRIVATE CURL::libcurl Threads::Threads ${ARK_LIBM})
     set_target_properties(arkilian PROPERTIES
         VERSION 1.1.0
         SOVERSION 1
@@ -79,7 +93,7 @@ if(ARKILIAN_BUILD_STATIC)
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/deps/sqlite>
         $<INSTALL_INTERFACE:include/arkilian>
     )
-    target_link_libraries(arkilian_static PRIVATE CURL::libcurl Threads::Threads)
+    target_link_libraries(arkilian_static PRIVATE CURL::libcurl Threads::Threads ${ARK_LIBM})
     set_target_properties(arkilian_static PROPERTIES
         OUTPUT_NAME arkilian
         PUBLIC_HEADER "src/class.h;src/deps/sqlite/sqlite3.h"
@@ -150,7 +164,7 @@ if(CMAKE_JS_VERSION OR ARKILIAN_BUILD_NAPI)
         target_include_directories(arkilian_napi PRIVATE ${CMAKE_JS_INC})
     endif()
 
-    target_link_libraries(arkilian_napi PRIVATE CURL::libcurl Threads::Threads)
+    target_link_libraries(arkilian_napi PRIVATE CURL::libcurl Threads::Threads ${ARK_LIBM})
 
     # Node.js import library (needed on Windows)
     if(CMAKE_JS_LIB)
