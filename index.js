@@ -101,6 +101,13 @@ class Arkilian {
     return native.db_backup_is_healthy(this.id);
   }
 
+  // (Risk #1) Returns true when a raw-handle schema change (DDL via
+  // db_get_handle()) has desynchronized the capture triggers. Alert when
+  // true — triggers are stale and a db_resyncTriggers() is needed.
+  get triggersDirty() {
+    return native.db_backup_triggers_dirty(this.id);
+  }
+
   resyncTriggers() {
     const rc = native.db_resync_triggers(this.id);
     if (rc !== SQLITE_OK) {

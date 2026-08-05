@@ -58,9 +58,13 @@ Without a callback, messages go to stderr (unchanged behavior).
 
 ## 3. Dead-letter queue (DLQ)
 
-A row lands in `_dead_backup` after `MAX_ATTEMPTS` (10) failed deliveries.
-**Every dead-lettered row is customer data that did not reach the backup
-destination.**
+A row lands in `_dead_backup` after `MAX_ATTEMPTS` (default 20, override
+with `ARKILIAN_MAX_ATTEMPTS`) failed deliveries. **Every dead-lettered row
+is customer data that did not reach the backup destination.**
+
+The `arkilian-dlq` tool is shipped as a prebuilt binary with each GitHub
+release (no toolchain required) and also builds from source:
+`cc tools/arkilian-dlq.c src/deps/sqlite/sqlite3.c -Isrc/deps/sqlite -o arkilian-dlq`
 
 ### Investigate first
 
@@ -68,6 +72,8 @@ destination.**
 # how many, and which rows are stuck
 arkilian-dlq app.sqlite --count
 arkilian-dlq app.sqlite --list --limit 50
+# inspect a single row by id
+arkilian-dlq app.sqlite --list --id 42
 ```
 
 `failed_reason` is always `max attempts exceeded` — the real question is
@@ -85,10 +91,12 @@ moment the destination is healthy again (original ids preserved, attempts
 reset):
 
 ```sh
-# preview
+# preview (all rows)
 arkilian-dlq app.sqlite --replay --dry-run
-# re-queue everything (or a single row with --id N)
+# re-queue everything
 arkilian-dlq app.sqlite --replay
+# re-queue a single row by id (attempts reset to 0)
+arkilian-dlq app.sqlite --replay --id 42
 ```
 
 Replay is idempotent: rows already present in `_pending_backup` are
@@ -137,18 +145,20 @@ dead-letter again.
 
 ### "Hourly snapshots not uploading"
 
-Check `ARKILIAN_SIGNED_URL_ENDPOINT` is set (it is independent of
-`ARKILIAN_WAL_PUSH_URL`) and the control plane's `/v1/upload/request`
-returns 200 with an `upload_url`. Verify an object exists in the bucket.
+Check `ARKILIAN_CONTROL_URL` is set and the control plane's
+`/v1/upload/request` returns 200 with an `upload_url`. Verify an object
+exists in the bucket. The client derives both the realtime push
+(`/v1/wal/push`) and the signed-URL endpoint (`/v1/upload/request`) from
+the single `ARKILIAN_CONTROL_URL` base.
 
 ### "Backup enabled but nothing ships"
 
-`db_backup_is_enabled()` returns 1 but `ARKILIAN_WAL_PUSH_URL` is empty —
+`db_backup_is_enabled()` returns 1 but `ARKILIAN_CONTROL_URL` is empty —
 the startup log line warns:
 
 ```
 arkilian: [warn] backup is enabled (ARKILIAN_ENABLE_BACKUP) but
-ARKILIAN_WAL_PUSH_URL is not set — rows will accumulate in _pending_backup and never ship
+ARKILIAN_CONTROL_URL is not set — rows will accumulate in _pending_backup and never ship
 ```
 
 Set the URL and restart. Rows captured while misconfigured ship once the
@@ -158,13 +168,17 @@ destination is configured.
 
 | Variable | Purpose |
 |----------|---------|
-| `ARKILIAN_WAL_PUSH_URL` | Realtime destination for row changes (`/v1/wal/push`) |
-| `ARKILIAN_SIGNED_URL_ENDPOINT` | Signed-URL issuer for hourly snapshots (`/v1/upload/request`) |
-| `ARKILIAN_DATABASE_TOKEN` | Bearer token for both endpoints |
+| `ARKILIAN_CONTROL_URL` | Control-plane base URL (e.g. `https://api.arkilian.com`); client derives `/v1/wal/push` and `/v1/upload/request` |
+| `ARKILIAN_API_KEY` | The ONLY credential — sent as `Authorization: Bearer <key>` to every control-plane endpoint |
 | `ARKILIAN_ENABLE_BACKUP` | `1/0/true/false`; runtime toggle via `db_backup_set_enabled` |
 | `ARKILIAN_BACKUP_INTERVAL` | Hourly snapshot interval (min 1 s) |
 | `ARKILIAN_MAX_QUEUE_DEPTH` | Queue ceiling for `db_backup_is_healthy()` (default 100000) |
+| `ARKILIAN_MAX_ATTEMPTS` | Dead-letter threshold (default 20; lower for faster DLQ in test) |
+| `ARKILIAN_SKIP_STARTUP_AUTH` | Skip the startup API-key validation (test only — do NOT set in production) |
+| `ARKILIAN_ALLOW_INSECURE` | Opt-in for non-HTTPS non-local endpoints (default 0 — never leak the key in cleartext) |
+| `ARKILIAN_OUTBOX_DURABLE` | `synchronous=FULL` for the outbox (default 1); set 0 for throughput over power-loss durability |
 | `ARKILIAN_DB_PATH` / `ARKILIAN_BACKUP_PATH` | Database and snapshot file paths |
+| `ARKILIAN_STORAGE_HOSTS` | Allowlist of custom storage hosts (comma-separated, suffix-matched) for SSRF guard |
 
 Real environment variables always win over a `./.env` file.
 
@@ -232,3 +246,150 @@ Real environment variables always win over a `./.env` file.
   re-enable — the queue drains afterward and the hourly snapshot covers
   the window. Never leave the kill-switch off for long; the skipped
   tables / queue-depth / lag monitors will tell you if you do.
+
+## 8. Large BLOB & payload size guidance (launch Checklist #3)
+
+Arkilian's capture triggers copy every column of every changed row into a
+SQL text payload in `_pending_backup`. The HTTP push path caps the payload
+at 16 MB (`CURLOPT_MAXFILESIZE_LARGE`) — rows exceeding this fail to ship
+and eventually dead-letter.
+
+**Do NOT store large binary objects (> 1 MB) directly in PK-backed
+SQLite tables.** A single INSERT of a 5 MB BLOB produces a >5 MB outbox
+payload; at 100 writes/sec that's >500 MB/sec of outbox growth + network
+egress — the queue cap is hit almost instantly and capture pauses.
+
+Instead, use the **external-blob pattern**:
+
+```sql
+-- BAD: the entire file enters _pending_backup on every change
+CREATE TABLE images (id INTEGER PRIMARY KEY, data BLOB);
+
+-- GOOD: store a reference; the small row ships instantly
+CREATE TABLE images (
+  id INTEGER PRIMARY KEY,
+  storage_url TEXT,    -- S3/GCS/R2 presigned URL or object key
+  sha256 TEXT,         -- content hash for integrity
+  size_bytes INTEGER,
+  content_type TEXT
+);
+```
+
+Upload the binary to S3/Cloud Storage/Cloudflare R2 (or a presigned-URL
+flow), then INSERT only the reference row. The capture payload is a few
+hundred bytes; the large object is already durable in object storage.
+
+## 9. Monitoring & alert hooks (launch Checklist #4)
+
+All monitoring signals are exposed via the C API, the Node.js binding,
+and a ready-to-run Prometheus exporter.
+
+### Prometheus / Grafana
+
+Run the bundled exporter:
+
+```bash
+node examples/monitoring.js app.sqlite 9100
+```
+
+Scrape it with Prometheus:
+
+```yaml
+# prometheus.yml
+scrape_configs:
+  - job_name: 'arkilian'
+    static_configs:
+      - targets: ['localhost:9100']
+```
+
+Alert rules (`alerts.yml`):
+
+```yaml
+groups:
+  - name: arkilian
+    rules:
+      - alert: ArkilianBackupUnhealthy
+        expr: arkilian_healthy == 0
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: "Arkilian backup is unhealthy"
+      - alert: ArkilianTriggersDirty
+        expr: arkilian_triggers_dirty == 1
+        for: 1m
+        labels: { severity: warning }
+        annotations:
+          summary: "Raw-handle DDL desynchronized capture triggers — run db_resync_triggers()"
+      - alert: ArkilianQueueBacklog
+        expr: arkilian_queue_depth > 0
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "Arkilian outbox backlog sustained — destination may be down"
+      - alert: ArkilianReplicationLag
+        expr: arkilian_oldest_pending_age_seconds > 300
+        for: 1m
+        labels: { severity: warning }
+        annotations:
+          summary: "Arkilian replication lag exceeds 5 min RPO"
+      - alert: ArkilianDeadLetters
+        expr: arkilian_dead_letter_count > 0
+        for: 1m
+        labels: { severity: critical }
+        annotations:
+          summary: "Arkilian has dead-lettered rows — investigate and replay"
+      - alert: ArkilianFlushThreadDead
+        expr: arkilian_flush_thread_heartbeat_age_ms > 30000
+        for: 1m
+        labels: { severity: critical }
+        annotations:
+          summary: "Arkilian flush thread appears dead"
+      - alert: ArkilianTriggerCoverageGap
+        expr: arkilian_trigger_coverage > 0
+        for: 1m
+        labels: { severity: warning }
+        annotations:
+          summary: "Arkilian trigger coverage gap — a table lost its capture triggers"
+```
+
+### Node.js (custom logger / OpenTelemetry)
+
+```js
+setInterval(() => {
+  const metrics = {
+    healthy: db.backupHealthy,
+    triggersDirty: db.triggersDirty,
+    queueDepth: db.backupQueueDepth,
+    lagSec: db.backupOldestPendingAgeSec,
+    deadLetters: db.backupDeadLetterCount,
+    hbAgeMs: db.backupThreadHeartbeatAgeMs,
+    triggerCoverage: db.backupTriggerCoverage,
+    skippedTables: db.backupSkippedTableCount,
+  };
+  // forward to Datadog / OTel / your metrics pipeline
+}, 15000);
+```
+
+## 10. Control-plane ingestion capacity verification (launch Checklist #1)
+
+Because each captured row ships as one HTTP POST to `ARKILIAN_CONTROL_URL/v1/wal/push`,
+at 5,000 businesses averaging 20–100 writes/sec the control plane must
+ingest **100,000–500,000 RPS**. Before launch:
+
+1. **Stress-test the ingestion path** (NGINX/Envoy → Kafka/NATS stream)
+   to confirm it handles 500k RPS with sub-50ms ACK latency. Use a load
+   generator (vegeta, wrk, k6) against the `/v1/wal/push` endpoint.
+2. **Verify client-side buffering.** The Arkilian client buffers up to
+   `ARKILIAN_MAX_QUEUE_DEPTH` (default 100,000) rows in `_pending_backup`
+   when the backend returns 429/503. Local database writes are never
+   blocked — capture pauses at the cap, but the application keeps running
+   (spec §0). This is verified by `test_dst_backpressure.c`.
+3. **Monitor for sustained backlog.** Alert when `db_backup_queue_depth`
+   grows across consecutive checks (see §9) — that's the signal the
+   backend is rejecting/ timing out, not a transient blip.
+4. **Micro-batching is the forward path.** The current one-row-per-POST
+   design is intentional for strict ordering (spec §8.1) but is the
+   ceiling on ingestion efficiency. When the control plane supports
+   batch payloads, client-side micro-batching (100 rows or 50ms window,
+   gzip/zstd) reduces RPS by ~100× — see Risk #2 in the production
+   readiness review.
