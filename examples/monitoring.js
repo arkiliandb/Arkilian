@@ -47,6 +47,8 @@ function renderMetrics() {
   const healthy = db.backupHealthy ? 1 : 0;
   const enabled = db.backupEnabled ? 1 : 0;
   const triggersDirty = db.triggersDirty ? 1 : 0;
+  const capturePaused = db.capturePaused ? 1 : 0;
+  const autoResync = db.autoResyncTriggers ? 1 : 0;
   const queueDepth = db.backupQueueDepth;
   const oldestAge = db.backupOldestPendingAgeSec;
   const deadLetters = db.backupDeadLetterCount;
@@ -95,6 +97,14 @@ function renderMetrics() {
     "# HELP arkilian_triggers_dirty 1 when raw-handle DDL (Prisma/Drizzle/TypeORM/raw sqlite3_exec) has desynchronized capture triggers. Alert and call db.resyncTriggers() to repair.",
     "# TYPE arkilian_triggers_dirty gauge",
     `arkilian_triggers_dirty ${triggersDirty}`,
+    "",
+    "# HELP arkilian_capture_paused Sticky: 1 when the outbox hit ARKILIAN_MAX_QUEUE_DEPTH and CDC rows are being dropped (only the hourly snapshot will recover them). Stays 1 after drain; clears on successful snapshot upload.",
+    "# TYPE arkilian_capture_paused gauge",
+    `arkilian_capture_paused ${capturePaused}`,
+    "",
+    "# HELP arkilian_auto_resync_triggers 1 when opt-in post-commit auto-resync is enabled (raw-handle DDL users).",
+    "# TYPE arkilian_auto_resync_triggers gauge",
+    `arkilian_auto_resync_triggers ${autoResync}`,
     "",
   ];
 

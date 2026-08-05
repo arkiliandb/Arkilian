@@ -144,6 +144,25 @@ int db_backup_skipped_table_count(arkilian *db);
 // the same gap after the fact; this signal is the proactive detection
 // at the moment of the migration.
 int db_backup_triggers_dirty(arkilian *db);
+// (Risk #1) Opt-in auto-repair: when enabled, the next wrapped dispatch
+// (db_exec / db_step) will call db_resync_triggers() if triggers_dirty is
+// set — so raw-handle DDL (Prisma/Drizzle/TypeORM) is auto-repaired
+// without the operator calling db_resync_triggers() manually. Defaults
+// off: the current contract is "raw DDL is an incident, repair explicitly."
+// Enable for apps that use ORMs and never call the wrapper for DDL.
+// The resync runs POST-commit on the game thread (never inside SQLite's
+// commit hook), so a trigger resync failure can never roll back app work.
+void db_set_auto_resync_triggers(arkilian *db, int enabled);
+int db_get_auto_resync_triggers(arkilian *db);
+// Sticky capture-paused signal: 1 when the outbox hit ARKILIAN_MAX_QUEUE_DEPTH
+// (CDC rows are being dropped — only the hourly snapshot will recover them)
+// AND a successful snapshot has not yet run to re-baseline. Stays 1 after
+// the queue drains so the operator knows "a gap occurred, verify the
+// snapshot caught it." Clears on successful snapshot upload. 0 = capturing
+// normally (or never paused). The distinction from db_backup_is_healthy()
+// == 0: that fires for many reasons (disabled, no dest, thread dead, cap);
+// this is the specific "CDC rows dropped, snapshot is the fallback" signal.
+int db_backup_capture_paused(arkilian *db);
 // 1 when the backup subsystem is healthy: backup enabled, a push
 // destination configured, flush thread alive, and queue depth below
 // ARKILIAN_MAX_QUEUE_DEPTH (default 100000). 0 otherwise — including

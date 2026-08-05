@@ -108,6 +108,27 @@ class Arkilian {
     return native.db_backup_triggers_dirty(this.id);
   }
 
+  // Sticky: true when the outbox hit ARKILIAN_MAX_QUEUE_DEPTH and CDC rows
+  // are being dropped (only the hourly snapshot will recover them). Stays
+  // true after the queue drains so the operator knows a gap occurred.
+  // Clears on successful snapshot upload. Alert on true.
+  get capturePaused() {
+    return native.db_backup_capture_paused(this.id);
+  }
+
+  // Opt-in auto-repair for raw-handle DDL: when enabled, the next wrapped
+  // dispatch resyncs triggers if triggers_dirty is set. Defaults off.
+  // Enable for apps using Prisma/Drizzle/TypeORM that run DDL on the raw
+  // handle (db_get_handle) and never call db_exec for DDL.
+  setAutoResyncTriggers(enabled) {
+    native.db_set_auto_resync_triggers(this.id, !!enabled);
+    return this;
+  }
+
+  get autoResyncTriggers() {
+    return native.db_get_auto_resync_triggers(this.id);
+  }
+
   resyncTriggers() {
     const rc = native.db_resync_triggers(this.id);
     if (rc !== SQLITE_OK) {

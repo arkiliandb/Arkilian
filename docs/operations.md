@@ -9,8 +9,6 @@ response.
 
 ## 1. Monitoring signals (spec §9)
 
-All four signals are exposed by the C API and the Node binding:
-
 | Signal | API | Alert when |
 |--------|-----|------------|
 | Queue depth | `db_backup_queue_depth()` | Sustained growth across checks |
@@ -18,6 +16,8 @@ All four signals are exposed by the C API and the Node binding:
 | Dead letters | `db_backup_dead_letter_count()` | Any non-zero growth — every row is a change that failed to ship |
 | Thread liveness | `db_backup_thread_heartbeat_age_ms()` | Age > 10,000 ms (5 poll intervals) — thread died silently |
 | Trigger coverage | `db_backup_trigger_coverage()` | Any non-zero value — a table lost its capture triggers |
+| Triggers dirty | `db_backup_triggers_dirty()` | Returns 1 — raw-handle DDL desynchronized capture triggers |
+| Capture paused | `db_backup_capture_paused()` | Returns 1 — outbox hit cap, CDC rows being dropped; sticky until snapshot clears |
 | Skipped tables | `db_backup_skipped_table_count()` | Any non-zero value — tables with no PRIMARY KEY are not captured (see §7) |
 | Health | `db_backup_is_healthy()` | Returns 0 — backup disabled, no destination configured, thread dead, OR queue above `ARKILIAN_MAX_QUEUE_DEPTH` (default 100,000) |
 
@@ -350,7 +350,37 @@ groups:
         labels: { severity: warning }
         annotations:
           summary: "Arkilian trigger coverage gap — a table lost its capture triggers"
+      - alert: ArkilianCapturePaused
+        expr: arkilian_capture_paused == 1
+        for: 1m
+        labels: { severity: critical }
+        annotations:
+          summary: "Arkilian outbox hit cap — CDC rows are being dropped; verify the hourly snapshot recovers the gap"
 ```
+
+### Auto-resync for raw-handle DDL
+
+Apps using Prisma/Drizzle/TypeORM execute DDL on the raw handle
+(`db_get_handle()`), which desynchronizes capture triggers (the wrapper
+can't intercept it). By default, `triggers_dirty` stays set until the
+operator manually calls `db_resync_triggers()`.
+
+For apps that exclusively use ORM-managed DDL and never call `db_exec`
+for schema changes, opt into automatic post-commit repair:
+
+```js
+db.setAutoResyncTriggers(true);
+// Now: raw DDL → triggers_dirty → next db.exec/step auto-resyncs
+```
+
+```c
+db_set_auto_resync_triggers(db, 1);
+```
+
+The resync runs on the game thread, **post-commit** (never inside
+SQLite's commit hook), so a trigger resync failure can never roll back
+legitimate application work. Default is off — the current contract is
+"raw DDL is an incident, repair explicitly."
 
 ### Node.js (custom logger / OpenTelemetry)
 

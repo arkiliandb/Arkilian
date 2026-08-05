@@ -555,6 +555,120 @@ static void test_local_fs_capture_not_disabled(void) {
   cleanup("test_reg_fstype.db");
 }
 
+// ── Opt-in auto-resync for raw-handle DDL (Risk #1) ─────────────────
+// With auto-resync ENABLED, raw DDL via db_get_handle followed by a
+// wrapped INSERT triggers an automatic resync — no manual
+// db_resync_triggers() needed. The INSERT is captured.
+
+static void test_auto_resync_repairs_raw_ddl(void) {
+  arkilian *db = open_db("test_reg_auto.db");
+  // Enable auto-resync BEFORE any raw DDL.
+  db_set_auto_resync_triggers(db, 1);
+  assert(db_get_auto_resync_triggers(db) == 1);
+
+  // Wrapped DDL: covers initial schema.
+  assert(db_exec(db, "CREATE TABLE wrapped (id INTEGER PRIMARY KEY, v TEXT)") == SQLITE_OK);
+  assert(db_backup_trigger_coverage(db) == 0);
+  assert(db_backup_triggers_dirty(db) == 0);
+
+  // Raw-handle DDL: authorizer flags dirty (no wrapped dispatch to repair).
+  sqlite3 *raw = db_get_handle(db);
+  assert(sqlite3_exec(raw, "CREATE TABLE raw (id INTEGER PRIMARY KEY, v TEXT)",
+                      NULL, NULL, NULL) == SQLITE_OK);
+  assert(db_backup_triggers_dirty(db) == 1);
+  assert(db_backup_trigger_coverage(db) > 0); // raw table has no triggers
+
+  // Now a wrapped INSERT — auto-resync fires at the top of db_exec before
+  // the INSERT runs. The INSERT into "raw" IS captured (triggers now exist).
+  assert(db_exec(db, "INSERT INTO raw (v) VALUES ('auto-captured')") == SQLITE_OK);
+
+  // Triggers repaired + dirty cleared by the auto-resync.
+  assert(db_backup_triggers_dirty(db) == 0);
+  assert(db_backup_trigger_coverage(db) == 0);
+
+  // The INSERT was captured in _pending_backup (proves the resync ran
+  // before the row was written).
+  assert(count_payloads(db, "REPLACE INTO \"raw\"%") >= 1);
+
+  // Auto-resync off (restore default): raw DDL stays dirty.
+  db_set_auto_resync_triggers(db, 0);
+  assert(db_get_auto_resync_triggers(db) == 0);
+
+  db_close(db);
+  cleanup("test_reg_auto.db");
+}
+
+// ── Auto-resync off (default) → raw DDL stays dirty ──────────────────
+// Without opting in, raw DDL leaves triggers_dirty set — the current
+// contract is "raw DDL is an incident, repair explicitly."
+
+static void test_auto_resync_off_by_default(void) {
+  arkilian *db = open_db("test_reg_noresync.db");
+  assert(db_get_auto_resync_triggers(db) == 0); // off by default
+
+  assert(db_exec(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)") == SQLITE_OK);
+  sqlite3 *raw = db_get_handle(db);
+  assert(sqlite3_exec(raw, "CREATE TABLE t2 (id INTEGER PRIMARY KEY)", NULL, NULL, NULL) == SQLITE_OK);
+
+  // Dirty stays set — no auto-repair. A wrapped INSERT doesn't clear it
+  // (apply_ddl_capture only fires on wrapped DDL, not on non-DDL INSERT).
+  assert(db_backup_triggers_dirty(db) == 1);
+  assert(db_exec(db, "INSERT INTO t2 (id) VALUES (1)") == SQLITE_OK);
+  assert(db_backup_triggers_dirty(db) == 1); // still dirty — not auto-repaired
+
+  // Explicit resync still works.
+  assert(db_resync_triggers(db) == SQLITE_OK);
+  assert(db_backup_triggers_dirty(db) == 0);
+
+  db_close(db);
+  cleanup("test_reg_noresync.db");
+}
+
+// ── Capture-paused sticky signal (Risk #1) ──────────────────────────
+// When the outbox hits ARKILIAN_MAX_QUEUE_DEPTH, capture pauses (the
+// trigger's `WHERE count < cap` gate stops inserting). db_backup_capture_paused()
+// returns 1. It stays 1 even after the queue drains (sticky) — the operator
+// knows a gap occurred until the snapshot clears it.
+
+static void test_capture_paused_at_cap(void) {
+  cleanup("test_reg_paused.db");
+  // No destination → flush thread can't drain → queue fills to cap.
+  setenv("ARKILIAN_ENABLE_BACKUP", "1", 1);
+  setenv("ARKILIAN_CONTROL_URL", "", 1);
+  setenv("ARKILIAN_SKIP_STARTUP_AUTH", "1", 1);
+  setenv("ARKILIAN_API_KEY", "test-key", 1);
+  setenv("ARKILIAN_BACKUP_INTERVAL", "3600", 1);
+  setenv("ARKILIAN_MAX_QUEUE_DEPTH", "5", 1); // tight cap
+  arkilian *db = NULL;
+  assert(db_init(&db, "test_reg_paused.db") == 0);
+
+  // Not paused at start.
+  assert(db_backup_capture_paused(db) == 0);
+
+  assert(db_exec(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)") == SQLITE_OK);
+
+  // Write past the cap — the flush thread can't drain (no destination),
+  // so the queue hits cap. The flush thread's poll cycle will set
+  // capture_paused after ~2s.
+  for (int i = 0; i < 20; i++) {
+    char sql[64];
+    snprintf(sql, sizeof(sql), "INSERT INTO t (v) VALUES ('row%d')", i);
+    assert(db_exec(db, sql) == SQLITE_OK);
+  }
+
+  // Wait for the flush thread to observe the cap.
+  int waited = 0;
+  while (!db_backup_capture_paused(db) && waited < 8000) {
+    usleep(200 * 1000);
+    waited += 200;
+  }
+  assert(db_backup_capture_paused(db) == 1);
+
+  db_close(db);
+  cleanup("test_reg_paused.db");
+  setenv("ARKILIAN_MAX_QUEUE_DEPTH", "100000", 1); // restore
+}
+
 // ── Main ────────────────────────────────────────────────────────────
 
 int main(void) {
@@ -600,8 +714,15 @@ int main(void) {
   printf("\n[Schema Desync Detection]\n");
   RUN_TEST(test_ddl_via_raw_handle_flags_dirty);
 
+  printf("\n[Auto-Resync]\n");
+  RUN_TEST(test_auto_resync_repairs_raw_ddl);
+  RUN_TEST(test_auto_resync_off_by_default);
+
   printf("\n[Filesystem Guard]\n");
   RUN_TEST(test_local_fs_capture_not_disabled);
+
+  printf("\n[Capture Paused Signal]\n");
+  RUN_TEST(test_capture_paused_at_cap);
 
   printf("\n=== Results: %d/%d passed ===\n", tests_passed, tests_run);
   return (tests_passed == tests_run) ? 0 : 1;

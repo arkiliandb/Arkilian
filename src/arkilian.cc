@@ -495,6 +495,26 @@ Napi::Value db_backup_triggers_dirty(const Napi::CallbackInfo& info) {
   return Napi::Boolean::New(env, dl ? db_backup_triggers_dirty(dl.db) != 0 : false);
 }
 
+Napi::Value db_backup_capture_paused(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  DbLock dl = lockDb(info);
+  return Napi::Boolean::New(env, dl ? db_backup_capture_paused(dl.db) != 0 : false);
+}
+
+Napi::Value db_set_auto_resync_triggers(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  DbLock dl = lockDb(info);
+  if (!dl || info.Length() < 2 || !info[1].IsBoolean()) return env.Null();
+  db_set_auto_resync_triggers(dl.db, info[1].As<Napi::Boolean>().Value() ? 1 : 0);
+  return env.Undefined();
+}
+
+Napi::Value db_get_auto_resync_triggers(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  DbLock dl = lockDb(info);
+  return Napi::Boolean::New(env, dl ? db_get_auto_resync_triggers(dl.db) != 0 : false);
+}
+
 Napi::Value db_resync_triggers(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   DbLock dl = lockDb(info);
@@ -663,6 +683,9 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
   exports.Set("db_backup_skipped_table_count", Napi::Function::New<db_backup_skipped_table_count>(env));
   exports.Set("db_backup_is_healthy", Napi::Function::New<db_backup_is_healthy>(env));
   exports.Set("db_backup_triggers_dirty", Napi::Function::New<db_backup_triggers_dirty>(env));
+  exports.Set("db_backup_capture_paused", Napi::Function::New<db_backup_capture_paused>(env));
+  exports.Set("db_set_auto_resync_triggers", Napi::Function::New<db_set_auto_resync_triggers>(env));
+  exports.Set("db_get_auto_resync_triggers", Napi::Function::New<db_get_auto_resync_triggers>(env));
   exports.Set("db_resync_triggers", Napi::Function::New<db_resync_triggers>(env));
   exports.Set("db_set_api_key", Napi::Function::New<db_set_api_key>(env));
   exports.Set("db_changes", Napi::Function::New<db_changes>(env));

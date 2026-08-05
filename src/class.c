@@ -185,6 +185,11 @@ struct arkilian {
   int in_wrapped_dispatch;             // db_exec/db_step in progress: suppress
                                        // the raw-DDL warning for DDL the wrapper
                                        // already auto-re-syncs (see on_schema_authorizer)
+  volatile int auto_resync_triggers;   // opt-in: resync on next wrapped dispatch
+                                       // when triggers_dirty is set (raw-handle DDL users)
+  volatile int capture_paused;         // sticky: set when outbox hits cap (CDC rows
+                                       // are being dropped); cleared on successful
+                                       // snapshot upload (the gap is recovered)
 };
 
 // ── Helper Prototypes ───────────────────────────────────────────────
@@ -1603,6 +1608,16 @@ void *run_wal_flush(void *arg) {
                             update_attempts_stmt, dead_letter_stmt);
     }
 
+    // (Risk #1) Sticky capture-paused signal: when the outbox is at cap,
+    // the capture trigger's `WHERE count < cap` gate stops inserting —
+    // CDC rows are being dropped and only the hourly snapshot will recover
+    // them. Set the sticky flag so monitoring surfaces the gap even after
+    // the queue drains (the snapshot thread clears it on successful upload).
+    // One COUNT(*) per poll cycle (~2s) is negligible vs the drain workload.
+    if (db_backup_queue_depth(db) >= outbox_cap()) {
+      db->capture_paused = 1;
+    }
+
     if (!drained) {
 #ifndef _WIN32
       pthread_mutex_lock(&db->wake_mutex);
@@ -2198,6 +2213,16 @@ static void apply_ddl_capture(arkilian *db, const char *sql) {
 int db_exec(arkilian *db, const char *sql) {
   if (!db || !db->handle || !sql) return SQLITE_ERROR;
 
+  // (Risk #1) Opt-in auto-resync: if raw-handle DDL set triggers_dirty
+  // and the operator enabled this, repair NOW — before the user's SQL
+  // runs — so the statement is captured. Post-commit (this runs after
+  // the raw DDL's transaction committed), on the game thread, never
+  // inside a SQLite hook. A resync failure logs + leaves dirty set;
+  // it never rolls back app work (spec §0).
+  if (db->auto_resync_triggers && db->triggers_dirty) {
+    db_resync_triggers(db);
+  }
+
   char *errmsg = NULL;
   // Mark this as a wrapped dispatch so the schema authorizer knows the
   // DDL (if any) will be auto-re-synced by apply_ddl_capture below — it
@@ -2299,6 +2324,14 @@ static sqlite3_stmt *get_current_stmt(arkilian *db) {
 int db_step(arkilian *db) {
   sqlite3_stmt *stmt = get_current_stmt(db);
   if (!stmt) return SQLITE_ERROR;
+
+  // (Risk #1) Opt-in auto-resync: same as db_exec — if raw-handle DDL
+  // set triggers_dirty, repair before the step runs. Post-commit, game
+  // thread, never inside a hook.
+  if (db->auto_resync_triggers && db->triggers_dirty) {
+    db_resync_triggers(db);
+  }
+
   // Mask DDL-through-step as wrapped so the authorizer suppresses its
   // bypass warning (apply_ddl_capture below re-syncs it). Non-DDL steps
   // never raise a DDL action, so the flag is harmless for them.
@@ -2750,6 +2783,33 @@ int db_backup_triggers_dirty(arkilian *db) {
   return (db && db->triggers_dirty) ? 1 : 0;
 }
 
+// (Risk #1) Opt-in post-commit auto-resync. When enabled, the next wrapped
+// dispatch (db_exec / db_step) checks triggers_dirty and resyncs before
+// executing — so raw-handle DDL (Prisma/Drizzle/TypeORM) is auto-repaired.
+// Defaults off. The resync runs on the game thread, post-commit, never
+// inside SQLite's commit hook — so a resync failure can never roll back
+// legitimate app work (spec §0).
+void db_set_auto_resync_triggers(arkilian *db, int enabled) {
+  if (!db) return;
+  db->auto_resync_triggers = enabled ? 1 : 0;
+}
+
+int db_get_auto_resync_triggers(arkilian *db) {
+  return (db && db->auto_resync_triggers) ? 1 : 0;
+}
+
+// Sticky capture-paused signal. Set by the flush thread when outbox depth
+// hits ARKILIAN_MAX_QUEUE_DEPTH (CDC rows are being dropped — the trigger's
+// `WHERE count < cap` gate stops inserting). Stays 1 after the queue
+// drains so the operator knows "a gap occurred, the hourly snapshot is
+// the fallback — verify it succeeded." Cleared by the snapshot thread
+// after a successful upload. db_backup_is_healthy()==0 is too broad (fires
+// for disabled/dest-down/thread-dead/cap); this is the specific "CDC rows
+// are being dropped" signal.
+int db_backup_capture_paused(arkilian *db) {
+  return (db && db->capture_paused) ? 1 : 0;
+}
+
 // ── Hourly Backup Implementation ────────────────────────────────────
 
 int backup_database(sqlite3 *pSource, const char *zFilename,
@@ -3084,6 +3144,11 @@ void *run_hourly_backup(void *arg) {
       if (signed_url && strlen(signed_url) > 5) {
         if (upload_to_s3(db, signed_url, db->backup_path, tok) != 0) {
           ark_log(db, ARK_LOG_ERROR, "scheduled backup upload failed");
+        } else {
+          // (Risk #1) A successful snapshot re-baselines the destination:
+          // any CDC gap from a prior outbox-cap pause is now recovered.
+          // Clear the sticky capture_paused flag.
+          db->capture_paused = 0;
         }
       }
       free(tok);
