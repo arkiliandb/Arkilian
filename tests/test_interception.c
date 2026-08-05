@@ -4,6 +4,7 @@
 //   cc tests/test_interception.c src/class.c src/deps/sqlite/sqlite3.c -Isrc -Isrc/deps/sqlite -lcurl -lpthread -o test_interception
 
 #include "class.h"
+#include "ark_test_env.h"
 #include <assert.h>
 #include <math.h>
 #include <stdio.h>
@@ -35,14 +36,12 @@ static int tests_passed = 0;
 // ── Helpers ─────────────────────────────────────────────────────────
 
 static arkilian *open_test_db(void) {
-#ifndef _WIN32
-  setenv("ARKILIAN_ENABLE_BACKUP", "0", 1);
+  ark_setenv("ARKILIAN_ENABLE_BACKUP", "0", 1);
   // Set a dummy push URL so the double-buffer accumulates entries.
   // The flush thread will start but fail-fast on this non-routable address.
-  setenv("ARKILIAN_API_KEY", "test-key", 1);
-  setenv("ARKILIAN_SKIP_STARTUP_AUTH", "1", 1);
-  setenv("ARKILIAN_CONTROL_URL", "http://127.0.0.1:1", 1);
-#endif
+  ark_setenv("ARKILIAN_API_KEY", "test-key", 1);
+  ark_setenv("ARKILIAN_SKIP_STARTUP_AUTH", "1", 1);
+  ark_setenv("ARKILIAN_CONTROL_URL", "http://127.0.0.1:1", 1);
   arkilian *db = NULL;
   int rc = db_init(&db, TEST_DB);
   assert(rc == 0 && "db_init failed");
@@ -684,11 +683,9 @@ static void test_perf_select_1000_reads(void) {
 // ── Main ────────────────────────────────────────────────────────────
 
 int main(void) {
-#ifndef _WIN32
-  setenv("ARKILIAN_ENABLE_BACKUP", "0", 1);
-  setenv("ARKILIAN_OUTBOX_DURABLE", "0", 1); // test expects synchronous=NORMAL
-  setenv("ARKILIAN_CONTROL_URL", "http://127.0.0.1:1", 1);
-#endif
+  ark_setenv("ARKILIAN_ENABLE_BACKUP", "0", 1);
+  ark_setenv("ARKILIAN_OUTBOX_DURABLE", "0", 1); // test expects synchronous=NORMAL
+  ark_setenv("ARKILIAN_CONTROL_URL", "http://127.0.0.1:1", 1);
 
   printf("=== Arkilian Write Interception Tests (ring buffer) ===\n\n");
 

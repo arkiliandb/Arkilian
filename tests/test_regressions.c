@@ -15,6 +15,7 @@
 //   cc tests/test_regressions.c src/class.c src/deps/sqlite/sqlite3.c -Isrc -Isrc/deps/sqlite -lcurl -lpthread -o test_regressions
 
 #include "class.h"
+#include "ark_test_env.h"
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -51,12 +52,10 @@ static void cleanup(const char *path) {
 // Failing push endpoint keeps payloads in _pending_backup for inspection.
 static arkilian *open_db(const char *path) {
   cleanup(path); // idempotent across re-runs
-#ifndef _WIN32
-  setenv("ARKILIAN_ENABLE_BACKUP", "0", 1);
-  setenv("ARKILIAN_API_KEY", "test-key", 1);
-  setenv("ARKILIAN_SKIP_STARTUP_AUTH", "1", 1);
-  setenv("ARKILIAN_CONTROL_URL", "http://127.0.0.1:1", 1);
-#endif
+  ark_setenv("ARKILIAN_ENABLE_BACKUP", "0", 1);
+  ark_setenv("ARKILIAN_API_KEY", "test-key", 1);
+  ark_setenv("ARKILIAN_SKIP_STARTUP_AUTH", "1", 1);
+  ark_setenv("ARKILIAN_CONTROL_URL", "http://127.0.0.1:1", 1);
   arkilian *db = NULL;
   int rc = db_init(&db, path);
   assert(rc == 0 && "db_init failed");
@@ -228,9 +227,9 @@ static void test_prepare_empty_sql_rejected(void) {
 // ── Shutdown latency ────────────────────────────────────────────────
 
 static void test_close_does_not_block_on_backup_interval(void) {
-  setenv("ARKILIAN_ENABLE_BACKUP", "1", 1);
-  setenv("ARKILIAN_BACKUP_INTERVAL", "3600", 1); // 1 hour
-  setenv("ARKILIAN_BACKUP_PATH", "test_reg_close_backup.sqlite", 1);
+  ark_setenv("ARKILIAN_ENABLE_BACKUP", "1", 1);
+  ark_setenv("ARKILIAN_BACKUP_INTERVAL", "3600", 1); // 1 hour
+  ark_setenv("ARKILIAN_BACKUP_PATH", "test_reg_close_backup.sqlite", 1);
   arkilian *db = NULL;
   assert(db_init(&db, "test_reg_close.db") == 0);
   db_exec(db, "CREATE TABLE t (id INTEGER PRIMARY KEY)");
@@ -242,7 +241,7 @@ static void test_close_does_not_block_on_backup_interval(void) {
   assert(elapsed < 10000.0); // must return in seconds, not an hour
   printf("(%.0f ms) ", elapsed);
 
-  setenv("ARKILIAN_ENABLE_BACKUP", "0", 1);
+  ark_setenv("ARKILIAN_ENABLE_BACKUP", "0", 1);
   cleanup("test_reg_close.db");
   remove("test_reg_close_backup.sqlite");
 }
@@ -331,14 +330,14 @@ static void test_no_destination_rows_survive(void) {
   // destination" in a way that survives the ./.env file the repo ships
   // (load_env only sets a key when getenv returns NULL; "" is non-NULL so
   // .env cannot override it). This was the root cause of the Task-27
-  // failure: a prior test set the URL, this test unsetenv()'d it, but
+  // failure: a prior test set the URL, this test ark_unsetenv()'d it, but
   // db_init's load_env re-injected it from ./.env → push_url became
   // non-empty → the flush thread shipped and incremented attempts,
   // breaking the assert that none were attempted.
-  setenv("ARKILIAN_CONTROL_URL", "", 1);
-  setenv("ARKILIAN_ENABLE_BACKUP", "1", 1);
-  setenv("ARKILIAN_BACKUP_INTERVAL", "3600", 1);
-  setenv("ARKILIAN_SKIP_STARTUP_AUTH", "1", 1);
+  ark_setenv("ARKILIAN_CONTROL_URL", "", 1);
+  ark_setenv("ARKILIAN_ENABLE_BACKUP", "1", 1);
+  ark_setenv("ARKILIAN_BACKUP_INTERVAL", "3600", 1);
+  ark_setenv("ARKILIAN_SKIP_STARTUP_AUTH", "1", 1);
   arkilian *db = NULL;
   assert(db_init(&db, "test_reg_nodest.db") == 0);
   assert(db_exec(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)") == SQLITE_OK);
@@ -366,9 +365,9 @@ static void test_no_destination_rows_survive(void) {
 
 static void test_text_pk_replay_fidelity(void) {
   cleanup("test_reg_fid.db");
-  setenv("ARKILIAN_ENABLE_BACKUP", "1", 1);
-  setenv("ARKILIAN_CONTROL_URL", "http://127.0.0.1:1", 1); // keep rows in outbox
-  setenv("ARKILIAN_BACKUP_INTERVAL", "3600", 1);
+  ark_setenv("ARKILIAN_ENABLE_BACKUP", "1", 1);
+  ark_setenv("ARKILIAN_CONTROL_URL", "http://127.0.0.1:1", 1); // keep rows in outbox
+  ark_setenv("ARKILIAN_BACKUP_INTERVAL", "3600", 1);
   arkilian *db = NULL;
   assert(db_init(&db, "test_reg_fid.db") == 0);
   assert(db_exec(db, "CREATE TABLE kv (k TEXT PRIMARY KEY, v TEXT)") == SQLITE_OK);
@@ -420,9 +419,9 @@ static void test_text_pk_replay_fidelity(void) {
 
 static void test_keyless_table_skipped(void) {
   cleanup("test_reg_keyless.db");
-  setenv("ARKILIAN_ENABLE_BACKUP", "1", 1);
-  setenv("ARKILIAN_CONTROL_URL", "http://127.0.0.1:1", 1);
-  setenv("ARKILIAN_BACKUP_INTERVAL", "3600", 1);
+  ark_setenv("ARKILIAN_ENABLE_BACKUP", "1", 1);
+  ark_setenv("ARKILIAN_CONTROL_URL", "http://127.0.0.1:1", 1);
+  ark_setenv("ARKILIAN_BACKUP_INTERVAL", "3600", 1);
   arkilian *db = NULL;
   assert(db_init(&db, "test_reg_keyless.db") == 0);
   // Keyless rowid table (unreplayable: REPLACE appends, rowids drift).
@@ -456,9 +455,9 @@ static void test_keyless_table_skipped(void) {
 
 static void test_dead_letter_zombie_cleared(void) {
   cleanup("test_reg_zombie.db");
-  setenv("ARKILIAN_ENABLE_BACKUP", "1", 1);
-  setenv("ARKILIAN_CONTROL_URL", "http://127.0.0.1:1", 1);
-  setenv("ARKILIAN_BACKUP_INTERVAL", "3600", 1);
+  ark_setenv("ARKILIAN_ENABLE_BACKUP", "1", 1);
+  ark_setenv("ARKILIAN_CONTROL_URL", "http://127.0.0.1:1", 1);
+  ark_setenv("ARKILIAN_BACKUP_INTERVAL", "3600", 1);
   arkilian *db = NULL;
   assert(db_init(&db, "test_reg_zombie.db") == 0);
 
@@ -540,11 +539,11 @@ static void test_local_fs_capture_not_disabled(void) {
   cleanup("test_reg_fstype.db");
   // Explicit empty URL: no destination, no background shipping, yet backup
   // stays "enabled" (capture runs; the flush loop just has nowhere to ship).
-  setenv("ARKILIAN_ENABLE_BACKUP", "1", 1);
-  setenv("ARKILIAN_CONTROL_URL", "", 1);
-  setenv("ARKILIAN_SKIP_STARTUP_AUTH", "1", 1);
-  setenv("ARKILIAN_API_KEY", "test-key", 1);
-  setenv("ARKILIAN_BACKUP_INTERVAL", "3600", 1);
+  ark_setenv("ARKILIAN_ENABLE_BACKUP", "1", 1);
+  ark_setenv("ARKILIAN_CONTROL_URL", "", 1);
+  ark_setenv("ARKILIAN_SKIP_STARTUP_AUTH", "1", 1);
+  ark_setenv("ARKILIAN_API_KEY", "test-key", 1);
+  ark_setenv("ARKILIAN_BACKUP_INTERVAL", "3600", 1);
   arkilian *db = NULL;
   assert(db_init(&db, "test_reg_fstype.db") == 0);
   // capture_ok stayed 1 → backup not force-disabled by a false FS positive.
@@ -634,12 +633,12 @@ static void test_auto_resync_off_by_default(void) {
 static void test_capture_paused_at_cap(void) {
   cleanup("test_reg_paused.db");
   // No destination → flush thread can't drain → queue fills to cap.
-  setenv("ARKILIAN_ENABLE_BACKUP", "1", 1);
-  setenv("ARKILIAN_CONTROL_URL", "", 1);
-  setenv("ARKILIAN_SKIP_STARTUP_AUTH", "1", 1);
-  setenv("ARKILIAN_API_KEY", "test-key", 1);
-  setenv("ARKILIAN_BACKUP_INTERVAL", "3600", 1);
-  setenv("ARKILIAN_MAX_QUEUE_DEPTH", "5", 1); // tight cap
+  ark_setenv("ARKILIAN_ENABLE_BACKUP", "1", 1);
+  ark_setenv("ARKILIAN_CONTROL_URL", "", 1);
+  ark_setenv("ARKILIAN_SKIP_STARTUP_AUTH", "1", 1);
+  ark_setenv("ARKILIAN_API_KEY", "test-key", 1);
+  ark_setenv("ARKILIAN_BACKUP_INTERVAL", "3600", 1);
+  ark_setenv("ARKILIAN_MAX_QUEUE_DEPTH", "5", 1); // tight cap
   arkilian *db = NULL;
   assert(db_init(&db, "test_reg_paused.db") == 0);
 
@@ -667,13 +666,13 @@ static void test_capture_paused_at_cap(void) {
 
   db_close(db);
   cleanup("test_reg_paused.db");
-  setenv("ARKILIAN_MAX_QUEUE_DEPTH", "100000", 1); // restore
+  ark_setenv("ARKILIAN_MAX_QUEUE_DEPTH", "100000", 1); // restore
 }
 
 // ── Main ────────────────────────────────────────────────────────────
 
 int main(void) {
-  setenv("ARKILIAN_MAX_ATTEMPTS", "3", 1); // fast dead-lettering for tests
+  ark_setenv("ARKILIAN_MAX_ATTEMPTS", "3", 1); // fast dead-lettering for tests
   printf("=== Arkilian Audit Regression Tests ===\n\n");
 
   printf("[WITHOUT ROWID]\n");

@@ -11,10 +11,10 @@
 //   - trigger re-sync after schema drift
 //
 // Compile (macOS/Linux):
-//   cc tests/test_monitoring.c src/class.c src/deps/sqlite/sqlite3.c \
-//      -Isrc -Isrc/deps/sqlite -lcurl -lpthread -o test_monitoring
+//   cc tests/test_monitoring.c src/class.c src/deps/sqlite/sqlite3.c -Isrc -Isrc/deps/sqlite -lcurl -lpthread -o test_monitoring
 
 #include "class.h"
+#include "ark_test_env.h"
 #include <assert.h>
 #include <signal.h>
 #include <stdio.h>
@@ -43,9 +43,9 @@ static void cleanup(const char *path) {
 }
 
 static void hermetic_env(void) {
-  setenv("ARKILIAN_ENABLE_BACKUP", "1", 1);
-  setenv("ARKILIAN_BACKUP_INTERVAL", "3600", 1);
-  unsetenv("ARKILIAN_MAX_QUEUE_DEPTH");
+  ark_setenv("ARKILIAN_ENABLE_BACKUP", "1", 1);
+  ark_setenv("ARKILIAN_BACKUP_INTERVAL", "3600", 1);
+  ark_unsetenv("ARKILIAN_MAX_QUEUE_DEPTH");
 }
 
 // ── Log capture ─────────────────────────────────────────────────────
@@ -67,9 +67,9 @@ static void capture_log(ark_log_level_t level, const char *msg, void *ctx) {
 static void test_queue_depth_and_oldest_age(void) {
   cleanup("test_mon_depth.db");
   hermetic_env();
-  setenv("ARKILIAN_API_KEY", "test-key", 1);
-  setenv("ARKILIAN_SKIP_STARTUP_AUTH", "1", 1);
-  setenv("ARKILIAN_CONTROL_URL", "http://127.0.0.1:1", 1); // failing dest
+  ark_setenv("ARKILIAN_API_KEY", "test-key", 1);
+  ark_setenv("ARKILIAN_SKIP_STARTUP_AUTH", "1", 1);
+  ark_setenv("ARKILIAN_CONTROL_URL", "http://127.0.0.1:1", 1); // failing dest
   arkilian *db = NULL;
   assert(db_init(&db, "test_mon_depth.db") == 0);
   assert(db_exec(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)") == SQLITE_OK);
@@ -92,7 +92,7 @@ static void test_queue_depth_and_oldest_age(void) {
 static void test_dead_letter_count(void) {
   cleanup("test_mon_dl.db");
   hermetic_env();
-  setenv("ARKILIAN_CONTROL_URL", "http://127.0.0.1:1", 1);
+  ark_setenv("ARKILIAN_CONTROL_URL", "http://127.0.0.1:1", 1);
   arkilian *db = NULL;
   assert(db_init(&db, "test_mon_dl.db") == 0);
   assert(db_backup_dead_letter_count(db) == 0);
@@ -114,7 +114,7 @@ static void test_dead_letter_count(void) {
 static void test_thread_heartbeat(void) {
   cleanup("test_mon_hb.db");
   hermetic_env();
-  setenv("ARKILIAN_CONTROL_URL", "http://127.0.0.1:1", 1);
+  ark_setenv("ARKILIAN_CONTROL_URL", "http://127.0.0.1:1", 1);
   arkilian *db = NULL;
   assert(db_init(&db, "test_mon_hb.db") == 0);
 
@@ -138,7 +138,7 @@ static void test_thread_heartbeat(void) {
 static void test_trigger_coverage_and_resync(void) {
   cleanup("test_mon_trg.db");
   hermetic_env();
-  setenv("ARKILIAN_CONTROL_URL", "http://127.0.0.1:1", 1);
+  ark_setenv("ARKILIAN_CONTROL_URL", "http://127.0.0.1:1", 1);
   arkilian *db = NULL;
   assert(db_init(&db, "test_mon_trg.db") == 0);
   assert(db_exec(db, "CREATE TABLE a (id INTEGER PRIMARY KEY)") == SQLITE_OK);
@@ -167,7 +167,7 @@ static void test_trigger_coverage_and_resync(void) {
 static void test_health(void) {
   cleanup("test_mon_health.db");
   hermetic_env();
-  setenv("ARKILIAN_CONTROL_URL", "http://127.0.0.1:1", 1);
+  ark_setenv("ARKILIAN_CONTROL_URL", "http://127.0.0.1:1", 1);
   arkilian *db = NULL;
   assert(db_init(&db, "test_mon_health.db") == 0);
 
@@ -184,7 +184,7 @@ static void test_health(void) {
   // soft-paused by the trigger's WHERE clause, so inserts beyond the cap
   // do NOT push more rows into _pending_backup. The application's writes
   // still succeed (spec §0); only capture is gated by the cap.
-  setenv("ARKILIAN_MAX_QUEUE_DEPTH", "10", 1);
+  ark_setenv("ARKILIAN_MAX_QUEUE_DEPTH", "10", 1);
   db_exec(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)");
   for (int i = 0; i < 20; i++) {
     char sql[64];
@@ -198,7 +198,7 @@ static void test_health(void) {
   // single-threaded, so 10 is the upper bound.
   assert(depth >= 1 && depth <= 10);
   assert(db_backup_is_healthy(db) == 0);
-  unsetenv("ARKILIAN_MAX_QUEUE_DEPTH");
+  ark_unsetenv("ARKILIAN_MAX_QUEUE_DEPTH");
 
   // Kill-switch → unhealthy: a green light while nothing ships is a
   // silent failure, and a deliberate disable must be visible.
@@ -218,7 +218,7 @@ static void test_log_callback_captures_init_warning(void) {
   hermetic_env();
   // Backup enabled but NO destination — db_init must emit a loud warning
   // through the (global, pre-handle) log callback.
-  unsetenv("ARKILIAN_CONTROL_URL");
+  ark_unsetenv("ARKILIAN_CONTROL_URL");
   g_captured[0] = '\0';
   g_capture_count = 0;
   db_set_default_log_callback(capture_log, NULL);
@@ -239,7 +239,7 @@ static void test_log_callback_captures_init_warning(void) {
 static void test_log_callback_per_handle(void) {
   cleanup("test_mon_log2.db");
   hermetic_env();
-  setenv("ARKILIAN_CONTROL_URL", "http://127.0.0.1:1", 1);
+  ark_setenv("ARKILIAN_CONTROL_URL", "http://127.0.0.1:1", 1);
   arkilian *db = NULL;
   assert(db_init(&db, "test_mon_log2.db") == 0);
 
@@ -257,7 +257,7 @@ static void test_log_callback_per_handle(void) {
 
 int main(void) {
   signal(SIGPIPE, SIG_IGN);
-  setenv("ARKILIAN_MAX_ATTEMPTS", "3", 1); // fast dead-lettering for tests
+  ark_setenv("ARKILIAN_MAX_ATTEMPTS", "3", 1); // fast dead-lettering for tests
   printf("=== Arkilian Monitoring Tests ===\n\n");
 
   printf("[Metrics]\n");

@@ -9,11 +9,10 @@
 // triggers.
 //
 // Compile (must enable FTS5 — it ships inside the amalgamation):
-//   cc tests/test_virtual_tables.c src/class.c src/deps/sqlite/sqlite3.c \
-//      -Isrc -Isrc/deps/sqlite -lcurl -lpthread \
-//      -DSQLITE_ENABLE_FTS5 -o test_virtual_tables
+//   cc tests/test_virtual_tables.c src/class.c src/deps/sqlite/sqlite3.c -Isrc -Isrc/deps/sqlite -lcurl -lpthread -DSQLITE_ENABLE_FTS5 -o test_virtual_tables
 
 #include "class.h"
+#include "ark_test_env.h"
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -30,11 +29,11 @@ static void cleanup(const char *path) {
 
 static void test_fts5_virtual_table_does_not_break_init(void) {
   cleanup("test_fts.db");
-  setenv("ARKILIAN_ENABLE_BACKUP", "1", 1);
-  setenv("ARKILIAN_API_KEY", "test-key", 1);
-  setenv("ARKILIAN_SKIP_STARTUP_AUTH", "1", 1);
-  setenv("ARKILIAN_CONTROL_URL", "http://127.0.0.1:1", 1);
-  setenv("ARKILIAN_BACKUP_INTERVAL", "3600", 1);
+  ark_setenv("ARKILIAN_ENABLE_BACKUP", "1", 1);
+  ark_setenv("ARKILIAN_API_KEY", "test-key", 1);
+  ark_setenv("ARKILIAN_SKIP_STARTUP_AUTH", "1", 1);
+  ark_setenv("ARKILIAN_CONTROL_URL", "http://127.0.0.1:1", 1);
+  ark_setenv("ARKILIAN_BACKUP_INTERVAL", "3600", 1);
 
   arkilian *db = NULL;
   assert(db_init(&db, "test_fts.db") == 0);

@@ -4,10 +4,10 @@
 // is expanded into literal values before shipping to the WAL.
 //
 // Compile (macOS/Linux):
-//   cc tests/test_deterministic.c src/class.c src/deps/sqlite/sqlite3.c \
-//      -Isrc -Isrc/deps/sqlite -lcurl -lpthread -o test_deterministic
+//   cc tests/test_deterministic.c src/class.c src/deps/sqlite/sqlite3.c -Isrc -Isrc/deps/sqlite -lcurl -lpthread -o test_deterministic
 
 #include "../src/class.h"
+#include "ark_test_env.h"
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -39,10 +39,10 @@ static int tests_passed = 0;
 // ── Helpers ─────────────────────────────────────────────────────────
 
 static arkilian *open_test_db(void) {
-  setenv("ARKILIAN_ENABLE_BACKUP", "0", 1);
-  setenv("ARKILIAN_API_KEY", "test-key", 1);
-  setenv("ARKILIAN_SKIP_STARTUP_AUTH", "1", 1);
-  setenv("ARKILIAN_CONTROL_URL", "http://127.0.0.1:9", 1);
+  ark_setenv("ARKILIAN_ENABLE_BACKUP", "0", 1);
+  ark_setenv("ARKILIAN_API_KEY", "test-key", 1);
+  ark_setenv("ARKILIAN_SKIP_STARTUP_AUTH", "1", 1);
+  ark_setenv("ARKILIAN_CONTROL_URL", "http://127.0.0.1:9", 1);
   arkilian *db = NULL;
   int rc = db_init(&db, TEST_DB);
   ASSERT(rc == 0);

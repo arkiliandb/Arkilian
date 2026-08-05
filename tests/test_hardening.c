@@ -12,6 +12,7 @@
 //      caller MUST db_close it (verified — no leak / no UB).
 
 #include "class.h"
+#include "ark_test_env.h"
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -27,10 +28,10 @@ static void cleanup(const char *path) {
 }
 
 static void hermetic_env(void) {
-  setenv("ARKILIAN_ENABLE_BACKUP", "1", 1);
-  setenv("ARKILIAN_BACKUP_INTERVAL", "3600", 1);
-  unsetenv("ARKILIAN_MAX_QUEUE_DEPTH");
-  unsetenv("ARKILIAN_ALLOW_INSECURE");
+  ark_setenv("ARKILIAN_ENABLE_BACKUP", "1", 1);
+  ark_setenv("ARKILIAN_BACKUP_INTERVAL", "3600", 1);
+  ark_unsetenv("ARKILIAN_MAX_QUEUE_DEPTH");
+  ark_unsetenv("ARKILIAN_ALLOW_INSECURE");
 }
 
 static int tests_run = 0, tests_passed = 0;
@@ -47,9 +48,9 @@ static int tests_run = 0, tests_passed = 0;
 static void test_cleartext_non_local_push_url_disables_backup(void) {
   cleanup("test_hard_http.db");
   hermetic_env();
-  setenv("ARKILIAN_API_KEY", "test-key", 1);
-  setenv("ARKILIAN_SKIP_STARTUP_AUTH", "1", 1);
-  setenv("ARKILIAN_CONTROL_URL", "http://example.com", 1);
+  ark_setenv("ARKILIAN_API_KEY", "test-key", 1);
+  ark_setenv("ARKILIAN_SKIP_STARTUP_AUTH", "1", 1);
+  ark_setenv("ARKILIAN_CONTROL_URL", "http://example.com", 1);
 
   arkilian *db = NULL;
   int rc = db_init(&db, "test_hard_http.db");
@@ -67,7 +68,7 @@ static void test_cleartext_non_local_push_url_disables_backup(void) {
 static void test_https_push_url_keeps_backup_enabled(void) {
   cleanup("test_hard_https.db");
   hermetic_env();
-  setenv("ARKILIAN_CONTROL_URL", "https://example.com", 1);
+  ark_setenv("ARKILIAN_CONTROL_URL", "https://example.com", 1);
 
   arkilian *db = NULL;
   assert(db_init(&db, "test_hard_https.db") == 0);
@@ -81,7 +82,7 @@ static void test_https_push_url_keeps_backup_enabled(void) {
 static void test_loopback_cleartart_is_permitted(void) {
   cleanup("test_hard_loopback.db");
   hermetic_env();
-  setenv("ARKILIAN_CONTROL_URL", "http://127.0.0.1:9000", 1);
+  ark_setenv("ARKILIAN_CONTROL_URL", "http://127.0.0.1:9000", 1);
 
   arkilian *db = NULL;
   assert(db_init(&db, "test_hard_loopback.db") == 0);
@@ -96,7 +97,7 @@ static void test_rfc1918_cleartext_is_permitted(void) {
   cleanup("test_hard_rfc1918.db");
   hermetic_env();
   // 192.168.1.100 — RFC1918
-  setenv("ARKILIAN_CONTROL_URL", "http://192.168.1.100:9000", 1);
+  ark_setenv("ARKILIAN_CONTROL_URL", "http://192.168.1.100:9000", 1);
 
   arkilian *db = NULL;
   assert(db_init(&db, "test_hard_rfc1918.db") == 0);
@@ -110,8 +111,8 @@ static void test_rfc1918_cleartext_is_permitted(void) {
 static void test_allow_insecure_opt_in(void) {
   cleanup("test_hard_allow.db");
   hermetic_env();
-  setenv("ARKILIAN_CONTROL_URL", "http://example.com", 1);
-  setenv("ARKILIAN_ALLOW_INSECURE", "1", 1);
+  ark_setenv("ARKILIAN_CONTROL_URL", "http://example.com", 1);
+  ark_setenv("ARKILIAN_ALLOW_INSECURE", "1", 1);
 
   arkilian *db = NULL;
   assert(db_init(&db, "test_hard_allow.db") == 0);
@@ -126,8 +127,8 @@ static void test_allow_insecure_opt_in(void) {
 static void test_max_queue_depth_caps_capture(void) {
   cleanup("test_hard_cap.db");
   hermetic_env();
-  setenv("ARKILIAN_CONTROL_URL", "http://127.0.0.1:1", 1); // refuse to connect
-  setenv("ARKILIAN_MAX_QUEUE_DEPTH", "5", 1);
+  ark_setenv("ARKILIAN_CONTROL_URL", "http://127.0.0.1:1", 1); // refuse to connect
+  ark_setenv("ARKILIAN_MAX_QUEUE_DEPTH", "5", 1);
 
   arkilian *db = NULL;
   assert(db_init(&db, "test_hard_cap.db") == 0);
@@ -150,7 +151,7 @@ static void test_max_queue_depth_caps_capture(void) {
 
   db_close(db);
   cleanup("test_hard_cap.db");
-  unsetenv("ARKILIAN_MAX_QUEUE_DEPTH");
+  ark_unsetenv("ARKILIAN_MAX_QUEUE_DEPTH");
 }
 
 // ── 7. db_init partial-init contract: failure still returns a live handle ─
@@ -159,7 +160,7 @@ static void test_partial_init_handle_must_be_closed(void) {
   // Pointing at a directory that cannot be created forces a sqlite
   // open failure deep in db_init. The contract (class.h) says *db may
   // still be set and the caller MUST db_close it.
-  unsetenv("ARKILIAN_DB_PATH");
+  ark_unsetenv("ARKILIAN_DB_PATH");
   arkilian *db = NULL;
   int rc = db_init(&db, "/nonexistent_dir_xyz/ark/cannot_create.db");
   // rc may be 0 (sqlite often creates parent-less files) or non-zero;
