@@ -24,12 +24,14 @@
 #include <string.h>
 #include "sqlite3.h"
 
-static void usage(void) {
+// Returns the usage exit code (2); does not exit() — callers propagate the
+// return value so MSVC sees the code path as reachable (no C4702).
+static int usage(void) {
   fprintf(stderr,
       "usage: arkilian-dlq <db.sqlite> --count\n"
       "       arkilian-dlq <db.sqlite> --list [--limit N] [--id N]\n"
       "       arkilian-dlq <db.sqlite> --replay [--id N] [--dry-run]\n");
-  exit(2);
+  return 2;
 }
 
 static int open_db(const char *path, sqlite3 **db, int readonly) {
@@ -192,7 +194,7 @@ static int cmd_replay(const char *path, long long only_id, int dry_run) {
 }
 
 int main(int argc, char **argv) {
-  if (argc < 3) usage();
+  if (argc < 3) return usage();
   const char *path = argv[1];
   const char *cmd = argv[2];
   int limit = 0;
@@ -203,12 +205,11 @@ int main(int argc, char **argv) {
     if (strcmp(argv[i], "--limit") == 0 && i + 1 < argc) limit = atoi(argv[++i]);
     else if (strcmp(argv[i], "--id") == 0 && i + 1 < argc) only_id = atoll(argv[++i]);
     else if (strcmp(argv[i], "--dry-run") == 0) dry_run = 1;
-    else usage();
+    else return usage();
   }
 
   if (strcmp(cmd, "--count") == 0) return cmd_count(path);
   if (strcmp(cmd, "--list") == 0) return cmd_list(path, limit, only_id);
   if (strcmp(cmd, "--replay") == 0) return cmd_replay(path, only_id, dry_run);
-  usage();
-  return 2;
+  return usage();
 }
