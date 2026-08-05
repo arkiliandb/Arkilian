@@ -27,8 +27,10 @@ static int tests_passed = 0;
 // ---------------------------------------------------------------------------
 
 static arkilian *open_test_db(void) {
+#ifndef _WIN32
   setenv("ARKILIAN_ENABLE_BACKUP", "0", 1);
   setenv("ARKILIAN_BACKUP_PATH", TEST_BACKUP, 1);
+#endif
   arkilian *db = NULL;
   int rc = db_init(&db, TEST_DB);
   assert(rc == 0 && "db_init failed");
@@ -59,14 +61,18 @@ static void test_init_null_ptr_returns_error(void) {
 }
 
 static void test_init_null_filename_uses_default(void) {
+#ifndef _WIN32
   setenv("ARKILIAN_ENABLE_BACKUP", "0", 1);
   setenv("ARKILIAN_DB_PATH", TEST_DB, 1);
+#endif
   arkilian *db = NULL;
   int rc = db_init(&db, NULL);
   assert(rc == 0);
   assert(db != NULL);
   db_close(db);
+#ifndef _WIN32
   unsetenv("ARKILIAN_DB_PATH");
+#endif
   cleanup_files();
 }
 
