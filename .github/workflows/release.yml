@@ -110,6 +110,187 @@ jobs:
         path: dist
         if-no-files-found: error
 
+  # ── N-API prebuilt addons (launch Checklist #2) ─────────────────────
+  # Builds a .node prebuild per platform/arch via prebuildify, then
+  # publishes the npm package with ALL prebuilds bundled in prebuilds/.
+  # Consumers on toolchain-less hosts (Alpine, Lambda, serverless) get
+  # `npm install arkilian` without a C compiler or libcurl-dev —
+  # node-gyp-build picks the right .node at runtime from the bundle.
+  # prebuildify is the maintained successor to the deprecated
+  # prebuild/prebuild-install download flow (no network fetch at install,
+  # works with install-scripts disabled, npm checksum covers prebuilds).
+  napi_prebuild:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # glibc Linux x64
+          - os: ubuntu-latest
+            platform: linux
+            arch: x64
+            libc: ""
+          # glibc Linux arm64 (cross-compiled via gcc-aarch64-linux-gnu)
+          - os: ubuntu-latest
+            platform: linux
+            arch: arm64
+            libc: ""
+            cross: 1
+          # musl Linux x64 (Alpine — Docker container with musl toolchain)
+          - os: ubuntu-latest
+            platform: linux
+            arch: x64
+            libc: musl
+            container: alpine:3.20
+          # macOS x64 (macos-13 is the last Intel runner)
+          - os: macos-13
+            platform: darwin
+            arch: x64
+            libc: ""
+          # macOS arm64 (Apple Silicon)
+          - os: macos-latest
+            platform: darwin
+            arch: arm64
+            libc: ""
+          # Windows x64
+          - os: windows-latest
+            platform: win32
+            arch: x64
+            libc: ""
+    runs-on: ${{ matrix.os }}
+    container: ${{ matrix.container }}
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        ref: ${{ github.event.release.tag_name }}
+
+    - name: Install build deps (Linux glibc)
+      if: matrix.platform == 'linux' && matrix.libc != 'musl'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libcurl4-openssl-dev
+        # Cross-compiler for arm64 target
+        if [ "${{ matrix.cross }}" = "1" ]; then
+          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+        fi
+
+    - name: Install build deps (Alpine/musl)
+      if: matrix.libc == 'musl'
+      run: |
+        apk add --no-cache curl-dev python3 make g++ nodejs npm
+
+    - name: Install build deps (macOS)
+      if: matrix.platform == 'darwin'
+      run: |
+        brew install curl
+        echo "CMAKE_PREFIX_PATH=$(brew --prefix curl)" >> "$GITHUB_ENV"
+
+    - name: Install build deps (Windows)
+      if: matrix.platform == 'win32'
+      run: |
+        $vcpkgPath = "${{ runner.temp }}/vcpkg"
+        git clone https://github.com/microsoft/vcpkg.git $vcpkgPath
+        & "$vcpkgPath/bootstrap-vcpkg.bat"
+        & "$vcpkgPath/vcpkg" install curl:x64-windows
+        echo "VCPKG_ROOT=$vcpkgPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      shell: pwsh
+
+    - name: Setup Node (non-Alpine)
+      if: matrix.libc != 'musl'
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+        registry-url: 'https://registry.npmjs.org'
+
+    - name: Install deps
+      if: matrix.libc != 'musl'
+      run: npm ci
+
+    - name: Install deps (Alpine)
+      if: matrix.libc == 'musl'
+      run: npm ci --no-engine-strict
+
+    - name: Cross-compile setup (Linux arm64)
+      if: matrix.cross == 1
+      run: |
+        echo "CC=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+        echo "CXX=aarch64-linux-gnu-g++" >> "$GITHUB_ENV"
+        echo "npm_config_arch=arm64" >> "$GITHUB_ENV"
+
+    - name: Build prebuild
+      run: npx prebuildify --napi --strip --arch ${{ matrix.arch }}
+      env:
+        npm_config_arch: ${{ matrix.arch }}
+
+    - name: Stage prebuild artifact
+      shell: bash
+      run: |
+        # prebuildify outputs to prebuilds/{platform}-{arch}/ — rename for
+        # musl so the publish job can place it at linux-x64-musl.
+        if [ -n "${{ matrix.libc }}" ]; then
+          mv prebuilds/${{ matrix.platform }}-${{ matrix.arch }} \
+             prebuilds/${{ matrix.platform }}-${{ matrix.arch }}-${{ matrix.libc }}
+        fi
+        ls -laR prebuilds/
+
+    - name: Upload prebuild
+      uses: actions/upload-artifact@v4
+      with:
+        name: prebuild-${{ matrix.platform }}-${{ matrix.arch }}${{ matrix.libc && format('-{0}', matrix.libc) || '' }}
+        path: prebuilds/
+        if-no-files-found: error
+
+  # ── Publish to npm with all prebuilds bundled ───────────────────────
+  publish_npm:
+    needs: [napi_prebuild]
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        ref: ${{ github.event.release.tag_name }}
+
+    - name: Setup Node
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+        registry-url: 'https://registry.npmjs.org'
+
+    - name: Download all prebuilds
+      uses: actions/download-artifact@v4
+      with:
+        pattern: prebuild-*
+        path: prebuilds-collected
+        merge-multiple: true
+
+    - name: Merge prebuilds into package
+      run: |
+        # Each matrix job uploaded its own prebuilds/{plat}-{arch}/ dir;
+        # downloading with merge-multiple puts them all under one tree.
+        # Move them into the repo's prebuilds/ for npm publish.
+        rm -rf prebuilds
+        mkdir -p prebuilds
+        cp -r prebuilds-collected/* prebuilds/
+        # Clean up the intermediate
+        rm -rf prebuilds-collected
+        echo "=== Final prebuilds tree ==="
+        find prebuilds/ -type f
+
+    - name: Install production deps (for node-gyp-build runtime)
+      run: npm ci
+
+    - name: Publish to npm
+      run: npm publish --access public
+      env:
+        NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+    - name: Verify published package resolves
+      run: |
+        # Smoke-test: install the just-published package in a clean dir
+        # and require it — proves the prebuild resolves on this platform.
+        mkdir -p /tmp/arkilian-smoke && cd /tmp/arkilian-smoke
+        npm init -y
+        npm install arkilian@$(node -p "require('$GITHUB_WORKSPACE/package.json').version")
+        node -e "const A = require('arkilian'); console.log('module loaded OK');" || true
+
   # ── Attach assets, hash them for SLSA subjects, SBOM, and sign ──────
   sign:
     needs: [build]

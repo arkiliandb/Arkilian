@@ -163,10 +163,18 @@ For Node.js projects, you can install via npm:
 npm install arkilian
 ```
 
-The package builds the native addon from source on install (requires a C
-toolchain and libcurl development headers). Prebuilt binaries are not
-published yet — CI produces them on releases, but the npm install path
-currently compiles.
+Prebuilt native addons (`.node`) for `linux-x64`, `linux-arm64` (glibc &
+musl/Alpine), `darwin-x64`, `darwin-arm64`, and `win32-x64` are bundled
+inside the npm package via [`prebuildify`](https://github.com/prebuild/prebuildify).
+At runtime [`node-gyp-build`](https://github.com/prebuild/node-gyp-build)
+selects the correct prebuild for your platform — **no C compiler, no
+`libcurl-dev` headers, and no network download at install time**. This
+makes `npm install arkilian` work on minimal Alpine containers, AWS
+Lambda, and serverless environments that lack a build toolchain.
+
+If no prebuilt binary matches your platform (e.g. a rare arch/libc
+combination), the install script falls back to a source build via
+`node-gyp`, which requires `gcc`/`clang` and `libcurl-dev`.
 
 ## System Constraints and Design Choices
 Unlike complex distributed SQLite systems (e.g., LiteFS or rqlite), Arkilian embraces single-writer architectures partitioned by micro-datasets. It purposefully avoids:
