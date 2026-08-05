@@ -170,6 +170,8 @@ static int cmd_replay(const char *path, long long only_id, int dry_run) {
   }
   if (rc != SQLITE_OK) {
     fprintf(stderr, "replay prepare failed: %s\n", sqlite3_errmsg(db));
+    sqlite3_free(replay_sql);
+    sqlite3_free(cleanup_sql);
     sqlite3_close(db);
     return 1;
   }
@@ -186,6 +188,9 @@ static int cmd_replay(const char *path, long long only_id, int dry_run) {
   int removed = 0;
   if (rc == SQLITE_OK && sqlite3_step(st) == SQLITE_DONE) removed = sqlite3_changes(db);
   sqlite3_finalize(st);
+
+  sqlite3_free(replay_sql);
+  sqlite3_free(cleanup_sql);
 
   printf("replayed %d row(s) to _pending_backup, removed %d from _dead_backup\n",
          replayed, removed);

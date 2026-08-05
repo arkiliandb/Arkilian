@@ -867,8 +867,8 @@ int arkilian_hydrate(const char *db_path,
     sqlite3 *ldb = NULL;
     if (sqlite3_open_v2(db_path, &ldb, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK) {
       pre_local_lsn = read_last_applied_lsn(ldb);
-      sqlite3_close(ldb);
     }
+    sqlite3_close(ldb);
     if (pre_local_lsn > plan.baseline_lsn) {
       fprintf(stderr,
               "arkilian: hydration refused — local DB is at LSN %lld but the "
@@ -908,8 +908,8 @@ int arkilian_hydrate(const char *db_path,
         goto hydrate_done;
       }
       sqlite3_exec(ldb, "ROLLBACK;", NULL, NULL, NULL);
-      sqlite3_close(ldb);
     }
+    sqlite3_close(ldb);
   }
 
   // ── Phase 1: Download baseline snapshot ──
