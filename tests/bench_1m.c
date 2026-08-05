@@ -679,8 +679,8 @@ int main(int argc, char **argv) {
   printf("  "
          "╚════════════════════════════════════════════════════════════════════"
          "══════════╝\n\n");
-  printf("  Operations per test : %'d\n", OPS);
-  printf("  Warmup              : %'d\n", WARMUP);
+  printf("  Operations per test : %d\n", OPS);
+  printf("  Warmup              : %d\n", WARMUP);
   printf("  Schema              : 10 columns (INTEGER PK, TEXT×4, REAL×3, "
          "INTEGER×2)\n");
   printf("  PRAGMAs             : journal_mode=WAL, synchronous=NORMAL,\n");
@@ -727,10 +727,10 @@ int main(int argc, char **argv) {
   sqlite3_finalize(bulk);
   sqlite3_exec(raw, "COMMIT", NULL, NULL, NULL);
   int seed_rows = count_rows(raw);
-  printf("  Seeded: %'d rows\n", seed_rows);
+  printf("  Seeded: %d rows\n", seed_rows);
 
   long mem_after_seed = get_resident_mem_kb();
-  printf("  Memory after seed : %'ld KB\n", mem_after_seed);
+  printf("  Memory after seed : %ld KB\n", mem_after_seed);
 
   // ── Helper: clear table and re-seed N rows for a fresh baseline ──
   // (the bulk insert pattern matches setup above)
