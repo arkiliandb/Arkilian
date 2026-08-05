@@ -285,6 +285,8 @@ if(ARKILIAN_BUILD_TESTS)
             target_link_libraries(test_hydration PRIVATE ${CMAKE_THREAD_LIBS_INIT}
                                   ${CURL_LIBRARIES})
             target_compile_options(test_hydration PRIVATE -UNDEBUG)
+            target_compile_definitions(test_hydration PRIVATE
+                _POSIX_C_SOURCE=200809L _DEFAULT_SOURCE)
             add_test(NAME test_hydration COMMAND test_hydration)
         endif()
 
@@ -305,6 +307,10 @@ if(ARKILIAN_BUILD_TESTS)
         target_compile_definitions(test_dlq PRIVATE
             ARKILIAN_DLQ_BIN="$<TARGET_FILE:arkilian-dlq>")
         target_compile_options(test_dlq PRIVATE -UNDEBUG)
+        if(NOT CMAKE_C_COMPILER_ID MATCHES "MSVC")
+            target_compile_definitions(test_dlq PRIVATE
+                _POSIX_C_SOURCE=200809L _DEFAULT_SOURCE)
+        endif()
         add_test(NAME test_dlq COMMAND test_dlq)
 
         # ── e2e/stress tests that need a live control plane: built but NOT
@@ -318,6 +324,8 @@ if(ARKILIAN_BUILD_TESTS)
             target_link_libraries(test_e2e_stress PRIVATE ${CMAKE_THREAD_LIBS_INIT}
                                   ${CURL_LIBRARIES})
             target_compile_options(test_e2e_stress PRIVATE -UNDEBUG)
+            target_compile_definitions(test_e2e_stress PRIVATE
+                _POSIX_C_SOURCE=200809L _DEFAULT_SOURCE)
 
             add_executable(test_minio_hydrate tests/test_minio_hydrate.c
                            src/hydration.c src/sha256.c src/deps/sqlite/sqlite3.c)
@@ -325,6 +333,8 @@ if(ARKILIAN_BUILD_TESTS)
             target_link_libraries(test_minio_hydrate PRIVATE ${CMAKE_THREAD_LIBS_INIT}
                                   ${CURL_LIBRARIES})
             target_compile_options(test_minio_hydrate PRIVATE -UNDEBUG)
+            target_compile_definitions(test_minio_hydrate PRIVATE
+                _POSIX_C_SOURCE=200809L _DEFAULT_SOURCE)
         endif()
 
         # ── Benchmarks / stress (built, NOT ctest-registered): assert
