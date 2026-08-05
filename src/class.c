@@ -8,6 +8,15 @@
 #ifndef _DEFAULT_SOURCE
 #define _DEFAULT_SOURCE
 #endif
+// macOS <sys/mount.h> (for statfs, used by the network-FS guard in
+// db_init) transitively needs BSD types (u_int/u_short/...) that
+// _POSIX_C_SOURCE hides. _DARWIN_C_SOURCE re-exposes them; it only
+// ADDS Darwin/BSD symbols and must be set before any system include.
+#ifdef __APPLE__
+#ifndef _DARWIN_C_SOURCE
+#define _DARWIN_C_SOURCE
+#endif
+#endif
 
 #include "class.h"
 #include <curl/curl.h>
@@ -27,6 +36,23 @@
 #include <pthread.h>
 #include <strings.h>
 #include <unistd.h>
+#endif
+
+// statfs-based network filesystem detection (NFS/SMB/AFP) for the
+// WAL-incompatibility guard in db_init (Risk #3). BSD/Mac expose
+// f_fstypename; Linux exposes f_type magic numbers. No portable
+// detection on Windows (the network-share hazard is surfaced by the
+// caller if it ever appears).
+#if !defined(_WIN32) && (defined(__APPLE__) || defined(__linux__) || \
+    defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__) || \
+    defined(__DragonFly__))
+#  define ARK_HAVE_STATFS 1
+#  if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || \
+      defined(__NetBSD__) || defined(__DragonFly__)
+#    include <sys/mount.h>
+#  elif defined(__linux__)
+#    include <sys/vfs.h>
+#  endif
 #endif
 
 #include <stdio.h>
@@ -148,6 +174,17 @@ struct arkilian {
   volatile int last_snapshot_heartbeat_sec; // hourly snapshot thread liveness
   ark_log_fn_t log_fn;                  // optional structured log sink
   void *log_ctx;
+
+  // Schema-change authorizer (Risk #1 / spec §1): set when DDL bypasses
+  // our wrapper via the raw handle returned by db_get_handle(). The next
+  // wrapped dispatch (or db_resync_triggers) clears it after re-syncing
+  // the capture triggers. game-thread only; volatile int is atomic on
+  // every supported target (matches the heartbeat convention above).
+  volatile int triggers_dirty;
+  int trigger_sync_in_progress;         // guards authorizer vs our own sync
+  int in_wrapped_dispatch;             // db_exec/db_step in progress: suppress
+                                       // the raw-DDL warning for DDL the wrapper
+                                       // already auto-re-syncs (see on_schema_authorizer)
 };
 
 // ── Helper Prototypes ───────────────────────────────────────────────
@@ -292,7 +329,17 @@ static void ensure_curl_global_init(void) {
 #endif
 }
 
-static void load_env(void) {
+// Apply ./.env at most ONCE per process. load_env is called from every
+// db_init; without a guard it re-injects .env values AFTER the application
+// has unsetenv()'d them (e.g. between two handles in the same process),
+// silently overriding the operator's runtime intent — the process-global
+// env pollution that broke multi-instance isolation (Risk #5). Real
+// environment variables always win on the FIRST load (setenv overwrite=0);
+// after that, the application's runtime setenv / unsetenv IS the live
+// configuration and is respected for every subsequent handle. Runtime
+// ./.env edits mid-process are not re-applied to new handles — use
+// db_backup_set_enabled / db_set_api_key or setenv instead.
+static void load_env_impl(void) {
   FILE *fp = fopen(".env", "r");
   if (!fp) return;
   char line[256];
@@ -319,6 +366,24 @@ static void load_env(void) {
     }
   }
   fclose(fp);
+}
+
+#ifdef _WIN32
+static BOOL CALLBACK load_env_once_w(PINIT_ONCE once, PVOID param, PVOID *ctx) {
+  (void)once; (void)param; (void)ctx;
+  load_env_impl();
+  return TRUE;
+}
+#endif
+
+static void load_env(void) {
+#ifndef _WIN32
+  static pthread_once_t once = PTHREAD_ONCE_INIT;
+  pthread_once(&once, load_env_impl);
+#else
+  static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
+  InitOnceExecuteOnce(&once, load_env_once_w, NULL, NULL);
+#endif
 }
 
 // ── Small Shared Helpers ────────────────────────────────────────────
@@ -533,6 +598,65 @@ static int url_is_allowed_storage(const char *url) {
   }
   return 0;
 }
+
+// (Risk #3) Detect a network filesystem (NFS/SMB/AFP/CIFS) hosting the
+// database. SQLite WAL mode uses a mmap'd <db>-shm file for shared
+// memory; on network mounts the mmap is either rejected (SQLITE_IOERR_LOCK)
+// or, worse, silently produces torn locks and database corruption. A
+// clear local filesystem reads as "not network" (no false positives on
+// the dev/CI platforms); when statfs is unavailable, returns 0 so the
+// existing WAL path is taken unchanged.
+//
+// stat the parent directory of the database (the file may not exist yet
+// at db_init time, but its directory does). Fall back to the current
+// directory if no directory component is present or the parent is the
+// root.
+#ifdef ARK_HAVE_STATFS
+static int fs_is_network(const char *path) {
+  if (!path || !*path) return 0;
+  struct statfs s;
+  if (statfs(path, &s) != 0) {
+    char dir[4096];
+    size_t n = strlen(path);
+    if (n >= sizeof(dir)) n = sizeof(dir) - 1;
+    memcpy(dir, path, n);
+    dir[n] = '\0';
+    char *slash = strrchr(dir, '/');
+    const char *probe = ".";
+    if (slash == dir) probe = "/";
+    else if (slash) { *slash = '\0'; probe = dir; }
+    if (statfs(probe, &s) != 0) return 0; // unknown — do not false-positive
+  }
+#  if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || \
+      defined(__NetBSD__) || defined(__DragonFly__)
+  const char *t = s.f_fstypename;
+  return (strcmp(t, "nfs") == 0 ||
+          strcmp(t, "smbfs") == 0 ||
+          strcmp(t, "smb") == 0 ||
+          strcmp(t, "cifs") == 0 ||
+          strcmp(t, "afpfs") == 0 ||
+          strcmp(t, "webdav") == 0) ? 1 : 0;
+#  elif defined(__linux__)
+  // Magic numbers from linux/magic.h. Cast through unsigned long so the
+  // comparison is sign-safe on 32- and 64-bit targets (the largest value,
+  // 0xFF534D42, does not fit in signed int). Modern SMB2/SMB3 mounts report
+  // CIFS_MAGIC_NUMBER, so the one value covers them.
+  switch ((unsigned long)s.f_type) {
+    case 0x00006969UL: return 1; // NFS_SUPER_MAGIC
+    case 0xFF534D42UL: return 1; // CIFS_MAGIC_NUMBER (cifs / smb2 / smb3)
+    case 0x0000517BUL: return 1; // SMB_SUPER_MAGIC (legacy)
+    default:           return 0;
+  }
+#  else
+  return 0;
+#  endif
+}
+#else
+static int fs_is_network(const char *path) {
+  (void)path;
+  return 0;
+}
+#endif
 
 // ── Trigger Auto-Generator ──────────────────────────────────────────
 
@@ -911,6 +1035,59 @@ static void on_db_update(void *user_data, int op_type, char const *db_name,
   WakeConditionVariable(&db->wake_cond);
   LeaveCriticalSection(&db->wake_mutex);
 #endif
+}
+
+// Schema-change authorizer (Risk #1 / spec §1). DDL executed through
+// db_exec / db_prepare/db_step is already intercepted and re-synced by
+// apply_ddl_capture; DDL run on the raw handle from db_get_handle() (e.g.
+// Prisma/Drizzle/TypeORM/raw sqlite3_exec) bypasses the wrapper and would
+// silently desynchronize the capture triggers — across 5,000 businesses,
+// routine migrations would quietly miss replication. Installed on the
+// primary connection, this observer flags `triggers_dirty` the instant DDL
+// happens so monitoring (db_backup_triggers_dirty) can surface the gap
+// and the operator can repair with db_resync_triggers(). It NEVER blocks
+// (returns SQLITE_OK) and performs no I/O — only an atomic flag store — so
+// it is safe from inside SQLite's prepare/step path. CREATE/DROP TRIGGER
+// actions are deliberately not in the switch (they are our own
+// bookkeeping), and sync_backup_triggers sets trigger_sync_in_progress so
+// the authorizer ignores the internal CREATE TABLE IF NOT EXISTS for the
+// outbox/meta tables.
+static int on_schema_authorizer(void *user_data, int action,
+                                const char *detail1, const char *detail2,
+                                const char *db_name, const char *trigger_name) {
+  (void)detail2; (void)db_name; (void)trigger_name;
+  arkilian *db = (arkilian *)user_data;
+  if (!db) return SQLITE_OK;
+  switch (action) {
+    case SQLITE_CREATE_TABLE:
+    case SQLITE_ALTER_TABLE:
+    case SQLITE_DROP_TABLE:
+      // Only base-table DDL desyncs the row-capture triggers (column
+      // lists / table existence change). Views, indexes, and virtual
+      // tables carry no capture triggers, so their DDL is ignored —
+      // flagging it would only trigger a wasteful no-op resync on the
+      // game thread.
+      if (db->trigger_sync_in_progress) return SQLITE_OK;
+      if (detail1 && is_reserved_table(detail1)) return SQLITE_OK;
+      db->triggers_dirty = 1;
+      // DDL routed through db_exec / db_prepare+db_step is re-synced
+      // automatically by apply_ddl_capture; only DDL that bypassed the
+      // wrapper (raw handle from db_get_handle) leaves the capture stale,
+      // so warn only there. The wrapped path is silent here.
+      if (!db->in_wrapped_dispatch) {
+        ark_log(db, ARK_LOG_WARN,
+                "schema change bypassed the backup wrapper (action=%d, "
+                "object=%s) — likely DDL on the raw handle from "
+                "db_get_handle() (Prisma/Drizzle/TypeORM/raw sqlite3_exec). "
+                "Capture triggers are stale; call db_resync_triggers() "
+                "after the migration to restore realtime backup coverage",
+                action, detail1 ? detail1 : "(null)");
+      }
+      break;
+    default:
+      break;
+  }
+  return SQLITE_OK;
 }
 
 // ── Backup Shipping & Delivery Thread ───────────────────────────────
@@ -1666,26 +1843,49 @@ int db_init(arkilian **db_ptr, const char *filename) {
   // failures are logged, not fatal.
   int capture_ok = 1;
   char *perr = NULL;
-  if (sqlite3_exec(db->handle, "PRAGMA journal_mode=WAL;", NULL, NULL, &perr) != SQLITE_OK) {
-    ark_log(db, ARK_LOG_ERROR, "PRAGMA journal_mode=WAL failed: %s",
-            perr ? perr : "unknown error");
-    sqlite3_free(perr);
-    perr = NULL;
+
+  // (Risk #3) Network-filesystem guard. SQLite WAL mode uses a mmap'd
+  // <db>-shm file that cannot be shared across network mounts (NFS/EFS/
+  // AFP/SMB): locks break with SQLITE_IOERR_LOCK or, worse, silently
+  // corrupt the database. On a network FS, disable capture (backup
+  // visibly off via db_backup_is_healthy) and run in rollback-journal
+  // mode — the application keeps running (spec §0). Local filesystems
+  // always proceed normally (no false positives on dev/CI platforms).
+  int fs_network = fs_is_network(path);
+  if (fs_network) {
+    ark_log(db, ARK_LOG_ERROR,
+            "database path '%s' is on a network filesystem "
+            "(NFS/SMB/AFP/CIFS). SQLite WAL mode uses a mmap'd -shm file "
+            "that does not work across network mounts "
+            "(SQLITE_IOERR_LOCK / silent corruption). Backup capture is "
+            "DISABLED and the database will run in rollback-journal mode; "
+            "the application keeps running. Move the database to a local "
+            "filesystem to enable realtime backup", path);
     capture_ok = 0;
   }
-  if (capture_ok) {
-    // Verify the mode actually took — exec can report OK while the
-    // journal stays rollback-mode on some paths.
-    sqlite3_stmt *jm = NULL;
-    if (sqlite3_prepare_v2(db->handle, "PRAGMA journal_mode", -1, &jm, NULL) == SQLITE_OK &&
-        sqlite3_step(jm) == SQLITE_ROW) {
-      const char *mode = (const char *)sqlite3_column_text(jm, 0);
-      capture_ok = mode && strcmp(mode, "wal") == 0;
+
+  if (!fs_network) {
+    if (sqlite3_exec(db->handle, "PRAGMA journal_mode=WAL;", NULL, NULL, &perr) != SQLITE_OK) {
+      ark_log(db, ARK_LOG_ERROR, "PRAGMA journal_mode=WAL failed: %s",
+              perr ? perr : "unknown error");
+      sqlite3_free(perr);
+      perr = NULL;
+      capture_ok = 0;
     }
-    sqlite3_finalize(jm);
-    if (!capture_ok) {
-      ark_log(db, ARK_LOG_ERROR,
-              "journal mode is not WAL — backup capture disabled");
+    if (capture_ok) {
+      // Verify the mode actually took — exec can report OK while the
+      // journal stays rollback-mode on some paths.
+      sqlite3_stmt *jm = NULL;
+      if (sqlite3_prepare_v2(db->handle, "PRAGMA journal_mode", -1, &jm, NULL) == SQLITE_OK &&
+          sqlite3_step(jm) == SQLITE_ROW) {
+        const char *mode = (const char *)sqlite3_column_text(jm, 0);
+        capture_ok = mode && strcmp(mode, "wal") == 0;
+      }
+      sqlite3_finalize(jm);
+      if (!capture_ok) {
+        ark_log(db, ARK_LOG_ERROR,
+                "journal mode is not WAL — backup capture disabled");
+      }
     }
   }
   {
@@ -1700,6 +1900,9 @@ int db_init(arkilian **db_ptr, const char *filename) {
     // ~15% write-latency cost is the price of not silently losing
     // captured data on power loss. Operators who prioritize throughput
     // over power-loss durability can set ARKILIAN_OUTBOX_DURABLE=0.
+    // These PRAGMAs apply in rollback-journal mode too and are run
+    // unconditionally so the application's durability profile is right
+    // even when capture was disabled by the network-FS guard.
     int outbox_durable = get_env_bool_default("ARKILIAN_OUTBOX_DURABLE", 1);
     const char *sync_pragma = outbox_durable ? "PRAGMA synchronous=FULL;"
                                               : "PRAGMA synchronous=NORMAL;";
@@ -1717,25 +1920,33 @@ int db_init(arkilian **db_ptr, const char *filename) {
         perr = NULL;
       }
     }
-    if (sqlite3_exec(db->backup_db, "PRAGMA journal_mode=WAL;", NULL, NULL, &perr) != SQLITE_OK ||
-        sqlite3_exec(db->backup_db, "PRAGMA synchronous=NORMAL;", NULL, NULL, &perr) != SQLITE_OK) {
-      ark_log(db, ARK_LOG_WARN, "backup connection PRAGMA failed: %s",
-              perr ? perr : "unknown error");
-      sqlite3_free(perr);
-      perr = NULL;
-    }
-    // Snapshot connection: WAL mode needed for concurrent readers; the
-    // synchronous setting matters little (read-only workload).
-    if (sqlite3_exec(db->snapshot_db, "PRAGMA journal_mode=WAL;", NULL, NULL, &perr) != SQLITE_OK) {
-      ark_log(db, ARK_LOG_WARN, "snapshot connection PRAGMA failed: %s",
-              perr ? perr : "unknown error");
-      sqlite3_free(perr);
-      perr = NULL;
+    // WAL on the backup/snapshot connections has the same network-mount
+    // hazard as on the primary; skip it (and let them inherit rollback
+    // journal) when a network filesystem was detected.
+    if (!fs_network) {
+      if (sqlite3_exec(db->backup_db, "PRAGMA journal_mode=WAL;", NULL, NULL, &perr) != SQLITE_OK ||
+          sqlite3_exec(db->backup_db, "PRAGMA synchronous=NORMAL;", NULL, NULL, &perr) != SQLITE_OK) {
+        ark_log(db, ARK_LOG_WARN, "backup connection PRAGMA failed: %s",
+                perr ? perr : "unknown error");
+        sqlite3_free(perr);
+        perr = NULL;
+      }
+      // Snapshot connection: WAL mode needed for concurrent readers; the
+      // synchronous setting matters little (read-only workload).
+      if (sqlite3_exec(db->snapshot_db, "PRAGMA journal_mode=WAL;", NULL, NULL, &perr) != SQLITE_OK) {
+        ark_log(db, ARK_LOG_WARN, "snapshot connection PRAGMA failed: %s",
+                perr ? perr : "unknown error");
+        sqlite3_free(perr);
+        perr = NULL;
+      }
     }
   }
 
   // Register non-blocking update hook
   sqlite3_update_hook(db->handle, on_db_update, db);
+  // Schema-change observer: flag raw-handle DDL so capture desync is
+  // visible (Risk #1 / spec §1). Never blocks, performs no I/O.
+  sqlite3_set_authorizer(db->handle, on_schema_authorizer, db);
 
   // Sync backup triggers. Per spec §0/§1 a capture failure must NEVER
   // prevent the game from starting: log loudly and fall back to the
@@ -1744,13 +1955,19 @@ int db_init(arkilian **db_ptr, const char *filename) {
   // visible instead of silent.
   if (capture_ok) {
     char *trigger_err = NULL;
-    if (sync_backup_triggers(db->handle, &trigger_err) != SQLITE_OK) {
+    db->trigger_sync_in_progress = 1;
+    int sync_rc = sync_backup_triggers(db->handle, &trigger_err);
+    db->trigger_sync_in_progress = 0;
+    if (sync_rc != SQLITE_OK) {
       ark_log(db, ARK_LOG_ERROR,
               "backup trigger sync FAILED — capture disabled: %s",
               trigger_err ? trigger_err : "unknown error");
       capture_ok = 0;
     }
     if (trigger_err) sqlite3_free(trigger_err);
+    // Init sync establishes full coverage: clear any transient dirty flag
+    // the authorizer may have raised before the guard took effect.
+    db->triggers_dirty = 0;
   }
 
   // Internal-schema version check: an outbox written by a NEWER release
@@ -1946,11 +2163,17 @@ sqlite3 *db_get_handle(arkilian *db) { return db ? db->handle : NULL; }
 // are logged loudly and capture of other tables keeps working.
 static void apply_ddl_capture(arkilian *db, const char *sql) {
   char *terr = NULL;
+  db->trigger_sync_in_progress = 1;
   int sync_rc = sync_backup_triggers(db->handle, &terr);
+  db->trigger_sync_in_progress = 0;
   if (sync_rc != SQLITE_OK) {
     snprintf(db->last_error_msg, sizeof(db->last_error_msg),
              "backup trigger sync failed after DDL: %s", terr ? terr : "unknown error");
     ark_log(db, ARK_LOG_ERROR, "%s", db->last_error_msg);
+  } else {
+    // Wrapped DDL re-established full trigger coverage: a previously-
+    // flagged raw-handle desync is now repaired too.
+    db->triggers_dirty = 0;
   }
   if (terr) sqlite3_free(terr);
 
@@ -1976,7 +2199,13 @@ int db_exec(arkilian *db, const char *sql) {
   if (!db || !db->handle || !sql) return SQLITE_ERROR;
 
   char *errmsg = NULL;
+  // Mark this as a wrapped dispatch so the schema authorizer knows the
+  // DDL (if any) will be auto-re-synced by apply_ddl_capture below — it
+  // stays silent and lets the wrapper handle it, instead of warning about
+  // a bypass that did not happen.
+  db->in_wrapped_dispatch = 1;
   int rc = sqlite3_exec(db->handle, sql, NULL, NULL, &errmsg);
+  db->in_wrapped_dispatch = 0;
   if (rc != SQLITE_OK) {
     if (errmsg) {
       strncpy(db->last_error_msg, errmsg, sizeof(db->last_error_msg) - 1);
@@ -2070,14 +2299,20 @@ static sqlite3_stmt *get_current_stmt(arkilian *db) {
 int db_step(arkilian *db) {
   sqlite3_stmt *stmt = get_current_stmt(db);
   if (!stmt) return SQLITE_ERROR;
+  // Mask DDL-through-step as wrapped so the authorizer suppresses its
+  // bypass warning (apply_ddl_capture below re-syncs it). Non-DDL steps
+  // never raise a DDL action, so the flag is harmless for them.
+  int is_ddl = (db->stmt_is_ddl &&
+                db->stmt_current >= 0 && db->stmt_current < db->stmt_count &&
+                db->stmt_is_ddl[db->stmt_current]);
+  if (is_ddl) db->in_wrapped_dispatch = 1;
   int rc = sqlite3_step(stmt);
+  if (is_ddl) db->in_wrapped_dispatch = 0;
   // DDL executed through prepare/step used to bypass trigger resync —
   // a table created this way was never captured (spec §1). Resync once
   // the statement completes successfully. The flag check is one
   // load-free branch on the non-DDL hot path.
-  if (rc == SQLITE_DONE && db->stmt_is_ddl &&
-      db->stmt_current >= 0 && db->stmt_current < db->stmt_count &&
-      db->stmt_is_ddl[db->stmt_current]) {
+  if (rc == SQLITE_DONE && is_ddl) {
     const char *raw = sqlite3_sql(stmt);
     apply_ddl_capture(db, raw ? raw : "");
   }
@@ -2492,13 +2727,27 @@ int db_backup_skipped_table_count(arkilian *db) {
 int db_resync_triggers(arkilian *db) {
   if (!db || !db->handle) return SQLITE_ERROR;
   char *err = NULL;
+  db->trigger_sync_in_progress = 1;
   int rc = sync_backup_triggers(db->handle, &err);
+  db->trigger_sync_in_progress = 0;
   if (rc != SQLITE_OK) {
     ark_log(db, ARK_LOG_ERROR, "trigger resync failed: %s",
             err ? err : "unknown error");
+    // resync failed — the schema may still be stale; leave the dirty flag
+    // as-is so monitoring keeps surfacing the gap.
+  } else {
+    db->triggers_dirty = 0;
   }
   if (err) sqlite3_free(err);
   return rc;
+}
+
+// (Risk #1) Whether a raw-handle schema change has desynchronized the
+// capture triggers and is awaiting db_resync_triggers(). Surfaced so
+// monitoring can detect the gap between DDL happening and the operator
+// repairing it (or the next wrapped dispatch auto-repairing).
+int db_backup_triggers_dirty(arkilian *db) {
+  return (db && db->triggers_dirty) ? 1 : 0;
 }
 
 // ── Hourly Backup Implementation ────────────────────────────────────

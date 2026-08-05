@@ -135,6 +135,15 @@ int db_backup_trigger_coverage(arkilian *db);
 // skipped loudly at sync time). Must be 0 in a fully-backed-up schema —
 // every skipped table is data that never leaves the box.
 int db_backup_skipped_table_count(arkilian *db);
+// (Risk #1) Returns 1 when a raw-handle schema change (DDL via
+// db_get_handle()) has desynchronized the capture triggers and the
+// outbox is awaiting a db_resync_triggers(); 0 when triggers are in
+// sync. The instant DDL happens the schema authorizer raises this; the
+// next wrapped dispatch that calls apply_ddl_capture, or an explicit
+// db_resync_triggers(), clears it. db_backup_trigger_coverage() catches
+// the same gap after the fact; this signal is the proactive detection
+// at the moment of the migration.
+int db_backup_triggers_dirty(arkilian *db);
 // 1 when the backup subsystem is healthy: backup enabled, a push
 // destination configured, flush thread alive, and queue depth below
 // ARKILIAN_MAX_QUEUE_DEPTH (default 100000). 0 otherwise — including

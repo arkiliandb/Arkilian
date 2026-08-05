@@ -326,9 +326,18 @@ static void test_sync_success_leaves_errmsg_clean(void) {
 
 static void test_no_destination_rows_survive(void) {
   cleanup("test_reg_nodest.db");
-  unsetenv("ARKILIAN_CONTROL_URL");
+  // An EXPLICITLY EMPTY control URL — not a missing one — is "no
+  // destination" in a way that survives the ./.env file the repo ships
+  // (load_env only sets a key when getenv returns NULL; "" is non-NULL so
+  // .env cannot override it). This was the root cause of the Task-27
+  // failure: a prior test set the URL, this test unsetenv()'d it, but
+  // db_init's load_env re-injected it from ./.env → push_url became
+  // non-empty → the flush thread shipped and incremented attempts,
+  // breaking the assert that none were attempted.
+  setenv("ARKILIAN_CONTROL_URL", "", 1);
   setenv("ARKILIAN_ENABLE_BACKUP", "1", 1);
   setenv("ARKILIAN_BACKUP_INTERVAL", "3600", 1);
+  setenv("ARKILIAN_SKIP_STARTUP_AUTH", "1", 1);
   arkilian *db = NULL;
   assert(db_init(&db, "test_reg_nodest.db") == 0);
   assert(db_exec(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)") == SQLITE_OK);
@@ -485,6 +494,67 @@ static void test_dead_letter_zombie_cleared(void) {
   cleanup("test_reg_zombie.db");
 }
 
+// ── Raw-handle DDL flags dirty & resync repairs (Risk #1) ───────────
+//
+// DDL through db_exec / db_prepare is intercepted and re-synced. DDL run
+// on the raw handle from db_get_handle() (Prisma/Drizzle/raw sqlite3_exec)
+// bypasses the wrapper; the schema authorizer must flag it so monitoring
+// surfaces the desync, and db_resync_triggers() must repair coverage.
+
+static void test_ddl_via_raw_handle_flags_dirty(void) {
+  arkilian *db = open_db("test_reg_dirty.db");
+
+  // Wrapped DDL: the authorizer fires during CREATE, but apply_ddl_capture
+  // re-syncs and clears the dirty flag — coverage is full and dirty is 0.
+  assert(db_exec(db, "CREATE TABLE wrapped (id INTEGER PRIMARY KEY, v TEXT)") == SQLITE_OK);
+  assert(db_backup_trigger_coverage(db) == 0);
+  assert(db_backup_triggers_dirty(db) == 0);
+
+  // Raw-handle DDL bypasses the wrapper → the authorizer flags dirty.
+  // The new table has NO triggers, so coverage reports the 3-trigger gap.
+  sqlite3 *raw = db_get_handle(db);
+  assert(raw != NULL);
+  assert(sqlite3_exec(raw, "CREATE TABLE raw (id INTEGER PRIMARY KEY, v TEXT)",
+                      NULL, NULL, NULL) == SQLITE_OK);
+  assert(db_backup_triggers_dirty(db) == 1);
+  assert(db_backup_trigger_coverage(db) > 0);
+
+  // An explicit resync repairs coverage and clears the dirty flag.
+  assert(db_resync_triggers(db) == SQLITE_OK);
+  assert(db_backup_trigger_coverage(db) == 0);
+  assert(db_backup_triggers_dirty(db) == 0);
+
+  db_close(db);
+  cleanup("test_reg_dirty.db");
+}
+
+// ── Local filesystem NOT flagged as network (Risk #3) ──────────────
+//
+// The network-filesystem guard must NOT false-positive on the local
+// storage the dev/CI suite runs on — otherwise capture would be silently
+// disabled. Backup-enabled init + a captured table with full coverage is
+// the guard.
+
+static void test_local_fs_capture_not_disabled(void) {
+  cleanup("test_reg_fstype.db");
+  // Explicit empty URL: no destination, no background shipping, yet backup
+  // stays "enabled" (capture runs; the flush loop just has nowhere to ship).
+  setenv("ARKILIAN_ENABLE_BACKUP", "1", 1);
+  setenv("ARKILIAN_CONTROL_URL", "", 1);
+  setenv("ARKILIAN_SKIP_STARTUP_AUTH", "1", 1);
+  setenv("ARKILIAN_API_KEY", "test-key", 1);
+  setenv("ARKILIAN_BACKUP_INTERVAL", "3600", 1);
+  arkilian *db = NULL;
+  assert(db_init(&db, "test_reg_fstype.db") == 0);
+  // capture_ok stayed 1 → backup not force-disabled by a false FS positive.
+  assert(db_backup_is_enabled(db) == 1);
+  assert(db_exec(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)") == SQLITE_OK);
+  assert(db_backup_trigger_coverage(db) == 0); // 1 captured table, 3 triggers
+  assert(db_backup_triggers_dirty(db) == 0);   // wrapped DDL auto-repaired
+  db_close(db);
+  cleanup("test_reg_fstype.db");
+}
+
 // ── Main ────────────────────────────────────────────────────────────
 
 int main(void) {
@@ -526,6 +596,12 @@ int main(void) {
 
   printf("\n[Dead-Letter Hygiene]\n");
   RUN_TEST(test_dead_letter_zombie_cleared);
+
+  printf("\n[Schema Desync Detection]\n");
+  RUN_TEST(test_ddl_via_raw_handle_flags_dirty);
+
+  printf("\n[Filesystem Guard]\n");
+  RUN_TEST(test_local_fs_capture_not_disabled);
 
   printf("\n=== Results: %d/%d passed ===\n", tests_passed, tests_run);
   return (tests_passed == tests_run) ? 0 : 1;
