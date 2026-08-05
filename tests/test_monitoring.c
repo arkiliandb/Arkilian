@@ -256,7 +256,9 @@ static void test_log_callback_per_handle(void) {
 // ── Main ────────────────────────────────────────────────────────────
 
 int main(void) {
+#ifndef _WIN32
   signal(SIGPIPE, SIG_IGN);
+#endif
   ark_setenv("ARKILIAN_MAX_ATTEMPTS", "3", 1); // fast dead-lettering for tests
   printf("=== Arkilian Monitoring Tests ===\n\n");
 
