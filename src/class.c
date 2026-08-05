@@ -323,11 +323,11 @@ static long long now_ms_mono(void) {
 // undefined. The once-guard makes db_init idempotent-safe; cleanup is
 // deliberately never called (see the comment at the call site).
 
+#ifndef _WIN32
 static void curl_global_init_once(void) {
   curl_global_init(CURL_GLOBAL_DEFAULT);
 }
-
-#ifdef _WIN32
+#else
 static BOOL CALLBACK curl_global_init_once_w(PINIT_ONCE once, PVOID param, PVOID *ctx) {
   (void)once; (void)param; (void)ctx;
   curl_global_init(CURL_GLOBAL_DEFAULT);

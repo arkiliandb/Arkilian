@@ -243,6 +243,14 @@ if(ARKILIAN_BUILD_TESTS)
             target_link_libraries(${name} PRIVATE ${ARK_TEST_LIBS})
             # Remove -DNDEBUG so assert() stays live even in Release builds.
             target_compile_options(${name} PRIVATE -UNDEBUG)
+            # POSIX feature macros for setenv/unsetenv/clock_gettime under
+            # -Wpedantic -Werror. Test files that already define these in
+            # source (guarded by #ifndef) are unaffected — same value is a
+            # no-op redefinition on GCC/Clang. MSVC doesn't use them.
+            if(NOT CMAKE_C_COMPILER_ID MATCHES "MSVC")
+                target_compile_definitions(${name} PRIVATE
+                    _POSIX_C_SOURCE=200809L _DEFAULT_SOURCE)
+            endif()
             add_test(NAME ${name} COMMAND ${name})
         endfunction()
 
