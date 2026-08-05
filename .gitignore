@@ -85,3 +85,4 @@ test_monitoring
 test_virtual_tables
 build_asan
 build_fix
+build_fix3

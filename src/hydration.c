@@ -239,10 +239,15 @@ static int http_init(HttpReq *r, const char *url, const char *token) {
   // to file://, gopher://, etc. is never followed. The SSRF guard only
   // inspects the INITIAL URL host — redirects must not bypass it to an
   // arbitrary scheme.
+#if CURL_AT_LEAST_VERSION(7, 85, 0)
+  curl_easy_setopt(r->handle, CURLOPT_REDIR_PROTOCOLS_STR, "http,https");
+  curl_easy_setopt(r->handle, CURLOPT_PROTOCOLS_STR, "http,https");
+#else
   curl_easy_setopt(r->handle, CURLOPT_REDIR_PROTOCOLS,
                    (long)(CURLPROTO_HTTP | CURLPROTO_HTTPS));
   curl_easy_setopt(r->handle, CURLOPT_PROTOCOLS,
                    (long)(CURLPROTO_HTTP | CURLPROTO_HTTPS));
+#endif
   // Explicit TLS posture: system defaults are 1/2; setting them explicitly
   // documents intent and protects against a regression patch disabling
   // verification. Hydration URLs come from the (trusted) control plane,
