@@ -300,10 +300,21 @@ void ark_log(arkilian *db, ark_log_level_t level, const char *fmt, ...) {
 }
 
 // Monotonic milliseconds, for heartbeats and latency instrumentation.
+// POSIX uses clock_gettime(CLOCK_MONOTONIC); Windows uses
+// QueryPerformanceCounter (high-resolution, monotonic). Both return a
+// millisecond value suitable for heartbeat age computation.
 static long long now_ms_mono(void) {
+#ifndef _WIN32
   struct timespec ts;
   clock_gettime(CLOCK_MONOTONIC, &ts);
   return (long long)ts.tv_sec * 1000LL + ts.tv_nsec / 1000000LL;
+#else
+  static LARGE_INTEGER freq = {0};
+  if (freq.QuadPart == 0) QueryPerformanceFrequency(&freq);
+  LARGE_INTEGER count;
+  QueryPerformanceCounter(&count);
+  return (long long)(count.QuadPart * 1000LL / freq.QuadPart);
+#endif
 }
 
 // ── libcurl one-time global init ────────────────────────────────────
