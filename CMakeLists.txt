@@ -351,16 +351,14 @@ if(ARKILIAN_BUILD_TESTS)
             target_link_libraries(bench_1m PRIVATE ${ARK_TEST_LIBS})
             target_compile_definitions(bench_1m PRIVATE ${ARKILIAN_SQLITE_DEFS})
             target_compile_options(bench_1m PRIVATE -UNDEBUG)
-            target_compile_definitions(bench_1m PRIVATE
-                _POSIX_C_SOURCE=200809L _DEFAULT_SOURCE)
+            target_compile_definitions(bench_1m PRIVATE ${ARK_POSIX_DEFS})
 
             add_executable(stress_200m tests/stress_200m.c
                            src/class.c src/deps/sqlite/sqlite3.c)
             target_include_directories(stress_200m PRIVATE src src/deps/sqlite)
             target_link_libraries(stress_200m PRIVATE ${CMAKE_THREAD_LIBS_INIT}
                                   ${CURL_LIBRARIES} m)
-            target_compile_definitions(stress_200m PRIVATE
-                _POSIX_C_SOURCE=200809L _DEFAULT_SOURCE)
+            target_compile_definitions(stress_200m PRIVATE ${ARK_POSIX_DEFS})
             target_compile_options(stress_200m PRIVATE -UNDEBUG)
         endif()
     endif()
