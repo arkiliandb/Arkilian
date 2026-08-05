@@ -16,7 +16,7 @@
 // re-queued rows are removed from _dead_backup.
 //
 // Compile (macOS/Linux):
-//   cc tools/arkilian-dlq.c src/deps/sqlite/sqlite3.c \
+//   cc tools/arkilian-dlq.c src/deps/sqlite/sqlite3.c
 //      -Isrc/deps/sqlite -o arkilian-dlq
 
 #include <stdio.h>
