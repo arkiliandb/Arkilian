@@ -5,10 +5,11 @@
   "main": "index.js",
   "type": "module",
   "scripts": {
-    "install": "node-gyp configure && node-gyp build",
+    "install": "node-gyp-build || node-gyp configure && node-gyp build",
     "build": "node-gyp configure && node-gyp build",
     "clean": "node-gyp clean",
-    "test": "node test.js"
+    "test": "node test.js",
+    "prebuildify": "prebuildify --napi --strip"
   },
   "keywords": [
     "sqlite",
@@ -26,17 +27,20 @@
     "url": "https://github.com/CodeDynasty-dev/birth-of-Arkilian.git"
   },
   "dependencies": {
-    "node-addon-api": "^8.0.0"
+    "node-addon-api": "^8.0.0",
+    "node-gyp-build": "^4.8.4"
   },
   "devDependencies": {
-    "node-gyp": "^10.0.0"
+    "node-gyp": "^10.0.0",
+    "prebuildify": "^6.1.0"
   },
-  "gypfile": true,
+  "gypfile": false,
   "files": [
     "index.js",
     "binding.gyp",
     "LICENSE",
     "README.md",
+    "prebuilds/",
     "src/class.c",
     "src/class.h",
     "src/arkilian.cc",

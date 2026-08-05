@@ -124,10 +124,17 @@ static int cmd_replay(const char *path, long long only_id, int dry_run) {
     return 1;
   }
 
-  const char *where = only_id > 0 ? "AND id = ?" : "";
+  // Two filter fragments: the replay SELECT has no WHERE clause, so it
+  // needs the "WHERE" form; count_sql and cleanup_sql already have a
+  // WHERE clause, so they take the "AND" form. Using "AND" for the replay
+  // SELECT produced "FROM _dead_backup AND id = ?" — a SQL syntax error
+  // that broke `--replay --id N` entirely (regression caught at launch
+  // verification). Verified before/after with the test_dlq suite.
+  const char *where_replay = only_id > 0 ? " WHERE id = ?" : "";
+  const char *where_extra  = only_id > 0 ? " AND id = ?" : "";
   char *count_sql = sqlite3_mprintf(
       "SELECT COUNT(*) FROM _dead_backup "
-      "WHERE id NOT IN (SELECT id FROM _pending_backup) %s", where);
+      "WHERE id NOT IN (SELECT id FROM _pending_backup) %s", where_extra);
 
   if (dry_run) {
     sqlite3_stmt *cst = NULL;
@@ -136,6 +143,7 @@ static int cmd_replay(const char *path, long long only_id, int dry_run) {
     if (rc == SQLITE_OK && only_id > 0) sqlite3_bind_int64(cst, 1, only_id);
     if (rc == SQLITE_OK && sqlite3_step(cst) == SQLITE_ROW) would = sqlite3_column_int(cst, 0);
     sqlite3_finalize(cst);
+    sqlite3_free(count_sql);
     printf("%d row(s) would be replayed\n", would);
     sqlite3_close(db);
     return 0;
@@ -144,11 +152,11 @@ static int cmd_replay(const char *path, long long only_id, int dry_run) {
 
   char *replay_sql = sqlite3_mprintf(
       "INSERT OR IGNORE INTO _pending_backup (id, payload, attempts, created_at) "
-      "SELECT id, payload, 0, created_at FROM _dead_backup %s", where);
+      "SELECT id, payload, 0, created_at FROM _dead_backup%s", where_replay);
   char *cleanup_sql = sqlite3_mprintf(
       "DELETE FROM _dead_backup WHERE id IN ("
       "  SELECT id FROM _pending_backup WHERE id IN (SELECT id FROM _dead_backup)) %s",
-      where);
+      where_extra);
 
   sqlite3_stmt *st = NULL;
   int rc;

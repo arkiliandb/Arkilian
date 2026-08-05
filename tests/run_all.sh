@@ -42,6 +42,22 @@ run_hydration() {
   rm -f test_hydration
 }
 
+# Dead-letter queue tool + its regression suite (launch Checklist #5).
+# The tool is standalone (SQLite only — no libcurl), so the build is cheap
+# and works on toolchain-less hosts. The test invokes the binary via
+# system() and asserts the recovery runbook's commands.
+run_dlq() {
+  echo "── arkilian-dlq (build) ──"
+  cc -O2 -Wall -Wextra -Wpedantic -Werror tools/arkilian-dlq.c \
+     src/deps/sqlite/sqlite3.c -Isrc/deps/sqlite -o arkilian-dlq
+  echo "── test_dlq ──"
+  cc -O2 -Wall -Wextra tests/test_dlq.c src/deps/sqlite/sqlite3.c \
+     -Isrc/deps/sqlite -lpthread \
+     -DARKILIAN_DLQ_BIN='"./arkilian-dlq"' -o test_dlq
+  ./test_dlq
+  rm -f arkilian-dlq test_dlq
+}
+
 run      test_basic           tests/test_basic.c
 run      test_interception    tests/test_interception.c
 run      test_regressions     tests/test_regressions.c
@@ -53,6 +69,7 @@ run      test_virtual_tables  tests/test_virtual_tables.c
 run      test_deterministic   tests/test_deterministic.c
 run      test_hardening       tests/test_hardening.c
 run_hydration
+run_dlq
 
 # Benchmarks: built + run, but they assert correctness internally. Not
 # part of the pass/fail gate (they're too long-running for default CI).

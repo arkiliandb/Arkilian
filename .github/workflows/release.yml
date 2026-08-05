@@ -33,11 +33,13 @@ jobs:
             artifact-dir: build
             shared-lib: libarkilian.so
             static-lib: libarkilian.a
+            dlq-bin: arkilian-dlq
           - os: macos-latest
             suffix: darwin-x64
             artifact-dir: build
             shared-lib: libarkilian.dylib
             static-lib: libarkilian.a
+            dlq-bin: arkilian-dlq
           - os: windows-latest
             suffix: windows-x64
             # MSVC uses a multi-config generator: Release outputs land in
@@ -47,6 +49,7 @@ jobs:
             # Renamed in CMakeLists.txt to avoid clashing with the DLL's
             # import library (which is also arkilian.lib).
             static-lib: arkilian_static.lib
+            dlq-bin: arkilian-dlq.exe
     runs-on: ${{ matrix.os }}
     steps:
     - uses: actions/checkout@v4
@@ -93,6 +96,10 @@ jobs:
         mkdir -p dist
         cp "${{ matrix.artifact-dir }}/${{ matrix.shared-lib }}" dist/ 2>/dev/null || true
         cp "${{ matrix.artifact-dir }}/${{ matrix.static-lib }}" dist/
+        # Dead-letter queue recovery tool (docs/operations.md §3) — built
+        # on every default build, shipped per-platform so operators can run
+        # support without a toolchain (launch Checklist #5).
+        cp "${{ matrix.artifact-dir }}/${{ matrix.dlq-bin }}" dist/ 2>/dev/null || true
         cp src/class.h src/hydration.h src/sha256.h dist/
         ls -la dist/
 

@@ -91,6 +91,16 @@ if(ARKILIAN_BUILD_EXAMPLES)
     endif()
 endif()
 
+# Dead-letter queue recovery tool (docs/operations.md §3). Built on every
+# default build so a CI break is caught early AND the binary is available as
+# a release asset (release.yml stages it). Standalone: only the SQLite
+# amalgamation — no libcurl, no pthread — so it builds on every target,
+# including minimal/Alpine containers and the toolchain-less hosts operators
+# run support from.
+add_executable(arkilian-dlq tools/arkilian-dlq.c src/deps/sqlite/sqlite3.c)
+target_include_directories(arkilian-dlq PRIVATE src/deps/sqlite)
+set_target_properties(arkilian-dlq PROPERTIES C_STANDARD 99)
+
 # Node.js N-API Addon (built via cmake-js)
 option(ARKILIAN_BUILD_NAPI "Build Node.js N-API addon" OFF)
 
@@ -261,6 +271,19 @@ if(ARKILIAN_BUILD_TESTS)
         target_include_directories(test_sha256 PRIVATE src)
         target_compile_options(test_sha256 PRIVATE -UNDEBUG)
         add_test(NAME test_sha256 COMMAND test_sha256)
+
+        # ── DLQ tool recovery tests (launch Checklist #5) ──
+        # Standalone (sqlite3 only — no libcurl/pthread), so it runs on the
+        # MSYS2/MinGW leg too. ARKILIAN_DLQ_BIN points at the just-built
+        # arkilian-dlq target via a generator expression (handles multi-config
+        # MSVC paths correctly).
+        add_executable(test_dlq tests/test_dlq.c src/deps/sqlite/sqlite3.c)
+        target_include_directories(test_dlq PRIVATE src/deps/sqlite)
+        target_link_libraries(test_dlq PRIVATE Threads::Threads)
+        target_compile_definitions(test_dlq PRIVATE
+            ARKILIAN_DLQ_BIN="$<TARGET_FILE:arkilian-dlq>")
+        target_compile_options(test_dlq PRIVATE -UNDEBUG)
+        add_test(NAME test_dlq COMMAND test_dlq)
 
         # ── e2e/stress tests that need a live control plane: built but NOT
         # registered with ctest (they require external services). Compile

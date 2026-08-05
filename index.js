@@ -1,7 +1,13 @@
 import { createRequire } from "node:module";
 
 const require = createRequire(import.meta.url);
-const native = require("./build/Release/arkilian");
+// Runtime resolution via node-gyp-build: picks the prebuilt .node for this
+// platform/arch from the bundled prebuilds/ dir (offline, no compiler),
+// falling back to the build/Release output of a source build. Lets
+// `npm install arkilian` succeed on toolchain-less hosts (Alpine/Lambda/
+// serverless) where the prebuildify-produced .node is bundled — launch
+// Checklist #2.
+const native = require("node-gyp-build")(__dirname);
 
 const SQLITE_OK = 0;
 const SQLITE_ROW = 100;
