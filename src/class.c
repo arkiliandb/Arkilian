@@ -207,9 +207,33 @@ struct arkilian {
                                        // already auto-re-syncs (see on_schema_authorizer)
   volatile int auto_resync_triggers;   // opt-in: resync on next wrapped dispatch
                                        // when triggers_dirty is set (raw-handle DDL users)
-  volatile int capture_paused;         // sticky: set when outbox hits cap (CDC rows
-                                       // are being dropped); cleared on successful
-                                       // snapshot upload (the gap is recovered)
+volatile int capture_paused;         // sticky: set when outbox hits cap (CDC rows
+                                        // are being dropped); cleared on successful
+                                        // snapshot upload (the gap is recovered)
+  // Async startup API-key validation (control-plane SPOF mitigation): the
+  // v1 design validated the API key synchronously on the caller's main
+  // thread inside db_init; if the control plane was unreachable at boot
+  // the backup subsystem was disabled for the ENTIRE process lifetime
+  // (and the flush/snapshot threads were never spawned) — at 5,000 tenants
+  // a brief control-plane outage at deploy time meant 5,000 permanently
+  // unbacked-up databases needing per-tenant operator intervention.
+  //
+  // v2 (this field): db_init enables backup aggressively with the
+  // configured key and starts both background threads. The flush thread,
+  // on its own (asynchronous, non-blocking) startup, runs the validation
+  // once against the control plane before its first drain cycle. States:
+  //   0 = PENDING   (validation not yet attempted from the flush thread)
+  //   1 = VALIDATED (control plane confirmed the key; shipping proceeds)
+  //   2 = DISABLED  (validation failed: bad key OR control plane down).
+  //                   The flush thread atomically clears backup_enabled so
+  //                   NO new rows ship, capture keeps queuing locally, the
+  //                   operator re-enables via db_backup_set_enabled(1)
+  //                   once the control plane returns; db_backup_is_healthy()
+  //                   surfaces the disabled state via monitoring — never a
+  //                   silent failure, and never a permanent one.
+  // Cross-thread accesses go through ARK_LOAD/ARK_STORE. Set to 0 by
+  // db_init (the default); set to 1 or 2 by run_wal_flush's first cycle.
+  volatile int startup_auth_state;
 };
 
 // ── Helper Prototypes ───────────────────────────────────────────────
@@ -1679,6 +1703,58 @@ void *run_wal_flush(void *arg) {
     if (backoff_s < 60) backoff_s *= 2;
   }
 
+  // Async startup API-key validation (control-plane SPOF mitigation, see
+  // struct arkilian.startup_auth_state): db_init no longer blocks the
+  // caller's main thread on validate_api_key — instead the flush thread
+  // validates the key here, before its first drain cycle. This runs ONCE
+  // per process. While startup_auth_state == 0 (PENDING), backup_enabled
+  // stays as configured (typically 1) and rows accumulate in
+  // _pending_backup; if validation eventually FAILS the loop below
+  // atomically clears backup_enabled so no rows ship, capture keeps
+  // queuing, and the operator re-enables via db_backup_set_enabled(1)
+  // once the control plane returns. A successful validation lets
+  // shipping proceed normally. Either way the app's main thread was
+  // never blocked, the threads are alive, and the failure is observable
+  // via db_backup_is_healthy() — never silent, never permanent.
+  //
+  // Validation is retried with backoff up to ARKILIAN_STARTUP_AUTH_RETRIES
+  // times (default 3) so a brief control-plane outage at boot is fully
+  // transparent: by the time the operator sees the dashboard, the flush
+  // thread has likely re-validated successfully and is shipping already.
+  if (ARK_LOAD(&db->startup_auth_state) == 0 && ARK_LOAD(&db->backup_enabled)) {
+    int retries = get_env_int_default("ARKILIAN_STARTUP_AUTH_RETRIES", 3);
+    if (retries < 0) retries = 0;
+    int validated = 0;
+    for (int attempt = 0; attempt <= retries && !ARK_LOAD(&db->shutdown_requested); attempt++) {
+      char *key_copy = api_key_snapshot(db);   // snapshot the key under its mutex
+      if (!key_copy || strlen(key_copy) == 0) {
+        free(key_copy);
+        break;                              // nothing to validate → leave PENDING
+      }
+      validated = validate_api_key(db, db->control_url, key_copy);
+      free(key_copy);
+      if (validated) break;
+      if (attempt < retries && !ARK_LOAD(&db->shutdown_requested)) {
+        int wait_s = 2 << attempt;          // 2s, 4s, 8s exponential backoff
+        if (wait_s > 30) wait_s = 30;
+        if (sleep_interruptible(db, wait_s)) break;
+      }
+    }
+    if (validated) {
+      ARK_STORE(&db->startup_auth_state, 1);
+      ark_log(db, ARK_LOG_INFO, "API key validated against control plane (async)");
+    } else {
+      ARK_STORE(&db->startup_auth_state, 2);
+      ARK_STORE(&db->backup_enabled, 0);
+      ark_log(db, ARK_LOG_ERROR,
+              "async startup API key validation failed after %d attempt(s) — "
+              "backup DISABLED. Capture keeps queuing locally; re-enable with "
+              "db_backup_set_enabled(1) once the control plane is reachable. "
+              "Verify ARKILIAN_API_KEY and ARKILIAN_CONTROL_URL",
+              retries + 1);
+    }
+  }
+
   // One CURL handle for every ship in this thread: reset (not cleanup)
   // between rows keeps the TCP/TLS connection pool alive — the
   // difference between ~3 rows/sec and thousands over a WAN. Created
@@ -1884,21 +1960,18 @@ int db_init(arkilian **db_ptr, const char *filename) {
   // is back.
   //
   // ARKILIAN_SKIP_STARTUP_AUTH=1 bypasses the validation for test
-  // environments that have no running control plane. In production this
-  // MUST NOT be set — the validation is the client's only guarantee
-  // that the API key is accepted before it starts shipping data.
+  // environments that have no running control plane. In production,
+  // validation now runs ASYNCHRONOUSLY from the flush thread (not
+  // synchronously here on the caller's main thread): db_init enables
+  // backup eagerly with the configured key and starts both background
+  // threads, so a control-plane outage at boot no longer permanently
+  // disables backup for the process lifetime (the v1 failure mode that
+  // broke 5,000 tenants on deploy). The flush thread's first cycle calls
+  // validate_api_key via run_wal_flush's async startup hook; a failed
+  // async validation clears backup_enabled + alerts via the standard
+  // monitoring path. See struct arkilian.startup_auth_state.
   int skip_auth = get_env_bool_default("ARKILIAN_SKIP_STARTUP_AUTH", 0);
-  if (db->backup_enabled && !skip_auth) {
-    if (!validate_api_key(db, db->control_url, db->api_key)) {
-      ark_log(db, ARK_LOG_ERROR,
-              "startup API key validation failed — backup DISABLED. "
-              "Verify ARKILIAN_API_KEY is correct and ARKILIAN_CONTROL_URL "
-              "is reachable");
-      ARK_STORE(&db->backup_enabled, 0);
-    } else {
-      ark_log(db, ARK_LOG_INFO, "API key validated against control plane");
-    }
-  }
+  ARK_STORE(&db->startup_auth_state, skip_auth ? 1 : 0);
 
   // libcurl global init must happen before ANY thread calls
   // curl_easy_init — concurrent first use is not thread-safe. The

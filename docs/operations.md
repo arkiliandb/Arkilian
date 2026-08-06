@@ -454,10 +454,15 @@ point of failure when deployed on GCP's managed redundancy:
    ≥ 3, autoscaled to the 500k-RPS ceiling from §10). Behind a regional
    Load Balancer with health-checked backends; a single-zone outage
    reroutes within seconds.
-3. **S3-equivalent object storage** → **GCS** multi-region bucket for
-   snapshots/chunks. Pre-signed URLs (S3) and signed URLs (GCS V4) are
-   both supported; the only client-side change is the storage URL base
-   in the control-plane response.
+3. **S3-equivalent object storage** → **GCS** multi-region bucket,
+   **AWS S3**, or **Cloudflare R2** for snapshots/chunks. All three are
+   S3-compatible for pre-signed URLs and already in the client's SSRF
+   storage allowlist (`class.c:678` amazonaws.com, `:681`
+   storage.googleapis.com, `:687` r2.cloudflarestorage.com). Pre-signed
+   (S3 V4) and signed (GCS V4) URLs are interchangeable on the client
+   because the storage URL comes from the control-plane response. R2
+   users get egress-free replication to R2's edge — a strong fit for the
+   5,000-tenant launch.
 4. **Cross-region failover** → run a replica control plane in a second
    GCP region; DNS-weighted routing. A regional GCP outage is an
    SEV-0, not an Arkilian design defect.
