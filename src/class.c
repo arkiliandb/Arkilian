@@ -1745,11 +1745,13 @@ void *run_wal_flush(void *arg) {
       ark_log(db, ARK_LOG_INFO, "API key validated against control plane (async)");
     } else {
       ARK_STORE(&db->startup_auth_state, 2);
-      ARK_STORE(&db->backup_enabled, 0);
       ark_log(db, ARK_LOG_ERROR,
               "async startup API key validation failed after %d attempt(s) — "
-              "backup DISABLED. Capture keeps queuing locally; re-enable with "
-              "db_backup_set_enabled(1) once the control plane is reachable. "
+              "the control plane may be unreachable or the API key is wrong. "
+              "Capture keeps queuing locally; shipping will resume "
+              "automatically the moment the control plane is reachable "
+              "again — no operator re-enable needed. Monitor "
+              "db_backup_is_healthy() for the liveness signal. "
               "Verify ARKILIAN_API_KEY and ARKILIAN_CONTROL_URL",
               retries + 1);
     }
