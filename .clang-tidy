@@ -1,0 +1,20 @@
+# .clang-tidy
+---
+Checks: >
+  -*,
+  bugprone-*,
+  clang-analyzer-*,
+  misc-*,
+  modernize-*,
+  performance-*,
+  portability-*,
+  readability-*
+
+# Ensure we do not lint vendored dependency headers or test files with strict guidelines
+HeaderFilterRegex: '^src/(class|hydration|sha256)\.h$'
+
+WarningsAsErrors: >
+  bugprone-*,
+  clang-analyzer-*,
+  performance-*,
+  portability-*

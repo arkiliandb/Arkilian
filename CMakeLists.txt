@@ -20,6 +20,15 @@ option(ARKILIAN_BUILD_STATIC "Build static library for embedded use" ON)
 option(ARKILIAN_BUILD_EXAMPLES "Build example programs" ON)
 option(ARKILIAN_BUILD_TESTS "Build test programs" OFF)
 
+# Find clang-tidy for static code analysis
+find_program(CLANG_TIDY_EXE NAMES clang-tidy)
+if(CLANG_TIDY_EXE)
+    message(STATUS "Found clang-tidy: ${CLANG_TIDY_EXE}")
+    set(CMAKE_C_CLANG_TIDY "${CLANG_TIDY_EXE}")
+else()
+    message(WARNING "clang-tidy not found. Static code analysis will be skipped.")
+endif()
+
 # Find CURL
 find_package(CURL REQUIRED)
 

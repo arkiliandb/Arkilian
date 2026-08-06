@@ -37,7 +37,7 @@ jobs:
       if: matrix.os == 'ubuntu-latest'
       run: |
         sudo apt-get update
-        sudo apt-get install -y libcurl4-openssl-dev
+        sudo apt-get install -y libcurl4-openssl-dev clang-tidy
 
     - name: Install Dependencies (Windows)
       if: matrix.os == 'windows-latest'
@@ -74,7 +74,7 @@ jobs:
           - os: ubuntu-latest
             install-deps: |
               sudo apt-get update
-              sudo apt-get install -y libcurl4-openssl-dev
+              sudo apt-get install -y libcurl4-openssl-dev clang-tidy
           - os: macos-latest
             install-deps: |
               brew install curl
@@ -163,7 +163,7 @@ jobs:
     - name: Install Dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y libcurl4-openssl-dev
+        sudo apt-get install -y libcurl4-openssl-dev clang-tidy
 
     - name: Configure CMake
       run: cmake -B build -S . -DCMAKE_BUILD_TYPE=Debug -DARKILIAN_BUILD_EXAMPLES=ON
@@ -187,7 +187,7 @@ jobs:
     - name: Install Dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y libcurl4-openssl-dev
+        sudo apt-get install -y libcurl4-openssl-dev clang-tidy
 
     - name: Configure (ASAN + UBSAN, tests ON)
       run: |
@@ -218,7 +218,7 @@ jobs:
     - name: Install Dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y libcurl4-openssl-dev
+        sudo apt-get install -y libcurl4-openssl-dev clang-tidy
 
     - name: Configure (TSAN, tests ON)
       run: |
