@@ -1,6 +1,16 @@
 import { createRequire } from "node:module";
+import { dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 
 const require = createRequire(import.meta.url);
+// `__dirname` is not defined in ES module scope (package.json sets
+// "type": "module"), so referencing it crashes the entry on load with
+// ERR_AMBIGUOUS_MODULE_SYNTAX on modern Node. `import.meta.dirname` is
+// the ESM equivalent on Node ≥ 20.11; fall back to a fileURLToPath-based
+// derivation to honor the declared engines floor (node >=18). Resolving
+// the native binding path at load time keeps `npm test` and any ESM
+// consumer working on plain `import Arkilian from "arkilian"`.
+const __dirname = import.meta.dirname ?? dirname(fileURLToPath(import.meta.url));
 // Runtime resolution via node-gyp-build: picks the prebuilt .node for this
 // platform/arch from the bundled prebuilds/ dir (offline, no compiler),
 // falling back to the build/Release output of a source build. Lets
