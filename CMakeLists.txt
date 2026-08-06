@@ -64,7 +64,17 @@ endif()
 # practice for vendored amalgamations; future-proofs against
 # SQLite-version-bump warning breakage.
 if(NOT CMAKE_C_COMPILER_ID MATCHES "MSVC")
-    set_source_files_properties(src/deps/sqlite/sqlite3.c PROPERTIES COMPILE_FLAGS -w)
+    set(_sqlite_flags "-w")
+    # SQLite uses mmap'd shared memory (-shm) for WAL index synchronization
+    # internally. TSAN cannot intercept this mmap-based coordination and
+    # reports false data-race positives on every main-thread db_exec vs
+    # flush-thread read. Exempt the amalgamation from thread-sanitizer.
+    # -fno-sanitize=thread is a no-op when TSAN is not enabled, so we apply
+    # it unconditionally on non-MSVC toolchains to avoid brittle flag-string
+    # detection across CMAKE_C_FLAGS, per-config flags, and target options.
+    string(APPEND _sqlite_flags " -fno-sanitize=thread")
+    set_source_files_properties(src/deps/sqlite/sqlite3.c
+        PROPERTIES COMPILE_FLAGS "${_sqlite_flags}")
 endif()
 
 # Shared Library

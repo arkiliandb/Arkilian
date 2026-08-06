@@ -358,9 +358,9 @@ static void *mock_plan_run(void *arg) {
   return NULL;
 }
 
-static void mock_plan_start(mock_plan_server *s) {
+static void mock_plan_start(mock_plan_server *s, long baseline_lsn) {
   memset(s, 0, sizeof(*s));
-  s->baseline_lsn = 3000; // historical default
+  s->baseline_lsn = baseline_lsn;
   s->fd = socket(AF_INET, SOCK_STREAM, 0);
   int one = 1;
   setsockopt(s->fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
@@ -399,7 +399,7 @@ static void mock_plan_stop(mock_plan_server *s) {
 // whose baseline is 3000 — that would silently destroy 2000 LSNs.
 static void test_hydrate_refuses_when_local_is_newer(void) {
   mock_plan_server srv;
-  mock_plan_start(&srv);
+  mock_plan_start(&srv, 3000);
 
   char base[64];
   snprintf(base, sizeof(base), "http://127.0.0.1:%d/v1", srv.port);
@@ -438,8 +438,7 @@ static void test_hydrate_refuses_when_local_is_newer(void) {
 // same point": no chunks to apply, no clamp, no refusal — hydration OK.
 static void test_hydrate_proceeds_when_local_behind(void) {
   mock_plan_server srv;
-  mock_plan_start(&srv);
-  srv.baseline_lsn = 1500; // faithful: snapshot would be at the same LSN
+  mock_plan_start(&srv, 1500);
 
   char base[64];
   snprintf(base, sizeof(base), "http://127.0.0.1:%d/v1", srv.port);
@@ -463,7 +462,7 @@ static void test_hydrate_proceeds_when_local_behind(void) {
 // A live writer on the local DB must block the restore (clobber guard).
 static void test_hydrate_refuses_when_db_locked(void) {
   mock_plan_server srv;
-  mock_plan_start(&srv);
+  mock_plan_start(&srv, 3000);
 
   char base[64];
   snprintf(base, sizeof(base), "http://127.0.0.1:%d/v1", srv.port);
