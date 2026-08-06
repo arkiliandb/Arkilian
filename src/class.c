@@ -632,10 +632,11 @@ static int host_is_local(const char *host) {
 }
   if (strncmp(host, "172.", 4) == 0) {
     unsigned second = 0;
-    // NOLINTNEXTLINE(bugprone-unchecked-string-to-number-conversion,cert-err34-c)
     // sscanf's %u overflow on malformed input yields ULONG_MAX, which the
     // >= 16 && <= 31 range guard rejects — the original value never reaches
-    // a wrong decision branch, so the unchecked-conversion warning is moot.
+    // a wrong decision branch, so bugprone-unchecked-string-to-number-
+    // conversion is moot here.
+    // NOLINTNEXTLINE(bugprone-unchecked-string-to-number-conversion,cert-err34-c)
     if (sscanf(host, "172.%u.", &second) == 1 && second >= 16 && second <= 31) {
       return 1;
 }
@@ -676,10 +677,11 @@ static int host_is_storage_safe(const char *host) {
 }
   if (strncmp(host, "172.", 4) == 0) {
     unsigned second = 0;
-    // NOLINTNEXTLINE(bugprone-unchecked-string-to-number-conversion,cert-err34-c)
     // sscanf's %u overflow on malformed input yields ULONG_MAX, which the
     // >= 16 && <= 31 range guard rejects — the original value never reaches
-    // a wrong decision branch, so the unchecked-conversion warning is moot.
+    // a wrong decision branch, so bugprone-unchecked-string-to-number-
+    // conversion is moot here.
+    // NOLINTNEXTLINE(bugprone-unchecked-string-to-number-conversion,cert-err34-c)
     if (sscanf(host, "172.%u.", &second) == 1 && second >= 16 && second <= 31) {
       return 1;
 }
