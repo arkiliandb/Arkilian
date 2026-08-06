@@ -21,6 +21,22 @@
 #include "class.h"
 #include <curl/curl.h>
 
+// Atomic helpers for cross-thread flags.  These fields are read and
+// written concurrently by multiple threads.  Plain volatile access is
+// not a portable memory model (and is not recognized by TSAN), so we
+// use compiler builtins on GNU-compatible compilers and MSVC
+// interlocked intrinsics on Windows.  All accesses to these flags go
+// through these macros so the access model is consistent everywhere.
+#ifdef _WIN32
+#define ARK_LOAD(ptr)        ((int)_InterlockedExchangeAdd((volatile long*)(ptr), 0L))
+#define ARK_STORE(ptr, val)  ((void)_InterlockedExchange((volatile long*)(ptr), (long)(val)))
+#elif defined(__GNUC__)
+#define ARK_LOAD(ptr)        __atomic_load_n((ptr), __ATOMIC_ACQUIRE)
+#define ARK_STORE(ptr, val)  __atomic_store_n((ptr), (val), __ATOMIC_RELEASE)
+#else
+#error "Unsupported compiler: need atomic load/store primitives"
+#endif
+
 #ifdef _WIN32
 #include <windows.h>
 #ifndef __MINGW32__
@@ -113,6 +129,7 @@ struct arkilian {
   sqlite3 *snapshot_db;       // Dedicated connection (hourly snapshot thread)
   char *db_path;
   int is_open;
+  int sync_initialized;        // 1 once wake/payload/api-key/log mutexes are initialized
   int last_error_code;
   char last_error_msg[256];
 
@@ -154,9 +171,11 @@ struct arkilian {
 #ifdef _WIN32
   CRITICAL_SECTION payload_mutex;
   CRITICAL_SECTION api_key_mutex;
+  CRITICAL_SECTION log_mutex;
 #else
   pthread_mutex_t payload_mutex;
   pthread_mutex_t api_key_mutex; // guards api_key (read/write)
+  pthread_mutex_t log_mutex;     // guards log_fn/log_ctx pair
 #endif
 
   // Transaction state tracking
@@ -167,9 +186,8 @@ struct arkilian {
 
   // Monitoring (spec §9). Seconds-based (not ms): a 32-bit int is never
   // torn on any platform — a 64-bit heartbeat could be read half-written
-  // on 32-bit ARM and cause spurious unhealthy alerts. Writes to the
-  // other shared flags are always done under wake_mutex; reads are
-  // volatile int, which is atomic on every supported target.
+  // on 32-bit ARM and cause spurious unhealthy alerts. All cross-thread
+  // accesses to these fields go through ARK_LOAD/ARK_STORE.
   volatile int last_heartbeat_sec;      // flush thread liveness (monotonic)
   volatile int last_snapshot_heartbeat_sec; // hourly snapshot thread liveness
   ark_log_fn_t log_fn;                  // optional structured log sink
@@ -178,8 +196,7 @@ struct arkilian {
   // Schema-change authorizer (Risk #1 / spec §1): set when DDL bypasses
   // our wrapper via the raw handle returned by db_get_handle(). The next
   // wrapped dispatch (or db_resync_triggers) clears it after re-syncing
-  // the capture triggers. game-thread only; volatile int is atomic on
-  // every supported target (matches the heartbeat convention above).
+  // the capture triggers. game-thread only.
   volatile int triggers_dirty;
   int trigger_sync_in_progress;         // guards authorizer vs our own sync
   int in_wrapped_dispatch;             // db_exec/db_step in progress: suppress
@@ -266,20 +283,49 @@ static void default_log_sink(ark_log_level_t level, const char *msg, void *ctx) 
 }
 
 // Global sink for messages emitted before a handle exists (init-time
-// warnings). Reads are intentionally racy (init-time only); fine for
-// diagnostics.
+// warnings) and as the fallback when a per-handle callback is not set.
 static ark_log_fn_t g_default_log_fn = NULL;
 static void *g_default_log_ctx = NULL;
+#ifndef _WIN32
+static pthread_mutex_t g_log_mutex = PTHREAD_MUTEX_INITIALIZER;
+#define ARK_GLOG_LOCK()   pthread_mutex_lock(&g_log_mutex)
+#define ARK_GLOG_UNLOCK() pthread_mutex_unlock(&g_log_mutex)
+#else
+static CRITICAL_SECTION g_log_mutex;
+static BOOL CALLBACK log_mutex_init_w(PINIT_ONCE once, PVOID param, PVOID *ctx) {
+  (void)once; (void)param; (void)ctx;
+  InitializeCriticalSection(&g_log_mutex);
+  return TRUE;
+}
+static void ensure_log_mutex(void) {
+  static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
+  InitOnceExecuteOnce(&once, log_mutex_init_w, NULL, NULL);
+}
+#define ARK_GLOG_LOCK()   do { ensure_log_mutex(); EnterCriticalSection(&g_log_mutex); } while(0)
+#define ARK_GLOG_UNLOCK() LeaveCriticalSection(&g_log_mutex)
+#endif
+
+#ifdef _WIN32
+#define ARK_LOG_LOCK(db)   EnterCriticalSection(&(db)->log_mutex)
+#define ARK_LOG_UNLOCK(db) LeaveCriticalSection(&(db)->log_mutex)
+#else
+#define ARK_LOG_LOCK(db)   pthread_mutex_lock(&(db)->log_mutex)
+#define ARK_LOG_UNLOCK(db) pthread_mutex_unlock(&(db)->log_mutex)
+#endif
 
 void db_set_default_log_callback(ark_log_fn_t fn, void *ctx) {
+  ARK_GLOG_LOCK();
   g_default_log_fn = fn;
   g_default_log_ctx = ctx;
+  ARK_GLOG_UNLOCK();
 }
 
 void db_set_log_callback(arkilian *db, ark_log_fn_t fn, void *ctx) {
   if (!db) return;
+  ARK_LOG_LOCK(db);
   db->log_fn = fn;
   db->log_ctx = ctx;
+  ARK_LOG_UNLOCK(db);
 }
 
 void ark_log(arkilian *db, ark_log_level_t level, const char *fmt, ...) {
@@ -290,10 +336,23 @@ void ark_log(arkilian *db, ark_log_level_t level, const char *fmt, ...) {
   va_end(ap);
   buf[sizeof(buf) - 1] = '\0';
 
-  if (db && db->log_fn) {
-    db->log_fn(level, buf, db->log_ctx);
-  } else if (g_default_log_fn) {
-    g_default_log_fn(level, buf, g_default_log_ctx);
+  ark_log_fn_t fn = NULL;
+  void *ctx = NULL;
+  if (db) {
+    ARK_LOG_LOCK(db);
+    fn = db->log_fn;
+    ctx = db->log_ctx;
+    ARK_LOG_UNLOCK(db);
+  }
+  if (!fn) {
+    ARK_GLOG_LOCK();
+    fn = g_default_log_fn;
+    ctx = g_default_log_ctx;
+    ARK_GLOG_UNLOCK();
+  }
+
+  if (fn) {
+    fn(level, buf, ctx);
   } else {
     default_log_sink(level, buf, NULL);
   }
@@ -1120,7 +1179,7 @@ static int curl_abort_cb(void *clientp, curl_off_t dltotal, curl_off_t dlnow,
                          curl_off_t ultotal, curl_off_t ulnow) {
   (void)dltotal; (void)dlnow; (void)ultotal; (void)ulnow;
   volatile int *shutdown_flag = (volatile int *)clientp;
-  return (shutdown_flag && *shutdown_flag) ? 1 : 0;
+  return (shutdown_flag && ARK_LOAD(shutdown_flag)) ? 1 : 0;
 }
 
 typedef enum { SHIP_OK = 0, SHIP_RETRY = 1 } ship_result_t;
@@ -1527,24 +1586,24 @@ static int sleep_interruptible(arkilian *db, int seconds) {
   struct timespec ts;
   clock_gettime(CLOCK_REALTIME, &ts);
   ts.tv_sec += seconds;
-  while (!db->shutdown_requested) {
+  while (!ARK_LOAD(&db->shutdown_requested)) {
     pthread_cond_timedwait(&db->wake_cond, &db->wake_mutex, &ts);
     time_t now = time(NULL);
     if (now >= ts.tv_sec) break;
   }
-  int shutdown = db->shutdown_requested;
+  int shutdown = ARK_LOAD(&db->shutdown_requested);
   pthread_mutex_unlock(&db->wake_mutex);
   return shutdown;
 #else
   EnterCriticalSection(&db->wake_mutex);
   DWORD remaining_ms = (DWORD)seconds * 1000;
-  while (!db->shutdown_requested && remaining_ms > 0) {
+  while (!ARK_LOAD(&db->shutdown_requested) && remaining_ms > 0) {
     DWORD start = GetTickCount();
     SleepConditionVariableCS(&db->wake_cond, &db->wake_mutex, remaining_ms);
     DWORD elapsed = GetTickCount() - start;
     remaining_ms = (elapsed >= remaining_ms) ? 0 : remaining_ms - elapsed;
   }
-  int shutdown = db->shutdown_requested;
+  int shutdown = ARK_LOAD(&db->shutdown_requested);
   LeaveCriticalSection(&db->wake_mutex);
   return shutdown;
 #endif
@@ -1576,7 +1635,7 @@ void *run_wal_flush(void *arg) {
   // silently-dead flush thread means writes never leave _pending_backup,
   // discovered only from a growing queue days later.
   int backoff_s = 1;
-  while (!db->shutdown_requested) {
+  while (!ARK_LOAD(&db->shutdown_requested)) {
     if (prepare_outbox_statements(db->backup_db, &select_stmt, &delete_stmt,
                                   &update_attempts_stmt, &dead_letter_stmt)) {
       break;
@@ -1600,10 +1659,10 @@ void *run_wal_flush(void *arg) {
             "flush thread: curl_easy_init failed — shipping disabled");
   }
 
-  while (!db->shutdown_requested && select_stmt && ship_curl) {
+  while (!ARK_LOAD(&db->shutdown_requested) && select_stmt && ship_curl) {
     // Liveness heartbeat (spec §9): the watchdog reads this from another
     // thread; a stale age means the thread died silently.
-    db->last_heartbeat_sec = (int)(now_ms_mono() / 1000);
+    ARK_STORE(&db->last_heartbeat_sec, (int)(now_ms_mono() / 1000));
 
     int drained = 0;
     // Kill-switch check: when backup is disabled — or no destination is
@@ -1614,7 +1673,7 @@ void *run_wal_flush(void *arg) {
     // would still never report success, but the retry/attempts path
     // would dead-letter rows after MAX_ATTEMPTS — which for a missing
     // destination is data destruction, not a transient failure.
-    if (db->backup_enabled && db->push_url && strlen(db->push_url) > 0) {
+    if (ARK_LOAD(&db->backup_enabled) && db->push_url && strlen(db->push_url) > 0) {
       drained = drain_batch(db, ship_curl, select_stmt, delete_stmt,
                             update_attempts_stmt, dead_letter_stmt);
     }
@@ -1626,13 +1685,13 @@ void *run_wal_flush(void *arg) {
     // the queue drains (the snapshot thread clears it on successful upload).
     // One COUNT(*) per poll cycle (~2s) is negligible vs the drain workload.
     if (db_backup_queue_depth(db) >= outbox_cap()) {
-      db->capture_paused = 1;
+      ARK_STORE(&db->capture_paused, 1);
     }
 
     if (!drained) {
 #ifndef _WIN32
       pthread_mutex_lock(&db->wake_mutex);
-      if (!db->wake_flag && !db->shutdown_requested) {
+      if (!db->wake_flag && !ARK_LOAD(&db->shutdown_requested)) {
         struct timespec ts;
         clock_gettime(CLOCK_REALTIME, &ts);
         ts.tv_sec += POLL_INTERVAL_MS / 1000;
@@ -1642,7 +1701,7 @@ void *run_wal_flush(void *arg) {
       pthread_mutex_unlock(&db->wake_mutex);
 #else
       EnterCriticalSection(&db->wake_mutex);
-      if (!db->wake_flag && !db->shutdown_requested) {
+      if (!db->wake_flag && !ARK_LOAD(&db->shutdown_requested)) {
         SleepConditionVariableCS(&db->wake_cond, &db->wake_mutex, POLL_INTERVAL_MS);
       }
       db->wake_flag = 0;
@@ -1672,6 +1731,29 @@ int db_init(arkilian **db_ptr, const char *filename) {
   arkilian *db = malloc(sizeof(arkilian));
   if (!db) return 1;
   memset(db, 0, sizeof(arkilian));
+
+  // Initialize all sync primitives before any logging or configuration
+  // step that could call ark_log() or touch shared state.
+#ifndef _WIN32
+  int init_ok = (pthread_mutex_init(&db->wake_mutex, NULL) == 0) &&
+                (pthread_cond_init(&db->wake_cond, NULL) == 0) &&
+                (pthread_mutex_init(&db->payload_mutex, NULL) == 0) &&
+                (pthread_mutex_init(&db->api_key_mutex, NULL) == 0) &&
+                (pthread_mutex_init(&db->log_mutex, NULL) == 0);
+#else
+  InitializeCriticalSection(&db->wake_mutex);
+  InitializeConditionVariable(&db->wake_cond);
+  InitializeCriticalSection(&db->payload_mutex);
+  InitializeCriticalSection(&db->api_key_mutex);
+  InitializeCriticalSection(&db->log_mutex);
+  int init_ok = 1;
+#endif
+  if (!init_ok) {
+    *db_ptr = NULL;
+    free(db);
+    return 1;
+  }
+  db->sync_initialized = 1;
 
   load_env();
 
@@ -1786,18 +1868,6 @@ int db_init(arkilian **db_ptr, const char *filename) {
       ark_log(db, ARK_LOG_INFO, "API key validated against control plane");
     }
   }
-
-#ifndef _WIN32
-  pthread_mutex_init(&db->wake_mutex, NULL);
-  pthread_cond_init(&db->wake_cond, NULL);
-  pthread_mutex_init(&db->payload_mutex, NULL);
-  pthread_mutex_init(&db->api_key_mutex, NULL);
-#else
-  InitializeCriticalSection(&db->wake_mutex);
-  InitializeConditionVariable(&db->wake_cond);
-  InitializeCriticalSection(&db->payload_mutex);
-  InitializeCriticalSection(&db->api_key_mutex);
-#endif
 
   // libcurl global init must happen before ANY thread calls
   // curl_easy_init — concurrent first use is not thread-safe. The
@@ -2035,7 +2105,7 @@ int db_init(arkilian **db_ptr, const char *filename) {
   }
 
   db->is_open = 1;
-  db->shutdown_requested = 0;
+  ARK_STORE(&db->shutdown_requested, 0);
   *db_ptr = db;
 
   // Start WAL flusher thread. A creation failure must not take the game
@@ -2087,7 +2157,7 @@ void db_close(arkilian *db) {
   // so neither can miss the shutdown signal.
 #ifndef _WIN32
   pthread_mutex_lock(&db->wake_mutex);
-  db->shutdown_requested = 1;
+  ARK_STORE(&db->shutdown_requested, 1);
   db->wake_flag = 1;
   pthread_cond_broadcast(&db->wake_cond);
   pthread_mutex_unlock(&db->wake_mutex);
@@ -2102,7 +2172,7 @@ void db_close(arkilian *db) {
   }
 #else
   EnterCriticalSection(&db->wake_mutex);
-  db->shutdown_requested = 1;
+  ARK_STORE(&db->shutdown_requested, 1);
   db->wake_flag = 1;
   WakeAllConditionVariable(&db->wake_cond);
   LeaveCriticalSection(&db->wake_mutex);
@@ -2149,14 +2219,20 @@ void db_close(arkilian *db) {
   // caller must not race db_close with in-flight DB statements on the
   // game thread — that is UB by contract (see class.h).
 #ifndef _WIN32
-  pthread_mutex_destroy(&db->wake_mutex);
-  pthread_cond_destroy(&db->wake_cond);
-  pthread_mutex_destroy(&db->payload_mutex);
-  pthread_mutex_destroy(&db->api_key_mutex);
+  if (db->sync_initialized) {
+    pthread_mutex_destroy(&db->wake_mutex);
+    pthread_cond_destroy(&db->wake_cond);
+    pthread_mutex_destroy(&db->payload_mutex);
+    pthread_mutex_destroy(&db->api_key_mutex);
+    pthread_mutex_destroy(&db->log_mutex);
+  }
 #else
-  DeleteCriticalSection(&db->wake_mutex);
-  DeleteCriticalSection(&db->payload_mutex);
-  DeleteCriticalSection(&db->api_key_mutex);
+  if (db->sync_initialized) {
+    DeleteCriticalSection(&db->wake_mutex);
+    DeleteCriticalSection(&db->payload_mutex);
+    DeleteCriticalSection(&db->api_key_mutex);
+    DeleteCriticalSection(&db->log_mutex);
+  }
 #endif
 
   if (db->db_path) free(db->db_path);
@@ -2620,7 +2696,7 @@ void db_backup_set_enabled(arkilian *db, int enabled) {
   if (!db) return;
 #ifndef _WIN32
   pthread_mutex_lock(&db->wake_mutex);
-  db->backup_enabled = enabled ? 1 : 0;
+  ARK_STORE(&db->backup_enabled, enabled ? 1 : 0);
   // Wake both threads so the new state is observed immediately (the
   // flush thread drains right away on re-enable instead of waiting out
   // the poll interval).
@@ -2629,7 +2705,7 @@ void db_backup_set_enabled(arkilian *db, int enabled) {
   pthread_mutex_unlock(&db->wake_mutex);
 #else
   EnterCriticalSection(&db->wake_mutex);
-  db->backup_enabled = enabled ? 1 : 0;
+  ARK_STORE(&db->backup_enabled, enabled ? 1 : 0);
   db->wake_flag = 1;
   WakeAllConditionVariable(&db->wake_cond);
   LeaveCriticalSection(&db->wake_mutex);
@@ -2637,7 +2713,7 @@ void db_backup_set_enabled(arkilian *db, int enabled) {
 }
 
 int db_backup_is_enabled(arkilian *db) {
-  return (db && db->backup_enabled) ? 1 : 0;
+  return (db && ARK_LOAD(&db->backup_enabled)) ? 1 : 0;
 }
 
 // ── Monitoring & health (spec §9) ───────────────────────────────────
@@ -2676,7 +2752,7 @@ int db_backup_dead_letter_count(arkilian *db) {
 
 long long db_backup_thread_heartbeat_age_ms(arkilian *db) {
   if (!db) return -1;
-  int hb = db->last_heartbeat_sec;
+  int hb = ARK_LOAD(&db->last_heartbeat_sec);
   if (hb == 0) return -1; // never beat — thread not (yet) running
   long long now = now_ms_mono();
   long long hb_ms = (long long)hb * 1000LL;
@@ -2685,7 +2761,7 @@ long long db_backup_thread_heartbeat_age_ms(arkilian *db) {
 
 long long db_backup_snapshot_heartbeat_age_ms(arkilian *db) {
   if (!db) return -1;
-  int hb = db->last_snapshot_heartbeat_sec;
+  int hb = ARK_LOAD(&db->last_snapshot_heartbeat_sec);
   if (hb == 0) return -1; // never beat — thread not (yet) running
   long long now = now_ms_mono();
   long long hb_ms = (long long)hb * 1000LL;
@@ -2729,7 +2805,7 @@ int db_backup_is_healthy(arkilian *db) {
   // off by an init failure (WAL/trigger setup), or configured without a
   // destination. A green light while nothing is shipping is exactly the
   // silent failure monitoring exists to catch.
-  if (!db->backup_enabled) return 0;
+  if (!ARK_LOAD(&db->backup_enabled)) return 0;
   if (!db->control_url || strlen(db->control_url) == 0) return 0;
   // Flush thread liveness: a 30s threshold covers a 10s ship + margin.
   long long hb_age = db_backup_thread_heartbeat_age_ms(db);
@@ -2818,7 +2894,7 @@ int db_get_auto_resync_triggers(arkilian *db) {
 // for disabled/dest-down/thread-dead/cap); this is the specific "CDC rows
 // are being dropped" signal.
 int db_backup_capture_paused(arkilian *db) {
-  return (db && db->capture_paused) ? 1 : 0;
+  return (db && ARK_LOAD(&db->capture_paused)) ? 1 : 0;
 }
 
 // ── Hourly Backup Implementation ────────────────────────────────────
@@ -2841,20 +2917,29 @@ int backup_database(sqlite3 *pSource, const char *zFilename,
     return rc;
   }
 
-  int retry_count = 0;
+  int busy_retries = 0;
   do {
     // Abort promptly on shutdown: without this check, a persistent
-    // SQLITE_BUSY could hold db_close() for up to 6000×100ms (10
+    // SQLITE_BUSY could hold db_close() for up to 6000x100ms (10
     // minutes) waiting to join this thread.
-    if (shutdown_flag && *shutdown_flag) {
+    if (shutdown_flag && ARK_LOAD(shutdown_flag)) {
       rc = SQLITE_ABORT;
       break;
     }
     rc = sqlite3_backup_step(pBackup, 5);
-    if (rc == SQLITE_OK || rc == SQLITE_BUSY || rc == SQLITE_LOCKED) {
-      if (rc != SQLITE_OK) sqlite3_sleep(100);
+    if (rc == SQLITE_BUSY || rc == SQLITE_LOCKED) {
+      if (++busy_retries >= 6000) {
+        rc = SQLITE_BUSY;
+        break;
+      }
+      sqlite3_sleep(100);
     }
-  } while ((rc == SQLITE_OK || rc == SQLITE_BUSY || rc == SQLITE_LOCKED) && ++retry_count < 6000);
+  } while (rc == SQLITE_OK || rc == SQLITE_BUSY || rc == SQLITE_LOCKED);
+
+  // Defensive check: a successful backup must report DONE with no pages left.
+  if (rc == SQLITE_DONE && sqlite3_backup_remaining(pBackup) != 0) {
+    rc = SQLITE_ERROR;
+  }
 
   int finish_rc = sqlite3_backup_finish(pBackup);
   if (finish_rc != SQLITE_OK && rc == SQLITE_DONE) rc = finish_rc;
@@ -2866,12 +2951,12 @@ int backup_database(sqlite3 *pSource, const char *zFilename,
 struct Memory {
   char *response;
   size_t size;
-  int *shutdown_flag;
+  volatile int *shutdown_flag;
 };
 
 static size_t write_cb(void *data, size_t size, size_t nmemb, void *userp) {
   struct Memory *mem = (struct Memory *)userp;
-  if (mem->shutdown_flag && *(mem->shutdown_flag)) return 0;
+  if (mem->shutdown_flag && ARK_LOAD(mem->shutdown_flag)) return 0;
   size_t realsize = size * nmemb;
   char *ptr = realloc(mem->response, mem->size + realsize + 1);
   if (!ptr) return 0;
@@ -2883,7 +2968,7 @@ static size_t write_cb(void *data, size_t size, size_t nmemb, void *userp) {
 }
 
 static char *get_signed_url(arkilian *db, const char *api_endpoint,
-                           const char *token, int *shutdown_flag) {
+                           const char *token, volatile int *shutdown_flag) {
   CURL *curl = curl_easy_init();
   struct Memory chunk;
   chunk.response = malloc(1);
@@ -3096,7 +3181,7 @@ void *run_hourly_backup(void *arg) {
   while (1) {
 #ifndef _WIN32
     pthread_mutex_lock(&db->wake_mutex);
-    while (!db->shutdown_requested) {
+    while (!ARK_LOAD(&db->shutdown_requested)) {
       time_t now = time(NULL);
       if (now >= next_backup) break;
       struct timespec ts;
@@ -3104,17 +3189,17 @@ void *run_hourly_backup(void *arg) {
       ts.tv_nsec = 0;
       pthread_cond_timedwait(&db->wake_cond, &db->wake_mutex, &ts);
     }
-    int shutdown = db->shutdown_requested;
+    int shutdown = ARK_LOAD(&db->shutdown_requested);
     pthread_mutex_unlock(&db->wake_mutex);
 #else
     EnterCriticalSection(&db->wake_mutex);
-    while (!db->shutdown_requested) {
+    while (!ARK_LOAD(&db->shutdown_requested)) {
       time_t now = time(NULL);
       if (now >= next_backup) break;
       DWORD remaining_ms = (DWORD)((next_backup - now) * 1000);
       SleepConditionVariableCS(&db->wake_cond, &db->wake_mutex, remaining_ms);
     }
-    int shutdown = db->shutdown_requested;
+    int shutdown = ARK_LOAD(&db->shutdown_requested);
     LeaveCriticalSection(&db->wake_mutex);
 #endif
 
@@ -3124,13 +3209,13 @@ void *run_hourly_backup(void *arg) {
     // Kill-switch check: skip the snapshot + upload entirely while
     // disabled. The interval still advances so re-enabling resumes on
     // the normal schedule (the flush thread handles realtime resume).
-    if (!db->backup_enabled) continue;
+    if (!ARK_LOAD(&db->backup_enabled)) continue;
 
     // Snapshot-thread heartbeat (spec §9): so a silent death of this
     // thread (unhandled condition, thread cancellation) is visible via
     // db_backup_snapshot_heartbeat_age_ms() instead of quietly stopping
     // hourly uploads with no signal.
-    db->last_snapshot_heartbeat_sec = (int)(now_ms_mono() / 1000);
+    ARK_STORE(&db->last_snapshot_heartbeat_sec, (int)(now_ms_mono() / 1000));
 
     // Snapshot from the SNAPSHOT connection (this thread's own, spec
     // §3.1) — never the game connection: sqlite3_backup_step page I/O
@@ -3151,7 +3236,7 @@ void *run_hourly_backup(void *arg) {
       // thread while this thread builds the request (use-after-free).
       char *tok = api_key_snapshot(db);
       char *signed_url = get_signed_url(db, db->signed_url_endpoint, tok,
-                                        (int *)&db->shutdown_requested);
+                                        &db->shutdown_requested);
       if (signed_url && strlen(signed_url) > 5) {
         if (upload_to_s3(db, signed_url, db->backup_path, tok) != 0) {
           ark_log(db, ARK_LOG_ERROR, "scheduled backup upload failed");
@@ -3159,7 +3244,7 @@ void *run_hourly_backup(void *arg) {
           // (Risk #1) A successful snapshot re-baselines the destination:
           // any CDC gap from a prior outbox-cap pause is now recovered.
           // Clear the sticky capture_paused flag.
-          db->capture_paused = 0;
+          ARK_STORE(&db->capture_paused, 0);
         }
       }
       free(tok);

@@ -10,7 +10,8 @@ extern "C" {
 
 // Public C API for Arkilian Managed SQLite Database Engine
 //
-// Thread-safety: the backup subsystem is fully thread-safe by design.
+// Thread-safety: the backup subsystem is thread-safe by design for its
+// internal state (kill-switch, monitoring flags, API key, payload log).
 // The statement cursor (db_prepare/db_step/db_bind_*/db_column_*) is a
 // single per-handle cursor: C callers using the cursor from multiple
 // threads must serialize those calls themselves. The N-API bindings
@@ -80,6 +81,9 @@ int db_column_bytes(arkilian *db, int col);
 
 int db_changes(arkilian *db);
 sqlite3_int64 db_last_insert_rowid(arkilian *db);
+// Returns a pointer to a per-handle buffer. The caller must serialize
+// calls to this function on the same handle; concurrent calls race on
+// the internal buffer and may return a torn/truncated string.
 const char* db_wal_last_sql(arkilian *db);
 
 // Auto-generate SQL backup triggers for live tables

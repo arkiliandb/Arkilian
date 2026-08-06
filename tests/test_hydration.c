@@ -318,11 +318,25 @@ typedef struct {
   int fd;
   int port;
   pthread_t thread;
-  volatile int stop;
+  int stop;
+  pthread_mutex_t stop_mutex;
   char snapshot_url[128]; // filled after bind; served in the plan
   long baseline_lsn;      // configurable; faithful control plane serves
                           // baseline_lsn == the snapshot's recorded LSN.
 } mock_plan_server;
+
+static int mock_plan_should_stop(mock_plan_server *s) {
+  pthread_mutex_lock(&s->stop_mutex);
+  int v = s->stop;
+  pthread_mutex_unlock(&s->stop_mutex);
+  return v;
+}
+
+static void mock_plan_set_stop(mock_plan_server *s) {
+  pthread_mutex_lock(&s->stop_mutex);
+  s->stop = 1;
+  pthread_mutex_unlock(&s->stop_mutex);
+}
 
 static void *mock_plan_run(void *arg) {
   mock_plan_server *s = (mock_plan_server *)arg;
@@ -335,7 +349,7 @@ static void *mock_plan_run(void *arg) {
     if (c < 0) break;
     char buf[8192];
     ssize_t n = recv(c, buf, sizeof(buf) - 1, 0);
-    if (s->stop) { close(c); break; } // stop-kick connection: exit now
+    if (mock_plan_should_stop(s)) { close(c); break; } // stop-kick connection: exit now
     if (n > 0) {
       buf[n] = '\0';
       int is_plan = strstr(buf, "/hydrate/plan") != NULL;
@@ -360,6 +374,7 @@ static void *mock_plan_run(void *arg) {
 
 static void mock_plan_start(mock_plan_server *s, long baseline_lsn) {
   memset(s, 0, sizeof(*s));
+  pthread_mutex_init(&s->stop_mutex, NULL);
   s->baseline_lsn = baseline_lsn;
   s->fd = socket(AF_INET, SOCK_STREAM, 0);
   int one = 1;
@@ -380,7 +395,7 @@ static void mock_plan_start(mock_plan_server *s, long baseline_lsn) {
 }
 
 static void mock_plan_stop(mock_plan_server *s) {
-  s->stop = 1;
+  mock_plan_set_stop(s);
   int fd = socket(AF_INET, SOCK_STREAM, 0);
   if (fd >= 0) {
     struct sockaddr_in a;
@@ -497,12 +512,26 @@ static void test_hydrate_refuses_when_db_locked(void) {
 
 typedef struct {
   int fd;
-  volatile int stop;
+  int stop;
+  pthread_mutex_t stop_mutex;
   char *plan;
   int plan_len;
   const char *snap_body;
   size_t snap_len;
 } sha_mock_ctx;
+
+static int sha_mock_should_stop(sha_mock_ctx *m) {
+  pthread_mutex_lock(&m->stop_mutex);
+  int v = m->stop;
+  pthread_mutex_unlock(&m->stop_mutex);
+  return v;
+}
+
+static void sha_mock_set_stop(sha_mock_ctx *m) {
+  pthread_mutex_lock(&m->stop_mutex);
+  m->stop = 1;
+  pthread_mutex_unlock(&m->stop_mutex);
+}
 
 static void *sha_mock_run(void *arg) {
   sha_mock_ctx *m = (sha_mock_ctx *)arg;
@@ -511,7 +540,7 @@ static void *sha_mock_run(void *arg) {
     if (c < 0) break;
     char buf[8192];
     ssize_t n = recv(c, buf, sizeof(buf) - 1, 0);
-    if (m->stop) { close(c); break; }
+    if (sha_mock_should_stop(m)) { close(c); break; }
     if (n > 0) {
       buf[n] = '\0';
       if (strstr(buf, "/hydrate/plan")) {
@@ -549,6 +578,7 @@ static void test_hydrate_refuses_on_sha_mismatch(void) {
   // so the SHA mismatch check fires BEFORE any snapshot install.
   sha_mock_ctx mc;
   memset(&mc, 0, sizeof(mc));
+  pthread_mutex_init(&mc.stop_mutex, NULL);
   const char *snap_body = "not-a-real-snapshot-but-fails-sha-first";
   mc.snap_body = snap_body;
   mc.snap_len = strlen(snap_body);
@@ -589,7 +619,7 @@ static void test_hydrate_refuses_on_sha_mismatch(void) {
   assert(rc == HYDRATION_ERR_PROTO);
 
   // Teardown: kick the accept loop, join the thread, close the socket.
-  mc.stop = 1;
+  sha_mock_set_stop(&mc);
   int kick = socket(AF_INET, SOCK_STREAM, 0);
   if (kick >= 0) {
     struct sockaddr_in ka;
