@@ -1,15 +1,15 @@
 <br/>
 <h1 align="center">Arkilian</h1>  
 <p align="center">
-  <a href="https://github.com/CodeDynasty-dev/birth-of-Arkilian">
+  <a href="https://github.com/arkiliandb/Arkilian">
     <img src="https://avatars.githubusercontent.com/u/261335565?s=88&v=4" alt="Arkilian Database"   
     >
   </a>
 </p>
 
-[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/CodeDynasty-dev/birth-of-Arkilian/blob/next/contributing.md)
+[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/arkiliandb/Arkilian/blob/next/contributing.md)
 ![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
-[![Stargazers](https://img.shields.io/github/stars/CodeDynasty-dev/birth-of-Arkilian?style=social)](https://github.com/CodeDynasty-dev/birth-of-Arkilian)
+[![Stargazers](https://img.shields.io/github/stars/arkiliandb/Arkilian?style=social)](https://github.com/arkiliandb/Arkilian)
 
 
 # Arkilian
@@ -38,7 +38,7 @@ You can build the library using CMake. Both static and shared libraries are buil
 
 ```bash
 # Clone the repository
-git clone https://github.com/CodeDynasty-dev/birth-of-Arkilian.git
+git clone https://github.com/arkiliandb/Arkilian.git
 cd birth-of-Arkilian
 
 # Generate build files

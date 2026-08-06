@@ -74,7 +74,7 @@ Please open an Issue for discussion. Major architectural or API changes require 
 
 ```bash
 # Clone the repository
-git clone https://github.com/CodeDynasty-dev/birth-of-Arkilian.git
+git clone https://github.com/arkiliandb/Arkilian.git
 cd birth-of-Arkilian
 
 # Build with all options enabled (for development)

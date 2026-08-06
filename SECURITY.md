@@ -10,7 +10,7 @@ Please **do not open a public GitHub issue** for a suspected vulnerability.
 
 Report privately through the GitHub Security Advisory channel:
 
-https://github.com/CodeDynasty-dev/birth-of-Arkilian/security/advisories
+https://github.com/arkiliandb/Arkilian/security/advisories
 
 If the advisory form cannot be used, email `security@arkilian.com` with the
 subject prefix `[Arkilian Security]`.

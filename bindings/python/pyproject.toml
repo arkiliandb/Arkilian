@@ -24,8 +24,8 @@ classifiers = [
 dependencies = ["cffi>=1.15.0"]
 
 [project.urls]
-Homepage = "https://github.com/CodeDynasty-dev/birth-of-Arkilian"
-Repository = "https://github.com/CodeDynasty-dev/birth-of-Arkilian"
+Homepage = "https://arkilian.com"
+Repository = "https://github.com/arkiliandb/Arkilian"
 
 [tool.setuptools.packages.find]
 where = ["."]

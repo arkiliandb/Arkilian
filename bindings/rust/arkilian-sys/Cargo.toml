@@ -4,7 +4,7 @@ version = "1.0.0"
 edition = "2021"
 description = "Raw FFI bindings to the Arkilian database library"
 license = "MIT"
-repository = "https://github.com/CodeDynasty-dev/birth-of-Arkilian"
+repository = "https://github.com/arkiliandb/Arkilian"
 links = "arkilian"
 build = "build.rs"
 

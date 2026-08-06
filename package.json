@@ -24,7 +24,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/CodeDynasty-dev/birth-of-Arkilian.git"
+    "url": "git+https://github.com/arkiliandb/Arkilian.git"
   },
   "dependencies": {
     "node-addon-api": "^8.0.0",
@@ -56,5 +56,6 @@
     "node": ">=18.0.0",
     "bun": ">=1.0.0"
   },
-  "private": false
+  "private": false,
+  "homepage": "https://arkilian.com"
 }

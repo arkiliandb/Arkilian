@@ -21,7 +21,7 @@ This document covers how to publish Arkilian to various package managers.
 
 ```bash
 # Navigate to project root
-cd /path/to/birth-of-Arkilian
+cd /path/to/Arkilian
 
 # Clean previous builds
 npm run clean
@@ -82,7 +82,7 @@ npm install arkilian
 
 ```bash
 # Navigate to Python bindings
-cd /path/to/birth-of-Arkilian/bindings/python
+cd /path/to/Arkilian/bindings/python
 
 # Install build dependencies
 pip3 install -e .
@@ -146,7 +146,7 @@ The Python package uses CFFI which requires the C library. Options:
 
 ```bash
 # Navigate to Rust bindings
-cd /path/to/birth-of-Arkilian/bindings/rust/arkilian
+cd /path/to/Arkilian/bindings/rust/arkilian
 
 # Check package compiles
 cargo build
@@ -244,7 +244,7 @@ arkilian = "1.0.0"
 
 1. Push code to GitHub:
    ```bash
-   cd /path/to/birth-of-Arkilian/bindings/php
+   cd /path/to/Arkilian/bindings/php
    git init
    git add .
    git commit -m "Initial commit"
@@ -261,7 +261,7 @@ arkilian = "1.0.0"
 
 ```bash
 # Create a distribution
-cd /path/to/birth-of-Arkilian/bindings/php
+cd /path/to/Arkilian/bindings/php
 zip -r arkilian.zip Arkilian.php composer.json
 
 # Submit to Packagist manually
