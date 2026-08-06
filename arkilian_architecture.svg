@@ -1,168 +1,108 @@
-<svg width="100%" viewBox="0 0 760 580" role="img" xmlns="http://www.w3.org/2000/svg">
-  <title>Arkilian Database Architecture</title>
-  <desc>Arkilian connection lifecycle showing Main Game Connection writing to Outbox table, Flush thread replicating to push endpoints, and Snapshot thread doing online backups to S3/GCS.</desc>
+<svg width="100%" viewBox="0 0 680 580" role="img" xmlns="http://www.w3.org/2000/svg">
+  <title>Arkilian Architecture</title>
+  <desc>Your app calls into the arkilian connection. Write triggers automatically populate the internal _pending_backup outbox table. An independent Flush Thread reads batches from the outbox and POSTs them to the push endpoint. The Snapshot Thread independently triggers an hourly online backup to S3/GCS using presigned URLs requested from the control plane API.</desc>
   <defs>
-    <linearGradient id="coreGrad" x1="0%" y1="0%" x2="100%" y2="100%">
-      <stop offset="0%" stop-color="#1e293b"/>
-      <stop offset="100%" stop-color="#0f172a"/>
-    </linearGradient>
-    <linearGradient id="blueGrad" x1="0%" y1="0%" x2="100%" y2="100%">
-      <stop offset="0%" stop-color="#3b82f6"/>
-      <stop offset="100%" stop-color="#1d4ed8"/>
-    </linearGradient>
-    <linearGradient id="orangeGrad" x1="0%" y1="0%" x2="100%" y2="100%">
-      <stop offset="0%" stop-color="#f97316"/>
-      <stop offset="100%" stop-color="#ea580c"/>
-    </linearGradient>
-    <linearGradient id="greenGrad" x1="0%" y1="0%" x2="100%" y2="100%">
-      <stop offset="0%" stop-color="#10b981"/>
-      <stop offset="100%" stop-color="#047857"/>
-    </linearGradient>
-    <linearGradient id="purpleGrad" x1="0%" y1="0%" x2="100%" y2="100%">
-      <stop offset="0%" stop-color="#8b5cf6"/>
-      <stop offset="100%" stop-color="#6d28d9"/>
-    </linearGradient>
-    <filter id="shadow" x="-5%" y="-5%" width="110%" height="110%">
-      <feDropShadow dx="0" dy="4" stdDeviation="6" flood-color="#000000" flood-opacity="0.25"/>
-    </filter>
-    <marker id="arrow" viewBox="0 0 10 10" refX="6" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
-      <path d="M2 2L7 5L2 8" fill="none" stroke="#64748b" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
     </marker>
+    <style>
+      .text-base { font-family: "Anthropic Sans", -apple-system, system-ui, "Segoe UI", sans-serif; font-size: 16px; font-weight: 400; text-anchor: start; dominant-baseline: auto; }
+      .text-title { font-family: "Anthropic Sans", -apple-system, system-ui, "Segoe UI", sans-serif; font-size: 14px; font-weight: 500; text-anchor: middle; dominant-baseline: central; }
+      .text-desc { font-family: "Anthropic Sans", -apple-system, system-ui, "Segoe UI", sans-serif; font-size: 12px; font-weight: 400; text-anchor: middle; dominant-baseline: central; }
+      .text-header { font-family: "Anthropic Sans", -apple-system, system-ui, "Segoe UI", sans-serif; font-size: 14px; font-weight: 500; text-anchor: start; dominant-baseline: auto; }
+      .text-sub { font-family: "Anthropic Sans", -apple-system, system-ui, "Segoe UI", sans-serif; font-size: 12px; font-weight: 400; text-anchor: start; dominant-baseline: auto; }
+      .line-conn { fill: none; stroke: rgb(115, 114, 108); stroke-width: 1.5; }
+      .line-dashed { fill: none; stroke: rgb(153, 60, 29); stroke-width: 1.5; stroke-dasharray: 4,4; }
+    </style>
   </defs>
 
-  <style>
-    .text-title { font-family: system-ui, -apple-system, sans-serif; font-size: 15px; font-weight: 600; fill: #f8fafc; }
-    .text-subtitle { font-family: system-ui, -apple-system, sans-serif; font-size: 11px; fill: #94a3b8; }
-    .text-bold { font-family: system-ui, -apple-system, sans-serif; font-size: 13px; font-weight: 700; fill: #ffffff; }
-    .text-mono { font-family: Menlo, Monaco, Consolas, monospace; font-size: 11px; fill: #38bdf8; }
-    .arrow-line { fill: none; stroke: #475569; stroke-width: 2; }
-    .arrow-dashed { fill: none; stroke: #ef4444; stroke-width: 1.5; stroke-dasharray: 4,4; }
-  </style>
-
-  <!-- Background Canvas -->
-  <rect width="100%" height="100%" fill="#0b0f19" />
-
   <!-- 1. YOUR APP CODE -->
-  <g transform="translate(270, 20)" filter="url(#shadow)">
-    <rect width="220" height="60" rx="10" fill="#1e293b" stroke="#334155" stroke-width="1.5" />
-    <text x="110" y="26" text-anchor="middle" class="text-title">Your App Code</text>
-    <text x="110" y="44" text-anchor="middle" class="text-subtitle" style="fill: #38bdf8;">Runs database queries</text>
+  <g class="text-base">
+    <rect x="230" y="40" width="220" height="56" rx="8" stroke-width="0.5" style="fill:rgb(241, 239, 232);stroke:rgb(95, 94, 90);"/>
+    <text x="340" y="58" class="text-title" style="fill:rgb(68, 68, 65);">Your app code</text>
+    <text x="340" y="76" class="text-desc" style="fill:rgb(95, 94, 90);">Calls the public API</text>
   </g>
 
-  <line x1="380" y1="80" x2="380" y2="108" class="arrow-line" marker-end="url(#arrow)" />
+  <!-- Connection to Main Handle -->
+  <line x1="340" y1="96" x2="340" y2="138" marker-end="url(#arrow)" class="line-conn"/>
 
-  <!-- 2. ARKILIAN INSTANCE (CORE BOUNDARY) -->
-  <g transform="translate(30, 110)" filter="url(#shadow)">
-    <!-- Core Boundary Container -->
-    <rect width="700" height="350" rx="18" fill="url(#coreGrad)" stroke="#1e293b" stroke-width="2" />
-    <text x="24" y="28" class="text-title" style="font-size: 16px; font-weight: 700; letter-spacing: 0.5px;">Arkilian Instance</text>
-    <text x="24" y="44" class="text-subtitle" style="fill: #38bdf8;">Thread-Safe Client Engine</text>
-
-    <!-- Main Game Connection -->
-    <g transform="translate(20, 65)">
-      <rect width="190" height="260" rx="12" fill="#151f32" stroke="#1e293b" stroke-width="1.5" />
-      <rect width="190" height="40" rx="12" fill="url(#blueGrad)" />
-      <text x="95" y="24" text-anchor="middle" class="text-bold">Main Connection</text>
-      <text x="95" y="62" text-anchor="middle" class="text-subtitle" style="fill: #93c5fd;">Active Game Thread</text>
-      
-      <!-- SQLite Engine Box -->
-      <g transform="translate(15, 80)">
-        <rect width="160" height="70" rx="8" fill="#0f172a" stroke="#1e293b" stroke-width="1.5" />
-        <text x="80" y="28" text-anchor="middle" class="text-bold" style="fill: #38bdf8;">SQLite Engine</text>
-        <text x="80" y="48" text-anchor="middle" class="text-subtitle">Sync read/write operations</text>
-      </g>
-
-      <!-- SQL Triggers Box -->
-      <g transform="translate(15, 165)">
-        <rect width="160" height="80" rx="8" fill="#0f172a" stroke="#1e293b" stroke-width="1.5" />
-        <text x="80" y="26" text-anchor="middle" class="text-bold" style="fill: #f97316;">SQL Triggers</text>
-        <text x="80" y="45" text-anchor="middle" class="text-subtitle">Intercept writes, populate</text>
-        <text x="80" y="62" text-anchor="middle" class="text-mono" style="fill: #f97316;">_pending_backup</text>
-      </g>
-    </g>
-
-    <!-- Outbox database table -->
-    <g transform="translate(240, 165)">
-      <rect width="220" height="130" rx="12" fill="#151f32" stroke="#1e293b" stroke-width="1.5" />
-      <rect width="220" height="40" rx="12" fill="url(#orangeGrad)" />
-      <text x="110" y="25" text-anchor="middle" class="text-bold">Outbox Table</text>
-      
-      <path d="M 20,62 L 200,62 M 20,85 L 200,85 M 20,108 L 200,108" stroke="#334155" stroke-width="1.5" />
-      <text x="110" y="70" text-anchor="middle" class="text-mono" style="font-size: 10px;">_pending_backup</text>
-      <text x="110" y="94" text-anchor="middle" class="text-subtitle" style="fill: #f97316; font-weight: 600;">Max Cap: 100,000 rows</text>
-      <text x="110" y="112" text-anchor="middle" class="text-subtitle">CDC Queue</text>
-    </g>
-
-    <!-- Flush Thread -->
-    <g transform="translate(490, 65)">
-      <rect width="190" height="115" rx="12" fill="#151f32" stroke="#1e293b" stroke-width="1.5" />
-      <rect width="190" height="40" rx="12" fill="url(#greenGrad)" />
-      <text x="95" y="25" text-anchor="middle" class="text-bold">Flush Thread</text>
-      
-      <rect x="15" y="55" width="160" height="45" rx="8" fill="#0f172a" stroke="#1e293b" stroke-width="1.5" />
-      <text x="95" y="72" text-anchor="middle" class="text-bold" style="font-size: 12px; fill: #34d399;">`backup_db` Conn</text>
-      <text x="95" y="87" text-anchor="middle" class="text-subtitle">Drains outbox batches</text>
-    </g>
-
-    <!-- Snapshot Thread -->
-    <g transform="translate(490, 195)">
-      <rect width="190" height="135" rx="12" fill="#151f32" stroke="#1e293b" stroke-width="1.5" />
-      <rect width="190" height="40" rx="12" fill="url(#greenGrad)" />
-      <text x="95" y="25" text-anchor="middle" class="text-bold">Snapshot Thread</text>
-      
-      <rect x="15" y="55" width="160" height="65" rx="8" fill="#0f172a" stroke="#1e293b" stroke-width="1.5" />
-      <text x="95" y="72" text-anchor="middle" class="text-bold" style="font-size: 12px; fill: #34d399;">`snapshot_db` Conn</text>
-      <text x="95" y="90" text-anchor="middle" class="text-subtitle">Online Backup to</text>
-      <text x="95" y="104" text-anchor="middle" class="text-mono" style="font-size: 10px;">backup.sqlite</text>
-    </g>
+  <!-- 2. ARKILIAN CONNECTION (CONTAINER) -->
+  <g class="text-base">
+    <rect x="50" y="140" width="580" height="310" rx="20" stroke-width="0.5" style="fill:rgb(238, 237, 254);stroke:rgb(83, 74, 183);"/>
+    <text x="80" y="172" class="text-header" style="fill:rgb(60, 52, 137);">arkilian connection</text>
+    <text x="80" y="190" class="text-sub" style="fill:rgb(83, 74, 183);">one per open database handle</text>
   </g>
 
-  <!-- Connectors inside Core -->
-  <path d="M 225,320 L 300,320 L 300,295" class="arrow-line" marker-end="url(#arrow)" />
-  <path d="M 350,165 L 350,122 L 490,122" class="arrow-line" marker-end="url(#arrow)" />
-  <path d="M 115,375 L 115,440 L 585,440 L 585,330" class="arrow-line" marker-end="url(#arrow)" />
+  <!-- Main Game Connection (left box) -->
+  <g class="text-base">
+    <rect x="80" y="210" width="230" height="220" rx="12" stroke-width="0.5" style="fill:rgb(225, 245, 238);stroke:rgb(15, 110, 86);"/>
+    <text x="195" y="235" class="text-title" style="fill:rgb(8, 80, 65);">Main Connection</text>
+    <text x="195" y="253" class="text-desc" style="fill:rgb(15, 110, 86);">Game Thread</text>
 
-  <!-- 3. EXTERNAL TARGETS -->
-  <!-- S3 / GCS Storage -->
-  <g transform="translate(30, 490)" filter="url(#shadow)">
-    <rect width="210" height="70" rx="12" fill="#111827" stroke="#1e293b" stroke-width="1.5" />
-    <rect width="210" height="6" rx="3" fill="url(#purpleGrad)" />
-    <text x="105" y="28" text-anchor="middle" class="text-bold" style="fill: #c084fc;">S3 / GCS Storage</text>
-    <text x="105" y="46" text-anchor="middle" class="text-subtitle">Presigned upload target</text>
-    <text x="105" y="58" text-anchor="middle" class="text-subtitle" style="font-weight: bold; fill: #c084fc;">Hourly Snapshots</text>
+    <!-- SQLite Engine -->
+    <rect x="95" y="275" width="200" height="50" rx="8" stroke-width="0.5" style="fill:rgb(241, 239, 232);stroke:rgb(95, 94, 90);"/>
+    <text x="195" y="291" class="text-title" style="fill:rgb(68, 68, 65);">SQLite Engine</text>
+    <text x="195" y="309" class="text-desc" style="fill:rgb(95, 94, 90);">executes writes synchronously</text>
+
+    <!-- SQL Triggers -->
+    <rect x="95" y="340" width="200" height="70" rx="8" stroke-width="0.5" style="fill:rgb(241, 239, 232);stroke:rgb(95, 94, 90);"/>
+    <text x="195" y="358" class="text-title" style="fill:rgb(68, 68, 65);">SQL Triggers</text>
+    <text x="195" y="376" class="text-desc" style="fill:rgb(95, 94, 90);">captures write metadata to</text>
+    <text x="195" y="394" class="text-desc" style="font-family: monospace; font-size: 11px; fill:rgb(15, 110, 86);">_pending_backup</text>
   </g>
 
-  <!-- arkilian.com API -->
-  <g transform="translate(275, 490)" filter="url(#shadow)">
-    <rect width="210" height="70" rx="12" fill="#111827" stroke="#1e293b" stroke-width="1.5" />
-    <rect width="210" height="6" rx="3" fill="url(#purpleGrad)" />
-    <text x="105" y="28" text-anchor="middle" class="text-bold" style="fill: #c084fc;">arkilian.com API</text>
-    <text x="105" y="46" text-anchor="middle" class="text-mono" style="font-size: 10px;">/v1/upload/request</text>
-    <text x="105" y="58" text-anchor="middle" class="text-subtitle">Request Presigned URLs</text>
+  <!-- Outbox Table (center box) -->
+  <g class="text-base">
+    <rect x="330" y="250" width="130" height="140" rx="12" stroke-width="0.5" style="fill:rgb(225, 245, 238);stroke:rgb(15, 110, 86);"/>
+    <text x="395" y="275" class="text-title" style="fill:rgb(8, 80, 65);">Outbox Table</text>
+    <text x="395" y="295" class="text-desc" style="font-family: monospace; font-size: 11px; fill:rgb(15, 110, 86);">_pending_backup</text>
+    <path d="M 345,315 L 445,315 M 345,335 L 445,335 M 345,355 L 445,355" stroke="rgb(15, 110, 86)" stroke-width="1" />
+    <text x="395" y="375" class="text-desc" style="fill:rgb(15, 110, 86); font-weight: bold;">Cap: 100k</text>
   </g>
 
-  <!-- Push Endpoint -->
-  <g transform="translate(520, 490)" filter="url(#shadow)">
-    <rect width="210" height="70" rx="12" fill="#111827" stroke="#1e293b" stroke-width="1.5" />
-    <rect width="210" height="6" rx="3" fill="url(#purpleGrad)" />
-    <text x="105" y="28" text-anchor="middle" class="text-bold" style="fill: #c084fc;">Push Endpoint</text>
-    <text x="105" y="46" text-anchor="middle" class="text-mono" style="font-size: 10px;">/v1/wal/push</text>
-    <text x="105" y="58" text-anchor="middle" class="text-subtitle" style="font-weight: bold; fill: #34d399;">Real-Time CDC Stream (&lt;2s)</text>
+  <!-- Connectors between Connection, Engine, Triggers and Outbox -->
+  <!-- App API call hits SQLite Engine -->
+  <line x1="340" y1="138" x2="195" y2="138" class="line-conn"/>
+  <line x1="195" y1="138" x2="195" y2="275" marker-end="url(#arrow)" class="line-conn"/>
+  
+  <!-- Engine feeds Triggers -->
+  <line x1="195" y1="325" x2="195" y2="340" marker-end="url(#arrow)" class="line-conn"/>
+
+  <!-- Triggers write to Outbox -->
+  <line x1="295" y1="375" x2="330" y2="375" marker-end="url(#arrow)" class="line-conn"/>
+
+  <!-- 3. EXTERNAL THREADS (BOTTOM RED BOXES) -->
+  <!-- Snapshot Thread -->
+  <g class="text-base">
+    <rect x="95" y="470" width="220" height="56" rx="8" stroke-width="0.5" style="fill:rgb(250, 236, 231);stroke:rgb(153, 60, 29);"/>
+    <text x="205" y="488" class="text-title" style="fill:rgb(113, 43, 19);">Snapshot thread</text>
+    <text x="205" y="506" class="text-desc" style="fill:rgb(153, 60, 29);">hourly online backup to GCS/S3</text>
   </g>
 
-  <!-- Connectors to External Targets -->
-  <path d="M 625,180 L 625,490" class="arrow-line" marker-end="url(#arrow)" />
-  <path d="M 530,330 L 380,330 L 380,490" class="arrow-line" marker-end="url(#arrow)" />
-  <path d="M 490,320 L 135,320 L 135,490" class="arrow-line" marker-end="url(#arrow)" />
+  <!-- Flush Thread -->
+  <g class="text-base">
+    <rect x="365" y="470" width="220" height="56" rx="8" stroke-width="0.5" style="fill:rgb(250, 236, 231);stroke:rgb(153, 60, 29);"/>
+    <text x="475" y="488" class="text-title" style="fill:rgb(113, 43, 19);">Flush thread</text>
+    <text x="475" y="506" class="text-desc" style="fill:rgb(153, 60, 29);">POSTs CDC batches to endpoint</text>
+  </g>
+
+  <!-- Connectors from Outbox and SQLite Engine to Threads -->
+  <!-- Flush thread drains Outbox -->
+  <path d="M 395,390 L 395,440 L 475,440 L 475,470" marker-end="url(#arrow)" class="line-conn"/>
+
+  <!-- Snapshot thread runs Online Backup from SQLite Engine -->
+  <path d="M 195,430 L 195,450 L 205,450 L 205,470" marker-end="url(#arrow)" class="line-conn"/>
 
   <!-- Sticky Flags / State Monitoring -->
-  <path d="M 350,295 L 350,380 L 400,380" class="arrow-dashed" marker-end="url(#arrow)" />
-  
-  <g transform="translate(410, 362)" filter="url(#shadow)">
-    <rect width="135" height="34" rx="6" fill="#7f1d1d" stroke="#f87171" stroke-width="1" />
-    <text x="67" y="21" text-anchor="middle" class="text-bold" style="fill: #fca5a5; font-size: 10px; letter-spacing: 0.5px;">capture_paused = 1</text>
+  <!-- Outbox Cap triggers sticky capture_paused -->
+  <path d="M 460,320 L 515,320 M 515,320 L 515,370" marker-end="url(#arrow)" class="line-dashed"/>
+
+  <g class="text-base" transform="translate(470, 375)">
+    <rect x="0" y="0" width="130" height="30" rx="4" stroke-width="0.5" style="fill:rgb(250, 236, 231);stroke:rgb(153, 60, 29);"/>
+    <text x="65" y="15" class="text-title" style="font-size: 10px; fill:rgb(113, 43, 19);">capture_paused = 1</text>
   </g>
-  
-  <path d="M 490,260 L 478,260 L 478,362" class="arrow-dashed" style="stroke: #10b981;" marker-end="url(#arrow)" />
+
+  <!-- Snapshot thread clears sticky capture_paused -->
+  <path d="M 205,526 L 205,546 L 535,546 L 535,405" marker-end="url(#arrow)" class="line-dashed" style="stroke: rgb(15, 110, 86);"/>
 
 </svg>
