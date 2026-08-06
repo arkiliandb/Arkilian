@@ -24,15 +24,16 @@
 // Atomic helpers for cross-thread flags.  These fields are read and
 // written concurrently by multiple threads.  Plain volatile access is
 // not a portable memory model (and is not recognized by TSAN), so we
-// use compiler builtins on GNU-compatible compilers and MSVC
-// interlocked intrinsics on Windows.  All accesses to these flags go
-// through these macros so the access model is consistent everywhere.
-#ifdef _WIN32
-#define ARK_LOAD(ptr)        ((int)_InterlockedExchangeAdd((volatile long*)(ptr), 0L))
-#define ARK_STORE(ptr, val)  ((void)_InterlockedExchange((volatile long*)(ptr), (long)(val)))
-#elif defined(__GNUC__)
+// use compiler builtins on GNU-compatible compilers (GCC, Clang, MinGW)
+// and MSVC interlocked intrinsics on Windows.  All accesses to these
+// flags go through these macros so the access model is consistent
+// everywhere.
+#ifdef __GNUC__
 #define ARK_LOAD(ptr)        __atomic_load_n((ptr), __ATOMIC_ACQUIRE)
 #define ARK_STORE(ptr, val)  __atomic_store_n((ptr), (val), __ATOMIC_RELEASE)
+#elif defined(_WIN32)
+#define ARK_LOAD(ptr)        ((int)_InterlockedExchangeAdd((volatile long*)(ptr), 0L))
+#define ARK_STORE(ptr, val)  ((void)_InterlockedExchange((volatile long*)(ptr), (long)(val)))
 #else
 #error "Unsupported compiler: need atomic load/store primitives"
 #endif
@@ -1804,7 +1805,7 @@ int db_init(arkilian **db_ptr, const char *filename) {
   // A 0 or negative interval would make the hourly thread hot-loop
   // (backup + signed-URL request with no sleep in between). Clamp it.
   if (db->backup_interval < 1) db->backup_interval = 1;
-  db->backup_enabled = get_env_bool_default("ARKILIAN_ENABLE_BACKUP", 1);
+  ARK_STORE(&db->backup_enabled, get_env_bool_default("ARKILIAN_ENABLE_BACKUP", 1));
   // ARKILIAN_ALLOW_INSECURE=1 opts into cleartext http:// endpoints that
   // are NOT loopback/RFC1918 (e.g. an internal-but-public corporate
   // aggregator). Default 0: anything non-https and non-local is refused.
@@ -1824,7 +1825,7 @@ int db_init(arkilian **db_ptr, const char *filename) {
     ark_log(db, ARK_LOG_WARN,
             "backup is enabled but ARKILIAN_API_KEY is not set — the "
             "control plane will reject every request; backup DISABLED");
-    db->backup_enabled = 0;
+    ARK_STORE(&db->backup_enabled, 0);
   }
 
   // Credential transport hygiene: over http:// the API key and every
@@ -1841,7 +1842,7 @@ int db_init(arkilian **db_ptr, const char *filename) {
             "API key would be sent in cleartext; backup DISABLED. Set "
             "https://, point at a loopback/RFC1918 host, or opt-in with "
             "ARKILIAN_ALLOW_INSECURE=1");
-    db->backup_enabled = 0;
+    ARK_STORE(&db->backup_enabled, 0);
   }
 
   // Startup API-key validation: the client connects to the control plane
@@ -1863,7 +1864,7 @@ int db_init(arkilian **db_ptr, const char *filename) {
               "startup API key validation failed — backup DISABLED. "
               "Verify ARKILIAN_API_KEY is correct and ARKILIAN_CONTROL_URL "
               "is reachable");
-      db->backup_enabled = 0;
+      ARK_STORE(&db->backup_enabled, 0);
     } else {
       ark_log(db, ARK_LOG_INFO, "API key validated against control plane");
     }
@@ -2088,7 +2089,7 @@ int db_init(arkilian **db_ptr, const char *filename) {
   }
 
   if (!capture_ok) {
-    db->backup_enabled = 0; // kill-switch state: game runs, nothing ships
+    ARK_STORE(&db->backup_enabled, 0); // kill-switch state: game runs, nothing ships
     snprintf(db->last_error_msg, sizeof(db->last_error_msg),
              "backup disabled: WAL or trigger setup failed");
   }
@@ -2116,7 +2117,7 @@ int db_init(arkilian **db_ptr, const char *filename) {
   if (pthread_create(&db->flush_thread_id, NULL, run_wal_flush, db) != 0) {
     ark_log(db, ARK_LOG_ERROR,
             "failed to start WAL flush thread — backup disabled");
-    db->backup_enabled = 0;
+    ARK_STORE(&db->backup_enabled, 0);
   } else {
     db->flush_thread_running = 1;
   }
@@ -2125,7 +2126,7 @@ int db_init(arkilian **db_ptr, const char *filename) {
   if (!db->flush_thread_handle) {
     ark_log(db, ARK_LOG_ERROR,
             "failed to start WAL flush thread — backup disabled");
-    db->backup_enabled = 0;
+    ARK_STORE(&db->backup_enabled, 0);
   }
 #endif
 
