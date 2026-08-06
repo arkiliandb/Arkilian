@@ -1,0 +1,27 @@
+{
+    "name": "arkilian-web",
+    "version": "1.0.1",
+    "description": "An managed embedded database service for the SAAS era.",
+    "main": "src/index.html",
+    "type": "module",
+    "scripts": {
+        "dev": "bun run node_modules/docmach/dist/index.js",
+        "watch": "bun run node_modules/docmach/dist/index.js",
+        "print": "bun run node_modules/docmach/dist/index.js print",
+        "build": "bun run node_modules/docmach/dist/index.js build"
+    },
+    "keywords": [
+        "db"
+    ],
+    "author": "Friday candour",
+    "license": "MIT",
+    "docmach": {
+        "build-directory": "dist",
+        "assets-folder": "./assets"
+    },
+    "dependencies": {
+        "arkilian": "^1.1.0",
+        "safetoken": "^2.0.3",
+        "sqlitebruv": "^1.1.16"
+    }
+}
