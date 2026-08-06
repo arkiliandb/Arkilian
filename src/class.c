@@ -2,6 +2,16 @@
 // Implements realtime SQL trigger capture, non-blocking wake signals,
 // and dedicated background WAL shipping.
 
+#include <sys/_pthread/_pthread_t.h>
+#include <sys/_pthread/_pthread_mutex_t.h>
+#include <sys/_pthread/_pthread_cond_t.h>
+#include <_strings.h>
+#include <_time.h>
+#include <sys/_pthread/_pthread_once_t.h>
+#include <_string.h>
+#include <_stdlib.h>
+#include <curl/system.h>
+#include <curl/easy.h>
 #ifndef _POSIX_C_SOURCE
 #define _POSIX_C_SOURCE 200809L
 #endif
@@ -51,8 +61,6 @@
 #define strdup _strdup
 #else
 #include <pthread.h>
-#include <strings.h>
-#include <unistd.h>
 #endif
 
 // statfs-based network filesystem detection (NFS/SMB/AFP) for the
@@ -103,13 +111,19 @@
 
 #define DEFAULT_DB_PATH "app.sqlite"
 #define DEFAULT_BACKUP_PATH "backup.sqlite"
-#define DEFAULT_BACKUP_INTERVAL 3600
+enum {
+DEFAULT_BACKUP_INTERVAL = 3600
+};
 
-#define BATCH_SIZE 100
-#define POLL_INTERVAL_MS 2000
+enum {
+BATCH_SIZE = 100,
+POLL_INTERVAL_MS = 2000
+};
 
 // Internal outbox schema version (see _arkilian_meta.schema_version).
-#define ARKILIAN_SCHEMA_VERSION 1
+enum {
+ARKILIAN_SCHEMA_VERSION = 1
+};
 
 // Default soft ceiling on _pending_backup rows. Capture pauses (skips the
 // INSERT) once the queue reaches this depth so the outbox can never grow
@@ -122,7 +136,9 @@
 // ARKILIAN_MAX_QUEUE_DEPTH. The cap is baked into the capture triggers at
 // sync time; changing the env requires a restart (or db_resync_triggers)
 // to take effect.
-#define ARKILIAN_DEFAULT_MAX_QUEUE_DEPTH 100000
+enum {
+ARKILIAN_DEFAULT_MAX_QUEUE_DEPTH = 100000
+};
 
 // ── Struct Definitions ──────────────────────────────────────────────
 
@@ -223,8 +239,8 @@ static char *api_key_snapshot(arkilian *db);
 DWORD WINAPI run_hourly_backup(LPVOID arg);
 DWORD WINAPI run_wal_flush(LPVOID arg);
 #else
-void *run_hourly_backup(void *arg);
-void *run_wal_flush(void *arg);
+static void *run_hourly_backup(void *arg);
+static void *run_wal_flush(void *arg);
 #endif
 static size_t curl_discard_cb(void *data, size_t sz, size_t nmemb, void *userp);
 
@@ -237,7 +253,8 @@ static const char *get_env_default(const char *env_var, const char *default_val)
 
 static int get_env_int_default(const char *env_var, int default_val) {
   const char *val = getenv(env_var);
-  if (!val || strlen(val) == 0) return default_val;
+  if (!val || strlen(val) == 0) { return default_val;
+}
   // atoi() silently returns 0 for malformed input, which would be
   // indistinguishable from a legitimate "0" and bypass the caller's
   // default (e.g. ARKILIAN_BACKUP_INTERVAL=oops quietly becoming 0).
@@ -258,18 +275,22 @@ static int get_env_int_default(const char *env_var, int default_val) {
 // Tests set a lower value (e.g. 3) to dead-letter quickly.
 static int max_attempts(void) {
   int v = get_env_int_default("ARKILIAN_MAX_ATTEMPTS", 100);
-  if (v < 1) v = 1;
+  if (v < 1) { v = 1;
+}
   return v;
 }
 
 // Boolean env var accepting 1/0/true/false/yes/no.
 static int get_env_bool_default(const char *env_var, int default_val) {
   const char *val = getenv(env_var);
-  if (!val || strlen(val) == 0) return default_val;
+  if (!val || strlen(val) == 0) { return default_val;
+}
   if (strcasecmp(val, "true") == 0 || strcasecmp(val, "yes") == 0 ||
-      strcmp(val, "1") == 0) return 1;
+      strcmp(val, "1") == 0) { return 1;
+}
   if (strcasecmp(val, "false") == 0 || strcasecmp(val, "no") == 0 ||
-      strcmp(val, "0") == 0) return 0;
+      strcmp(val, "0") == 0) { return 0;
+}
   // Permissive truthiness fallback for unrecognized boolean env values.
   // strtol (not atoi) avoids bugprone-unchecked-string-to-number-conversion
   // and yields 0 (falsy) for malformed input — the documented behavior for
@@ -277,7 +298,8 @@ static int get_env_bool_default(const char *env_var, int default_val) {
   char *end = NULL;
   errno = 0;
   long parsed = strtol(val, &end, 10);
-  if (end == val || *end != '\0' || errno != 0) return 0;
+  if (end == val || *end != '\0' || errno != 0) { return 0;
+}
   return parsed != 0;
 }
 
@@ -288,7 +310,8 @@ static int get_env_bool_default(const char *env_var, int default_val) {
 static long outbox_cap(void) {
   long cap = (long)get_env_int_default("ARKILIAN_MAX_QUEUE_DEPTH",
                                        ARKILIAN_DEFAULT_MAX_QUEUE_DEPTH);
-  if (cap < 1) cap = 1;
+  if (cap < 1) { cap = 1;
+}
   return cap;
 }
 
@@ -344,14 +367,15 @@ void db_set_default_log_callback(ark_log_fn_t fn, void *ctx) {
 }
 
 void db_set_log_callback(arkilian *db, ark_log_fn_t fn, void *ctx) {
-  if (!db) return;
+  if (!db) { return;
+}
   ARK_LOG_LOCK(db);
   db->log_fn = fn;
   db->log_ctx = ctx;
   ARK_LOG_UNLOCK(db);
 }
 
-void ark_log(arkilian *db, ark_log_level_t level, const char *fmt, ...) {
+static void ark_log(arkilian *db, ark_log_level_t level, const char *fmt, ...) {
   char buf[1024];
   va_list ap;
   va_start(ap, fmt);
@@ -389,7 +413,7 @@ static long long now_ms_mono(void) {
 #ifndef _WIN32
   struct timespec ts;
   clock_gettime(CLOCK_MONOTONIC, &ts);
-  return (long long)ts.tv_sec * 1000LL + ts.tv_nsec / 1000000LL;
+  return ((long long)ts.tv_sec * 1000LL) + (ts.tv_nsec / 1000000LL);
 #else
   static LARGE_INTEGER freq = {0};
   if (freq.QuadPart == 0) QueryPerformanceFrequency(&freq);
@@ -439,7 +463,8 @@ static void ensure_curl_global_init(void) {
 // db_backup_set_enabled / db_set_api_key or setenv instead.
 static void load_env_impl(void) {
   FILE *fp = fopen(".env", "r");
-  if (!fp) return;
+  if (!fp) { return;
+}
   char line[256];
   while (fgets(line, sizeof(line), fp)) {
     // Discard the remainder of overlong lines so a truncated
@@ -490,12 +515,15 @@ static void load_env(void) {
 // (doubles every single quote).  Caller frees.
 static char *sql_literal_escape(const char *s) {
   size_t len = 0;
-  for (const char *p = s; *p; p++) len += (*p == '\'') ? 2 : 1;
+  for (const char *p = s; *p; p++) { len += (*p == '\'') ? 2 : 1;
+}
   char *out = malloc(len + 1);
-  if (!out) return NULL;
+  if (!out) { return NULL;
+}
   char *w = out;
   for (const char *p = s; *p; p++) {
-    if (*p == '\'') *w++ = '\'';
+    if (*p == '\'') { *w++ = '\'';
+}
     *w++ = *p;
   }
   *w = '\0';
@@ -506,9 +534,11 @@ static char *sql_literal_escape(const char *s) {
 // even when the statement doesn't start at column 0.
 static const char *skip_sql_prefix(const char *sql) {
   for (;;) {
-    while (*sql && isspace((unsigned char)*sql)) sql++;
+    while (*sql && isspace((unsigned char)*sql)) { sql++;
+}
     if (sql[0] == '-' && sql[1] == '-') {
-      while (*sql && *sql != '\n') sql++;
+      while (*sql && *sql != '\n') { sql++;
+}
       continue;
     }
     if (sql[0] == '/' && sql[1] == '*') {
@@ -524,7 +554,8 @@ static const char *skip_sql_prefix(const char *sql) {
 // query string — attaching our bearer token both leaks the credential
 // to the storage host and breaks signature validation.
 static int url_is_presigned(const char *url) {
-  if (!url) return 0;
+  if (!url) { return 0;
+}
   return strstr(url, "X-Amz-Signature=") != NULL ||
          strstr(url, "X-Amz-Credential=") != NULL ||
          strstr(url, "X-Goog-Signature=") != NULL ||
@@ -536,18 +567,24 @@ static int url_is_presigned(const char *url) {
 // Strips any user@info and :port. Returns the host length, or 0 on
 // failure / parse error. e.g. "http://user@127.0.0.1:9000/x" -> "127.0.0.1".
 static size_t url_host(const char *url, char *out, size_t out_cap) {
-  if (!url || !out || out_cap == 0) return 0;
+  if (!url || !out || out_cap == 0) { return 0;
+}
   const char *p = strstr(url, "://");
-  if (!p) return 0;
+  if (!p) { return 0;
+}
   p += 3;
   const char *end = p;
   while (*end && *end != '/' && *end != ':' && *end != '@' &&
-         *end != '?' && *end != '#') end++;
+         *end != '?' && *end != '#') { end++;
+}
   const char *at = NULL;
-  for (const char *q = p; q < end; q++) if (*q == '@') at = q;
+  for (const char *q = p; q < end; q++) { if (*q == '@') { at = q;
+}
+}
   const char *hstart = at ? at + 1 : p;
   size_t hlen = (size_t)(end - hstart);
-  if (hlen >= out_cap) hlen = out_cap - 1;
+  if (hlen >= out_cap) { hlen = out_cap - 1;
+}
   memcpy(out, hstart, hlen);
   out[hlen] = '\0';
   return hlen;
@@ -566,30 +603,43 @@ static int url_is_https(const char *url) {
 // from the storage destination allowlist (host_is_storage_safe) because
 // 169.254.169.254 is the AWS/GCP/Azure instance-metadata endpoint.
 static int host_is_local(const char *host) {
-  if (!host || !*host) return 0;
+  if (!host || !*host) { return 0;
+}
   // IPv6 [::1] form
   if (host[0] == '[') {
-    if (strncmp(host, "[::1]", 5) == 0) return 1;
-    if (strncmp(host, "[fe80", 5) == 0) return 1;
-    if (strncmp(host, "[fc", 3) == 0 || strncmp(host, "[fd", 3) == 0) return 1; // ULA
+    if (strncmp(host, "[::1]", 5) == 0) { return 1;
+}
+    if (strncmp(host, "[fe80", 5) == 0) { return 1;
+}
+    if (strncmp(host, "[fc", 3) == 0 || strncmp(host, "[fd", 3) == 0) { return 1; // ULA
+}
     return 0;
   }
-  if (strcmp(host, "localhost") == 0) return 1;
-  if (strncmp(host, "127.", 4) == 0) return 1;
-  if (strncmp(host, "10.", 3) == 0) return 1;
-  if (strncmp(host, "192.168.", 8) == 0) return 1;
-  if (strncmp(host, "169.254.", 8) == 0) return 1; // link-local
-  if (strncmp(host, "fe80", 4) == 0) return 1;     // IPv6 link-local
-  if (strncmp(host, "::1", 3) == 0) return 1;      // IPv6 loopback
-  if (strncmp(host, "fc", 2) == 0 || strncmp(host, "fd", 2) == 0) return 1; // ULA
+  if (strcmp(host, "localhost") == 0) { return 1;
+}
+  if (strncmp(host, "127.", 4) == 0) { return 1;
+}
+  if (strncmp(host, "10.", 3) == 0) { return 1;
+}
+  if (strncmp(host, "192.168.", 8) == 0) { return 1;
+}
+  if (strncmp(host, "169.254.", 8) == 0) { return 1; // link-local
+}
+  if (strncmp(host, "fe80", 4) == 0) { return 1;     // IPv6 link-local
+}
+  if (strncmp(host, "::1", 3) == 0) { return 1;      // IPv6 loopback
+}
+  if (strncmp(host, "fc", 2) == 0 || strncmp(host, "fd", 2) == 0) { return 1; // ULA
+}
   if (strncmp(host, "172.", 4) == 0) {
     unsigned second = 0;
     // sscanf's %u overflow on malformed input yields ULONG_MAX, which the
     // >= 16 && <= 31 range guard rejects — the original value never reaches
     // a wrong decision branch, so the unchecked-conversion warning is moot.
     // NOLINTNEXTLINE(bugprone-unchecked-string-to-number-conversion,cert-err34-c)
-    if (sscanf(host, "172.%u.", &second) == 1 && second >= 16 && second <= 31)
+    if (sscanf(host, "172.%u.", &second) == 1 && second >= 16 && second <= 31) {
       return 1;
+}
   }
   return 0;
 }
@@ -601,29 +651,39 @@ static int host_is_local(const char *host) {
 // would otherwise have the client upload the full database (and, for
 // non-presigned URLs, the bearer token) to the metadata service.
 static int host_is_storage_safe(const char *host) {
-  if (!host || !*host) return 0;
+  if (!host || !*host) { return 0;
+}
   if (host[0] == '[') {
-    if (strncmp(host, "[::1]", 5) == 0) return 1;
-    if (strncmp(host, "[fc", 3) == 0 || strncmp(host, "[fd", 3) == 0) return 1; // ULA
+    if (strncmp(host, "[::1]", 5) == 0) { return 1;
+}
+    if (strncmp(host, "[fc", 3) == 0 || strncmp(host, "[fd", 3) == 0) { return 1; // ULA
+}
     // NO [fe80 — link-local excluded
     return 0;
   }
-  if (strcmp(host, "localhost") == 0) return 1;
-  if (strncmp(host, "127.", 4) == 0) return 1;
-  if (strncmp(host, "10.", 3) == 0) return 1;
-  if (strncmp(host, "192.168.", 8) == 0) return 1;
+  if (strcmp(host, "localhost") == 0) { return 1;
+}
+  if (strncmp(host, "127.", 4) == 0) { return 1;
+}
+  if (strncmp(host, "10.", 3) == 0) { return 1;
+}
+  if (strncmp(host, "192.168.", 8) == 0) { return 1;
+}
   // NO 169.254. — IMDS excluded
   // NO fe80 — IPv6 link-local excluded
-  if (strncmp(host, "::1", 3) == 0) return 1;
-  if (strncmp(host, "fc", 2) == 0 || strncmp(host, "fd", 2) == 0) return 1; // ULA
+  if (strncmp(host, "::1", 3) == 0) { return 1;
+}
+  if (strncmp(host, "fc", 2) == 0 || strncmp(host, "fd", 2) == 0) { return 1; // ULA
+}
   if (strncmp(host, "172.", 4) == 0) {
     unsigned second = 0;
     // sscanf's %u overflow on malformed input yields ULONG_MAX, which the
     // >= 16 && <= 31 range guard rejects — the original value never reaches
     // a wrong decision branch, so the unchecked-conversion warning is moot.
     // NOLINTNEXTLINE(bugprone-unchecked-string-to-number-conversion,cert-err34-c)
-    if (sscanf(host, "172.%u.", &second) == 1 && second >= 16 && second <= 31)
+    if (sscanf(host, "172.%u.", &second) == 1 && second >= 16 && second <= 31) {
       return 1;
+}
   }
   return 0;
 }
@@ -634,11 +694,15 @@ static int host_is_storage_safe(const char *host) {
 // ARKILIAN_ALLOW_INSECURE=1 — the loud-failure default keeps a
 // misconfiguration from leaking the bearer token.
 static int url_transport_is_safe(const char *url, int allow_insecure) {
-  if (!url || !*url) return 1; // empty endpoint => nothing to ship
-  if (url_is_https(url)) return 1;
-  if (allow_insecure) return 1;
+  if (!url || !*url) { return 1; // empty endpoint => nothing to ship
+}
+  if (url_is_https(url)) { return 1;
+}
+  if (allow_insecure) { return 1;
+}
   char host[256];
-  if (url_host(url, host, sizeof(host)) == 0) return 0; // unparseable
+  if (url_host(url, host, sizeof(host)) == 0) { return 0; // unparseable
+}
   return host_is_local(host);
 }
 
@@ -649,22 +713,31 @@ static int url_transport_is_safe(const char *url, int allow_insecure) {
 // add its host via ARKILIAN_STORAGE_HOSTS="host1,host2" (comma-separated,
 // suffix-matched).
 static int host_is_known_storage(const char *host) {
-  if (!host || !*host) return 0;
+  if (!host || !*host) { return 0;
+}
   // AWS S3 (and s3-website, s3-accelerate, dualstack)
-  if (strstr(host, ".amazonaws.com")) return 1;
+  if (strstr(host, ".amazonaws.com")) { return 1;
+}
   // Google Cloud Storage
-  if (strcmp(host, "storage.googleapis.com") == 0) return 1;
-  if (strstr(host, ".storage.googleapis.com")) return 1;
+  if (strcmp(host, "storage.googleapis.com") == 0) { return 1;
+}
+  if (strstr(host, ".storage.googleapis.com")) { return 1;
+}
   // Azure Blob
-  if (strstr(host, ".blob.core.windows.net")) return 1;
+  if (strstr(host, ".blob.core.windows.net")) { return 1;
+}
   // Backblaze B2
-  if (strstr(host, ".backblazeb2.com")) return 1;
+  if (strstr(host, ".backblazeb2.com")) { return 1;
+}
   // Cloudflare R2
-  if (strstr(host, ".r2.cloudflarestorage.com")) return 1;
+  if (strstr(host, ".r2.cloudflarestorage.com")) { return 1;
+}
   // Wasabi
-  if (strstr(host, ".wasabisys.com")) return 1;
+  if (strstr(host, ".wasabisys.com")) { return 1;
+}
   // DigitalOcean Spaces
-  if (strstr(host, ".digitaloceanspaces.com")) return 1;
+  if (strstr(host, ".digitaloceanspaces.com")) { return 1;
+}
   return 0;
 }
 
@@ -676,11 +749,15 @@ static int host_is_known_storage(const char *host) {
 // upload_url pointing at cloud metadata (169.254.169.254) or an internal
 // service is refused here, so the customer's snapshot is never exfiltrated.
 static int url_is_allowed_storage(const char *url) {
-  if (!url) return 0;
+  if (!url) { return 0;
+}
   char host[256];
-  if (url_host(url, host, sizeof(host)) == 0) return 0;
-  if (host_is_known_storage(host)) return 1;
-  if (host_is_storage_safe(host)) return 1;
+  if (url_host(url, host, sizeof(host)) == 0) { return 0;
+}
+  if (host_is_known_storage(host)) { return 1;
+}
+  if (host_is_storage_safe(host)) { return 1;
+}
   // Operator allowlist (comma-separated, exact-or-suffix match)
   const char *extra = getenv("ARKILIAN_STORAGE_HOSTS");
   if (extra && *extra) {
@@ -690,15 +767,19 @@ static int url_is_allowed_storage(const char *url) {
     char *save = NULL;
     char *tok = strtok_r(buf, ",", &save);
     while (tok) {
-      while (*tok == ' ') tok++;
+      while (*tok == ' ') { tok++;
+}
       size_t tlen = strlen(tok);
-      if (tlen && tok[tlen - 1] == ' ') tok[--tlen] = '\0';
+      if (tlen && tok[tlen - 1] == ' ') { tok[--tlen] = '\0';
+}
       if (tlen == 0) { tok = strtok_r(NULL, ",", &save); continue; }
       size_t hlen = strlen(host);
       // exact match, or host ends with ".<allowed>" (subdomain), or equals
-      if (strcmp(host, tok) == 0) return 1;
+      if (strcmp(host, tok) == 0) { return 1;
+}
       if (hlen > tlen + 1 && host[hlen - tlen - 1] == '.' &&
-          strcmp(host + hlen - tlen, tok) == 0) return 1;
+          strcmp(host + hlen - tlen, tok) == 0) { return 1;
+}
       tok = strtok_r(NULL, ",", &save);
     }
   }
@@ -719,19 +800,22 @@ static int url_is_allowed_storage(const char *url) {
 // root.
 #ifdef ARK_HAVE_STATFS
 static int fs_is_network(const char *path) {
-  if (!path || !*path) return 0;
+  if (!path || !*path) { return 0;
+}
   struct statfs s;
   if (statfs(path, &s) != 0) {
     char dir[4096];
     size_t n = strlen(path);
-    if (n >= sizeof(dir)) n = sizeof(dir) - 1;
+    if (n >= sizeof(dir)) { n = sizeof(dir) - 1;
+}
     memcpy(dir, path, n);
     dir[n] = '\0';
     char *slash = strrchr(dir, '/');
     const char *probe = ".";
-    if (slash == dir) probe = "/";
-    else if (slash) { *slash = '\0'; probe = dir; }
-    if (statfs(probe, &s) != 0) return 0; // unknown — do not false-positive
+    if (slash == dir) { { probe = "/";
+    } } else if (slash) { *slash = '\0'; probe = dir; }
+    if (statfs(probe, &s) != 0) { return 0; // unknown — do not false-positive
+}
   }
 #  if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || \
       defined(__NetBSD__) || defined(__DragonFly__)
@@ -771,16 +855,20 @@ static const char *RESERVED_TABLES[] = {
 };
 
 static int is_reserved_table(const char *name) {
-  if (!name) return 1;
-  if (strncmp(name, "sqlite_", 7) == 0) return 1;
+  if (!name) { return 1;
+}
+  if (strncmp(name, "sqlite_", 7) == 0) { return 1;
+}
   for (int i = 0; RESERVED_TABLES[i]; i++) {
-    if (strcmp(name, RESERVED_TABLES[i]) == 0) return 1;
+    if (strcmp(name, RESERVED_TABLES[i]) == 0) { return 1;
+}
   }
   return 0;
 }
 
 int sync_backup_triggers(sqlite3 *db, char **err_out) {
-  if (!db) return SQLITE_ERROR;
+  if (!db) { return SQLITE_ERROR;
+}
   int rc;
   char *errmsg = NULL;
   int began = 0;
@@ -791,8 +879,9 @@ int sync_backup_triggers(sqlite3 *db, char **err_out) {
   if (sqlite3_get_autocommit(db)) {
     rc = sqlite3_exec(db, "BEGIN IMMEDIATE;", NULL, NULL, &errmsg);
     if (rc != SQLITE_OK) {
-      if (err_out) *err_out = errmsg;
-      else sqlite3_free(errmsg);
+      if (err_out) { *err_out = errmsg;
+      } else { sqlite3_free(errmsg);
+}
       return rc;
     }
     began = 1;
@@ -834,9 +923,11 @@ int sync_backup_triggers(sqlite3 *db, char **err_out) {
   for (int i = 0; kInternalDDL[i]; i++) {
     rc = sqlite3_exec(db, kInternalDDL[i], NULL, NULL, &errmsg);
     if (rc != SQLITE_OK) {
-      if (began) sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
-      if (err_out) *err_out = errmsg;
-      else sqlite3_free(errmsg);
+      if (began) { sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
+}
+      if (err_out) { *err_out = errmsg;
+      } else { sqlite3_free(errmsg);
+}
       return rc;
     }
   }
@@ -857,14 +948,17 @@ int sync_backup_triggers(sqlite3 *db, char **err_out) {
         -1, &table_stmt, NULL);
   }
   if (rc != SQLITE_OK) {
-    if (err_out) *err_out = sqlite3_mprintf("prepare table list: %s", sqlite3_errmsg(db));
-    if (began) sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
+    if (err_out) { *err_out = sqlite3_mprintf("prepare table list: %s", sqlite3_errmsg(db));
+}
+    if (began) { sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
+}
     return rc;
   }
 
   while ((rc = sqlite3_step(table_stmt)) == SQLITE_ROW) {
     const char *table = (const char *)sqlite3_column_text(table_stmt, 0);
-    if (!table || is_reserved_table(table)) continue;
+    if (!table || is_reserved_table(table)) { continue;
+}
 
     // Per-table allocations declared up-front and NULL-initialized so that
     // EVERY OOM/error path (including ones reached before they are
@@ -873,7 +967,8 @@ int sync_backup_triggers(sqlite3 *db, char **err_out) {
     // jump over their declaration (which is UB in C).
     char **cols = NULL;
     int *pk_ranks = NULL;
-    int ncols = 0, cap = 0;
+    int ncols = 0;
+    int cap = 0;
     char *raw_cols = NULL;
     char *new_vals = NULL;
     char *replace_lit = NULL;
@@ -891,10 +986,12 @@ int sync_backup_triggers(sqlite3 *db, char **err_out) {
     if (rc != SQLITE_OK) {
       // Build the message BEFORE finalizing table_stmt — `table` points
       // into table_stmt's row buffer and is invalid after finalize.
-      if (err_out) *err_out = sqlite3_mprintf("prepare table_info(%s): %s", table, sqlite3_errmsg(db));
+      if (err_out) { *err_out = sqlite3_mprintf("prepare table_info(%s): %s", table, sqlite3_errmsg(db));
+}
       sqlite3_finalize(col_stmt);
       sqlite3_finalize(table_stmt);
-      if (began) sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
+      if (began) { sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
+}
       return rc;
     }
 
@@ -902,20 +999,24 @@ int sync_backup_triggers(sqlite3 *db, char **err_out) {
 
     while ((rc = sqlite3_step(col_stmt)) == SQLITE_ROW) {
       const char *col = (const char *)sqlite3_column_text(col_stmt, 1);
-      if (!col) continue;
+      if (!col) { continue;
+}
       // table_xinfo's 7th column flags hidden (1) and generated (2/3)
       // columns — those can never appear in INSERT/REPLACE column lists,
       // so capturing them would produce payloads that fail on replay.
       if (sqlite3_column_count(col_stmt) > 6 &&
-          sqlite3_column_int(col_stmt, 6) != 0) continue;
+          sqlite3_column_int(col_stmt, 6) != 0) { continue;
+}
       if (ncols == cap) {
         int ncap = cap ? cap * 2 : 8;
         char **nc = realloc(cols, (size_t)ncap * sizeof(char *));
         int *nr = realloc(pk_ranks, (size_t)ncap * sizeof(int));
         // A failed realloc leaves the original block intact; a successful
         // one moved it — adopt each result independently to stay consistent.
-        if (nc) cols = nc;
-        if (nr) pk_ranks = nr;
+        if (nc) { cols = nc;
+}
+        if (nr) { pk_ranks = nr;
+}
         if (!nc || !nr) {
           sqlite3_finalize(col_stmt);
           goto oom;
@@ -928,14 +1029,17 @@ int sync_backup_triggers(sqlite3 *db, char **err_out) {
       ncols++;
     }
     sqlite3_finalize(col_stmt);
-    if (rc != SQLITE_DONE) goto fail;
+    if (rc != SQLITE_DONE) { goto fail;
+}
 
-    if (ncols == 0) goto next_table;
+    if (ncols == 0) { goto next_table;
+}
 
     // Raw identifier list: "c1", "c2"  and  NEW-value expression:
     // quote(NEW."c1") || ', ' || quote(NEW."c2")
     for (int i = 0; i < ncols; i++) {
-      char *next_cols, *next_vals;
+      char *next_cols;
+      char *next_vals;
       if (i == 0) {
         next_cols = sqlite3_mprintf("\"%w\"", cols[i]);
         next_vals = sqlite3_mprintf("quote(NEW.\"%w\")", cols[i]);
@@ -959,7 +1063,8 @@ int sync_backup_triggers(sqlite3 *db, char **err_out) {
     replace_lit = sql_literal_escape(replace_lit_raw ? replace_lit_raw : "");
     delete_prefix = sql_literal_escape(delete_prefix_raw ? delete_prefix_raw : "");
     sqlite3_free(replace_lit_raw); sqlite3_free(delete_prefix_raw);
-    if (!replace_lit || !delete_prefix) goto oom;
+    if (!replace_lit || !delete_prefix) { goto oom;
+}
 
     // DELETE payloads are keyed on the PRIMARY KEY columns for every
     // table that has one. Keying on OLD.rowid is NOT replay-faithful:
@@ -973,7 +1078,8 @@ int sync_backup_triggers(sqlite3 *db, char **err_out) {
     // warning (spec §1: capture must not be silently bypassed).
     int pk_seen = 0;
     for (int i = 0; i < ncols; i++) {
-      if (pk_ranks[i] > 0) pk_seen++;
+      if (pk_ranks[i] > 0) { pk_seen++;
+}
     }
     if (pk_seen == 0) {
       ark_log(NULL, ARK_LOG_WARN,
@@ -989,10 +1095,12 @@ int sync_backup_triggers(sqlite3 *db, char **err_out) {
     }
     {
       char *lit_accum = strdup(delete_prefix);
-      if (!lit_accum) goto oom;
+      if (!lit_accum) { goto oom;
+}
       int pk_done = 0;
       for (int i = 0; i < ncols; i++) {
-        if (pk_ranks[i] == 0) continue;
+        if (pk_ranks[i] == 0) { continue;
+}
         char *piece = sqlite3_mprintf(pk_done == 0 ? "\"%w\" = " : " AND \"%w\" = ", cols[i]);
         if (!piece) { free(lit_accum); goto oom; }
         char *new_accum = malloc(strlen(lit_accum) + strlen(piece) + 1);
@@ -1017,7 +1125,8 @@ int sync_backup_triggers(sqlite3 *db, char **err_out) {
       }
       free(lit_accum);
     }
-    if (!delete_expr) goto oom;
+    if (!delete_expr) { goto oom;
+}
 
     {
       const char *ops[3][2] = {
@@ -1026,10 +1135,12 @@ int sync_backup_triggers(sqlite3 *db, char **err_out) {
 
       for (int i = 0; i < 3; i++) {
         char *drop_sql = sqlite3_mprintf("DROP TRIGGER IF EXISTS \"trg_%w_%s\";", table, ops[i][0]);
-        if (!drop_sql) goto trigger_oom;
+        if (!drop_sql) { goto trigger_oom;
+}
         rc = sqlite3_exec(db, drop_sql, NULL, NULL, &errmsg);
         sqlite3_free(drop_sql);
-        if (rc != SQLITE_OK) goto trigger_fail;
+        if (rc != SQLITE_OK) { goto trigger_fail;
+}
 
         char *create_sql = NULL;
         if (i == 2) {
@@ -1045,11 +1156,13 @@ int sync_backup_triggers(sqlite3 *db, char **err_out) {
               "'%s' || %s || ')') WHERE (SELECT COUNT(*) FROM _pending_backup) < %ld; END;",
               table, ops[i][0], ops[i][1], table, replace_lit, new_vals, outbox_cap());
         }
-        if (!create_sql) goto trigger_oom;
+        if (!create_sql) { goto trigger_oom;
+}
 
         rc = sqlite3_exec(db, create_sql, NULL, NULL, &errmsg);
         sqlite3_free(create_sql);
-        if (rc != SQLITE_OK) goto trigger_fail;
+        if (rc != SQLITE_OK) { goto trigger_fail;
+}
       }
       goto triggers_done;
 
@@ -1068,17 +1181,20 @@ triggers_done:
     sqlite3_free(raw_cols); sqlite3_free(new_vals);
 
 next_table:
-    for (int i = 0; i < ncols; i++) free(cols[i]);
+    for (int i = 0; i < ncols; i++) { free(cols[i]);
+}
     free(cols); free(pk_ranks);
     continue;
 
 oom:
     rc = SQLITE_NOMEM;
-    if (!errmsg) errmsg = sqlite3_mprintf("out of memory");
+    if (!errmsg) { errmsg = sqlite3_mprintf("out of memory");
+}
     goto fail_with_errmsg;
 
 fail:
-    if (!errmsg) errmsg = sqlite3_mprintf("trigger sync failed (rc=%d)", rc);
+    if (!errmsg) { errmsg = sqlite3_mprintf("trigger sync failed (rc=%d)", rc);
+}
 fail_with_errmsg:
     // Single owner of every per-table allocation: NULL-safe frees so that
     // any entry path (oom before partial assignment, oom mid-build,
@@ -1090,28 +1206,34 @@ fail_with_errmsg:
     sqlite3_free(delete_expr);
     sqlite3_free(raw_cols);
     sqlite3_free(new_vals);
-    for (int i = 0; i < ncols; i++) free(cols[i]);
+    for (int i = 0; i < ncols; i++) { free(cols[i]);
+}
     free(cols); free(pk_ranks);
     sqlite3_finalize(col_stmt);
     sqlite3_finalize(table_stmt);
-    if (began) sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
-    if (err_out) *err_out = errmsg;
-    else sqlite3_free(errmsg);
+    if (began) { sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
+}
+    if (err_out) { *err_out = errmsg;
+    } else { sqlite3_free(errmsg);
+}
     return rc;
   }
   sqlite3_finalize(table_stmt);
 
   if (rc != SQLITE_DONE) {
-    if (began) sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
-    if (err_out) *err_out = sqlite3_mprintf("table scan: %s", sqlite3_errmsg(db));
+    if (began) { sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
+}
+    if (err_out) { *err_out = sqlite3_mprintf("table scan: %s", sqlite3_errmsg(db));
+}
     return rc;
   }
 
   if (began) {
     rc = sqlite3_exec(db, "COMMIT;", NULL, NULL, &errmsg);
     if (rc != SQLITE_OK) {
-      if (err_out) *err_out = errmsg;
-      else sqlite3_free(errmsg);
+      if (err_out) { *err_out = errmsg;
+      } else { sqlite3_free(errmsg);
+}
       return rc;
     }
   }
@@ -1125,7 +1247,8 @@ static void on_db_update(void *user_data, int op_type, char const *db_name,
                           char const *table_name, sqlite3_int64 row_id) {
   arkilian *db = (arkilian *)user_data;
   (void)op_type; (void)db_name; (void)row_id;
-  if (!db || is_reserved_table(table_name)) return;
+  if (!db || is_reserved_table(table_name)) { return;
+}
 
   // The flag and the signal must be issued under the mutex — otherwise
   // the flush thread can miss the wakeup between its predicate check
@@ -1163,7 +1286,8 @@ static int on_schema_authorizer(void *user_data, int action,
                                 const char *db_name, const char *trigger_name) {
   (void)detail2; (void)db_name; (void)trigger_name;
   arkilian *db = (arkilian *)user_data;
-  if (!db) return SQLITE_OK;
+  if (!db) { return SQLITE_OK;
+}
   switch (action) {
     case SQLITE_CREATE_TABLE:
     case SQLITE_ALTER_TABLE:
@@ -1173,8 +1297,10 @@ static int on_schema_authorizer(void *user_data, int action,
       // tables carry no capture triggers, so their DDL is ignored —
       // flagging it would only trigger a wasteful no-op resync on the
       // game thread.
-      if (db->trigger_sync_in_progress) return SQLITE_OK;
-      if (detail1 && is_reserved_table(detail1)) return SQLITE_OK;
+      if (db->trigger_sync_in_progress) { return SQLITE_OK;
+}
+      if (detail1 && is_reserved_table(detail1)) { return SQLITE_OK;
+}
       db->triggers_dirty = 1;
       // DDL routed through db_exec / db_prepare+db_step is re-synced
       // automatically by apply_ddl_capture; only DDL that bypassed the
@@ -1219,24 +1345,30 @@ typedef enum { SHIP_OK = 0, SHIP_RETRY = 1 } ship_result_t;
 // failed `attempts` times. Caps at 5 minutes so a prolonged outage
 // retries for ~1 hour (20 attempts) instead of dead-lettering after 20s.
 static long backoff_seconds(int attempts) {
-  if (attempts <= 0) return 0;
-  if (attempts > 20) attempts = 20;
+  if (attempts <= 0) { return 0;
+}
+  if (attempts > 20) { attempts = 20;
+}
   long b = 1L << attempts; // 2^attempts
-  if (b > 300) b = 300;
+  if (b > 300) { b = 300;
+}
   return b;
 }
 
 // Join a control-plane base URL with a path suffix. Handles the case
 // where the base URL has a trailing slash. Caller frees the result.
 static char *join_url(const char *base, const char *suffix) {
-  if (!base || !suffix) return NULL;
+  if (!base || !suffix) { return NULL;
+}
   size_t blen = strlen(base);
   int need_strip = (blen > 0 && base[blen - 1] == '/');
   size_t len = blen - (need_strip ? 1 : 0) + strlen(suffix) + 1;
   char *out = malloc(len);
-  if (!out) return NULL;
-  if (need_strip) snprintf(out, len, "%.*s%s", (int)(blen - 1), base, suffix);
-  else snprintf(out, len, "%s%s", base, suffix);
+  if (!out) { return NULL;
+}
+  if (need_strip) { snprintf(out, len, "%.*s%s", (int)(blen - 1), base, suffix);
+  } else { snprintf(out, len, "%s%s", base, suffix);
+}
   return out;
 }
 
@@ -1247,42 +1379,55 @@ static char *join_url(const char *base, const char *suffix) {
 // db_backup_is_healthy(). The API key is the only credential sent.
 static int validate_api_key(arkilian *db, const char *control_url,
                             const char *api_key) {
-  if (!control_url || strlen(control_url) == 0 || !api_key || strlen(api_key) == 0)
+  if (!control_url || strlen(control_url) == 0 || !api_key || strlen(api_key) == 0) {
     return 0;
+}
 
   char *validate_url = join_url(control_url, "/v1/auth/validate");
-  if (!validate_url) return 0;
+  if (!validate_url) { return 0;
+}
 
   CURL *curl = curl_easy_init();
   int ok = 0;
   if (curl) {
     CURLcode rc = CURLE_OK;
     rc = curl_easy_setopt(curl, CURLOPT_URL, validate_url);
-    if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_POSTFIELDS, "");
-    if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_discard_cb);
-    if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_MAXFILESIZE_LARGE, (curl_off_t)1048576);
-    if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
-    if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5L);
-    if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
-    if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
+    if (rc == CURLE_OK) { rc = curl_easy_setopt(curl, CURLOPT_POSTFIELDS, "");
+}
+    if (rc == CURLE_OK) { rc = curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_discard_cb);
+}
+    if (rc == CURLE_OK) { rc = curl_easy_setopt(curl, CURLOPT_MAXFILESIZE_LARGE, (curl_off_t)1048576);
+}
+    if (rc == CURLE_OK) { rc = curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
+}
+    if (rc == CURLE_OK) { rc = curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5L);
+}
+    if (rc == CURLE_OK) { rc = curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
+}
+    if (rc == CURLE_OK) { rc = curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
+}
 
     struct curl_slist *headers = NULL;
     if (rc == CURLE_OK) {
       headers = curl_slist_append(headers, "Content-Type: application/json");
-      if (!headers) rc = CURLE_OUT_OF_MEMORY;
+      if (!headers) { rc = CURLE_OUT_OF_MEMORY;
+}
     }
     if (rc == CURLE_OK && strlen(api_key) > 0) {
       char auth[512];
       snprintf(auth, sizeof(auth), "Authorization: Bearer %s", api_key);
       headers = curl_slist_append(headers, auth);
-      if (!headers) rc = CURLE_OUT_OF_MEMORY;
+      if (!headers) { rc = CURLE_OUT_OF_MEMORY;
+}
     }
-    if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    if (rc == CURLE_OK) { rc = curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+}
 
     if (rc == CURLE_OK) {
       CURLcode res = curl_easy_perform(curl);
       long http_code = 0;
-      if (res == CURLE_OK) curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+      if (res == CURLE_OK) { curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+}
       ok = (res == CURLE_OK && http_code >= 200 && http_code < 300) ? 1 : 0;
       if (!ok) {
         ark_log(db, ARK_LOG_ERROR,
@@ -1291,7 +1436,8 @@ static int validate_api_key(arkilian *db, const char *control_url,
                 "ARKILIAN_CONTROL_URL", http_code, (int)res);
       }
     }
-    if (headers) curl_slist_free_all(headers);
+    if (headers) { curl_slist_free_all(headers);
+}
     curl_easy_cleanup(curl);
   }
   free(validate_url);
@@ -1303,13 +1449,15 @@ static int validate_api_key(arkilian *db, const char *control_url,
 static long curl_timeout_sec(size_t bytes, long base) {
   long extra = (long)(bytes / 100000);
   long t = base + extra;
-  if (t > 600) t = 600; // hard cap: 10 minutes
+  if (t > 600) { t = 600; // hard cap: 10 minutes
+}
   return t;
 }
 
 static ship_result_t ship_to_backup(arkilian *db, CURL *curl,
                                     sqlite3_int64 id, const char *payload) {
-  if (!payload || strlen(payload) == 0) return SHIP_OK;
+  if (!payload || strlen(payload) == 0) { return SHIP_OK;
+}
 
 #ifndef _WIN32
   pthread_mutex_lock(&db->payload_mutex);
@@ -1342,7 +1490,8 @@ static ship_result_t ship_to_backup(arkilian *db, CURL *curl,
   // 100k-row backlog is 100k requests over one connection instead of
   // 100k TCP+TLS handshakes. A fresh curl_easy_init per row caps
   // real-world WAN throughput at a few rows/sec.
-  if (!curl) return SHIP_RETRY;
+  if (!curl) { return SHIP_RETRY;
+}
   curl_easy_reset(curl);
 
   // Every curl_easy_setopt / curl_slist_append return code is checked: a
@@ -1352,32 +1501,44 @@ static ship_result_t ship_to_backup(arkilian *db, CURL *curl,
   CURLcode rc = CURLE_OK;
 
   rc = curl_easy_setopt(curl, CURLOPT_URL, push_url);
-  if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_POSTFIELDS, payload);
-  if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_TIMEOUT, curl_timeout_sec(strlen(payload), 10));
-  if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5L);
+  if (rc == CURLE_OK) { rc = curl_easy_setopt(curl, CURLOPT_POSTFIELDS, payload);
+}
+  if (rc == CURLE_OK) { rc = curl_easy_setopt(curl, CURLOPT_TIMEOUT, curl_timeout_sec(strlen(payload), 10));
+}
+  if (rc == CURLE_OK) { rc = curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5L);
+}
   // The destination's control-plane response body is small and discarded;
   // cap it so a compromised endpoint cannot stream-gigabytes OOM this
   // process. payload sizes are bounded by row size; responses are bounded
   // by the cap.
-  if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_MAXFILESIZE_LARGE, (curl_off_t)16777216);
-  if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
-  if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
-  if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_discard_cb);
-  if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
-  if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, curl_abort_cb);
-  if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_XFERINFODATA, (void *)&db->shutdown_requested);
+  if (rc == CURLE_OK) { rc = curl_easy_setopt(curl, CURLOPT_MAXFILESIZE_LARGE, (curl_off_t)16777216);
+}
+  if (rc == CURLE_OK) { rc = curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
+}
+  if (rc == CURLE_OK) { rc = curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
+}
+  if (rc == CURLE_OK) { rc = curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_discard_cb);
+}
+  if (rc == CURLE_OK) { rc = curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+}
+  if (rc == CURLE_OK) { rc = curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, curl_abort_cb);
+}
+  if (rc == CURLE_OK) { rc = curl_easy_setopt(curl, CURLOPT_XFERINFODATA, (void *)&db->shutdown_requested);
+}
 
   struct curl_slist *headers = NULL;
   if (rc == CURLE_OK) {
     headers = curl_slist_append(headers, "Content-Type: application/sql");
-    if (!headers) rc = CURLE_OUT_OF_MEMORY;
+    if (!headers) { rc = CURLE_OUT_OF_MEMORY;
+}
   }
   // Idempotency key lets the receiver deduplicate retries of the same row.
   char id_header[64];
   snprintf(id_header, sizeof(id_header), "X-Arkilian-Payload-Id: %lld", (long long)id);
   if (rc == CURLE_OK) {
     headers = curl_slist_append(headers, id_header);
-    if (!headers) rc = CURLE_OUT_OF_MEMORY;
+    if (!headers) { rc = CURLE_OUT_OF_MEMORY;
+}
   }
   // Never attach our API key to a pre-signed storage URL — the
   // signature IS the credential, and the key would leak to the host.
@@ -1386,10 +1547,12 @@ static ship_result_t ship_to_backup(arkilian *db, CURL *curl,
     char auth[512];
     snprintf(auth, sizeof(auth), "Authorization: Bearer %s", tok);
     headers = curl_slist_append(headers, auth);
-    if (!headers) rc = CURLE_OUT_OF_MEMORY;
+    if (!headers) { rc = CURLE_OUT_OF_MEMORY;
+}
   }
   free(tok);
-  if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+  if (rc == CURLE_OK) { rc = curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+}
 
   if (rc != CURLE_OK) {
     ark_log(db, ARK_LOG_ERROR,
@@ -1427,7 +1590,8 @@ typedef struct {
 static int drain_batch(arkilian *db, CURL *ship_curl, sqlite3_stmt *select_stmt,
                         sqlite3_stmt *delete_stmt, sqlite3_stmt *update_attempts_stmt,
                         sqlite3_stmt *dead_letter_stmt) {
-  if (!db || !db->backup_db) return 0;
+  if (!db || !db->backup_db) { return 0;
+}
 
   // Pass 1: read the batch into heap memory.
   outbox_row rows[BATCH_SIZE];
@@ -1439,15 +1603,18 @@ static int drain_batch(arkilian *db, CURL *ship_curl, sqlite3_stmt *select_stmt,
 
   for (;;) {
     int rc = sqlite3_step(select_stmt);
-    if (rc == SQLITE_DONE) break;
+    if (rc == SQLITE_DONE) { break;
+}
     if (rc != SQLITE_ROW) {
       ark_log(db, ARK_LOG_ERROR, "select from _pending_backup failed: %s",
                sqlite3_errmsg(db->backup_db));
       break;
     }
-    if (nrows >= BATCH_SIZE) break; // defensive; LIMIT already bounds it
+    if (nrows >= BATCH_SIZE) { break; // defensive; LIMIT already bounds it
+}
     const unsigned char *payload = sqlite3_column_text(select_stmt, 1);
-    if (!payload) continue;
+    if (!payload) { continue;
+}
     char *copy = strdup((const char *)payload);
     if (!copy) {
       ark_log(db, ARK_LOG_ERROR, "OOM copying payload id=%lld",
@@ -1549,8 +1716,7 @@ static int drain_batch(arkilian *db, CURL *ship_curl, sqlite3_stmt *select_stmt,
       }
       processed_any = 1;
       continue;
-    } else {
-      sqlite3_reset(update_attempts_stmt);
+    }       sqlite3_reset(update_attempts_stmt);
       sqlite3_clear_bindings(update_attempts_stmt);
       sqlite3_bind_int(update_attempts_stmt, 1, new_attempts);
       sqlite3_bind_int64(update_attempts_stmt, 2, id);
@@ -1563,10 +1729,11 @@ static int drain_batch(arkilian *db, CURL *ship_curl, sqlite3_stmt *select_stmt,
       // failing endpoint and burning through MAX_ATTEMPTS instantly.
       processed_any = 0;
       break;
-    }
+   
   }
 
-  for (int i = 0; i < nrows; i++) free(rows[i].payload);
+  for (int i = 0; i < nrows; i++) { free(rows[i].payload);
+}
   return processed_any;
 }
 
@@ -1587,17 +1754,21 @@ static int prepare_outbox_statements(sqlite3 *db, sqlite3_stmt **select_stmt,
 
   if (sqlite3_prepare_v2(db,
         "SELECT id, payload, attempts, COALESCE(last_attempt_at, 0) FROM _pending_backup ORDER BY id LIMIT ?1",
-        -1, select_stmt, NULL) != SQLITE_OK) goto fail;
+        -1, select_stmt, NULL) != SQLITE_OK) { goto fail;
+}
   if (sqlite3_prepare_v2(db,
         "DELETE FROM _pending_backup WHERE id = ?1",
-        -1, delete_stmt, NULL) != SQLITE_OK) goto fail;
+        -1, delete_stmt, NULL) != SQLITE_OK) { goto fail;
+}
   if (sqlite3_prepare_v2(db,
         "UPDATE _pending_backup SET attempts = ?1, last_attempt_at = strftime('%s','now') WHERE id = ?2",
-        -1, update_attempts_stmt, NULL) != SQLITE_OK) goto fail;
+        -1, update_attempts_stmt, NULL) != SQLITE_OK) { goto fail;
+}
   if (sqlite3_prepare_v2(db,
         "INSERT OR IGNORE INTO _dead_backup (id, payload, attempts, failed_reason, created_at) "
         "SELECT id, payload, ?1, ?2, created_at FROM _pending_backup WHERE id = ?3",
-        -1, dead_letter_stmt, NULL) != SQLITE_OK) goto fail;
+        -1, dead_letter_stmt, NULL) != SQLITE_OK) { goto fail;
+}
   return 1;
 
 fail:
@@ -1611,7 +1782,8 @@ fail:
 // Sleep for `seconds`, interruptible by shutdown (via the shared wake
 // condition variable). Returns 1 if shutdown was requested.
 static int sleep_interruptible(arkilian *db, int seconds) {
-  if (seconds < 1) seconds = 1;
+  if (seconds < 1) { seconds = 1;
+}
 #ifndef _WIN32
   pthread_mutex_lock(&db->wake_mutex);
   struct timespec ts;
@@ -1620,7 +1792,8 @@ static int sleep_interruptible(arkilian *db, int seconds) {
   while (!ARK_LOAD(&db->shutdown_requested)) {
     pthread_cond_timedwait(&db->wake_cond, &db->wake_mutex, &ts);
     time_t now = time(NULL);
-    if (now >= ts.tv_sec) break;
+    if (now >= ts.tv_sec) { break;
+}
   }
   int shutdown = ARK_LOAD(&db->shutdown_requested);
   pthread_mutex_unlock(&db->wake_mutex);
@@ -1675,8 +1848,10 @@ void *run_wal_flush(void *arg) {
             "flush thread: failed to prepare outbox statements: %s "
             "(shipping paused; retrying in %ds)",
             sqlite3_errmsg(db->backup_db), backoff_s);
-    if (sleep_interruptible(db, backoff_s)) break;
-    if (backoff_s < 60) backoff_s *= 2;
+    if (sleep_interruptible(db, backoff_s)) { break;
+}
+    if (backoff_s < 60) { backoff_s *= 2;
+}
   }
 
   // One CURL handle for every ship in this thread: reset (not cleanup)
@@ -1741,11 +1916,16 @@ void *run_wal_flush(void *arg) {
     }
   }
 
-  if (select_stmt) sqlite3_finalize(select_stmt);
-  if (delete_stmt) sqlite3_finalize(delete_stmt);
-  if (update_attempts_stmt) sqlite3_finalize(update_attempts_stmt);
-  if (dead_letter_stmt) sqlite3_finalize(dead_letter_stmt);
-  if (ship_curl) curl_easy_cleanup(ship_curl);
+  if (select_stmt) { sqlite3_finalize(select_stmt);
+}
+  if (delete_stmt) { sqlite3_finalize(delete_stmt);
+}
+  if (update_attempts_stmt) { sqlite3_finalize(update_attempts_stmt);
+}
+  if (dead_letter_stmt) { sqlite3_finalize(dead_letter_stmt);
+}
+  if (ship_curl) { curl_easy_cleanup(ship_curl);
+}
 
 #ifdef _WIN32
   return 0;
@@ -1757,10 +1937,12 @@ void *run_wal_flush(void *arg) {
 // ── Database Lifecycle: db_init / db_close ──────────────────────────
 
 int db_init(arkilian **db_ptr, const char *filename) {
-  if (!db_ptr) return 1;
+  if (!db_ptr) { return 1;
+}
 
   arkilian *db = malloc(sizeof(arkilian));
-  if (!db) return 1;
+  if (!db) { return 1;
+}
   memset(db, 0, sizeof(arkilian));
 
   // Initialize all sync primitives before any logging or configuration
@@ -1792,18 +1974,21 @@ int db_init(arkilian **db_ptr, const char *filename) {
     get_env_default("ARKILIAN_DB_PATH", DEFAULT_DB_PATH);
 
   db->db_path = malloc(strlen(path) + 1);
-  if (db->db_path) strcpy(db->db_path, path);
+  if (db->db_path) { strcpy(db->db_path, path);
+}
 
   const char *backup_path_tmp = get_env_default("ARKILIAN_BACKUP_PATH", DEFAULT_BACKUP_PATH);
   db->backup_path = malloc(strlen(backup_path_tmp) + 1);
-  if (db->backup_path) strcpy(db->backup_path, backup_path_tmp);
+  if (db->backup_path) { strcpy(db->backup_path, backup_path_tmp);
+}
 
   // Control-plane base URL (e.g. https://api.arkilian.com). The client
   // derives /v1/wal/push and /v1/upload/request from this base — the
   // ONLY credential is the API key, sent as Bearer to every endpoint.
   const char *control_url_tmp = get_env_default("ARKILIAN_CONTROL_URL", "");
   db->control_url = malloc(strlen(control_url_tmp) + 1);
-  if (db->control_url) strcpy(db->control_url, control_url_tmp);
+  if (db->control_url) { strcpy(db->control_url, control_url_tmp);
+}
 
   // Derive the two endpoint URLs from the control-plane base.
   if (db->control_url && strlen(db->control_url) > 0) {
@@ -1819,7 +2004,8 @@ int db_init(arkilian **db_ptr, const char *filename) {
   // No S3 credentials, JWT, or separate bearer token are ever used.
   const char *api_key_tmp = get_env_default("ARKILIAN_API_KEY", "");
   db->api_key = malloc(strlen(api_key_tmp) + 1);
-  if (db->api_key) strcpy(db->api_key, api_key_tmp);
+  if (db->api_key) { strcpy(db->api_key, api_key_tmp);
+}
   // The API key is sent in a 512-byte stack buffer; a key longer than
   // ~490 bytes would be silently truncated and the control plane would
   // reject every request as unauthorized — surface it loudly instead.
@@ -1834,7 +2020,8 @@ int db_init(arkilian **db_ptr, const char *filename) {
   db->backup_interval = get_env_int_default("ARKILIAN_BACKUP_INTERVAL", DEFAULT_BACKUP_INTERVAL);
   // A 0 or negative interval would make the hourly thread hot-loop
   // (backup + signed-URL request with no sleep in between). Clamp it.
-  if (db->backup_interval < 1) db->backup_interval = 1;
+  if (db->backup_interval < 1) { db->backup_interval = 1;
+}
   ARK_STORE(&db->backup_enabled, get_env_bool_default("ARKILIAN_ENABLE_BACKUP", 1));
   // ARKILIAN_ALLOW_INSECURE=1 opts into cleartext http:// endpoints that
   // are NOT loopback/RFC1918 (e.g. an internal-but-public corporate
@@ -1917,7 +2104,8 @@ int db_init(arkilian **db_ptr, const char *filename) {
     const char *err = sqlite3_errstr(rc);
     strncpy(db->last_error_msg, err, sizeof(db->last_error_msg) - 1);
     db->last_error_msg[sizeof(db->last_error_msg) - 1] = '\0';
-    if (db->handle) sqlite3_close(db->handle);
+    if (db->handle) { sqlite3_close(db->handle);
+}
     db->handle = NULL;
     *db_ptr = db;
     return 1;
@@ -1930,7 +2118,8 @@ int db_init(arkilian **db_ptr, const char *filename) {
   if (rc != SQLITE_OK) {
     snprintf(db->last_error_msg, sizeof(db->last_error_msg),
              "backup connection: %s", sqlite3_errstr(rc));
-    if (db->backup_db) sqlite3_close(db->backup_db);
+    if (db->backup_db) { sqlite3_close(db->backup_db);
+}
     sqlite3_close(db->handle);
     db->handle = NULL;
     db->backup_db = NULL;
@@ -1948,8 +2137,10 @@ int db_init(arkilian **db_ptr, const char *filename) {
   if (rc != SQLITE_OK) {
     snprintf(db->last_error_msg, sizeof(db->last_error_msg),
              "snapshot connection: %s", sqlite3_errstr(rc));
-    if (db->snapshot_db) sqlite3_close(db->snapshot_db);
-    if (db->backup_db) sqlite3_close(db->backup_db);
+    if (db->snapshot_db) { sqlite3_close(db->snapshot_db);
+}
+    if (db->backup_db) { sqlite3_close(db->backup_db);
+}
     sqlite3_close(db->handle);
     db->handle = NULL;
     db->backup_db = NULL;
@@ -2091,7 +2282,8 @@ int db_init(arkilian **db_ptr, const char *filename) {
               trigger_err ? trigger_err : "unknown error");
       capture_ok = 0;
     }
-    if (trigger_err) sqlite3_free(trigger_err);
+    if (trigger_err) { sqlite3_free(trigger_err);
+}
     // Init sync establishes full coverage: clear any transient dirty flag
     // the authorizer may have raised before the guard took effect.
     db->triggers_dirty = 0;
@@ -2106,7 +2298,8 @@ int db_init(arkilian **db_ptr, const char *filename) {
     if (sqlite3_prepare_v2(db->handle,
           "SELECT v FROM _arkilian_meta WHERE k = 'schema_version'",
           -1, &sv, NULL) == SQLITE_OK) {
-      if (sqlite3_step(sv) == SQLITE_ROW) db_version = sqlite3_column_int(sv, 0);
+      if (sqlite3_step(sv) == SQLITE_ROW) { db_version = sqlite3_column_int(sv, 0);
+}
       sqlite3_finalize(sv);
     }
     if (db_version > ARKILIAN_SCHEMA_VERSION) {
@@ -2182,7 +2375,8 @@ int db_init(arkilian **db_ptr, const char *filename) {
 }
 
 void db_close(arkilian *db) {
-  if (!db) return;
+  if (!db) { return;
+}
 
   // Wake BOTH sleeper threads (flush + hourly backup) under the mutex
   // so neither can miss the shutdown signal.
@@ -2221,14 +2415,20 @@ void db_close(arkilian *db) {
 #endif
 
   for (int i = 0; i < db->stmt_count; i++) {
-    if (db->stmts && db->stmts[i]) sqlite3_finalize(db->stmts[i]);
+    if (db->stmts && db->stmts[i]) { sqlite3_finalize(db->stmts[i]);
+}
   }
-  if (db->stmts) free(db->stmts);
-  if (db->stmt_is_ddl) free(db->stmt_is_ddl);
+  if (db->stmts) { free(db->stmts);
+}
+  if (db->stmt_is_ddl) { free(db->stmt_is_ddl);
+}
 
-  if (db->begin_stmt) sqlite3_finalize(db->begin_stmt);
-  if (db->commit_stmt) sqlite3_finalize(db->commit_stmt);
-  if (db->rollback_stmt) sqlite3_finalize(db->rollback_stmt);
+  if (db->begin_stmt) { sqlite3_finalize(db->begin_stmt);
+}
+  if (db->commit_stmt) { sqlite3_finalize(db->commit_stmt);
+}
+  if (db->rollback_stmt) { sqlite3_finalize(db->rollback_stmt);
+}
 
   if (db->backup_db) {
     sqlite3_close(db->backup_db);
@@ -2266,12 +2466,18 @@ void db_close(arkilian *db) {
   }
 #endif
 
-  if (db->db_path) free(db->db_path);
-  if (db->backup_path) free(db->backup_path);
-  if (db->control_url) free(db->control_url);
-  if (db->push_url) free(db->push_url);
-  if (db->signed_url_endpoint) free(db->signed_url_endpoint);
-  if (db->api_key) free(db->api_key);
+  if (db->db_path) { free(db->db_path);
+}
+  if (db->backup_path) { free(db->backup_path);
+}
+  if (db->control_url) { free(db->control_url);
+}
+  if (db->push_url) { free(db->push_url);
+}
+  if (db->signed_url_endpoint) { free(db->signed_url_endpoint);
+}
+  if (db->api_key) { free(db->api_key);
+}
 
   free(db);
 }
@@ -2279,9 +2485,12 @@ void db_close(arkilian *db) {
 // ── Query Execution ─────────────────────────────────────────────────
 
 const char *db_errmsg(arkilian *db) {
-  if (!db) return "Invalid database handle";
-  if (db->last_error_msg[0] != '\0') return db->last_error_msg;
-  if (db->handle) return sqlite3_errmsg(db->handle);
+  if (!db) { return "Invalid database handle";
+}
+  if (db->last_error_msg[0] != '\0') { return db->last_error_msg;
+}
+  if (db->handle) { return sqlite3_errmsg(db->handle);
+}
   return "Unknown error";
 }
 
@@ -2308,7 +2517,8 @@ static void apply_ddl_capture(arkilian *db, const char *sql) {
     // flagged raw-handle desync is now repaired too.
     db->triggers_dirty = 0;
   }
-  if (terr) sqlite3_free(terr);
+  if (terr) { sqlite3_free(terr);
+}
 
   sqlite3_stmt *ddl_stmt = NULL;
   char ddl_insert_sql[160];
@@ -2329,7 +2539,8 @@ static void apply_ddl_capture(arkilian *db, const char *sql) {
 }
 
 int db_exec(arkilian *db, const char *sql) {
-  if (!db || !db->handle || !sql) return SQLITE_ERROR;
+  if (!db || !db->handle || !sql) { return SQLITE_ERROR;
+}
 
   // (Risk #1) Opt-in auto-resync: if raw-handle DDL set triggers_dirty
   // and the operator enabled this, repair NOW — before the user's SQL
@@ -2374,7 +2585,8 @@ int db_exec(arkilian *db, const char *sql) {
 }
 
 int db_prepare(arkilian *db, const char *sql) {
-  if (!db || !db->handle || !sql) return SQLITE_ERROR;
+  if (!db || !db->handle || !sql) { return SQLITE_ERROR;
+}
 
   if (db->stmt_count >= db->stmt_capacity) {
     int new_cap = (db->stmt_capacity == 0) ? 8 : db->stmt_capacity * 2;
@@ -2382,7 +2594,8 @@ int db_prepare(arkilian *db, const char *sql) {
     // to grow, the (larger) flag block is harmless — it is only ever
     // indexed below stmt_capacity.
     unsigned char *new_flags = realloc(db->stmt_is_ddl, (size_t)new_cap);
-    if (!new_flags) return SQLITE_NOMEM;
+    if (!new_flags) { return SQLITE_NOMEM;
+}
     sqlite3_stmt **new_arr = realloc(db->stmts, (size_t)new_cap * sizeof(sqlite3_stmt *));
     if (!new_arr) {
       db->stmt_is_ddl = new_flags;
@@ -2424,8 +2637,10 @@ int db_prepare(arkilian *db, const char *sql) {
 }
 
 int db_use_stmt(arkilian *db, int index) {
-  if (!db || index < 0 || index >= db->stmt_count) return SQLITE_ERROR;
-  if (!db->stmts[index]) return SQLITE_ERROR;
+  if (!db || index < 0 || index >= db->stmt_count) { return SQLITE_ERROR;
+}
+  if (!db->stmts[index]) { return SQLITE_ERROR;
+}
   db->stmt_current = index;
   return SQLITE_OK;
 }
@@ -2435,13 +2650,15 @@ int db_stmt_count(arkilian *db) {
 }
 
 static sqlite3_stmt *get_current_stmt(arkilian *db) {
-  if (!db || db->stmt_current < 0 || db->stmt_current >= db->stmt_count) return NULL;
+  if (!db || db->stmt_current < 0 || db->stmt_current >= db->stmt_count) { return NULL;
+}
   return db->stmts[db->stmt_current];
 }
 
 int db_step(arkilian *db) {
   sqlite3_stmt *stmt = get_current_stmt(db);
-  if (!stmt) return SQLITE_ERROR;
+  if (!stmt) { return SQLITE_ERROR;
+}
 
   // (Risk #1) Opt-in auto-resync: same as db_exec — if raw-handle DDL
   // set triggers_dirty, repair before the step runs. Post-commit, game
@@ -2456,9 +2673,11 @@ int db_step(arkilian *db) {
   int is_ddl = (db->stmt_is_ddl &&
                 db->stmt_current >= 0 && db->stmt_current < db->stmt_count &&
                 db->stmt_is_ddl[db->stmt_current]);
-  if (is_ddl) db->in_wrapped_dispatch = 1;
+  if (is_ddl) { db->in_wrapped_dispatch = 1;
+}
   int rc = sqlite3_step(stmt);
-  if (is_ddl) db->in_wrapped_dispatch = 0;
+  if (is_ddl) { db->in_wrapped_dispatch = 0;
+}
   // DDL executed through prepare/step used to bypass trigger resync —
   // a table created this way was never captured (spec §1). Resync once
   // the statement completes successfully. The flag check is one
@@ -2471,19 +2690,22 @@ int db_step(arkilian *db) {
 }
 
 int db_finalize(arkilian *db) {
-  if (!db) return SQLITE_ERROR;
+  if (!db) { return SQLITE_ERROR;
+}
   sqlite3_stmt *stmt = get_current_stmt(db);
   if (stmt) {
     sqlite3_finalize(stmt);
     db->stmts[db->stmt_current] = NULL;
-    if (db->stmt_is_ddl) db->stmt_is_ddl[db->stmt_current] = 0;
+    if (db->stmt_is_ddl) { db->stmt_is_ddl[db->stmt_current] = 0;
+}
   }
   return SQLITE_OK;
 }
 
 int db_reset(arkilian *db) {
   sqlite3_stmt *stmt = get_current_stmt(db);
-  if (!stmt) return SQLITE_ERROR;
+  if (!stmt) { return SQLITE_ERROR;
+}
   return sqlite3_reset(stmt);
 }
 
@@ -2536,7 +2758,8 @@ int db_column_bytes(arkilian *db, int col) {
 
 int db_bind_text(arkilian *db, int idx, const char *val) {
   sqlite3_stmt *stmt = get_current_stmt(db);
-  if (!stmt || !val) return SQLITE_ERROR;
+  if (!stmt || !val) { return SQLITE_ERROR;
+}
   return sqlite3_bind_text(stmt, idx, val, -1, SQLITE_TRANSIENT);
 }
 
@@ -2573,7 +2796,8 @@ sqlite3_int64 db_last_insert_rowid(arkilian *db) {
 // directly — db_set_api_key can swap/free it from the game thread while a
 // backup thread is mid-request (use-after-free).
 static char *api_key_snapshot(arkilian *db) {
-  if (!db) return NULL;
+  if (!db) { return NULL;
+}
   char *copy = NULL;
 #ifndef _WIN32
   pthread_mutex_lock(&db->api_key_mutex);
@@ -2592,16 +2816,19 @@ static char *api_key_snapshot(arkilian *db) {
 }
 
 int db_set_api_key(arkilian *db, const char *api_key) {
-  if (!db || !api_key) return 1;
+  if (!db || !api_key) { return 1;
+}
   char *replacement = malloc(strlen(api_key) + 1);
-  if (!replacement) return 1;
+  if (!replacement) { return 1;
+}
   strcpy(replacement, api_key);
 #ifndef _WIN32
   pthread_mutex_lock(&db->api_key_mutex);
 #else
   EnterCriticalSection(&db->api_key_mutex);
 #endif
-  if (db->api_key) free(db->api_key);
+  if (db->api_key) { free(db->api_key);
+}
   db->api_key = replacement;
 #ifndef _WIN32
   pthread_mutex_unlock(&db->api_key_mutex);
@@ -2614,8 +2841,10 @@ int db_set_api_key(arkilian *db, const char *api_key) {
 // ── Transaction Control ─────────────────────────────────────────────
 
 int db_begin(arkilian *db) {
-  if (!db || !db->handle) return SQLITE_ERROR;
-  if (db->in_batch_txn) return SQLITE_BUSY;
+  if (!db || !db->handle) { return SQLITE_ERROR;
+}
+  if (db->in_batch_txn) { return SQLITE_BUSY;
+}
   int rc = sqlite3_step(db->begin_stmt);
   sqlite3_reset(db->begin_stmt);
   if (rc == SQLITE_DONE) {
@@ -2626,8 +2855,10 @@ int db_begin(arkilian *db) {
 }
 
 int db_commit(arkilian *db) {
-  if (!db || !db->handle) return SQLITE_ERROR;
-  if (!db->in_batch_txn) return SQLITE_ERROR;
+  if (!db || !db->handle) { return SQLITE_ERROR;
+}
+  if (!db->in_batch_txn) { return SQLITE_ERROR;
+}
   int rc = sqlite3_step(db->commit_stmt);
   sqlite3_reset(db->commit_stmt);
   db->in_batch_txn = 0;
@@ -2635,8 +2866,10 @@ int db_commit(arkilian *db) {
 }
 
 int db_rollback(arkilian *db) {
-  if (!db || !db->handle) return SQLITE_ERROR;
-  if (!db->in_batch_txn) return SQLITE_ERROR;
+  if (!db || !db->handle) { return SQLITE_ERROR;
+}
+  if (!db->in_batch_txn) { return SQLITE_ERROR;
+}
   int rc = sqlite3_step(db->rollback_stmt);
   sqlite3_reset(db->rollback_stmt);
   db->in_batch_txn = 0;
@@ -2651,7 +2884,8 @@ int db_rollback(arkilian *db) {
 // ── Introspection & Diagnostics ─────────────────────────────────────
 
 int db_wal_pending(arkilian *db) {
-  if (!db || !db->handle) return 0;
+  if (!db || !db->handle) { return 0;
+}
   sqlite3_stmt *stmt = NULL;
   int count = 0;
   if (sqlite3_prepare_v2(db->handle, "SELECT COUNT(*) FROM _pending_backup", -1, &stmt, NULL) == SQLITE_OK) {
@@ -2664,7 +2898,8 @@ int db_wal_pending(arkilian *db) {
 }
 
 const char *db_wal_last_sql(arkilian *db) {
-  if (!db || !db->handle) return NULL;
+  if (!db || !db->handle) { return NULL;
+}
   // Per-instance buffer — a static buffer would race and leak data
   // across database instances.
   db->wal_last_buf[0] = '\0';
@@ -2679,7 +2914,8 @@ const char *db_wal_last_sql(arkilian *db) {
     }
     sqlite3_finalize(stmt);
   }
-  if (db->wal_last_buf[0] != '\0') return db->wal_last_buf;
+  if (db->wal_last_buf[0] != '\0') { return db->wal_last_buf;
+}
 #ifndef _WIN32
   pthread_mutex_lock(&db->payload_mutex);
 #else
@@ -2698,7 +2934,8 @@ const char *db_wal_last_sql(arkilian *db) {
 }
 
 void db_wal_flush(arkilian *db) {
-  if (!db) return;
+  if (!db) { return;
+}
 #ifndef _WIN32
   pthread_mutex_lock(&db->wake_mutex);
   db->wake_flag = 1;
@@ -2724,7 +2961,8 @@ void db_wal_flush(arkilian *db) {
 // An in-flight ship/upload completes before the threads observe the new
 // state; the switch gates new work, not already-running requests.
 void db_backup_set_enabled(arkilian *db, int enabled) {
-  if (!db) return;
+  if (!db) { return;
+}
 #ifndef _WIN32
   pthread_mutex_lock(&db->wake_mutex);
   ARK_STORE(&db->backup_enabled, enabled ? 1 : 0);
@@ -2754,7 +2992,8 @@ int db_backup_queue_depth(arkilian *db) {
 }
 
 long long db_backup_oldest_pending_age_sec(arkilian *db) {
-  if (!db || !db->handle) return 0;
+  if (!db || !db->handle) { return 0;
+}
   sqlite3_stmt *stmt = NULL;
   long long age = 0;
   if (sqlite3_prepare_v2(db->handle,
@@ -2762,7 +3001,8 @@ long long db_backup_oldest_pending_age_sec(arkilian *db) {
         -1, &stmt, NULL) == SQLITE_OK) {
     if (sqlite3_step(stmt) == SQLITE_ROW && sqlite3_column_type(stmt, 0) != SQLITE_NULL) {
       age = sqlite3_column_int64(stmt, 0);
-      if (age < 0) age = 0;
+      if (age < 0) { age = 0;
+}
     }
     sqlite3_finalize(stmt);
   }
@@ -2770,39 +3010,47 @@ long long db_backup_oldest_pending_age_sec(arkilian *db) {
 }
 
 int db_backup_dead_letter_count(arkilian *db) {
-  if (!db || !db->handle) return 0;
+  if (!db || !db->handle) { return 0;
+}
   sqlite3_stmt *stmt = NULL;
   int count = 0;
   if (sqlite3_prepare_v2(db->handle, "SELECT COUNT(*) FROM _dead_backup",
                          -1, &stmt, NULL) == SQLITE_OK) {
-    if (sqlite3_step(stmt) == SQLITE_ROW) count = sqlite3_column_int(stmt, 0);
+    if (sqlite3_step(stmt) == SQLITE_ROW) { count = sqlite3_column_int(stmt, 0);
+}
     sqlite3_finalize(stmt);
   }
   return count;
 }
 
 long long db_backup_thread_heartbeat_age_ms(arkilian *db) {
-  if (!db) return -1;
+  if (!db) { return -1;
+}
   int hb = ARK_LOAD(&db->last_heartbeat_sec);
-  if (hb == 0) return -1; // never beat — thread not (yet) running
+  if (hb == 0) { return -1; // never beat — thread not (yet) running
+}
   long long now = now_ms_mono();
   long long hb_ms = (long long)hb * 1000LL;
   return (now >= hb_ms) ? (now - hb_ms) : 0;
 }
 
 long long db_backup_snapshot_heartbeat_age_ms(arkilian *db) {
-  if (!db) return -1;
+  if (!db) { return -1;
+}
   int hb = ARK_LOAD(&db->last_snapshot_heartbeat_sec);
-  if (hb == 0) return -1; // never beat — thread not (yet) running
+  if (hb == 0) { return -1; // never beat — thread not (yet) running
+}
   long long now = now_ms_mono();
   long long hb_ms = (long long)hb * 1000LL;
   return (now >= hb_ms) ? (now - hb_ms) : 0;
 }
 
 int db_backup_trigger_coverage(arkilian *db) {
-  if (!db || !db->handle) return -1;
+  if (!db || !db->handle) { return -1;
+}
   sqlite3_stmt *stmt = NULL;
-  int expect = 0, have = 0;
+  int expect = 0;
+  int have = 0;
   // Expected: 3 triggers per captured table. Must mirror the trigger
   // scan exactly: real (non-virtual, non-shadow) tables WITH a PRIMARY
   // KEY — keyless rowid tables are skipped (unreplayable) and get no
@@ -2814,13 +3062,15 @@ int db_backup_trigger_coverage(arkilian *db) {
         "AND t.name NOT IN ('_pending_backup', '_dead_backup', '_arkilian_meta') "
         "AND EXISTS (SELECT 1 FROM pragma_table_xinfo(t.name) WHERE pk > 0)",
         -1, &stmt, NULL) == SQLITE_OK) {
-    if (sqlite3_step(stmt) == SQLITE_ROW) expect = 3 * sqlite3_column_int(stmt, 0);
+    if (sqlite3_step(stmt) == SQLITE_ROW) { expect = 3 * sqlite3_column_int(stmt, 0);
+}
     sqlite3_finalize(stmt);
   }
   if (sqlite3_prepare_v2(db->handle,
         "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'trg\\_%' ESCAPE '\\'",
         -1, &stmt, NULL) == SQLITE_OK) {
-    if (sqlite3_step(stmt) == SQLITE_ROW) have = sqlite3_column_int(stmt, 0);
+    if (sqlite3_step(stmt) == SQLITE_ROW) { have = sqlite3_column_int(stmt, 0);
+}
     sqlite3_finalize(stmt);
   }
   int deficit = expect - have;
@@ -2831,26 +3081,32 @@ int db_backup_trigger_coverage(arkilian *db) {
 // ARKILIAN_MAX_QUEUE_DEPTH. Kept in sync with the cap baked into the
 // capture triggers via outbox_cap().
 int db_backup_is_healthy(arkilian *db) {
-  if (!db) return 0;
+  if (!db) { return 0;
+}
   // A disabled subsystem is NOT healthy — whether kill-switched, forced
   // off by an init failure (WAL/trigger setup), or configured without a
   // destination. A green light while nothing is shipping is exactly the
   // silent failure monitoring exists to catch.
-  if (!ARK_LOAD(&db->backup_enabled)) return 0;
-  if (!db->control_url || strlen(db->control_url) == 0) return 0;
+  if (!ARK_LOAD(&db->backup_enabled)) { return 0;
+}
+  if (!db->control_url || strlen(db->control_url) == 0) { return 0;
+}
   // Flush thread liveness: a 30s threshold covers a 10s ship + margin.
   long long hb_age = db_backup_thread_heartbeat_age_ms(db);
-  if (hb_age < 0 || hb_age > 30000) return 0;
+  if (hb_age < 0 || hb_age > 30000) { return 0;
+}
   // Snapshot thread liveness: the hourly thread beats once per backup
   // interval (default 3600s). The threshold must be generous —
   // backup_interval + margin for the snapshot+upload work. A stale
   // snapshot heartbeat (e.g. 2× the interval) means the thread died.
   if (db->backup_interval > 0) {
     long long snap_age = db_backup_snapshot_heartbeat_age_ms(db);
-    long long snap_threshold = (long long)db->backup_interval * 1000LL * 2 + 60000LL;
-    if (snap_age < 0 || snap_age > snap_threshold) return 0;
+    long long snap_threshold = ((long long)db->backup_interval * 1000LL * 2) + 60000LL;
+    if (snap_age < 0 || snap_age > snap_threshold) { return 0;
+}
   }
-  if (db_backup_queue_depth(db) >= outbox_cap()) return 0;
+  if (db_backup_queue_depth(db) >= outbox_cap()) { return 0;
+}
   return 1;
 }
 
@@ -2859,7 +3115,8 @@ int db_backup_is_healthy(arkilian *db) {
 // sync_backup_triggers. Every skipped table is data that never leaves
 // the box — operators must see this, not just the one-time WARN.
 int db_backup_skipped_table_count(arkilian *db) {
-  if (!db || !db->handle) return -1;
+  if (!db || !db->handle) { return -1;
+}
   sqlite3_stmt *stmt = NULL;
   int count = -1;
   if (sqlite3_prepare_v2(db->handle,
@@ -2869,14 +3126,16 @@ int db_backup_skipped_table_count(arkilian *db) {
         "AND t.name NOT IN ('_pending_backup', '_dead_backup', '_arkilian_meta') "
         "AND NOT EXISTS (SELECT 1 FROM pragma_table_xinfo(t.name) WHERE pk > 0)",
         -1, &stmt, NULL) == SQLITE_OK) {
-    if (sqlite3_step(stmt) == SQLITE_ROW) count = sqlite3_column_int(stmt, 0);
+    if (sqlite3_step(stmt) == SQLITE_ROW) { count = sqlite3_column_int(stmt, 0);
+}
     sqlite3_finalize(stmt);
   }
   return count;
 }
 
 int db_resync_triggers(arkilian *db) {
-  if (!db || !db->handle) return SQLITE_ERROR;
+  if (!db || !db->handle) { return SQLITE_ERROR;
+}
   char *err = NULL;
   db->trigger_sync_in_progress = 1;
   int rc = sync_backup_triggers(db->handle, &err);
@@ -2889,7 +3148,8 @@ int db_resync_triggers(arkilian *db) {
   } else {
     db->triggers_dirty = 0;
   }
-  if (err) sqlite3_free(err);
+  if (err) { sqlite3_free(err);
+}
   return rc;
 }
 
@@ -2908,7 +3168,8 @@ int db_backup_triggers_dirty(arkilian *db) {
 // inside SQLite's commit hook — so a resync failure can never roll back
 // legitimate app work (spec §0).
 void db_set_auto_resync_triggers(arkilian *db, int enabled) {
-  if (!db) return;
+  if (!db) { return;
+}
   db->auto_resync_triggers = enabled ? 1 : 0;
 }
 
@@ -2930,14 +3191,16 @@ int db_backup_capture_paused(arkilian *db) {
 
 // ── Hourly Backup Implementation ────────────────────────────────────
 
-int backup_database(sqlite3 *pSource, const char *zFilename,
-                    volatile int *shutdown_flag) {
-  if (!pSource) return SQLITE_ERROR;
+static int backup_database(sqlite3 *pSource, const char *zFilename,
+                    const volatile int *shutdown_flag) {
+  if (!pSource) { return SQLITE_ERROR;
+}
   sqlite3 *pDest = NULL;
   const char *actualPath = (zFilename != NULL) ? zFilename : DEFAULT_BACKUP_PATH;
   int rc = sqlite3_open_v2(actualPath, &pDest, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, NULL);
   if (rc != SQLITE_OK) {
-    if (pDest) sqlite3_close(pDest);
+    if (pDest) { sqlite3_close(pDest);
+}
     return rc;
   }
 
@@ -2973,8 +3236,9 @@ int backup_database(sqlite3 *pSource, const char *zFilename,
   }
 
   int finish_rc = sqlite3_backup_finish(pBackup);
-  if (finish_rc != SQLITE_OK && rc == SQLITE_DONE) rc = finish_rc;
-  else if (rc == SQLITE_DONE) rc = SQLITE_OK;
+  if (finish_rc != SQLITE_OK && rc == SQLITE_DONE) { rc = finish_rc;
+  } else if (rc == SQLITE_DONE) { rc = SQLITE_OK;
+}
   sqlite3_close(pDest);
   return rc;
 }
@@ -2987,10 +3251,12 @@ struct Memory {
 
 static size_t write_cb(void *data, size_t size, size_t nmemb, void *userp) {
   struct Memory *mem = (struct Memory *)userp;
-  if (mem->shutdown_flag && ARK_LOAD(mem->shutdown_flag)) return 0;
+  if (mem->shutdown_flag && ARK_LOAD(mem->shutdown_flag)) { return 0;
+}
   size_t realsize = size * nmemb;
   char *ptr = realloc(mem->response, mem->size + realsize + 1);
-  if (!ptr) return 0;
+  if (!ptr) { return 0;
+}
   mem->response = ptr;
   memcpy(&(mem->response[mem->size]), data, realsize);
   mem->size += realsize;
@@ -3005,7 +3271,8 @@ static char *get_signed_url(arkilian *db, const char *api_endpoint,
   chunk.response = malloc(1);
   chunk.size = 0;
   chunk.shutdown_flag = shutdown_flag;
-  if (!chunk.response) return NULL;
+  if (!chunk.response) { return NULL;
+}
 
   char *result = NULL;
   if (curl) {
@@ -3014,31 +3281,44 @@ static char *get_signed_url(arkilian *db, const char *api_endpoint,
     // /v1/upload/request (it requires POST; GET would 405). An empty
     // body selects the snapshot branch on the control plane.
     rc = curl_easy_setopt(curl, CURLOPT_URL, api_endpoint);
-    if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_POSTFIELDS, "");
-    if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_cb);
-    if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)&chunk);
+    if (rc == CURLE_OK) { rc = curl_easy_setopt(curl, CURLOPT_POSTFIELDS, "");
+}
+    if (rc == CURLE_OK) { rc = curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_cb);
+}
+    if (rc == CURLE_OK) { rc = curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)&chunk);
+}
     // Cap the response: a signed-URL plan is a few hundred bytes. A
     // misbehaving/compromised control plane streaming gigabytes would
     // otherwise OOM this process before the JSON is ever parsed.
-    if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_MAXFILESIZE_LARGE, (curl_off_t)1048576);
-    if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
-    if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5L);
+    if (rc == CURLE_OK) { rc = curl_easy_setopt(curl, CURLOPT_MAXFILESIZE_LARGE, (curl_off_t)1048576);
+}
+    if (rc == CURLE_OK) { rc = curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
+}
+    if (rc == CURLE_OK) { rc = curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5L);
+}
     // Fail loudly on a TLS verification problem rather than silently
     // degrading to an unauthenticated/insecure connection.
-    if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
-    if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
-    if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
-    if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, curl_abort_cb);
-    if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_XFERINFODATA, (void *)shutdown_flag);
+    if (rc == CURLE_OK) { rc = curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
+}
+    if (rc == CURLE_OK) { rc = curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
+}
+    if (rc == CURLE_OK) { rc = curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+}
+    if (rc == CURLE_OK) { rc = curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, curl_abort_cb);
+}
+    if (rc == CURLE_OK) { rc = curl_easy_setopt(curl, CURLOPT_XFERINFODATA, (void *)shutdown_flag);
+}
 
     struct curl_slist *headers = NULL;
     if (rc == CURLE_OK && token && strlen(token) > 0) {
       char auth_header[512];
       snprintf(auth_header, sizeof(auth_header), "Authorization: Bearer %s", token);
       headers = curl_slist_append(headers, auth_header);
-      if (!headers) rc = CURLE_OUT_OF_MEMORY;
+      if (!headers) { rc = CURLE_OUT_OF_MEMORY;
+}
     }
-    if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    if (rc == CURLE_OK) { rc = curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+}
 
     if (rc != CURLE_OK) {
       ark_log(db, ARK_LOG_ERROR, "get_signed_url: request setup failed: %s",
@@ -3046,7 +3326,8 @@ static char *get_signed_url(arkilian *db, const char *api_endpoint,
     } else {
       CURLcode res = curl_easy_perform(curl);
       long http_code = 0;
-      if (res == CURLE_OK) curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+      if (res == CURLE_OK) { curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+}
 
       // Only a 200 response is a valid answer — an error body must never
       // be mistaken for an upload URL.
@@ -3098,7 +3379,8 @@ static char *get_signed_url(arkilian *db, const char *api_endpoint,
         }
       }
     }
-    if (headers) curl_slist_free_all(headers);
+    if (headers) { curl_slist_free_all(headers);
+}
     curl_easy_cleanup(curl);
   }
   free(chunk.response);
@@ -3117,7 +3399,8 @@ static int upload_to_s3(arkilian *db, const char *signed_url,
     return 1;
   }
   CURL *curl = curl_easy_init();
-  if (!curl) return 1;
+  if (!curl) { return 1;
+}
   FILE *fd = fopen(file_path, "rb");
   if (!fd) {
     curl_easy_cleanup(curl);
@@ -3150,26 +3433,37 @@ static int upload_to_s3(arkilian *db, const char *signed_url,
   // a misconfigured upload must be reported, not silently swallowed.
   CURLcode rc = CURLE_OK;
   rc = curl_easy_setopt(curl, CURLOPT_URL, signed_url);
-  if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_UPLOAD, 1L);
-  if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_READDATA, fd);
-  if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_INFILESIZE_LARGE, (curl_off_t)file_size);
+  if (rc == CURLE_OK) { rc = curl_easy_setopt(curl, CURLOPT_UPLOAD, 1L);
+}
+  if (rc == CURLE_OK) { rc = curl_easy_setopt(curl, CURLOPT_READDATA, fd);
+}
+  if (rc == CURLE_OK) { rc = curl_easy_setopt(curl, CURLOPT_INFILESIZE_LARGE, (curl_off_t)file_size);
+}
   // Timeout scales with file size (~10s per MB past the 30s base) so
   // multi-hundred-MB snapshots aren't guaranteed failures on a WAN.
-  if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_TIMEOUT, curl_timeout_sec((size_t)file_size, 30));
-  if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
+  if (rc == CURLE_OK) { rc = curl_easy_setopt(curl, CURLOPT_TIMEOUT, curl_timeout_sec((size_t)file_size, 30));
+}
+  if (rc == CURLE_OK) { rc = curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
+}
   // Explicit TLS verification posture — system defaults are 1/2; setting
   // them explicitly documents intent and protects against a future patch
   // accidentally disabling verification.
-  if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
-  if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
-  if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
-  if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, curl_abort_cb);
-  if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_XFERINFODATA, (void *)&db->shutdown_requested);
+  if (rc == CURLE_OK) { rc = curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
+}
+  if (rc == CURLE_OK) { rc = curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
+}
+  if (rc == CURLE_OK) { rc = curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+}
+  if (rc == CURLE_OK) { rc = curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, curl_abort_cb);
+}
+  if (rc == CURLE_OK) { rc = curl_easy_setopt(curl, CURLOPT_XFERINFODATA, (void *)&db->shutdown_requested);
+}
 
   struct curl_slist *headers = NULL;
   if (rc == CURLE_OK) {
     headers = curl_slist_append(headers, "Content-Type: application/x-sqlite3");
-    if (!headers) rc = CURLE_OUT_OF_MEMORY;
+    if (!headers) { rc = CURLE_OUT_OF_MEMORY;
+}
   }
   // Pre-signed URLs must NOT carry our bearer token — it leaks the
   // credential to the storage host and S3 rejects requests that mix
@@ -3178,9 +3472,11 @@ static int upload_to_s3(arkilian *db, const char *signed_url,
     char auth_header[512];
     snprintf(auth_header, sizeof(auth_header), "Authorization: Bearer %s", token);
     headers = curl_slist_append(headers, auth_header);
-    if (!headers) rc = CURLE_OUT_OF_MEMORY;
+    if (!headers) { rc = CURLE_OUT_OF_MEMORY;
+}
   }
-  if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+  if (rc == CURLE_OK) { rc = curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+}
 
   int ok = 0;
   if (rc != CURLE_OK) {
@@ -3189,7 +3485,8 @@ static int upload_to_s3(arkilian *db, const char *signed_url,
   } else {
     CURLcode res = curl_easy_perform(curl);
     long http_code = 0;
-    if (res == CURLE_OK) curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+    if (res == CURLE_OK) { curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+}
 
     // A completed transfer is not success — check the HTTP status so
     // rejected uploads (4xx/5xx) are reported rather than swallowed.
@@ -3223,7 +3520,8 @@ void *run_hourly_backup(void *arg) {
     pthread_mutex_lock(&db->wake_mutex);
     while (!ARK_LOAD(&db->shutdown_requested)) {
       time_t now = time(NULL);
-      if (now >= next_backup) break;
+      if (now >= next_backup) { break;
+}
       struct timespec ts;
       ts.tv_sec = next_backup;
       ts.tv_nsec = 0;
@@ -3243,13 +3541,15 @@ void *run_hourly_backup(void *arg) {
     LeaveCriticalSection(&db->wake_mutex);
 #endif
 
-    if (shutdown || !db->is_open || !db->handle) break;
+    if (shutdown || !db->is_open || !db->handle) { break;
+}
     next_backup = time(NULL) + db->backup_interval;
 
     // Kill-switch check: skip the snapshot + upload entirely while
     // disabled. The interval still advances so re-enabling resumes on
     // the normal schedule (the flush thread handles realtime resume).
-    if (!ARK_LOAD(&db->backup_enabled)) continue;
+    if (!ARK_LOAD(&db->backup_enabled)) { continue;
+}
 
     // Snapshot-thread heartbeat (spec §9): so a silent death of this
     // thread (unhandled condition, thread cancellation) is visible via
