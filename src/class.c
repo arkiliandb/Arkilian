@@ -2132,7 +2132,7 @@ int db_init(arkilian **db_ptr, const char *filename) {
 
   // Start backup thread. Failure here only loses the hourly snapshots —
   // realtime shipping keeps running; the failure is logged loudly.
-  if (db->backup_enabled) {
+  if (ARK_LOAD(&db->backup_enabled)) {
 #ifdef _WIN32
     db->backup_thread_handle = CreateThread(NULL, 0, run_hourly_backup, db, 0, NULL);
     if (!db->backup_thread_handle) {
