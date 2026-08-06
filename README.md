@@ -191,6 +191,204 @@ If no prebuilt binary matches your platform (e.g. a rare arch/libc
 combination), the install script falls back to a source build via
 `node-gyp`, which requires `gcc`/`clang` and `libcurl-dev`.
 
+## Real-World Examples
+
+### 1 — Multi-tenant SaaS: one database per tenant, zero ops
+
+Each tenant gets their own isolated SQLite file. Arkilian runs inside every
+Cloud Run instance and streams row changes to your control plane in real time.
+If an instance is torn down, the next cold start calls `Arkilian.hydrate()` and
+is back to the exact state it left off — including every write that shipped
+while the old instance was live.
+
+```js
+// server.js — Cloud Run / Fly.io / any container
+import Arkilian from 'arkilian';
+
+const TENANT = process.env.TENANT_ID;          // e.g. "acme-corp"
+const API_KEY = process.env.ARKILIAN_DATABASE_TOKEN;
+
+// Cold-start restore: download the latest snapshot + replay incremental WAL.
+// No-op if the local file is already up-to-date.
+Arkilian.hydrate(`${TENANT}.sqlite`, 'https://api.arkilian.com', API_KEY);
+
+const db = new Arkilian(API_KEY, `${TENANT}.sqlite`);
+
+// Schema is auto-created; capture triggers are wired automatically.
+db.exec(`CREATE TABLE IF NOT EXISTS orders (
+  id    INTEGER PRIMARY KEY,
+  item  TEXT    NOT NULL,
+  qty   INTEGER NOT NULL DEFAULT 1,
+  ts    INTEGER NOT NULL DEFAULT (unixepoch())
+)`);
+
+// Every INSERT is captured and shipped to the control plane in < 2 s.
+export function placeOrder(item, qty) {
+  db.run('INSERT INTO orders (item, qty) VALUES (?, ?)', [item, qty]);
+  return db.lastInsertRowid;
+}
+
+// Health endpoint — wire to Cloud Run liveness probe.
+export function health() {
+  return {
+    healthy:       db.backupHealthy,
+    queueDepth:    db.backupQueueDepth,
+    deadLetters:   db.backupDeadLetterCount,
+    flushThreadMs: db.backupThreadHeartbeatAgeMs,
+  };
+}
+
+process.on('SIGTERM', () => db.close());
+```
+
+**What happens on GCP:**
+- Deploy to **Cloud Run** (scales to zero — Arkilian's 2-second poll loop costs nothing at idle).
+- Point `ARKILIAN_SIGNED_URL_ENDPOINT` at a **Cloud Function** that issues GCS signed URLs.
+- Every hourly snapshot lands in a **Cloud Storage** bucket (`gs://arkilian-backups/<tenant>/`).
+- The WAL stream feeds your control plane, which fans out to **BigQuery** for analytics.
+
+---
+
+### 2 — Real-time analytics pipeline into BigQuery
+
+Arkilian's WAL push endpoint ships every row change as replayable SQL within
+2 seconds of commit. Wire your control plane to publish those payloads onto
+**Pub/Sub** and let a Dataflow pipeline hydrate **BigQuery** in near-real time.
+
+```js
+// Control-plane webhook handler (Cloud Functions / Cloud Run)
+// POST /v1/wal/push — called by Arkilian's flush thread
+import { BigQuery } from '@google-cloud/bigquery';
+
+const bq = new BigQuery();
+const dataset = bq.dataset('arkilian_cdc');
+
+export async function walPushHandler(req, res) {
+  const { db_id, payload_id, sql, params } = req.body;
+
+  // Idempotency: Arkilian guarantees at-least-once; dedupe on payload_id.
+  await dataset.table('raw_events').insert([{
+    db_id,
+    payload_id,
+    sql,
+    params: JSON.stringify(params),
+    received_at: BigQuery.datetime(new Date().toISOString()),
+  }], { skipInvalidRows: false, ignoreUnknownValues: false });
+
+  res.status(200).json({ ok: true });
+}
+```
+
+```sql
+-- BigQuery scheduled query: materialize the orders table from CDC
+SELECT
+  JSON_VALUE(params, '$[0]') AS item,
+  CAST(JSON_VALUE(params, '$[1]') AS INT64) AS qty,
+  received_at
+FROM `project.arkilian_cdc.raw_events`
+WHERE sql LIKE 'INSERT INTO orders%'
+ORDER BY received_at;
+```
+
+The result: **sub-5-second latency** from SQLite write to BigQuery row — without
+Kafka, Debezium, or a managed database. The entire pipeline is SQLite on the
+edge, a Cloud Function in the middle, and BigQuery at the end.
+
+---
+
+### 3 — Offline-first mobile backend (Go / Cloud Run)
+
+The Go binding lets you embed Arkilian directly into a Go service with zero CGO
+overhead beyond the initial open. Here a game server persists per-player state
+locally and replicates automatically.
+
+```go
+// main.go
+package main
+
+/*
+#cgo LDFLAGS: -L./lib -larkilian -lcurl
+#include "class.h"
+#include <stdlib.h>
+*/
+import "C"
+import (
+    "fmt"
+    "log"
+    "unsafe"
+)
+
+func main() {
+    var db *C.arkilian
+    path := C.CString("players.sqlite")
+    defer C.free(unsafe.Pointer(path))
+
+    if C.db_init(&db, path) != 0 {
+        log.Fatal("db_init failed")
+    }
+    defer C.db_close(db)
+
+    sql := C.CString(`CREATE TABLE IF NOT EXISTS players (
+        id    INTEGER PRIMARY KEY,
+        name  TEXT    NOT NULL,
+        score INTEGER NOT NULL DEFAULT 0
+    )`)
+    defer C.free(unsafe.Pointer(sql))
+    C.db_exec(db, sql)
+
+    // Every score update ships to GCS within 2 seconds.
+    upd := C.CString("UPDATE players SET score = score + 1 WHERE id = 1")
+    defer C.free(unsafe.Pointer(upd))
+    C.db_exec(db, upd)
+
+    // Monitoring
+    fmt.Printf("queue=%d healthy=%d\n",
+        C.db_backup_queue_depth(db),
+        C.db_backup_is_healthy(db))
+}
+```
+
+**Deploy pattern on GCP:**
+- Build to a Docker image → push to **Artifact Registry** → run on **Cloud Run** or **GKE**.
+- Each player shard is a Cloud Run instance with its own `players.sqlite`.
+- Arkilian replicates to **Cloud Storage**; a Cloud Scheduler job triggers hydration on instance spin-up.
+- 5,000 shards = 5,000 independent SQLite files, each replicating at 2-second cadence, **no shared database bottleneck**.
+
+---
+
+### 4 — Incident response: kill-switch & dead-letter replay
+
+```js
+import Arkilian from 'arkilian';
+
+const db = new Arkilian(process.env.ARKILIAN_DATABASE_TOKEN, 'app.sqlite');
+
+// ── Incident: upstream destination is down ──────────────────────────
+// Stop shipping without losing any captured rows.
+// Rows continue queuing in _pending_backup; nothing is dropped.
+db.setBackupEnabled(false);
+console.log('Backup paused. Queue depth:', db.backupQueueDepth);
+
+// ── Mitigation resolved: resume ─────────────────────────────────────
+db.setBackupEnabled(true);
+// Flush thread wakes immediately and drains the accumulated queue.
+
+// ── After: check for any rows that exhausted retries ────────────────
+if (db.backupDeadLetterCount > 0) {
+  console.warn(`${db.backupDeadLetterCount} rows need manual replay`);
+  // Run the bundled CLI to replay them:
+  // ./arkilian-dlq app.sqlite --replay
+}
+
+// ── Detect CDC gap (outbox was full during the incident) ─────────────
+if (db.capturePaused) {
+  console.warn('A capture gap occurred — verify the hourly snapshot covered it');
+  // capturePaused clears automatically after the next successful GCS upload.
+}
+
+db.close();
+```
+
 ## System Constraints and Design Choices
 Unlike complex distributed SQLite systems (e.g., LiteFS or rqlite), Arkilian embraces single-writer architectures partitioned by micro-datasets. It purposefully avoids:
 * Virtual File System (VFS) complexities.
