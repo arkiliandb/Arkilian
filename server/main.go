@@ -620,6 +620,46 @@ func handleAuthValidate(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, `{"ok":true,"db_id":"%s"}`, dbID)
 }
 
+// handleStorageCredentials issues the S3-compatible storage credentials to a
+// tenant's client. The client calls this ONCE after validating its API key
+// (POST /v1/auth/validate), caches the response, and signs all subsequent
+// PUT URLs locally with AWS SigV4 — so the storage path has NO per-upload
+// control-plane round trip. The control plane maintains the bucket for all
+// tenants; each tenant writes to a prefix scoped by its db_id
+// ("db_<db_id>/backup.sqlite", "db_<db_id>/chunks/...") which the client
+// builds into the S3 key. Auth: Bearer <api_key>.
+// If the S3-compatible storage used by the control plane is down, the client
+// logs + skips that snapshot upload and retries the next cycle — no fallback
+// to the control plane, no hard failure (spec §0).
+func handleStorageCredentials(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	dbID, ok := apiKeyAuth(r)
+	if !ok {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+	// The client signs URLs for the db_<db_id>/ prefix itself; the control
+	// plane hands over the bucket's access/secret so the client can compute
+	// SigV4 signatures locally. v1 launch model: the bucket is shared, the
+	// key prefix is the tenant boundary. v2 will mint STS sessions scoped
+	// to the tenant prefix (see docs/operations.md §11.3).
+	scheme := "http"
+	if strings.HasPrefix(s3Endpoint, "https://") || os.Getenv("S3_SSL") == "true" {
+		scheme = "https"
+	}
+	host := strings.TrimPrefix(strings.TrimPrefix(s3Endpoint, "https://"), "http://")
+	host = strings.TrimSuffix(host, "/")
+	endpoint := scheme + "://" + host
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprintf(w,
+		`{"db_id":"%s","endpoint":"%s","bucket":"%s","region":"%s","access_key":"%s","secret_key":"%s"}`,
+		dbID, endpoint, s3Bucket, s3Region, s3AccessKey, s3SecretKey)
+	recordActivity(dbID, 0, 0)
+}
+
 // ── Database management handlers ────────────────────────────────────
 
 func handleDBCreate(w http.ResponseWriter, r *http.Request) {
@@ -1215,6 +1255,7 @@ func main() {
 	mux.HandleFunc("/v1/auth/register", handleRegister)
 	mux.HandleFunc("/v1/auth/login", handleLogin)
 	mux.HandleFunc("/v1/auth/validate", handleAuthValidate)
+	mux.HandleFunc("/v1/storage/credentials", handleStorageCredentials)
 	// Database management (session auth)
 	mux.HandleFunc("/v1/db/create", handleDBCreate)
 	mux.HandleFunc("/v1/db/list", handleDBList)

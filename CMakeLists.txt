@@ -28,7 +28,7 @@ set(THREADS_PREFER_PTHREAD_FLAG ON)
 find_package(Threads REQUIRED)
 
 # Common source files
-set(ARKILIAN_SOURCES src/class.c src/deps/sqlite/sqlite3.c)
+set(ARKILIAN_SOURCES src/class.c src/sha256.c src/deps/sqlite/sqlite3.c)
 
 # Compile-time SQLite options required by Arkilian. The preupdate hook
 # drives deterministic-capture tests; FTS5 must be enabled in the
@@ -350,7 +350,7 @@ if(ARKILIAN_BUILD_TESTS)
         # ARKILIAN_HYDRATION_URL=… ctest -R e2e — or just invoke manually. ──
         if(NOT WIN32)
             add_executable(test_e2e_stress tests/test_e2e_stress.c
-                           src/class.c src/deps/sqlite/sqlite3.c)
+                           src/class.c src/sha256.c src/deps/sqlite/sqlite3.c)
             target_include_directories(test_e2e_stress PRIVATE src src/deps/sqlite)
             target_link_libraries(test_e2e_stress PRIVATE ${CMAKE_THREAD_LIBS_INIT}
                                   ${CURL_LIBRARIES})
@@ -378,7 +378,7 @@ if(ARKILIAN_BUILD_TESTS)
             target_compile_definitions(bench_1m PRIVATE ${ARK_POSIX_DEFS})
 
             add_executable(stress_200m tests/stress_200m.c
-                           src/class.c src/deps/sqlite/sqlite3.c)
+                           src/class.c src/sha256.c src/deps/sqlite/sqlite3.c)
             target_include_directories(stress_200m PRIVATE src src/deps/sqlite)
             target_link_libraries(stress_200m PRIVATE ${CMAKE_THREAD_LIBS_INIT}
                                   ${CURL_LIBRARIES} m)

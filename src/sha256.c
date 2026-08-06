@@ -153,3 +153,55 @@ int ark_sha256_hex_file(const char *path, char out[65]) {
   to_hex(digest, out);
   return 0;
 }
+
+void ark_sha256_raw(const void *data, size_t len, uint8_t out[32]) {
+  ark_sha256_ctx ctx;
+  sha256_init(&ctx);
+  if (data && len) sha256_update(&ctx, (const uint8_t *)data, len);
+  sha256_final(&ctx, out);
+}
+
+// ── HMAC-SHA-256 ────────────────────────────────────────────────────
+
+#define HMAC_BLOCK 64
+#define HMAC_OUT   32
+
+void ark_hmac_sha256(const uint8_t *key, size_t key_len,
+                     const void *data, size_t data_len,
+                     uint8_t out[32]) {
+  uint8_t k_pad[HMAC_BLOCK], ki[HMAC_BLOCK], ko[HMAC_BLOCK];
+
+  if (key_len > HMAC_BLOCK) {
+    ark_sha256_raw(key, key_len, k_pad);
+    memset(k_pad + HMAC_OUT, 0, HMAC_BLOCK - HMAC_OUT);
+  } else {
+    memcpy(k_pad, key, key_len);
+    if (key_len < HMAC_BLOCK) memset(k_pad + key_len, 0, HMAC_BLOCK - key_len);
+  }
+
+  for (int i = 0; i < HMAC_BLOCK; i++) {
+    ki[i] = k_pad[i] ^ 0x36;
+    ko[i] = k_pad[i] ^ 0x5c;
+  }
+
+  ark_sha256_ctx ctx;
+  uint8_t inner[HMAC_OUT];
+
+  sha256_init(&ctx);
+  sha256_update(&ctx, ki, HMAC_BLOCK);
+  if (data && data_len) sha256_update(&ctx, (const uint8_t *)data, data_len);
+  sha256_final(&ctx, inner);
+
+  sha256_init(&ctx);
+  sha256_update(&ctx, ko, HMAC_BLOCK);
+  sha256_update(&ctx, inner, HMAC_OUT);
+  sha256_final(&ctx, out);
+}
+
+void ark_hmac_sha256_hex(const uint8_t *key, size_t key_len,
+                         const void *data, size_t data_len,
+                         char out[65]) {
+  uint8_t raw[HMAC_OUT];
+  ark_hmac_sha256(key, key_len, data, data_len, raw);
+  to_hex(raw, out);
+}

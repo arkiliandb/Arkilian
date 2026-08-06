@@ -19,6 +19,7 @@
 #endif
 
 #include "class.h"
+#include "sha256.h"
 #include <curl/curl.h>
 
 // Atomic helpers for cross-thread flags.  These fields are read and
@@ -149,6 +150,11 @@ struct arkilian {
   char *push_url;              // Derived: <control_url>/v1/wal/push
   char *signed_url_endpoint;   // Derived: <control_url>/v1/upload/request
   char *api_key;               // The ONLY credential — sent as Bearer to all control-plane endpoints
+  char *s3_endpoint;
+  char *s3_bucket;
+  char *s3_region;
+  char *s3_access_key;
+  char *s3_secret_key;
   int backup_interval;
   volatile int backup_enabled; // runtime kill-switch (written under wake_mutex)
 
@@ -224,13 +230,12 @@ volatile int capture_paused;         // sticky: set when outbox hits cap (CDC ro
   // once against the control plane before its first drain cycle. States:
   //   0 = PENDING   (validation not yet attempted from the flush thread)
   //   1 = VALIDATED (control plane confirmed the key; shipping proceeds)
-  //   2 = DISABLED  (validation failed: bad key OR control plane down).
-  //                   The flush thread atomically clears backup_enabled so
-  //                   NO new rows ship, capture keeps queuing locally, the
-  //                   operator re-enables via db_backup_set_enabled(1)
-  //                   once the control plane returns; db_backup_is_healthy()
-  //                   surfaces the disabled state via monitoring — never a
-  //                   silent failure, and never a permanent one.
+  //   2 = DEGRADED  (validation failed: bad key OR control plane down).
+  //                   Backup stays enabled — capture keeps queuing locally
+  //                   and shipping resumes automatically the moment the
+  //                   control plane is reachable again. No operator
+  //                   intervention needed. db_backup_is_healthy() +
+  //                   queue-depth monitoring surface the degraded state.
   // Cross-thread accesses go through ARK_LOAD/ARK_STORE. Set to 0 by
   // db_init (the default); set to 1 or 2 by run_wal_flush's first cycle.
   volatile int startup_auth_state;
@@ -1909,6 +1914,25 @@ int db_init(arkilian **db_ptr, const char *filename) {
             strlen(db->api_key));
   }
 
+  // Direct S3 credentials (control-plane-independent upload path).
+  {
+    const char *ep = get_env_default("ARKILIAN_S3_ENDPOINT", "");
+    const char *bk = get_env_default("ARKILIAN_S3_BUCKET", "");
+    const char *rg = get_env_default("ARKILIAN_S3_REGION", "us-east-1");
+    const char *ak = get_env_default("ARKILIAN_S3_ACCESS_KEY", "");
+    const char *sk = get_env_default("ARKILIAN_S3_SECRET_KEY", "");
+    db->s3_endpoint   = malloc(strlen(ep) + 1);
+    db->s3_bucket     = malloc(strlen(bk) + 1);
+    db->s3_region     = malloc(strlen(rg) + 1);
+    db->s3_access_key = malloc(strlen(ak) + 1);
+    db->s3_secret_key = malloc(strlen(sk) + 1);
+    if (db->s3_endpoint)   strcpy(db->s3_endpoint, ep);
+    if (db->s3_bucket)     strcpy(db->s3_bucket, bk);
+    if (db->s3_region)     strcpy(db->s3_region, rg);
+    if (db->s3_access_key) strcpy(db->s3_access_key, ak);
+    if (db->s3_secret_key) strcpy(db->s3_secret_key, sk);
+  }
+
   db->backup_interval = get_env_int_default("ARKILIAN_BACKUP_INTERVAL", DEFAULT_BACKUP_INTERVAL);
   // A 0 or negative interval would make the hourly thread hot-loop
   // (backup + signed-URL request with no sleep in between). Clamp it.
@@ -2347,6 +2371,11 @@ void db_close(arkilian *db) {
   if (db->push_url) free(db->push_url);
   if (db->signed_url_endpoint) free(db->signed_url_endpoint);
   if (db->api_key) free(db->api_key);
+  if (db->s3_endpoint) free(db->s3_endpoint);
+  if (db->s3_bucket) free(db->s3_bucket);
+  if (db->s3_region) free(db->s3_region);
+  if (db->s3_access_key) free(db->s3_access_key);
+  if (db->s3_secret_key) free(db->s3_secret_key);
 
   free(db);
 }
@@ -3282,6 +3311,111 @@ static int upload_to_s3(arkilian *db, const char *signed_url,
   return ok ? 0 : 1;
 }
 
+// ── Direct S3 upload helpers ───────────────────────────────────────
+// When ARKILIAN_S3_ENDPOINT / _BUCKET / _ACCESS_KEY / _SECRET_KEY are
+// configured, the snapshot thread signs presigned PUT URLs locally using
+// AWS Signature V4 and uploads directly to S3. The control plane is
+// never involved in the data write path — purely an observability layer.
+
+static int has_direct_s3(arkilian *db) {
+  return db &&
+    db->s3_endpoint && db->s3_endpoint[0] &&
+    db->s3_bucket && db->s3_bucket[0] &&
+    db->s3_access_key && db->s3_access_key[0] &&
+    db->s3_secret_key && db->s3_secret_key[0];
+}
+
+static void s3_url_encode_inline(const char *src, char *dst, size_t cap) {
+  static const char *okchars =
+      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.~";
+  size_t w = 0;
+  for (const char *p = src; *p && w + 4 < cap; p++) {
+    if (strchr(okchars, *p))
+      dst[w++] = *p;
+    else
+      w += (size_t)snprintf(dst + w, cap - w, "%%%02X", (unsigned char)*p);
+  }
+  dst[w] = '\0';
+}
+
+static char *s3_presign_put(arkilian *db, const char *key, long expires_sec) {
+  if (!db || !key || !has_direct_s3(db)) return NULL;
+
+  time_t now = time(NULL);
+  struct tm g;
+  gmtime_r(&now, &g);
+  char date_stamp[9], amz_date[17];
+  strftime(date_stamp, sizeof(date_stamp), "%Y%m%d", &g);
+  strftime(amz_date, sizeof(amz_date), "%Y%m%dT%H%M%SZ", &g);
+
+  char cred_plain[512];
+  snprintf(cred_plain, sizeof(cred_plain), "%s/%s/%s/s3/aws4_request",
+           db->s3_access_key, date_stamp, db->s3_region);
+  char cred_enc[2048];
+  s3_url_encode_inline(cred_plain, cred_enc, sizeof(cred_enc));
+
+  const char *scheme = "https";
+  const char *host = db->s3_endpoint;
+  if (strncmp(host, "https://", 8) == 0) host += 8;
+  else if (strncmp(host, "http://", 7) == 0) { scheme = "http"; host += 7; }
+  char host_clean[256];
+  {
+    size_t hl = strlen(host);
+    if (hl >= sizeof(host_clean)) hl = sizeof(host_clean) - 1;
+    memcpy(host_clean, host, hl);
+    while (hl > 0 && host_clean[hl - 1] == '/') hl--;
+    host_clean[hl] = '\0';
+  }
+
+  char canonical[4096];
+  snprintf(canonical, sizeof(canonical),
+    "PUT\n/%s\n"
+    "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=%s&"
+    "X-Amz-Date=%s&X-Amz-Expires=%ld&X-Amz-SignedHeaders=host\n"
+    "host:%s\n\nhost\nUNSIGNED-PAYLOAD",
+    key, cred_enc, amz_date, expires_sec, host_clean);
+
+  char scope[256];
+  snprintf(scope, sizeof(scope), "%s/%s/s3/aws4_request",
+           date_stamp, db->s3_region);
+  char canon_hash[65];
+  ark_sha256_hex(canonical, strlen(canonical), canon_hash);
+
+  char sts[1024];
+  snprintf(sts, sizeof(sts), "AWS4-HMAC-SHA256\n%s\n%s\n%s",
+           amz_date, scope, canon_hash);
+
+  uint8_t k_date[32], k_region[32], k_service[32], k_signing[32];
+  char kseed[512];
+  snprintf(kseed, sizeof(kseed), "AWS4%s", db->s3_secret_key);
+  ark_hmac_sha256((const uint8_t *)kseed, strlen(kseed),
+                  date_stamp, strlen(date_stamp), k_date);
+  ark_hmac_sha256(k_date, 32, db->s3_region, strlen(db->s3_region), k_region);
+  ark_hmac_sha256(k_region, 32, "s3", 2, k_service);
+  ark_hmac_sha256(k_service, 32, "aws4_request", 12, k_signing);
+
+  char sig_hex[65];
+  ark_hmac_sha256_hex(k_signing, 32, sts, strlen(sts), sig_hex);
+
+  char sig_enc[256];
+  s3_url_encode_inline(sig_hex, sig_enc, sizeof(sig_enc));
+
+  size_t url_len = strlen(scheme) + 3 + strlen(host_clean) + strlen(key) + 2048;
+  char *url = malloc(url_len);
+  if (!url) return NULL;
+  snprintf(url, url_len,
+    "%s://%s/%s"
+    "?X-Amz-Algorithm=AWS4-HMAC-SHA256"
+    "&X-Amz-Credential=%s"
+    "&X-Amz-Date=%s"
+    "&X-Amz-Expires=%ld"
+    "&X-Amz-SignedHeaders=host"
+    "&X-Amz-Signature=%s",
+    scheme, host_clean, key,
+    cred_enc, amz_date, expires_sec, sig_enc);
+  return url;
+}
+
 #ifdef _WIN32
 DWORD WINAPI run_hourly_backup(LPVOID arg) {
 #else
@@ -3341,29 +3475,43 @@ void *run_hourly_backup(void *arg) {
     int status = backup_database(db->snapshot_db, db->backup_path,
                                  &db->shutdown_requested);
 
-    // Skip the remote upload when no signed-URL endpoint has been
-    // configured — nothing phones home unless explicitly enabled.
+    // Upload path: direct S3 (no control plane) when credentials are
+    // configured, falling back to the CP signed-URL endpoint.
     int endpoint_configured = db->signed_url_endpoint &&
         strlen(db->signed_url_endpoint) > 0;
 
-    if (status == SQLITE_OK && endpoint_configured) {
-      // API key snapshot: db_set_api_key can swap the string from the game
-      // thread while this thread builds the request (use-after-free).
-      char *tok = api_key_snapshot(db);
-      char *signed_url = get_signed_url(db, db->signed_url_endpoint, tok,
-                                        &db->shutdown_requested);
-      if (signed_url && strlen(signed_url) > 5) {
-        if (upload_to_s3(db, signed_url, db->backup_path, tok) != 0) {
+    if (status == SQLITE_OK && (has_direct_s3(db) || endpoint_configured)) {
+      char s3_key[512];
+      {
+        const char *name = db->db_path ? db->db_path : "unknown";
+        const char *base = strrchr(name, '/');
+        const char *fname = base ? base + 1 : name;
+        snprintf(s3_key, sizeof(s3_key), "backups/%.400s", fname);
+      }
+
+      char *upload_url = NULL;
+      if (has_direct_s3(db)) {
+        char full_key[768];
+        snprintf(full_key, sizeof(full_key), "%s/%s", db->s3_bucket, s3_key);
+        upload_url = s3_presign_put(db, full_key, 3600L);
+        if (!upload_url)
+          ark_log(db, ARK_LOG_ERROR,
+                  "snapshot upload skipped: local SigV4 signing failed");
+      } else {
+        char *tok = api_key_snapshot(db);
+        upload_url = get_signed_url(db, db->signed_url_endpoint, tok,
+                                    &db->shutdown_requested);
+        free(tok);
+      }
+
+      if (upload_url && strlen(upload_url) > 5) {
+        if (upload_to_s3(db, upload_url, db->backup_path, NULL) != 0) {
           ark_log(db, ARK_LOG_ERROR, "scheduled backup upload failed");
         } else {
-          // (Risk #1) A successful snapshot re-baselines the destination:
-          // any CDC gap from a prior outbox-cap pause is now recovered.
-          // Clear the sticky capture_paused flag.
           ARK_STORE(&db->capture_paused, 0);
         }
       }
-      free(tok);
-      free(signed_url);
+      free(upload_url);
     }
   }
 #ifdef _WIN32

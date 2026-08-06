@@ -35,6 +35,20 @@ void ark_sha256_hex(const void *data, size_t len, char out[65]);
 // state on failure).
 int ark_sha256_hex_file(const char *path, char out[65]);
 
+// Raw SHA-256 digest of `data` (len bytes) into `out` (must be 32 bytes).
+void ark_sha256_raw(const void *data, size_t len, uint8_t out[32]);
+
+// HMAC-SHA-256 of `data` (data_len bytes) with `key` (key_len bytes).
+// Writes 32 raw bytes to `out`.
+void ark_hmac_sha256(const uint8_t *key, size_t key_len,
+                     const void *data, size_t data_len,
+                     uint8_t out[32]);
+
+// HMAC-SHA-256 rendered as lowercase hex in `out` (65 bytes).
+void ark_hmac_sha256_hex(const uint8_t *key, size_t key_len,
+                         const void *data, size_t data_len,
+                         char out[65]);
+
 #ifdef __cplusplus
 }
 #endif

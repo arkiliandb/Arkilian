@@ -177,10 +177,30 @@ destination is configured.
 | `ARKILIAN_SKIP_STARTUP_AUTH` | Skip the startup API-key validation (test only — do NOT set in production) |
 | `ARKILIAN_ALLOW_INSECURE` | Opt-in for non-HTTPS non-local endpoints (default 0 — never leak the key in cleartext) |
 | `ARKILIAN_OUTBOX_DURABLE` | `synchronous=FULL` for the outbox (default 1); set 0 for throughput over power-loss durability |
+| `ARKILIAN_S3_ENDPOINT` | S3-compatible endpoint for direct uploads (e.g. `https://s3.amazonaws.com`). When set with the other `ARKILIAN_S3_*` vars, snapshots bypass the control plane entirely. |
+| `ARKILIAN_S3_BUCKET` | S3 bucket for direct snapshot uploads |
+| `ARKILIAN_S3_REGION` | S3 region (e.g. `us-east-1`). Defaults to `us-east-1` |
+| `ARKILIAN_S3_ACCESS_KEY` | S3 access key ID |
+| `ARKILIAN_S3_SECRET_KEY` | S3 secret access key |
 | `ARKILIAN_DB_PATH` / `ARKILIAN_BACKUP_PATH` | Database and snapshot file paths |
 | `ARKILIAN_STORAGE_HOSTS` | Allowlist of custom storage hosts (comma-separated, suffix-matched) for SSRF guard |
 
 Real environment variables always win over a `./.env` file.
+
+### Architecture: Control Plane is Observability-Only
+
+In production, the control plane issues API keys and provides monitoring.
+It is **not** in the data write path:
+
+- **Snapshots:** When `ARKILIAN_S3_*` are configured, the client signs
+  presigned PUT URLs locally using AWS Signature V4 and uploads directly
+  to S3 — no control-plane round trip. `/v1/upload/request` is a fallback.
+- **WAL push:** `POST /v1/wal/push` is fire-and-forget for the live
+  dashboard. Data durability comes from S3 snapshots + local outbox.
+- **Startup auth:** Validation runs asynchronously; failure does NOT
+  disable backup. Shipping resumes automatically when the CP returns.
+- **Hydrate:** Cold-start restore queries the CP for the snapshot manifest
+  (v2 manifest-in-bucket is tracked in §11.3).
 
 ## 7. Design decisions (reviewed, spec §8.1 / §11)
 
