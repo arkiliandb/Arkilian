@@ -1,18 +1,60 @@
 # .clang-tidy
 ---
+# Curated rather than blanket-prefix-globbed: this project's lint gate
+# fails the build on genuinely high-signal findings only, and excludes
+# cosmetic / libc-and-platform-API-mandated checks that produce
+# persistent false positives. Disabled checks and the rationale for
+# each:
+#
+#   bugprone-reserved-identifier
+#     Flags POSIX feature-test macros (_POSIX_C_SOURCE, _DEFAULT_SOURCE,
+#     _DARWIN_C_SOURCE) which are the documented mechanism to opt into
+#     libc APIs (strdup, statfs, BSD types). Removing them breaks the
+#     Linux/macOS build; the warning is universally signal-poor here.
+#
+#   bugprone-easily-swappable-parameters
+#     Fires on libcurl's curl_abort_cb signature (4 curl_off_t/void*),
+#     SQLite's on_db_update and on_schema_authorizer hook signatures,
+#     and small util functions whose adjacent string params are obvious.
+#     The signatures are externally mandated and cannot be changed.
+#
+#   bugprone-multi-level-implicit-pointer-conversion
+#     Flags `&ptr`-as-`void*` callbacks required by sqlite3_exec /
+#     sqlite3_prepare_v2 (the C SQLite API accepts the output statement
+#     via `void**`); explicit `(void*)` casts would be cosmetic only.
+#
+#   performance-no-int-to-ptr
+#     Flags NULL-pointer as integer (`(void*)0`), NULL macro
+#     expansions, and curl/xferinfo data-passing idioms (passing the
+#     address of an int flag through void*). Pervasive, signal-poor.
+#
+# Kept active as build-failing (in WarningsAsErrors): clang-analyzer-*,
+# portability-*, bugprone-unchecked-string-to-number-conversion
+# (the real atoi/malformed-env-var class — see get_env_int_default),
+# bugprone-unsafe-functions (cert-msc33-c — rewind() class),
+# bugprone-suspicious-*, bugprone-narrowing-conversions, etc.
 Checks: >
   -*,
   bugprone-*,
+  -bugprone-reserved-identifier,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-multi-level-implicit-pointer-conversion,
   clang-analyzer-*,
   misc-*,
   modernize-*,
   performance-*,
+  -performance-no-int-to-ptr,
   portability-*,
   readability-*
 
-# Ensure we do not lint vendored dependency headers or test files with strict guidelines
+# Lint only the project's own headers — never the vendored SQLite
+# amalgamation or system headers (822 findings suppressed otherwise).
 HeaderFilterRegex: '^src/(class|hydration|sha256)\.h$'
 
+# Treat these specific categories as build failures:
+#   - clang-analyzer-* (high-signal static analysis)
+#   - portability-* (real cross-platform bugs)
+#   - the subset of bugprone-* we did NOT silently disable above
 WarningsAsErrors: >
   bugprone-*,
   clang-analyzer-*,
