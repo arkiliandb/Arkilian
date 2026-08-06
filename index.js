@@ -26,6 +26,19 @@ const SQLITE_DONE = 101;
 class Arkilian {
   constructor(apiKey, dbPath = "app.sqlite") {
     if (!apiKey) throw new Error("Your API key is required");
+    // db_init reads ARKILIAN_API_KEY from the environment to decide
+    // whether to enable backup (src/class.c disables it when the key is
+    // absent) and to run startup auth validation against the control
+    // plane. If the JS wrapper calls setApiKey AFTER db_init — as it did
+    // before — the key arrives too late: backup is already permanently
+    // disabled for the process and the startup validation never ran, so
+    // `new Arkilian('your-api-key', 'app.sqlite')` silently ran without
+    // backup. Sync the env from the constructor argument BEFORE db_init so
+    // the documented constructor apiKey drives both enablement and
+    // validation; db_set_api_key then keeps the in-memory key in lockstep.
+    if (!process.env.ARKILIAN_API_KEY) {
+      process.env.ARKILIAN_API_KEY = apiKey;
+    }
     this.id = native.db_init(dbPath);
     if (!this.id) {
       throw new Error("Failed to initialize database");
