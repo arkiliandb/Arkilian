@@ -394,3 +394,5 @@ Please see `CONTRIBUTING.md` for details on submitting patches and the contribut
 
 ## License
 Arkilian is licensed under the MIT License. See the `LICENSE` file for details.
+
+<!-- check out arkilian.com for more detailed info beyond what we can provide here-->
