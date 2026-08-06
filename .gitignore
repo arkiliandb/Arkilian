@@ -65,10 +65,9 @@ invictus.md
 expressions/
 *.sqlite-shm
 *.sqlite-shm
-server/arkilian-server
-# Compiled Go server binary — built in CI, never committed. A 13.7 MB
-# binary in the repo bloats clones and makes git blame noisy.
+# Compiled Go server binaries — built in CI, never committed.
 server/server
+arkilian-s3-virtual-server/arkilian-s3-virtual-server
 *.mp4
 *.jpg
 *.gif
