@@ -418,8 +418,93 @@ ingest **100,000–500,000 RPS**. Before launch:
    grows across consecutive checks (see §9) — that's the signal the
    backend is rejecting/ timing out, not a transient blip.
 4. **Micro-batching is the forward path.** The current one-row-per-POST
-   design is intentional for strict ordering (spec §8.1) but is the
-   ceiling on ingestion efficiency. When the control plane supports
-   batch payloads, client-side micro-batching (100 rows or 50ms window,
-   gzip/zstd) reduces RPS by ~100× — see Risk #2 in the production
-   readiness review.
+    design is intentional for strict ordering (spec §8.1) but is the
+    ceiling on ingestion efficiency. When the control plane supports
+    batch payloads, client-side micro-batching (100 rows or 50ms window,
+    gzip/zstd) reduces RPS by ~100× — see Risk #2 in the production
+    readiness review.
+
+## 11. Control-plane dependency model & SPOF mitigation
+
+The Arkilian control plane is involved in **four** operations on the v1
+data path. This section documents each, the v1 mitigation, and the
+planned v2 decoupling — so operators (and reviewers) understand the
+dependency shape before launch.
+
+### 11.1 Where the control plane is in the critical path (v1)
+
+| # | Operation | Code path | Failure mode | v1 mitigation |
+|---|-----------|-----------|--------------|---------------|
+| 1 | **Startup API-key validation** | `class.c:2078` → `validate_api_key` → `POST /v1/auth/validate` | Control plane down at boot → backup disabled for process lifetime | §0 soft-fail (app keeps running); `db_backup_set_enabled(1)` operator re-enable; `ARKILIAN_SKIP_STARTUP_AUTH=1` DR escape hatch |
+| 2 | **Per-upload signed URL** | `get_signed_url` (`class.c:3267`) → `POST /v1/upload/request` called from the snapshot/flush loops | Control plane down → no new snapshots/chunks ship this cycle | Outbox rows + local `_pending_backup` keep accumulating (capped at `ARKILIAN_MAX_QUEUE_DEPTH`); `db_backup_capture_paused` alerts; next cycle retries |
+| 3 | **Cold-start hydrate** | `hydration.c` asks `/v1/manifest` for latest snapshot + chunk list | Control plane down at cold start → restore blocked (no data loss; restore resumes once control plane returns) | Restores are operator-initiated and rare; standard DR is "wait for CP, retry hydrate" — no data loss because all chunks are already in S3 |
+| 4 | **WAL row durability** | `POST /v1/wal/push` writes rows into the control plane's `wal_entries` table (`server/schema.go:21`) | Control plane down → this batch's rows not durable in central store | The hourly snapshot (S3-durable) is the **authoritative** recovery source; `wal_entries` is the **replayable** layer for low-RPO restores and the live dashboard. Even if `wal_entries` is lost, the next snapshot captures full state |
+
+### 11.2 v1 mitigation: run the control plane on GCP with regional HA
+
+For the 5,000-business launch, the control plane is **not** a single
+point of failure when deployed on GCP's managed redundancy:
+
+1. **Control plane state** → **Cloud SQL for PostgreSQL HA** (regional,
+   sync standby, automatic failover, 99.95% regional SLA). NOT a single
+   SQLite file — promote `server/schema.go`'s SQLite to Cloud SQL on
+   deploy (the schema is portable; `CREATE TABLE IF NOT EXISTS` works
+   unchanged on Postgres with the `payload_id` migration in `main.go:367`).
+2. **Control plane HTTP tier** → **Cloud Run** (multi-zone, min-instances
+   ≥ 3, autoscaled to the 500k-RPS ceiling from §10). Behind a regional
+   Load Balancer with health-checked backends; a single-zone outage
+   reroutes within seconds.
+3. **S3-equivalent object storage** → **GCS** multi-region bucket for
+   snapshots/chunks. Pre-signed URLs (S3) and signed URLs (GCS V4) are
+   both supported; the only client-side change is the storage URL base
+   in the control-plane response.
+4. **Cross-region failover** → run a replica control plane in a second
+   GCP region; DNS-weighted routing. A regional GCP outage is an
+   SEV-0, not an Arkilian design defect.
+5. **Startup-validation blast radius** → if the control plane is down at
+   a client's cold start, the client's app runs without backup until the
+   operator calls `setBackupEnabled(true)` (or sets
+   `ARKILIAN_SKIP_STARTUP_AUTH=1` temporarily). At 5,000 tenants this is
+   visible via the central dashboard's `db_backup_is_healthy` roll-up;
+   the on-call runbook (§5 "Backup enabled but nothing ships") covers
+   the recovery.
+
+### 11.3 v2 roadmap — decouple the write path from the control plane
+
+The reviewer's proposed architecture (control plane as **observability
+only**, storage as the durable path) is the v2 target. It is NOT shipping
+in v1 because each piece is multi-day work and high-risk to introduce
+minutes before launch. Tracked in the v2 roadmap document:
+
+1. **Scoped, cached storage credentials** (replace per-upload signed
+   URL): the control plane mints a short-lived, prefix-scoped S3/GCS
+   STS session (multi-hour TTL) on first validation; the client caches
+   it, refreshes in the background before expiry, and uploads directly
+   to storage with **no per-upload round-trip**. Continues using the
+   last-known-good credential until expiry if the control plane is down.
+   - Tradeoff: weaker key-revocation (bounded by credential TTL instead
+     of instant); keep TTL short enough to bound blast radius.
+
+2. **Manifest object in the storage bucket** (replace control-plane
+   hydrate): the client writes `<db_id>/manifest.json` (latest baseline
+   LSN + chunk list) to storage itself on every snapshot, using a
+   conditional/versioned PUT so concurrent writers can't race. Cold
+   start reads the manifest directly from storage. Control plane can
+   still read it for the dashboard, but no longer serves it.
+
+3. **Chunks as the durable replication path** (replace
+   control-plane-brokered `wal_entries`): the client batches WAL entries
+   locally and ships them as immutable chunk files straight to storage
+   on the flush cadence. `/v1/wal/push` becomes a best-effort,
+   fire-and-forget mirror purely for the live dashboard; if it's down,
+   chunks land durably in storage and the dashboard just goes stale.
+
+4. **Asynchronous startup auth** (replace startup gate): attempt
+   validation async, never block local writes on it. A revoked key
+   stays valid until credential TTL expires — bounded by the STS TTL
+   from (1).ship
+
+Net post-v2: with the control plane fully down, capture / backup /
+hydrate all keep working off cached credentials + the storage manifest;
+only dashboard freshness degrades — exactly the "observability only"
+posture.
