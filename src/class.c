@@ -79,6 +79,8 @@
 #include <stdarg.h>
 #include <ctype.h>
 #include <time.h>
+#include <errno.h>
+#include <limits.h>
 
 #include "deps/sqlite/sqlite3.h"
 
@@ -235,8 +237,20 @@ static const char *get_env_default(const char *env_var, const char *default_val)
 
 static int get_env_int_default(const char *env_var, int default_val) {
   const char *val = getenv(env_var);
-  if (val && strlen(val) > 0) return atoi(val);
-  return default_val;
+  if (!val || strlen(val) == 0) return default_val;
+  // atoi() silently returns 0 for malformed input, which would be
+  // indistinguishable from a legitimate "0" and bypass the caller's
+  // default (e.g. ARKILIAN_BACKUP_INTERVAL=oops quietly becoming 0).
+  // strtol reports parse failure via endptr so we fall back to the
+  // documented default instead of producing a silent misconfiguration.
+  char *end = NULL;
+  errno = 0;
+  long parsed = strtol(val, &end, 10);
+  if (end == val || *end != '\0' || errno != 0 ||
+      parsed < INT_MIN || parsed > INT_MAX) {
+    return default_val;
+  }
+  return (int)parsed;
 }
 
 // Configurable via ARKILIAN_MAX_ATTEMPTS env var. Default 20 with
@@ -3105,7 +3119,16 @@ static int upload_to_s3(arkilian *db, const char *signed_url,
     curl_easy_cleanup(curl);
     return 1;
   }
-  rewind(fd);
+  // rewind() discards errno — a failed seek would silently upload from
+  // the wrong position, producing a torn snapshot. Use fseek() and treat
+  // any failure as an upload failure (consistent with the SEEK_END probe
+  // above) so the snapshot re-attempts on the next hourly cycle rather
+  // than shipping a corrupted backup.
+  if (fseek(fd, 0L, SEEK_SET) != 0) {
+    fclose(fd);
+    curl_easy_cleanup(curl);
+    return 1;
+  }
 
   // Every curl_easy_setopt / curl_slist_append return code is checked —
   // a misconfigured upload must be reported, not silently swallowed.
