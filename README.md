@@ -15,13 +15,13 @@
 # Arkilian
 
 
-Arkilian is a managed embedded databas that wraps SQLite and is written in C, designed to extend SQLite with  automated cloud backup functionality and horizontal scaling (in the coming updates).
+Arkilian is a managed embedded database that wraps SQLite and is written in C, designed to extend SQLite with automated cloud backup functionality and horizontal scaling (in the coming updates).
 
 ### Key Features
 * **Simplified SQLite Binding:** Exposes fundamental SQLite session management alongside fully permissive raw handle extraction.
-* **Background Data Protection:** Features an integrated background thread that continuously executes unblocking online snapshots and securely replicates the database to AWS S3 using presigned URLs. 
-* **Cross-platform CMake Integration:** Configured to compile seamlessly across macOS, Linux, and Windows.
-* **Multi-language Support:** Build as shared library for Node.js/Python FFI or static library for embedded C/C++ applications.
+* **Background Data Protection:** Features two integrated background threads — a flush thread that continuously ships row-level changes to a push endpoint, and a snapshot thread that uploads full hourly backups to S3 via presigned URLs.
+* **Cross-platform:** Compiles natively on macOS, Linux, and Windows (MSVC and MinGW) without a POSIX compatibility layer.
+* **Multi-language Support:** Build as a shared library for FFI or static library for embedded C/C++ applications. A prebuilt N-API addon is published to npm for Node.js/Bun.
 * **Environment-based Configuration:** All settings configurable via `ARKILIAN_` prefixed environment variables.
 
 ## Getting Started
@@ -29,8 +29,7 @@ Arkilian is a managed embedded databas that wraps SQLite and is written in C, de
 ### Prerequisites
 * A C99 compliant compiler (GCC, Clang, or MSVC)
 * CMake 3.10 or higher
-* `libcurl` (e.g., `libcurl4-openssl-dev` on Debian/Ubuntu, or native via Xcode SDK on macOS)
-* A POSIX environment or compatibility layer (for Windows)
+* `libcurl` (e.g., `libcurl4-openssl-dev` on Debian/Ubuntu, or native via Xcode SDK on macOS, or vcpkg on Windows)
 
 ### Build Instructions
 
@@ -39,7 +38,7 @@ You can build the library using CMake. Both static and shared libraries are buil
 ```bash
 # Clone the repository
 git clone https://github.com/arkiliandb/Arkilian.git
-cd birth-of-Arkilian
+cd Arkilian
 
 # Generate build files
 cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
@@ -98,7 +97,6 @@ ARKILIAN_ENABLE_BACKUP=1
 ```c
 #include "class.h"
 #include <stdio.h>
-#include <sqlite3.h>
 
 int main(void) {
     arkilian *db = NULL;
@@ -111,13 +109,17 @@ int main(void) {
         return 1;
     }
 
-    // Extract the raw sqlite3 handle to execute arbitrary statements
-    sqlite3 *raw_db = db_get_handle(db);
-    int rc = sqlite3_exec(raw_db, "CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, name TEXT);", 0, 0, NULL);
+    // Execute SQL directly through the wrapper
+    int rc = db_exec(db, "CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, name TEXT);");
     
     if (rc != SQLITE_OK) {
         fprintf(stderr, "SQL Execution failed: %s\n", db_errmsg(db));
     }
+
+    // Or extract the raw sqlite3 handle for direct SQLite API access
+    sqlite3 *raw_db = db_get_handle(db);
+    // Note: DDL via the raw handle bypasses capture triggers.
+    // Call db_resync_triggers(db) afterwards to re-sync them.
 
     // Release resources gracefully
     db_close(db);
@@ -130,38 +132,51 @@ Compile with static library:
 gcc -I/usr/local/include/arkilian -L/usr/local/lib -larkilian myapp.c -o myapp
 ```
 
-### Node.js FFI (using node-ffi or similar)
+### Node.js / Bun (npm package)
 
-The shared library (`libarkilian.so`/`libarkilian.dylib`/`arkilian.dll`) exports C functions that can be called from Node.js using FFI libraries like `ffi-napi` or `koffi`.
-
-### Python FFI (using ctypes)
-
-```python
-import ctypes
-import os
-
-# Load the shared library
-if os.name == 'nt':  # Windows
-    arkilian = ctypes.CDLL('./libarkilian.dll')
-else:  # Unix-like
-    arkilian = ctypes.CDLL('./libarkilian.so')
-
-# Define function signatures
-arkilian.db_init.restype = ctypes.c_int
-arkilian.db_init.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_char_p]
-
-# Use the library
-db = ctypes.c_void_p()
-ret = arkilian.db_init(ctypes.byref(db), b"app.sqlite")
-```
-
-## NPM Package
-
-For Node.js projects, you can install via npm:
+Arkilian ships as a **prebuilt N-API addon** — no C compiler or `libcurl-dev` required at install time.
 
 ```bash
 npm install arkilian
 ```
+
+```js
+import Arkilian from 'arkilian';
+
+const db = new Arkilian('your-api-key', 'app.sqlite');
+
+// Execute SQL
+db.exec('CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, name TEXT)');
+
+// Prepared statements
+db.prepare('INSERT INTO users (name) VALUES (?)');
+db.bindText(1, 'Alice');
+db.step();
+db.finalize();
+
+// Cold-start restore from the control plane (call before new Arkilian())
+Arkilian.hydrate('app.sqlite', 'https://api.arkilian.com', 'your-api-key');
+
+db.close();
+```
+
+### FFI (C shared library)
+
+The shared library (`libarkilian.so` / `libarkilian.dylib` / `arkilian.dll`) exports all C functions listed in `src/class.h` and can be called from any language with a C FFI (Python `ctypes`, Ruby `fiddle`, Go `cgo`, etc.).
+
+```python
+import ctypes, os
+
+lib = ctypes.CDLL('./libarkilian.so' if os.name != 'nt' else './arkilian.dll')
+
+lib.db_init.restype = ctypes.c_int
+lib.db_init.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_char_p]
+
+db = ctypes.c_void_p()
+lib.db_init(ctypes.byref(db), b"app.sqlite")
+```
+
+## NPM Package
 
 Prebuilt native addons (`.node`) for `linux-x64`, `linux-arm64` (glibc &
 musl/Alpine), `darwin-x64`, `darwin-arm64`, and `win32-x64` are bundled
@@ -201,11 +216,22 @@ Unlike complex distributed SQLite systems (e.g., LiteFS or rqlite), Arkilian emb
 
 ## Monitoring & operations
 
-The client exposes spec §9 monitoring signals as C APIs and Node
-getters: `backupQueueDepth`, `backupOldestPendingAgeSec` (the realtime-lag
-metric), `backupDeadLetterCount`, `backupThreadHeartbeatAgeMs`,
-`backupTriggerCoverage`, and `backupHealthy`. Diagnostics are routed
-through `db_set_log_callback()` / `setLogCallback(fn)` (level, message).
+The client exposes spec §9 monitoring signals as C APIs and Node getters:
+
+| Getter (Node.js) | C API | Description |
+|---|---|---|
+| `backupQueueDepth` | `db_backup_queue_depth` | Rows in outbox not yet delivered |
+| `backupOldestPendingAgeSec` | `db_backup_oldest_pending_age_sec` | Realtime-lag metric; 0 when queue is empty |
+| `backupDeadLetterCount` | `db_backup_dead_letter_count` | Rows dead-lettered after max retries |
+| `backupThreadHeartbeatAgeMs` | `db_backup_thread_heartbeat_age_ms` | Flush thread liveness; -1 if not running |
+| `backupSnapshotHeartbeatAgeMs` | `db_backup_snapshot_heartbeat_age_ms` | Snapshot thread liveness; -1 if not running |
+| `backupTriggerCoverage` | `db_backup_trigger_coverage` | 0 = all tables covered; N = N triggers missing |
+| `backupSkippedTableCount` | `db_backup_skipped_table_count` | Tables with no PK skipped by capture (must be 0) |
+| `backupHealthy` | `db_backup_is_healthy` | 1 = subsystem fully healthy; 0 = investigate |
+| `triggersDirty` | `db_backup_triggers_dirty` | 1 = raw-handle DDL desynchronized triggers |
+| `capturePaused` | `db_backup_capture_paused` | Sticky: CDC rows dropped since last snapshot |
+
+Diagnostics are routed through `db_set_log_callback()` / `setLogCallback(fn)` (level, message).
 
 Dead-lettered rows are inspected and replayed with the bundled CLI:
 
@@ -224,7 +250,14 @@ the kill-switch procedure, and incident response.
 ```bash
 cmake -B build -S . -DCMAKE_BUILD_TYPE=Debug -DARKILIAN_BUILD_TESTS=ON
 cmake --build build --config Debug
-./build/test_basic
+
+# Run all 11 test suites
+for t in test_basic test_interception test_regressions test_monitoring \
+          test_deterministic test_virtual_tables test_hardening \
+          test_kill_switch test_kill_resilience test_load_contention \
+          test_dst_backpressure; do
+  ./build/$t
+done
 ```
 
 ## Contributing
