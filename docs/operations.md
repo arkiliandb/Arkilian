@@ -458,7 +458,6 @@ dependency shape before launch.
 | 1 | **Startup API-key validation** | `class.c:2078` → `validate_api_key` → `POST /v1/auth/validate` | Control plane down at boot → backup disabled for process lifetime | §0 soft-fail (app keeps running); `db_backup_set_enabled(1)` operator re-enable; `ARKILIAN_SKIP_STARTUP_AUTH=1` DR escape hatch |
 | 2 | **Per-upload signed URL** | `get_signed_url` (`class.c:3267`) → `POST /v1/upload/request` called from the snapshot/flush loops | Control plane down → no new snapshots/chunks ship this cycle | Outbox rows + local `_pending_backup` keep accumulating (capped at `ARKILIAN_MAX_QUEUE_DEPTH`); `db_backup_capture_paused` alerts; next cycle retries |
 | 3 | **Cold-start hydrate** | `hydration.c` asks `/v1/manifest` for latest snapshot + chunk list | Control plane down at cold start → restore blocked (no data loss; restore resumes once control plane returns) | Restores are operator-initiated and rare; standard DR is "wait for CP, retry hydrate" — no data loss because all chunks are already in S3 |
-| 4 | **WAL row durability** | `POST /v1/wal/push` writes rows into the control plane's `wal_entries` table (`server/schema.go:21`) | Control plane down → this batch's rows not durable in central store | The hourly snapshot (S3-durable) is the **authoritative** recovery source; `wal_entries` is the **replayable** layer for low-RPO restores and the live dashboard. Even if `wal_entries` is lost, the next snapshot captures full state |
 
 ### 11.2 v1 mitigation: run the control plane on GCP with regional HA
 

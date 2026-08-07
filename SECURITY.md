@@ -26,8 +26,8 @@ subject prefix `[Arkilian Security]`.
 To help us triage quickly, include:
 
 - Product and version affected (C client `src/class.c`, hydration engine
-  `src/hydration.c`, Node binding `src/arkilian.cc`, or Go control plane
-  in `server/`).
+  `src/hydration.c`, Node binding `src/arkilian.cc`, or your control plane
+  at `arkilian.com`).
 - A minimal reproducer (code, SQL schema, or environment variable
   combination).
 - Expected vs. observed behavior.
@@ -62,8 +62,7 @@ agreed to earlier coordinated disclosure.
 In scope:
 
 - The C library: `src/class.c`, `src/hydration.c`, `src/sha256.c`.
-- The Node.js binding: `src/arkilian.cc`.
-- The Go control plane: `server/`.
+- The Node.js binding: `src/arkilian.cc`. 
 
 Out of scope / not eligible:
 
