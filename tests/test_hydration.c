@@ -4,6 +4,7 @@
 //   cc tests/test_hydration.c src/hydration.c -Isrc -Isrc/deps/sqlite -lcurl -lsqlite3 -o test_hydration
 
 #include "hydration.h"
+#include "sha256.h"
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -321,6 +322,8 @@ typedef struct {
   int stop;
   pthread_mutex_t stop_mutex;
   char snapshot_url[128]; // filled after bind; served in the plan
+  char snapshot_path[256];// path to the SQLite file to serve on /snap GET
+  char snapshot_sha256[65];// hex sha256 to include in the plan (or "" to omit)
   long baseline_lsn;      // configurable; faithful control plane serves
                           // baseline_lsn == the snapshot's recorded LSN.
 } mock_plan_server;
@@ -340,29 +343,56 @@ static void mock_plan_set_stop(mock_plan_server *s) {
 
 static void *mock_plan_run(void *arg) {
   mock_plan_server *s = (mock_plan_server *)arg;
-  char plan[512];
-  int plan_len = snprintf(plan, sizeof(plan),
-      "{\"snapshot_url\":\"%s\",\"baseline_lsn\":%ld,\"chunks\":[]}",
-      s->snapshot_url, s->baseline_lsn);
+  int has_sha = s->snapshot_sha256[0] != 0;
+  char plan[1024];
+  int plan_len;
+  if (has_sha)
+    plan_len = snprintf(plan, sizeof(plan),
+        "{\"snapshot_url\":\"%s\",\"snapshot_sha256\":\"%s\","
+        "\"baseline_lsn\":%ld,\"chunks\":[],\"expires_at\":9999999999}",
+        s->snapshot_url, s->snapshot_sha256, s->baseline_lsn);
+  else
+    plan_len = snprintf(plan, sizeof(plan),
+        "{\"snapshot_url\":\"%s\",\"baseline_lsn\":%ld,\"chunks\":[]}",
+        s->snapshot_url, s->baseline_lsn);
   for (;;) {
     int c = accept(s->fd, NULL, NULL);
     if (c < 0) break;
     char buf[8192];
     ssize_t n = recv(c, buf, sizeof(buf) - 1, 0);
-    if (mock_plan_should_stop(s)) { close(c); break; } // stop-kick connection: exit now
+    if (mock_plan_should_stop(s)) { close(c); break; }
     if (n > 0) {
       buf[n] = '\0';
       int is_plan = strstr(buf, "/hydrate/plan") != NULL;
       if (is_plan) {
-        char resp[1024];
+        char resp[1536];
         int rl = snprintf(resp, sizeof(resp),
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
             "Content-Length: %d\r\nConnection: close\r\n\r\n%s",
             plan_len, plan);
         send(c, resp, (size_t)rl, 0);
+      } else if (s->snapshot_path[0]) {
+        // Serve the actual snapshot SQLite file
+        FILE *f = fopen(s->snapshot_path, "rb");
+        if (f) {
+          fseek(f, 0, SEEK_END);
+          long fsize = ftell(f);
+          fseek(f, 0, SEEK_SET);
+          char hdr[256];
+          int hl = snprintf(hdr, sizeof(hdr),
+              "HTTP/1.1 200 OK\r\nContent-Type: application/x-sqlite3\r\n"
+              "Content-Length: %ld\r\nConnection: close\r\n\r\n", fsize);
+          send(c, hdr, (size_t)hl, 0);
+          char fbuf[65536];
+          size_t nr;
+          while ((nr = fread(fbuf, 1, sizeof(fbuf), f)) > 0)
+            send(c, fbuf, nr, 0);
+          fclose(f);
+        } else {
+          const char *nf = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+          send(c, nf, strlen(nf), 0);
+        }
       } else {
-        // Any other path (the snapshot download) → 404, exercising the
-        // cold-start path when the guard permits proceeding.
         const char *nf = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
         send(c, nf, strlen(nf), 0);
       }
@@ -372,10 +402,13 @@ static void *mock_plan_run(void *arg) {
   return NULL;
 }
 
-static void mock_plan_start(mock_plan_server *s, long baseline_lsn) {
+static void mock_plan_start(mock_plan_server *s, long baseline_lsn,
+                             const char *snap_path, const char *snap_sha256) {
   memset(s, 0, sizeof(*s));
   pthread_mutex_init(&s->stop_mutex, NULL);
   s->baseline_lsn = baseline_lsn;
+  if (snap_path) strncpy(s->snapshot_path, snap_path, sizeof(s->snapshot_path)-1);
+  if (snap_sha256) strncpy(s->snapshot_sha256, snap_sha256, sizeof(s->snapshot_sha256)-1);
   s->fd = socket(AF_INET, SOCK_STREAM, 0);
   int one = 1;
   setsockopt(s->fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
@@ -414,7 +447,7 @@ static void mock_plan_stop(mock_plan_server *s) {
 // whose baseline is 3000 — that would silently destroy 2000 LSNs.
 static void test_hydrate_refuses_when_local_is_newer(void) {
   mock_plan_server srv;
-  mock_plan_start(&srv, 3000);
+  mock_plan_start(&srv, 3000, NULL, NULL);
 
   char base[64];
   snprintf(base, sizeof(base), "http://127.0.0.1:%d/v1", srv.port);
@@ -453,7 +486,7 @@ static void test_hydrate_refuses_when_local_is_newer(void) {
 // same point": no chunks to apply, no clamp, no refusal — hydration OK.
 static void test_hydrate_proceeds_when_local_behind(void) {
   mock_plan_server srv;
-  mock_plan_start(&srv, 1500);
+  mock_plan_start(&srv, 1500, NULL, NULL);
 
   char base[64];
   snprintf(base, sizeof(base), "http://127.0.0.1:%d/v1", srv.port);
@@ -477,7 +510,7 @@ static void test_hydrate_proceeds_when_local_behind(void) {
 // A live writer on the local DB must block the restore (clobber guard).
 static void test_hydrate_refuses_when_db_locked(void) {
   mock_plan_server srv;
-  mock_plan_start(&srv, 3000);
+  mock_plan_start(&srv, 3000, NULL, NULL);
 
   char base[64];
   snprintf(base, sizeof(base), "http://127.0.0.1:%d/v1", srv.port);
@@ -518,6 +551,7 @@ typedef struct {
   int plan_len;
   const char *snap_body;
   size_t snap_len;
+  const char *snap_path;          // if set, serve from this file instead of snap_body
 } sha_mock_ctx;
 
 static int sha_mock_should_stop(sha_mock_ctx *m) {
@@ -550,6 +584,23 @@ static void *sha_mock_run(void *arg) {
             "Content-Length: %d\r\nConnection: close\r\n\r\n%s",
             m->plan_len, m->plan);
         send(c, resp, (size_t)rl, 0);
+      } else if (m->snap_path) {
+        // Serve the snapshot from a file (round-trip restore happy path).
+        FILE *f = fopen(m->snap_path, "rb");
+        if (f) {
+          fseek(f, 0, SEEK_END); long fsz = ftell(f); fseek(f, 0, SEEK_SET);
+          char hdr[256];
+          int hl = snprintf(hdr, sizeof(hdr),
+              "HTTP/1.1 200 OK\r\nContent-Type: application/x-sqlite3\r\n"
+              "Content-Length: %ld\r\nConnection: close\r\n\r\n", fsz);
+          send(c, hdr, (size_t)hl, 0);
+          char b[65536]; size_t nr;
+          while ((nr = fread(b, 1, sizeof(b), f)) > 0) send(c, b, nr, 0);
+          fclose(f);
+        } else {
+          const char *nf = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+          send(c, nf, strlen(nf), 0);
+        }
       } else {
         // Snapshot download: serve a body whose SHA-256 differs from
         // the (wrong) digest declared in the plan so the mismatch check
@@ -636,6 +687,194 @@ static void test_hydrate_refuses_on_sha_mismatch(void) {
   remove(db_path);
 }
 
+// ── Round-trip restore: snapshot download + SHA-256 verify + install ──
+// Creates a source DB, configures a mock CP+S3 that serves both the plan
+// and the file, calls arkilian_hydrate, then asserts the restored DB has
+// the source's data. This is the flagship-feature test — without it the
+// test suite gave false confidence that the restore path works end-to-end
+// when in fact the client never sent sha256 to the control plane and the
+// upload key was self-colliding across tenants.
+
+// Helper: create a source SQLite DB with known test data, compute sha256.
+// Caller removes the file when done.
+static int create_source_db(const char *path, sqlite3_int64 *rows_out) {
+  remove(path);  // also removes -wal / -shm sidecars via hydration_remove_db_files
+  sqlite3 *db = NULL;
+  if (sqlite3_open_v2(path, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, NULL) != SQLITE_OK)
+    return 1;
+  assert(sqlite3_exec(db,
+      "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, email TEXT);"
+      "INSERT INTO users VALUES (1, 'alice', 'alice@arkilian.com');"
+      "INSERT INTO users VALUES (2, 'bob',   'bob@arkilian.com');"
+      "INSERT INTO users VALUES (3, 'carol', 'carol@arkilian.com');",
+      NULL, NULL, NULL) == SQLITE_OK);
+  sqlite3_stmt *st = NULL;
+  sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM users", -1, &st, NULL);
+  if (sqlite3_step(st) == SQLITE_ROW) *rows_out = sqlite3_column_int64(st, 0);
+  sqlite3_finalize(st);
+  sqlite3_close(db);
+  return 0;
+}
+
+// Happy-path: mock serves plan with CORRECT sha256 + the actual snapshot
+// file. arkilian_hydrate SHOULD succeed: download → sha256 verify → install.
+static void test_round_trip_restore_happy_path(void) {
+  const char *src  = "/tmp/ark_hydrate_rt_source.db";
+  const char *dst  = "/tmp/ark_hydrate_rt_restored.db";
+  remove(dst);
+
+  sqlite3_int64 src_rows = 0;
+  assert(create_source_db(src, &src_rows) == 0);
+  assert(src_rows == 3);
+
+  char sha[65] = {0};
+  assert(ark_sha256_hex_file(src, sha) == 0);
+  assert(sha[0] != 0);
+
+  sha_mock_ctx mc = {0};
+  pthread_mutex_init(&mc.stop_mutex, NULL);
+  mc.snap_path = src;
+  mc.fd = socket(AF_INET, SOCK_STREAM, 0);
+  int one = 1; setsockopt(mc.fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+  struct sockaddr_in a = {0}; a.sin_family = AF_INET; a.sin_addr.s_addr = htonl(INADDR_LOOPBACK); a.sin_port = 0;
+  assert(bind(mc.fd, (struct sockaddr*)&a, sizeof(a)) == 0);
+  socklen_t alen = sizeof(a); getsockname(mc.fd, (struct sockaddr*)&a, &alen);
+  int port = ntohs(a.sin_port);
+  listen(mc.fd, 8);
+
+  char snap_url[128], plan_body[1024];
+  snprintf(snap_url, sizeof(snap_url), "http://127.0.0.1:%d/snap", port);
+  snprintf(plan_body, sizeof(plan_body),
+      "{\"snapshot_url\":\"%s\",\"snapshot_sha256\":\"%s\","
+      "\"baseline_lsn\":0,\"chunks\":[],\"expires_at\":9999999999}",
+      snap_url, sha);
+  mc.plan = plan_body; mc.plan_len = (int)strlen(plan_body);
+
+  pthread_t t; pthread_create(&t, NULL, sha_mock_run, &mc);
+  char base[64]; snprintf(base, sizeof(base), "http://127.0.0.1:%d/v1", port);
+
+  int rc = arkilian_hydrate(dst, base, "token", NULL, NULL);
+  assert(rc == HYDRATION_OK);
+
+  sha_mock_set_stop(&mc);
+  int kick = socket(AF_INET, SOCK_STREAM, 0);
+  if (kick >= 0) { struct sockaddr_in ka = {0}; ka.sin_family = AF_INET;
+    ka.sin_addr.s_addr = htonl(INADDR_LOOPBACK); ka.sin_port = htons((unsigned short)port);
+    connect(kick, (struct sockaddr*)&ka, sizeof(ka)); close(kick); }
+  pthread_join(t, NULL); close(mc.fd);
+
+  // Verify restored DB has the source data
+  sqlite3 *db = NULL;
+  assert(sqlite3_open_v2(dst, &db, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
+  sqlite3_stmt *st = NULL;
+  sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM users", -1, &st, NULL);
+  assert(sqlite3_step(st) == SQLITE_ROW);
+  assert(sqlite3_column_int64(st, 0) == 3);
+  sqlite3_finalize(st);
+  sqlite3_prepare_v2(db, "SELECT name, email FROM users WHERE id = 1", -1, &st, NULL);
+  assert(sqlite3_step(st) == SQLITE_ROW);
+  assert(strcmp((const char*)sqlite3_column_text(st, 0), "alice") == 0);
+  assert(strcmp((const char*)sqlite3_column_text(st, 1), "alice@arkilian.com") == 0);
+  sqlite3_finalize(st);
+  sqlite3_close(db);
+
+  remove(src); remove(dst);
+}
+
+// Negative: mock serves the snapshot file but declares a DIFFERENT sha256
+// in the plan. Must return HYDRATION_ERR_PROTO (storage tampering).
+static void test_round_trip_sha256_mismatch(void) {
+  const char *src = "/tmp/ark_hydrate_rt_badsha.db";
+  remove("/tmp/ark_hydrate_rt_dst.db");
+  sqlite3_int64 rows = 0;
+  assert(create_source_db(src, &rows) == 0);
+
+  sha_mock_ctx mc = {0};
+  pthread_mutex_init(&mc.stop_mutex, NULL);
+  mc.snap_path = src;
+  mc.fd = socket(AF_INET, SOCK_STREAM, 0);
+  int one = 1; setsockopt(mc.fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+  struct sockaddr_in a = {0}; a.sin_family = AF_INET; a.sin_addr.s_addr = htonl(INADDR_LOOPBACK); a.sin_port = 0;
+  assert(bind(mc.fd, (struct sockaddr*)&a, sizeof(a)) == 0);
+  socklen_t alen = sizeof(a); getsockname(mc.fd, (struct sockaddr*)&a, &alen);
+  int port = ntohs(a.sin_port);
+  listen(mc.fd, 8);
+
+  char snap_url[128], plan_body[1024];
+  snprintf(snap_url, sizeof(snap_url), "http://127.0.0.1:%d/snap", port);
+  // DELIBERATELY wrong sha256 — the file is correct but the plan lies.
+  snprintf(plan_body, sizeof(plan_body),
+      "{\"snapshot_url\":\"%s\",\"snapshot_sha256\":"
+      "\"0000000000000000000000000000000000000000000000000000000000000000\","
+      "\"baseline_lsn\":0,\"chunks\":[]}",
+      snap_url);
+  mc.plan = plan_body; mc.plan_len = (int)strlen(plan_body);
+
+  pthread_t t; pthread_create(&t, NULL, sha_mock_run, &mc);
+  char base[64]; snprintf(base, sizeof(base), "http://127.0.0.1:%d/v1", port);
+  int rc = arkilian_hydrate("/tmp/ark_hydrate_rt_dst.db", base, "token", NULL, NULL);
+  assert(rc == HYDRATION_ERR_PROTO);
+
+  sha_mock_set_stop(&mc);
+  int kick = socket(AF_INET, SOCK_STREAM, 0);
+  if (kick >= 0) { struct sockaddr_in ka = {0}; ka.sin_family = AF_INET;
+    ka.sin_addr.s_addr = htonl(INADDR_LOOPBACK); ka.sin_port = htons((unsigned short)port);
+    connect(kick, (struct sockaddr*)&ka, sizeof(ka)); close(kick); }
+  pthread_join(t, NULL); close(mc.fd);
+  remove(src);
+}
+
+// Cold-start: mock returns 404 on snapshot download. Must succeed
+// (HYDRATION_OK) with an empty DB (the cold-start path initializes
+// _arkilian_meta but has no user data).
+static void test_round_trip_cold_start(void) {
+  const char *dst = "/tmp/ark_hydrate_rt_cold.db";
+  remove(dst);
+
+  sha_mock_ctx mc = {0};
+  pthread_mutex_init(&mc.stop_mutex, NULL);
+  mc.snap_path = NULL;  // NO file → sha_mock_run's else branch returns 404
+  mc.fd = socket(AF_INET, SOCK_STREAM, 0);
+  int one = 1; setsockopt(mc.fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+  struct sockaddr_in a = {0}; a.sin_family = AF_INET; a.sin_addr.s_addr = htonl(INADDR_LOOPBACK); a.sin_port = 0;
+  assert(bind(mc.fd, (struct sockaddr*)&a, sizeof(a)) == 0);
+  socklen_t alen = sizeof(a); getsockname(mc.fd, (struct sockaddr*)&a, &alen);
+  int port = ntohs(a.sin_port);
+  listen(mc.fd, 8);
+
+  char snap_url[128], plan_body[1024];
+  snprintf(snap_url, sizeof(snap_url), "http://127.0.0.1:%d/snap", port);
+  snprintf(plan_body, sizeof(plan_body),
+      "{\"snapshot_url\":\"%s\",\"baseline_lsn\":0,\"chunks\":[],\"expires_at\":9999999999}",
+      snap_url);
+  mc.plan = plan_body; mc.plan_len = (int)strlen(plan_body);
+
+  pthread_t t; pthread_create(&t, NULL, sha_mock_run, &mc);
+  char base[64]; snprintf(base, sizeof(base), "http://127.0.0.1:%d/v1", port);
+  int rc = arkilian_hydrate(dst, base, "token", NULL, NULL);
+  assert(rc == HYDRATION_OK);
+
+  // Cold-start creates an empty DB with _arkilian_meta initialized
+  sqlite3 *db = NULL;
+  assert(sqlite3_open_v2(dst, &db, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
+  sqlite3_stmt *st = NULL;
+  sqlite3_prepare_v2(db,
+      "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='_arkilian_meta'",
+      -1, &st, NULL);
+  assert(sqlite3_step(st) == SQLITE_ROW);
+  assert(sqlite3_column_int64(st, 0) == 1); // _arkilian_meta exists
+  sqlite3_finalize(st);
+  sqlite3_close(db);
+
+  sha_mock_set_stop(&mc);
+  int kick = socket(AF_INET, SOCK_STREAM, 0);
+  if (kick >= 0) { struct sockaddr_in ka = {0}; ka.sin_family = AF_INET;
+    ka.sin_addr.s_addr = htonl(INADDR_LOOPBACK); ka.sin_port = htons((unsigned short)port);
+    connect(kick, (struct sockaddr*)&ka, sizeof(ka)); close(kick); }
+  pthread_join(t, NULL); close(mc.fd);
+  remove(dst);
+}
+
 // ── Main ────────────────────────────────────────────────────────────
 
 int main(int argc, char **argv) {
@@ -684,6 +923,10 @@ int main(int argc, char **argv) {
   if (integration) {
     printf("\n[Integration]\n");
     RUN_TEST(test_hydration_integration);
+    printf("\n[Round-Trip Restore]\n");
+    RUN_TEST(test_round_trip_restore_happy_path);
+    RUN_TEST(test_round_trip_sha256_mismatch);
+    RUN_TEST(test_round_trip_cold_start);
   }
 
   printf("\n=== Results: %d/%d passed ===\n", tests_passed, tests_run);
