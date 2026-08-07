@@ -633,18 +633,22 @@ static int host_is_storage_safe(const char *host) {
   if (!host || !*host) return 0;
   if (host[0] == '[') {
     if (strncmp(host, "[::1]", 5) == 0) return 1;
-    if (strncmp(host, "[fc", 3) == 0 || strncmp(host, "[fd", 3) == 0) return 1; // ULA
-    // NO [fe80 — link-local excluded
+    // NO [fc / [fd ULA — AWS IMDSv2 is reachable at fd00:ec2::254 and
+    // must never be treated as a safe storage destination. ULA prefixes
+    // are NOT metadata-endpoint boundaries; rejecting them closes the
+    // exfiltration path where a compromised control plane returns a
+    // presigned URL pointing at fd00:ec2::254 and the client uploads
+    // the full database to the cloud instance-metadata service.
     return 0;
   }
   if (strcmp(host, "localhost") == 0) return 1;
   if (strncmp(host, "127.", 4) == 0) return 1;
   if (strncmp(host, "10.", 3) == 0) return 1;
   if (strncmp(host, "192.168.", 8) == 0) return 1;
-  // NO 169.254. — IMDS excluded
+  // NO 169.254. — IMDS (IPv4) excluded
   // NO fe80 — IPv6 link-local excluded
-  if (strncmp(host, "::1", 3) == 0) return 1;
-  if (strncmp(host, "fc", 2) == 0 || strncmp(host, "fd", 2) == 0) return 1; // ULA
+  // NO fc / fd ULA — AWS IMDSv2 (fd00:ec2::254) excluded
+  if (strcmp(host, "::1") == 0) return 1;
   if (strncmp(host, "172.", 4) == 0) {
     unsigned second = 0;
     // sscanf's %u overflow on malformed input yields ULONG_MAX, which the
@@ -1748,16 +1752,30 @@ void *run_wal_flush(void *arg) {
     if (validated) {
       ARK_STORE(&db->startup_auth_state, 1);
       ark_log(db, ARK_LOG_INFO, "API key validated against control plane (async)");
+      // Control plane is reachable → fetch storage credentials ONCE so
+      // the snapshot thread can sign PUT URLs locally and upload direct
+      // to S3/GCS/R2 (no per-upload control-plane round trip). A failure
+      // here just leaves s3_creds_loaded=0 and the snapshot thread skips
+      // its upload this cycle.
+      if (!ARK_LOAD(&db->s3_creds_loaded)) (void)fetch_storage_credentials(db);
     } else {
       ARK_STORE(&db->startup_auth_state, 2);
+      // CRITICAL: clear backup_enabled so the flush loop's drain gate
+      // (below) skips ship_to_backup entirely. Without this, rows keep
+      // being POSTed to a dead CP → 401 → exponential backoff → after
+      // max_attempts (default 100) every row dead-letters AND is deleted
+      // from _pending_backup → db_backup_is_healthy() flips GREEN again
+      // (queue empty) = silent bulk data loss between snapshots. With
+      // backup_enabled=0, capture keeps queuing with attempts=0 (nothing
+      // ever dead-letters) and the periodic recheck in the main loop
+      // re-enables the moment the CP validates.
+      ARK_STORE(&db->backup_enabled, 0);
       ark_log(db, ARK_LOG_ERROR,
               "async startup API key validation failed after %d attempt(s) — "
-              "the control plane may be unreachable or the API key is wrong. "
-              "Capture keeps queuing locally; shipping will resume "
-              "automatically the moment the control plane is reachable "
-              "again — no operator re-enable needed. Monitor "
-              "db_backup_is_healthy() for the liveness signal. "
-              "Verify ARKILIAN_API_KEY and ARKILIAN_CONTROL_URL",
+              "backup DISABLED (capture keeps queuing, no dead-lettering). "
+              "The flush thread will re-validate periodically and re-enable "
+              "shipping automatically once the control plane validates the "
+              "key. Verify ARKILIAN_API_KEY and ARKILIAN_CONTROL_URL",
               retries + 1);
     }
   }
@@ -1776,7 +1794,36 @@ void *run_wal_flush(void *arg) {
   while (!ARK_LOAD(&db->shutdown_requested) && select_stmt && ship_curl) {
     // Liveness heartbeat (spec §9): the watchdog reads this from another
     // thread; a stale age means the thread died silently.
-    ARK_STORE(&db->last_heartbeat_sec, (int)(now_ms_mono() / 1000));
+    long long now_ms = now_ms_mono();
+    ARK_STORE(&db->last_heartbeat_sec, (int)(now_ms / 1000));
+
+    // Periodic re-validation (startup_auth_state recovery): if async
+    // validation FAILED at boot (state==2, backup_enabled==0), retry it
+    // every ~60s. When the CP comes back and the key validates, we flip
+    // state back to VALIDATED, re-enable backup, and (re)fetch storage
+    // credentials. This is the mechanism that turns a CP outage from
+    // "permanent disable until operator notices" into "self-healing the
+    // moment CP returns" — bounded by this 60s recheck, NOT by a human.
+    // Without it, async-on-failure would disable backup for the whole
+    // process lifetime, reintroducing the v1 SPOF we set out to kill.
+    if (ARK_LOAD(&db->startup_auth_state) == 2) {
+      static long long last_revalidate_ms = 0;  // function-static ok: single flush thread per process
+      if (now_ms - last_revalidate_ms >= 60000) {
+        last_revalidate_ms = now_ms;
+        char *key_copy = api_key_snapshot(db);
+        if (key_copy && strlen(key_copy) > 0) {
+          if (validate_api_key(db, db->control_url, key_copy)) {
+            ARK_STORE(&db->startup_auth_state, 1);
+            ARK_STORE(&db->backup_enabled, 1);
+            ark_log(db, ARK_LOG_INFO,
+                    "API key re-validated against control plane — backup "
+                    "RE-ENABLED (capture resumes shipping)");
+            if (!ARK_LOAD(&db->s3_creds_loaded)) (void)fetch_storage_credentials(db);
+          }
+        }
+        free(key_copy);
+      }
+    }
 
     int drained = 0;
     // Kill-switch check: when backup is disabled — or no destination is
@@ -3367,13 +3414,37 @@ static char *s3_presign_put(arkilian *db, const char *key, long expires_sec) {
     host_clean[hl] = '\0';
   }
 
+  // URL-encode the S3 object key for the URL path: per AWS SigV4 for the
+  // S3 service the canonical URI is NOT normalized and the '/' separators
+  // between key components are NOT encoded (they're structural). S3 keys
+  // built here are always "db_<hex>/backup.sqlite" or
+  // "db_<hex>/chunks/lsn_..._...sql.zst" — all chars are already in the
+  // RFC 3986 unreserved set except '/'. The shared s3_url_encode_inline
+  // helper preserves '/', so passing the key through it both (a) ensures
+  // any future exotic char in a key is handled and (b) keeps the canonical
+  // request's path identical to the path in the final URL (S3 recomputes
+  // the signature from the URL it receives and they must match byte for
+  // byte). For keys containing only the unreserved set the encoding is a
+  // no-op — the safe, defensive default.
+  char key_enc[1024];
+  s3_url_encode_inline(key, key_enc, sizeof(key_enc));
+  // The helper above encodes ALL non-unreserved chars, but S3 SigV4
+  // requires '/' to remain literal in the canonical URI for the S3
+  // service. Walk key_enc and convert %2F → / so path separators are
+  // preserved exactly as S3 expects.
+  for (char *p = key_enc; *p; p++) {
+    if (p[0] == '%' && p[1] == '2' && (p[2] == 'F' || p[2] == 'f')) {
+      *p = '/'; memmove(p + 1, p + 3, strlen(p + 3) + 1);
+    }
+  }
+
   char canonical[4096];
   snprintf(canonical, sizeof(canonical),
-    "PUT\n/%s\n"
+    "PUT\n/%s/%s\n"
     "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=%s&"
     "X-Amz-Date=%s&X-Amz-Expires=%ld&X-Amz-SignedHeaders=host\n"
     "host:%s\n\nhost\nUNSIGNED-PAYLOAD",
-    key, cred_enc, amz_date, expires_sec, host_clean);
+    db->s3_bucket, key_enc, cred_enc, amz_date, expires_sec, host_clean);
 
   char scope[256];
   snprintf(scope, sizeof(scope), "%s/%s/s3/aws4_request",
@@ -3400,18 +3471,22 @@ static char *s3_presign_put(arkilian *db, const char *key, long expires_sec) {
   char sig_enc[256];
   s3_url_encode_inline(sig_hex, sig_enc, sizeof(sig_enc));
 
-  size_t url_len = strlen(scheme) + 3 + strlen(host_clean) + strlen(key) + 2048;
+  // Final URL path uses the URL-encoded key (matches the canonical request,
+  // so S3's signature recomputation matches; '/' in the key is %2F-encoded
+  // and decoded by S3 as part of the object key, not as a path separator).
+  size_t url_len = strlen(scheme) + 3 + strlen(host_clean) + 1 +
+                   strlen(db->s3_bucket) + 1 + strlen(key_enc) + 2048;
   char *url = malloc(url_len);
   if (!url) return NULL;
   snprintf(url, url_len,
-    "%s://%s/%s"
+    "%s://%s/%s/%s"
     "?X-Amz-Algorithm=AWS4-HMAC-SHA256"
     "&X-Amz-Credential=%s"
     "&X-Amz-Date=%s"
     "&X-Amz-Expires=%ld"
     "&X-Amz-SignedHeaders=host"
     "&X-Amz-Signature=%s",
-    scheme, host_clean, key,
+    scheme, host_clean, db->s3_bucket, key_enc,
     cred_enc, amz_date, expires_sec, sig_enc);
   return url;
 }

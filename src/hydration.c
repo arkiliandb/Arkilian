@@ -234,11 +234,13 @@ static int http_init(HttpReq *r, const char *url, const char *token) {
   curl_easy_setopt(r->handle, CURLOPT_WRITEFUNCTION, curl_write_cb);
   curl_easy_setopt(r->handle, CURLOPT_TIMEOUT, 120L);
   curl_easy_setopt(r->handle, CURLOPT_CONNECTTIMEOUT, 15L);
-  curl_easy_setopt(r->handle, CURLOPT_FOLLOWLOCATION, 1L);
-  // Restrict redirect targets to HTTP/HTTPS so a 302 from an allowed host
-  // to file://, gopher://, etc. is never followed. The SSRF guard only
-  // inspects the INITIAL URL host — redirects must not bypass it to an
-  // arbitrary scheme.
+  // Do NOT follow redirects. The SSRF guard only inspects the INITIAL URL
+  // host; a 302 to http://169.25.169.254/ would otherwise bypass it and
+  // feed attacker-controlled bytes into hydration's SQL executor
+  // (remote-code-execution chain). Presigned S3/GCS/R2 GET URLs never
+  // 302 in practice — the object IS at the signed URL — so disabling
+  // redirects closes the bypass with zero benign impact.
+  curl_easy_setopt(r->handle, CURLOPT_FOLLOWLOCATION, 0L);
 #if CURL_AT_LEAST_VERSION(7, 85, 0)
   curl_easy_setopt(r->handle, CURLOPT_REDIR_PROTOCOLS_STR, "http,https");
   curl_easy_setopt(r->handle, CURLOPT_PROTOCOLS_STR, "http,https");

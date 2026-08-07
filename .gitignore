@@ -83,3 +83,4 @@ test_load_contention
 test_monitoring
 test_virtual_tables
 build_**
+server/arkilian-server
