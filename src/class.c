@@ -3252,7 +3252,8 @@ static size_t write_cb(void *data, size_t size, size_t nmemb, void *userp) {
 }
 
 static char *get_signed_url(arkilian *db, const char *api_endpoint,
-                           const char *token, volatile int *shutdown_flag) {
+                            const char *token, volatile int *shutdown_flag,
+                            const char *sha256) {
   CURL *curl = curl_easy_init();
   struct Memory chunk;
   chunk.response = malloc(1);
@@ -3260,14 +3261,17 @@ static char *get_signed_url(arkilian *db, const char *api_endpoint,
   chunk.shutdown_flag = shutdown_flag;
   if (!chunk.response) return NULL;
 
+  // Build the POST body: {"sha256":"..."} when a digest is available,
+  // "" (empty) for legacy snapshot-branch compat.
+  char body[128];
+  if (sha256 && sha256[0]) snprintf(body, sizeof(body), "{\"sha256\":\"%s\"}", sha256);
+  else body[0] = 0;
+
   char *result = NULL;
   if (curl) {
     CURLcode rc = CURLE_OK;
-    // Signed-URL issuance is a POST against the control plane's
-    // /v1/upload/request (it requires POST; GET would 405). An empty
-    // body selects the snapshot branch on the control plane.
     rc = curl_easy_setopt(curl, CURLOPT_URL, api_endpoint);
-    if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_POSTFIELDS, "");
+    if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body);
     if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_cb);
     if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)&chunk);
     // Cap the response: a signed-URL plan is a few hundred bytes. A
@@ -3593,6 +3597,64 @@ static char *s3_presign_put(arkilian *db, const char *key, long expires_sec) {
   return url;
 }
 
+// Register a direct-uploaded snapshot with the control plane so the
+// hydrate plan knows about it. POST /v1/snapshot/register with the
+// sha256 and baseline_lsn=0; the server INSERTS into the snapshots table
+// and derives the S3 key from the authenticated db_id (never the client-
+// supplied s3_key — cross-tenant-IDOR prevention). Called ONLY after a
+// successful direct-S3 upload.
+static void register_snapshot_with_cp(arkilian *db, const char *sha256,
+                                      volatile int *shutdown_flag) {
+  if (!db || !db->control_url || !sha256 || !sha256[0]) return;
+  char *url = join_url(db->control_url, "/v1/snapshot/register");
+  if (!url) return;
+  char *tok = api_key_snapshot(db);
+  if (!tok || strlen(tok) == 0) { free(tok); free(url); return; }
+
+  CURL *curl = curl_easy_init();
+  if (curl) {
+    char body[256];
+    snprintf(body, sizeof(body), "{\"baseline_lsn\":0,\"sha256\":\"%s\"}", sha256);
+    CURLcode rc = curl_easy_setopt(curl, CURLOPT_URL, url);
+    if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body);
+    if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_discard_cb);
+    if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
+    if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5L);
+    if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
+    if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
+    if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+    if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, curl_abort_cb);
+    if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_XFERINFODATA, (void *)shutdown_flag);
+
+    struct curl_slist *headers = NULL;
+    if (rc == CURLE_OK) {
+      headers = curl_slist_append(headers, "Content-Type: application/json");
+      if (!headers) rc = CURLE_OUT_OF_MEMORY;
+    }
+    if (rc == CURLE_OK && tok) {
+      char auth[512]; snprintf(auth, sizeof(auth), "Authorization: Bearer %s", tok);
+      headers = curl_slist_append(headers, auth);
+      if (!headers) rc = CURLE_OUT_OF_MEMORY;
+    }
+    if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+
+    if (rc == CURLE_OK) {
+      CURLcode res = curl_easy_perform(curl);
+      long http_code = 0;
+      if (res == CURLE_OK) curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+      if (res != CURLE_OK || http_code < 200 || http_code >= 300)
+        ark_log(db, ARK_LOG_ERROR,
+                "snapshot register with control plane failed (http=%ld curl=%d) — "
+                "hydrate plan may not include this snapshot until the next "
+                "successful upload", http_code, (int)res);
+    }
+    if (headers) curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+  }
+  free(tok);
+  free(url);
+}
+
 #ifdef _WIN32
 DWORD WINAPI run_hourly_backup(LPVOID arg) {
 #else
@@ -3658,26 +3720,39 @@ void *run_hourly_backup(void *arg) {
         strlen(db->signed_url_endpoint) > 0;
 
     if (status == SQLITE_OK && (has_direct_s3(db) || endpoint_configured)) {
+      // Compute sha256 of the backup file so the control plane can
+      // authenticate the snapshot on restore. Only the CP path sends
+      // sha256 inline (the server records it in /v1/upload/request);
+      // the direct-S3 path registers it after upload.
+      char snap_sha256[65] = {0};
+      (void)ark_sha256_hex_file(db->backup_path, snap_sha256);
+
       char s3_key[512];
-      {
+      if (has_direct_s3(db)) {
+        // Tenant-scoped key: "db_<db_id>/backup.sqlite" — not a
+        // filename-based key, not a double-bucket key. The db_id
+        // prefix isolates tenants in the shared bucket.
+        const char *dbid = (db->db_id && db->db_id[0]) ? db->db_id : "db_unknown";
+        snprintf(s3_key, sizeof(s3_key), "%s/backup.sqlite", dbid);
+      } else {
         const char *name = db->db_path ? db->db_path : "unknown";
         const char *base = strrchr(name, '/');
-        const char *fname = base ? base + 1 : name;
-        snprintf(s3_key, sizeof(s3_key), "backups/%.400s", fname);
+        snprintf(s3_key, sizeof(s3_key), "backups/%.400s", base ? base + 1 : name);
       }
 
       char *upload_url = NULL;
       if (has_direct_s3(db)) {
-        char full_key[768];
-        snprintf(full_key, sizeof(full_key), "%s/%s", db->s3_bucket, s3_key);
-        upload_url = s3_presign_put(db, full_key, 3600L);
+        // Sign the PUT URL locally with cached storage credentials.
+        // The key is db_<id>/backup.sqlite; s3_presign_put builds
+        // the full path as /<bucket>/<key> (no double-bucket bug).
+        upload_url = s3_presign_put(db, s3_key, 3600L);
         if (!upload_url)
           ark_log(db, ARK_LOG_ERROR,
                   "snapshot upload skipped: local SigV4 signing failed");
       } else {
         char *tok = api_key_snapshot(db);
         upload_url = get_signed_url(db, db->signed_url_endpoint, tok,
-                                    &db->shutdown_requested);
+                                    &db->shutdown_requested, snap_sha256);
         free(tok);
       }
 
@@ -3685,6 +3760,15 @@ void *run_hourly_backup(void *arg) {
         if (upload_to_s3(db, upload_url, db->backup_path, NULL) != 0) {
           ark_log(db, ARK_LOG_ERROR, "scheduled backup upload failed");
         } else {
+          // Notify the control plane: the snapshot is NOW durable in S3
+          // and its sha256 is known. This keeps the CP's snapshots table
+          // in sync so hydrate plans return the correct digest and the
+          // right S3 key (server-authored via db_id, not client-supplied).
+          // Only needed for direct-S3 (the CP path's /v1/upload/request
+          // already handles this server-side).
+          if (has_direct_s3(db) && snap_sha256[0]) {
+            register_snapshot_with_cp(db, snap_sha256, &db->shutdown_requested);
+          }
           ARK_STORE(&db->capture_paused, 0);
         }
       }

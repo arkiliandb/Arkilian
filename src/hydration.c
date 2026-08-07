@@ -291,6 +291,7 @@ static char *http_get_string(const char *url, const char *token, int *err_out) {
   if (rc != CURLE_OK || http_code != 200) {
     free(buf.data);
     if (http_code == 401 || http_code == 403) *err_out = HYDRATION_ERR_PROTO;
+    else if (http_code == 404) *err_out = HYDRATION_ERR_NOTFOUND;
     else *err_out = HYDRATION_ERR_NET;
     return NULL;
   }

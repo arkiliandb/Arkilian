@@ -931,8 +931,12 @@ func handleHydratePlan(w http.ResponseWriter, r *http.Request) {
 		 WHERE db_id = ? ORDER BY baseline_lsn DESC LIMIT 1`,
 		dbID).Scan(&snapLSN, &snapKey, &snapSHAPtr)
 	if err != nil {
-		snapLSN = 0
-		snapKey = fmt.Sprintf("db_%s/backup.sqlite", dbID)
+		// No snapshot row exists for this tenant — return 404 rather
+		// than synthesise a bogus URL to a non-existent object. The
+		// client's hydrate code already handles 404 as a "cold start"
+		// (no baseline snapshot yet) and creates a fresh empty database.
+		http.Error(w, `{"error":"no snapshot found"}`, http.StatusNotFound)
+		return
 	}
 	if snapSHAPtr != nil {
 		snapSHA = *snapSHAPtr
