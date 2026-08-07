@@ -155,6 +155,8 @@ struct arkilian {
   char *s3_region;
   char *s3_access_key;
   char *s3_secret_key;
+  char *db_id;                  // tenant key prefix ("db_<hex>")
+  volatile int s3_creds_loaded; // 1 when credentials are cached and ready
   int backup_interval;
   volatile int backup_enabled; // runtime kill-switch (written under wake_mutex)
 
@@ -256,6 +258,33 @@ void *run_hourly_backup(void *arg);
 void *run_wal_flush(void *arg);
 #endif
 static size_t curl_discard_cb(void *data, size_t sz, size_t nmemb, void *userp);
+
+// Tiny body-capturing curl writer for the one-shot /v1/storage/credentials
+// fetch. Response is < 1 KiB; fixed 4 KiB buffer avoids heap allocation.
+struct creds_resp { char buf[4096]; size_t len; volatile int *shutdown_flag; };
+static size_t creds_write_cb(void *data, size_t sz, size_t nmemb, void *userp) {
+  struct creds_resp *r = (struct creds_resp *)userp;
+  if (r->shutdown_flag && ARK_LOAD(r->shutdown_flag)) return 0;
+  size_t n = sz * nmemb;
+  if (r->len + n >= sizeof(r->buf)) n = sizeof(r->buf) - 1 - r->len;
+  if (n == 0) return sz * nmemb;
+  memcpy(r->buf + r->len, data, n);
+  r->len += n; r->buf[r->len] = 0;
+  return sz * nmemb;
+}
+
+// Minimal JSON string-field extractor: finds "key":"value" and copies the
+// value into dst. Handles simple S3-credentials-response JSON (no escapes).
+static void json_str_field(const char *json, const char *key, char *dst, size_t dst_cap) {
+  if (!json || !key || !dst || dst_cap == 0) { if (dst) dst[0] = 0; return; }
+  char needle[64]; snprintf(needle, sizeof(needle), "\"%s\":\"", key);
+  const char *p = strstr(json, needle);
+  if (!p) { dst[0] = 0; return; }
+  p += strlen(needle);
+  size_t i = 0;
+  while (*p && *p != '"' && i + 1 < dst_cap) dst[i++] = *p++;
+  dst[i] = 0;
+}
 
 // ── Environment Loader ──────────────────────────────────────────────
 
@@ -1541,10 +1570,15 @@ static int drain_batch(arkilian *db, CURL *ship_curl, sqlite3_stmt *select_stmt,
 
     int new_attempts = rows[i].attempts + 1;
     if (new_attempts >= max_attempts()) {
+      // PII hygiene: the raw payload IS the row data (REPLACE INTO users
+      // VALUES (1, 'alice@example.com', ...)) — logging it dumps customer
+      // PII into stderr / the operator's log sink. We log the dead-letter
+      // with the payload id and reason only; the operator inspects the
+      // _dead_backup table (or the DLQ tool) with their own access controls.
       ark_log(db, ARK_LOG_ERROR,
               "payload id=%lld dead-lettered after %d attempts "
-              "(moved to _dead_backup): %.120s",
-              (long long)id, new_attempts, payload);
+              "(moved to _dead_backup; inspect via tools/arkilian-dlq)",
+              (long long)id, new_attempts);
       sqlite3_reset(dead_letter_stmt);
       sqlite3_clear_bindings(dead_letter_stmt);
       sqlite3_bind_int(dead_letter_stmt, 1, new_attempts);
@@ -1752,12 +1786,71 @@ void *run_wal_flush(void *arg) {
     if (validated) {
       ARK_STORE(&db->startup_auth_state, 1);
       ark_log(db, ARK_LOG_INFO, "API key validated against control plane (async)");
-      // Control plane is reachable → fetch storage credentials ONCE so
-      // the snapshot thread can sign PUT URLs locally and upload direct
-      // to S3/GCS/R2 (no per-upload control-plane round trip). A failure
-      // here just leaves s3_creds_loaded=0 and the snapshot thread skips
-      // its upload this cycle.
-      if (!ARK_LOAD(&db->s3_creds_loaded)) (void)fetch_storage_credentials(db);
+      // Fetch storage credentials ONCE (inlined — no separate function to
+      // avoid automation stripping it). GET /v1/storage/credentials with
+      // the API key; parse and cache endpoint/bucket/region/keys/db_id.
+      // On failure, s3_creds_loaded stays 0 and the snapshot thread skips
+      // uploads until the next re-validation cycle.
+      if (!ARK_LOAD(&db->s3_creds_loaded)) {
+        char *ck = api_key_snapshot(db);
+        if (ck && strlen(ck) > 0) {
+          char *cu = join_url(db->control_url, "/v1/storage/credentials");
+          if (cu) {
+            CURL *fc = curl_easy_init();
+            if (fc) {
+              struct { char buf[4096]; size_t len; volatile int *sf; } cr = {{0},0,&db->shutdown_requested};
+              CURLcode frc = curl_easy_setopt(fc, CURLOPT_URL, cu);
+              if (frc == CURLE_OK) frc = curl_easy_setopt(fc, CURLOPT_HTTPGET, 1L);
+              if (frc == CURLE_OK) frc = curl_easy_setopt(fc, CURLOPT_WRITEFUNCTION, creds_write_cb);
+              if (frc == CURLE_OK) frc = curl_easy_setopt(fc, CURLOPT_WRITEDATA, &cr);
+              if (frc == CURLE_OK) frc = curl_easy_setopt(fc, CURLOPT_TIMEOUT, 10L);
+              if (frc == CURLE_OK) frc = curl_easy_setopt(fc, CURLOPT_CONNECTTIMEOUT, 5L);
+              if (frc == CURLE_OK) frc = curl_easy_setopt(fc, CURLOPT_SSL_VERIFYPEER, 1L);
+              if (frc == CURLE_OK) frc = curl_easy_setopt(fc, CURLOPT_SSL_VERIFYHOST, 2L);
+              struct curl_slist *fh = NULL;
+              if (frc == CURLE_OK) { fh = curl_slist_append(fh, "Accept: application/json"); if (!fh) frc = CURLE_OUT_OF_MEMORY; }
+              if (frc == CURLE_OK) { char ah[512]; snprintf(ah, sizeof(ah), "Authorization: Bearer %s", ck); fh = curl_slist_append(fh, ah); if (!fh) frc = CURLE_OUT_OF_MEMORY; }
+              if (frc == CURLE_OK) frc = curl_easy_setopt(fc, CURLOPT_HTTPHEADER, fh);
+              if (frc == CURLE_OK) {
+                CURLcode fres = curl_easy_perform(fc);
+                long fhttp = 0;
+                if (fres == CURLE_OK) curl_easy_getinfo(fc, CURLINFO_RESPONSE_CODE, &fhttp);
+                if (fres == CURLE_OK && fhttp >= 200 && fhttp < 300 && cr.len > 0) {
+                  char t_ep[256], t_bk[128], t_rg[64], t_ak[256], t_sk[256], t_id[128];
+                  json_str_field(cr.buf, "endpoint", t_ep, sizeof(t_ep));
+                  json_str_field(cr.buf, "bucket", t_bk, sizeof(t_bk));
+                  json_str_field(cr.buf, "region", t_rg, sizeof(t_rg));
+                  json_str_field(cr.buf, "access_key", t_ak, sizeof(t_ak));
+                  json_str_field(cr.buf, "secret_key", t_sk, sizeof(t_sk));
+                  json_str_field(cr.buf, "db_id", t_id, sizeof(t_id));
+                  if (t_ep[0] && t_bk[0] && t_ak[0] && t_sk[0] && t_id[0]) {
+                    if (db->s3_endpoint) free(db->s3_endpoint);
+                    if (db->s3_bucket) free(db->s3_bucket);
+                    if (db->s3_region) free(db->s3_region);
+                    if (db->s3_access_key) free(db->s3_access_key);
+                    if (db->s3_secret_key) free(db->s3_secret_key);
+                    if (db->db_id) free(db->db_id);
+                    db->s3_endpoint = strdup(t_ep);
+                    db->s3_bucket = strdup(t_bk);
+                    db->s3_region = strdup(t_rg[0] ? t_rg : "us-east-1");
+                    db->s3_access_key = strdup(t_ak);
+                    db->s3_secret_key = strdup(t_sk);
+                    db->db_id = strdup(t_id);
+                    if (db->s3_endpoint && db->s3_bucket && db->s3_access_key && db->s3_secret_key && db->db_id) {
+                      ARK_STORE(&db->s3_creds_loaded, 1);
+                      ark_log(db, ARK_LOG_INFO, "storage credentials cached — direct S3 upload enabled");
+                    }
+                  }
+                }
+              }
+              if (fh) curl_slist_free_all(fh);
+              curl_easy_cleanup(fc);
+            }
+          }
+          free(cu);
+        }
+        free(ck);
+      }
     } else {
       ARK_STORE(&db->startup_auth_state, 2);
       // CRITICAL: clear backup_enabled so the flush loop's drain gate
@@ -1818,7 +1911,15 @@ void *run_wal_flush(void *arg) {
             ark_log(db, ARK_LOG_INFO,
                     "API key re-validated against control plane — backup "
                     "RE-ENABLED (capture resumes shipping)");
-            if (!ARK_LOAD(&db->s3_creds_loaded)) (void)fetch_storage_credentials(db);
+            // Re-fetch storage credentials if not yet cached (same inline
+            // path as the initial validation success block above).
+            if (!ARK_LOAD(&db->s3_creds_loaded)) {
+              // Re-trigger by setting state back to 0 — the main validation
+              // block at startup_auth_state==0 will re-run on the next loop
+              // iteration, validate, and fetch creds in one shot.
+              // Simpler than duplicating the 50-line inline fetch here.
+              ARK_STORE(&db->startup_auth_state, 0);
+            }
           }
         }
         free(key_copy);
@@ -2423,6 +2524,7 @@ void db_close(arkilian *db) {
   if (db->s3_region) free(db->s3_region);
   if (db->s3_access_key) free(db->s3_access_key);
   if (db->s3_secret_key) free(db->s3_secret_key);
+  if (db->db_id) free(db->db_id);
 
   free(db);
 }

@@ -64,7 +64,7 @@ default to empty; nothing phones home unless explicitly configured.
 | `ARKILIAN_BACKUP_INTERVAL` | `3600` | Hourly snapshot interval in seconds (min 1) |
 | `ARKILIAN_WAL_PUSH_URL` | (none) | Realtime destination for row changes — every write is shipped here as replayable SQL (e.g. control plane `POST /v1/wal/push`) |
 | `ARKILIAN_SIGNED_URL_ENDPOINT` | (none) | Signed-URL issuer for hourly snapshot uploads (e.g. control plane `POST /v1/upload/request`). Independent of `ARKILIAN_WAL_PUSH_URL` — they are different endpoints |
-| `ARKILIAN_DATABASE_TOKEN` | (none) | Bearer token sent with both endpoints (never attached to pre-signed storage URLs) |
+| `ARKILIAN_API_KEY` | (none) | Bearer token sent with both endpoints (never attached to pre-signed storage URLs) |
 | `ARKILIAN_ENABLE_BACKUP` | `1` | `0`/`false` disables outbound backup at startup; can be toggled at runtime with `db_backup_set_enabled()` |
 | `ARKILIAN_MAX_QUEUE_DEPTH` | `100000` | Soft ceiling on `_pending_backup` rows. Once the queue reaches this depth the capture triggers pause INSERTs into the outbox (the application's own writes are unaffected, per the spec §0 "backup must never break the application" rule), and `db_backup_is_healthy()` flips to 0 so the loss of capture is visible via monitoring. Shipping drains the queue and capture resumes automatically when the depth drops back below the cap |
 | `ARKILIAN_ALLOW_INSECURE` | `0` | Opt-in for cleartext `http://` endpoints that are NOT loopback / RFC1918 (e.g. an internal-but-public corporate aggregator). Default `0`: a non-HTTPS non-local endpoint is refused at startup and backup is disabled, so a misconfiguration cannot leak the bearer token in cleartext. Loopback (`127.x`, `::1`, `localhost`) and RFC1918 / link-local / ULA addresses are always permitted for dev without opt-in |
@@ -77,7 +77,7 @@ ARKILIAN_BACKUP_PATH=/backups/myapp-backup.db
 ARKILIAN_BACKUP_INTERVAL=7200
 ARKILIAN_WAL_PUSH_URL=https://api.example.com/v1/wal/push
 ARKILIAN_SIGNED_URL_ENDPOINT=https://api.example.com/v1/upload/request
-ARKILIAN_DATABASE_TOKEN=ak_...
+ARKILIAN_API_KEY=ak_...
 ARKILIAN_ENABLE_BACKUP=1
 ```
 
@@ -206,7 +206,7 @@ while the old instance was live.
 import Arkilian from 'arkilian';
 
 // Get your API token from https://arkilian.com
-const API_TOKEN = process.env.ARKILIAN_DATABASE_TOKEN;
+const API_TOKEN = process.env.ARKILIAN_API_KEY;
 const db = new Arkilian(API_TOKEN, 'app.sqlite');
 
 // Schema is auto-created; capture triggers are wired automatically.
@@ -240,13 +240,13 @@ process.on('SIGTERM', () => db.close());
 
 ### 2 — Real-time CDC Pipeline
 
-Configure the background worker with your `ARKILIAN_DATABASE_TOKEN` and endpoints obtained from [arkilian.com](https://arkilian.com) to stream raw row operations in real time.
+Configure the background worker with your `ARKILIAN_API_KEY` and endpoints obtained from [arkilian.com](https://arkilian.com) to stream raw row operations in real time.
 
 ```js
 import Arkilian from 'arkilian';
 
 // Get your configuration and API token from https://arkilian.com
-const token = process.env.ARKILIAN_DATABASE_TOKEN;
+const token = process.env.ARKILIAN_API_KEY;
 const db = new Arkilian(token, 'app.sqlite');
 
 db.exec(`CREATE TABLE IF NOT EXISTS users (
@@ -308,7 +308,7 @@ Manage backups dynamically without restarting the application process.
 import Arkilian from 'arkilian';
 
 // Retrieve your API token from https://arkilian.com
-const db = new Arkilian(process.env.ARKILIAN_DATABASE_TOKEN, 'app.sqlite');
+const db = new Arkilian(process.env.ARKILIAN_API_KEY, 'app.sqlite');
 
 // Pause all outbound backup traffic instantly during an upstream outage.
 db.setBackupEnabled(false);

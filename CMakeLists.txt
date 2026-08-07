@@ -12,6 +12,17 @@ if(CMAKE_C_COMPILER_ID MATCHES "MSVC")
     add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
 else()
     add_compile_options(-Wall -Wextra -Wpedantic -Werror)
+    # Hardened build posture for production cloud deployments: stack
+    # canaries (-fstack-protector-strong) and compile-time buffer-overflow
+    # checks (-D_FORTIFY_SOURCE=2) mitigate the memory-corruption class
+    # of bugs that is uncatchable by tests alone. Both are no-ops on
+    # correct code; they catch issues at runtime. _FORTIFY_SOURCE=2 needs
+    # optimization on (-O2 or higher); we set it only in Release/RelWithDebInfo
+    # builds to avoid breaking debug builds (where -O0 disables FORTIFY).
+    add_compile_options(-fstack-protector-strong)
+    if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
+        add_compile_definitions(_FORTIFY_SOURCE=2)
+    endif()
 endif()
 
 # Options for library types
