@@ -86,3 +86,4 @@ build_**
 server/arkilian-server
 src/graphify-out
 graphify-out
+arkilian-s3-virtual-server
