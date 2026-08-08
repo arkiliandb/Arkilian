@@ -1023,6 +1023,7 @@ int arkilian_hydrate_s3(const char *db_path,
                          const char *s3_prefix,
                          hydration_progress_cb progress,
                          void *user_data) {
+  (void)server_url;
   if (!db_path) return HYDRATION_ERR_PROTO;
 
   pthread_mutex_lock(&g_hydrate_mutex);

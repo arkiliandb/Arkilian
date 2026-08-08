@@ -355,6 +355,7 @@ static int get_env_int_default(const char *env_var, int default_val) {
 // Configurable via ARKILIAN_MAX_ATTEMPTS env var. Default 20 with
 // exponential backoff gives ~1 hour of retrying before dead-lettering.
 // Tests set a lower value (e.g. 3) to dead-letter quickly.
+__attribute__((unused))
 static int max_attempts(void) {
   int v = get_env_int_default("ARKILIAN_MAX_ATTEMPTS", 100);
   if (v < 1) v = 1;
@@ -1410,6 +1411,7 @@ static long curl_timeout_sec(size_t bytes, long base) {
   return t;
 }
 
+__attribute__((unused))
 static ship_result_t ship_to_backup(arkilian *db, CURL *curl,
                                     sqlite3_int64 id, const char *payload) {
   if (!payload || strlen(payload) == 0) return SHIP_OK;
@@ -2191,7 +2193,9 @@ int db_init(arkilian **db_ptr, const char *filename) {
   db->chunk_interval = get_env_int_default("ARKILIAN_CHUNK_INTERVAL_SEC",
                                            CHUNK_FLUSH_INTERVAL_SEC);
   if (db->chunk_interval < 1) db->chunk_interval = 1;
-  db->chunk_enabled = get_env_bool_default("ARKILIAN_WAL_DIRECT_S3", 1);
+  db->chunk_enabled = get_env_bool_default("ARKILIAN_WAL_DIRECT_S3",
+    (db->s3_endpoint && db->s3_endpoint[0] &&
+     db->s3_access_key && db->s3_access_key[0]) ? 1 : 0);
   // ARKILIAN_ALLOW_INSECURE=1 opts into cleartext http:// endpoints that
   // are NOT loopback/RFC1918 (e.g. an internal-but-public corporate
   // aggregator). Default 0: anything non-https and non-local is refused.
@@ -3946,6 +3950,8 @@ static void manifest_write(arkilian *db, const char *snapshot_s3_key,
                             const char *snapshot_sha256, int64_t baseline_lsn) {
   if (!db || !snapshot_s3_key || !has_direct_s3(db)) return;
   if (!db->s3_tenant_prefix || !db->s3_tenant_prefix[0]) return;
+  if (strstr(db->s3_tenant_prefix, "..") || db->s3_tenant_prefix[0] == '/')
+    return;
   if (strstr(db->s3_tenant_prefix, "..") || db->s3_tenant_prefix[0] == '/')
     return;
 
