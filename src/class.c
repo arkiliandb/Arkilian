@@ -1529,7 +1529,7 @@ static int wal_chunk_append(wal_chunk *c, const char *sql, int sql_len,
   if (c->cap < needed) {
     c->cap = needed < 65536 ? needed * 2 : needed + 65536;
     char *p = realloc(c->buffer, c->cap);
-    if (!p) return 0;
+    if (!p) return -1;
     c->buffer = p;
   }
 
@@ -1593,6 +1593,8 @@ static int wal_chunk_flush_to_s3(arkilian *db, wal_chunk *c) {
   if (c->entry_count == 0) return SHIP_OK;
   if (!db->s3_endpoint || !db->s3_endpoint[0]) return SHIP_RETRY;
   if (!db->s3_tenant_prefix || !db->s3_tenant_prefix[0]) return SHIP_RETRY;
+  if (strstr(db->s3_tenant_prefix, "..") || db->s3_tenant_prefix[0] == '/')
+    return SHIP_RETRY;
 
   // 1. Compress with zstd level 3
   size_t zstd_bound = ZSTD_compressBound(c->len);
@@ -1857,6 +1859,7 @@ static int drain_chunk(arkilian *db, wal_chunk *c, sqlite3_stmt *select_stmt,
     int full = wal_chunk_append(c, rows[i].payload,
                                  (int)strlen(rows[i].payload),
                                  (uint64_t)rows[i].id);
+    if (full < 0) break;  // allocation failure — stop, rows stay in outbox
 
     sqlite3_reset(delete_stmt);
     sqlite3_clear_bindings(delete_stmt);
@@ -1865,7 +1868,7 @@ static int drain_chunk(arkilian *db, wal_chunk *c, sqlite3_stmt *select_stmt,
 
     processed++;
 
-    if (full) break;  // chunk hit size cap — flush immediately
+    if (full > 0) break;
   }
 
   for (int i = 0; i < nrows; i++) free(rows[i].payload);
@@ -2190,7 +2193,7 @@ void *run_wal_flush(void *arg) {
 
     if (use_chunk && db->chunk.entry_count > 0) {
       time_t age = time(NULL) - db->chunk.opened_at;
-      if (age >= db->chunk_interval) {
+      if (age >= db->chunk_interval || db->chunk.len >= CHUNK_MAX_SIZE_BYTES) {
         int flush_rc = wal_chunk_flush_to_s3(db, &db->chunk);
         if (flush_rc == SHIP_OK) {
           wal_chunk_reset(&db->chunk);
@@ -4110,6 +4113,8 @@ static void manifest_write(arkilian *db, const char *snapshot_s3_key,
                             const char *snapshot_sha256, int64_t baseline_lsn) {
   if (!db || !snapshot_s3_key || !has_direct_s3(db)) return;
   if (!db->s3_tenant_prefix || !db->s3_tenant_prefix[0]) return;
+  if (strstr(db->s3_tenant_prefix, "..") || db->s3_tenant_prefix[0] == '/')
+    return;
 
   char json_buf[4096];
   int n = snprintf(json_buf, sizeof(json_buf),
