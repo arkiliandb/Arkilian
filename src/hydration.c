@@ -826,12 +826,7 @@ int hydrate_replay_chunk(sqlite3 *db, const char *raw_sql, int64_t chunk_lsn) {
   return 0;
 }
 
-// ── v2 S3 Manifest Hydration ─────────────────────────────────────────
-// Reads manifest.json from S3 and builds a hydrate plan directly from it,
-// bypassing the control plane.  Falls back to CP hydrate plan if S3 is
-// unreachable or credentials are not configured.
 
-// URL-encode a single character for S3 SigV4 query params.
 static int is_unreserved_s3(char c) {
   return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
          (c >= '0' && c <= '9') || c == '-' || c == '_' ||
@@ -852,8 +847,6 @@ static void s3_url_encode(const char *src, char *dst, size_t cap) {
   dst[di] = '\0';
 }
 
-// Generate a presigned S3 GET URL using AWS SigV4. Local-only; no control
-// plane round trip.  Used to fetch manifest.json from the tenant's prefix.
 static char *s3_presign_get(const char *endpoint, const char *bucket,
                              const char *region, const char *access_key,
                              const char *secret_key, const char *key,
@@ -947,7 +940,6 @@ static int manifest_read_from_s3(const char *endpoint, const char *bucket,
   if (!endpoint || !bucket || !access_key || !secret_key || !prefix || !plan)
     return -1;
 
-  // Build presigned GET for <prefix>/manifest.json
   char manifest_key[512];
   snprintf(manifest_key, sizeof(manifest_key), "%s/manifest.json", prefix);
 
@@ -1039,7 +1031,6 @@ int arkilian_hydrate_s3(const char *db_path,
   HydratePlan plan;
   int plan_ok = 0;
 
-  // Try S3 manifest first
   if (s3_endpoint && s3_endpoint[0] && s3_bucket && s3_bucket[0] &&
       s3_access_key && s3_access_key[0] && s3_secret_key && s3_secret_key[0] &&
       s3_prefix && s3_prefix[0]) {
@@ -1049,7 +1040,6 @@ int arkilian_hydrate_s3(const char *db_path,
     if (rc == 0) plan_ok = 1;
   }
 
-  // Fall back to CP hydrate plan
   if (!plan_ok && server_url && server_url[0]) {
     int rc = request_hydrate_plan(server_url, api_key, &plan);
     if (rc == 0) plan_ok = 1;

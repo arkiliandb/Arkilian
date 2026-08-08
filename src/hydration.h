@@ -110,12 +110,6 @@ int arkilian_hydrate(const char *db_path,
                      hydration_progress_cb progress,
                      void *user_data);
 
-// Updated v2 variant: reads manifest.json directly from S3 (no CP round
-// trip).  Falls back to the control-plane hydrate plan if the manifest is
-// unavailable or S3 credentials are not provided.
-//   s3_endpoint, s3_bucket, s3_region, s3_access_key, s3_secret_key,
-//   s3_prefix — S3 credentials and tenant prefix (e.g. "u12345-db_abc")
-//   Pass NULL/empty for any of these to skip S3 and use CP-only path.
 int arkilian_hydrate_s3(const char *db_path,
                          const char *server_url,
                          const char *api_key,
