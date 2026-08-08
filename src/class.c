@@ -2362,6 +2362,13 @@ int db_init(arkilian **db_ptr, const char *filename) {
   db->chunk_enabled = get_env_bool_default("ARKILIAN_WAL_DIRECT_S3",
     (db->s3_endpoint && db->s3_endpoint[0] &&
      db->s3_access_key && db->s3_access_key[0]) ? 1 : 0);
+  if (db->chunk_enabled && db->s3_prefix == NULL) {
+    if (db->db_id && db->db_id[0])
+      db->s3_prefix = strdup(db->db_id);
+    else
+      db->s3_prefix = strdup("db_default");
+    ARK_STORE(&db->s3_creds_loaded, 1);
+  }
   // ARKILIAN_ALLOW_INSECURE=1 opts into cleartext http:// endpoints that
   // are NOT loopback/RFC1918 (e.g. an internal-but-public corporate
   // aggregator). Default 0: anything non-https and non-local is refused.
@@ -2373,15 +2380,25 @@ int db_init(arkilian **db_ptr, const char *filename) {
   // failure, per the §0 rule that the backup subsystem must not break
   // the application.
   if (db->backup_enabled && (!db->control_url || strlen(db->control_url) == 0)) {
-    ark_log(db, ARK_LOG_WARN,
-            "backup is enabled (ARKILIAN_ENABLE_BACKUP) but ARKILIAN_CONTROL_URL "
-            "is not set — rows will accumulate in _pending_backup and never ship");
+    if (ARK_LOAD(&db->s3_creds_loaded)) {
+      ark_log(db, ARK_LOG_INFO,
+              "no control plane configured — direct S3 backup active");
+    } else {
+      ark_log(db, ARK_LOG_WARN,
+              "backup is enabled (ARKILIAN_ENABLE_BACKUP) but ARKILIAN_CONTROL_URL "
+              "is not set — rows will accumulate in _pending_backup and never ship");
+    }
   }
   if (db->backup_enabled && (!db->api_key || strlen(db->api_key) == 0)) {
-    ark_log(db, ARK_LOG_WARN,
-            "backup is enabled but ARKILIAN_API_KEY is not set — the "
-            "control plane will reject every request; backup DISABLED");
-    ARK_STORE(&db->backup_enabled, 0);
+    if (ARK_LOAD(&db->s3_creds_loaded)) {
+      ark_log(db, ARK_LOG_INFO,
+              "no API key configured — direct S3 backup active");
+    } else {
+      ark_log(db, ARK_LOG_WARN,
+              "backup is enabled but ARKILIAN_API_KEY is not set — the "
+              "control plane will reject every request; backup DISABLED");
+      ARK_STORE(&db->backup_enabled, 0);
+    }
   }
 
   // Credential transport hygiene: over http:// the API key and every
@@ -2421,7 +2438,12 @@ int db_init(arkilian **db_ptr, const char *filename) {
   // async validation clears backup_enabled + alerts via the standard
   // monitoring path. See struct arkilian.startup_auth_state.
   int skip_auth = get_env_bool_default("ARKILIAN_SKIP_STARTUP_AUTH", 0);
-  ARK_STORE(&db->startup_auth_state, skip_auth ? 1 : 0);
+  if (skip_auth || (ARK_LOAD(&db->s3_creds_loaded) &&
+      (!db->control_url || !db->control_url[0]))) {
+    ARK_STORE(&db->startup_auth_state, 1);
+  } else {
+    ARK_STORE(&db->startup_auth_state, 0);
+  }
 
   // libcurl global init must happen before ANY thread calls
   // curl_easy_init — concurrent first use is not thread-safe. The
