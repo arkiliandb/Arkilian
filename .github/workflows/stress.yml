@@ -1,0 +1,44 @@
+name: stress
+
+# Client-only stress gate (nemesis-style, libsql pattern): runs the full
+# client stress suite — build, C suites, DLQ tool, throughput stress with
+# backup/outbox machinery alive — on every src/tests change, and on demand.
+#
+# The control plane is a private business codebase and never runs against
+# public CI, so scripts/stress.sh runs in --client-only mode (Phases 2-6
+# skipped). The C suites here overlap ctest in ci.yml, but this workflow
+# adds what ctest deliberately does not: the correctness-asserting
+# benchmark stress_200m under load with the backup subsystem enabled.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "main" ]
+    paths:
+      - "src/**"
+      - "tests/**"
+      - "scripts/**"
+      - "tools/**"
+      - "CMakeLists.txt"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  client-stress:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libcurl4-openssl-dev sqlite3
+
+    - name: Run client-only stress suite
+      run: bash scripts/stress.sh --client-only
+      env:
+        # CI-tuned sizes: 100k ops keeps the gate fast; crank these in a
+        # workflow_dispatch run for a real soak (STRESS_WRITES=200000000).
+        STRESS_WRITES: "100000"
