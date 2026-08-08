@@ -2083,6 +2083,7 @@ void *run_wal_flush(void *arg) {
                     }
                     if (db->s3_endpoint && db->s3_bucket && db->s3_access_key && db->s3_secret_key && db->db_id) {
                       ARK_STORE(&db->s3_creds_loaded, 1);
+                      db->chunk_enabled = 1;
                       ark_log(db, ARK_LOG_INFO, "storage credentials cached — direct S3 upload enabled");
                     }
                   }
