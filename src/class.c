@@ -4223,7 +4223,6 @@ void *run_hourly_backup(void *arg) {
       if (has_direct_s3(db)) {
         // Client-scoped key: "db_<db_id>/backup.sqlite" — not a
         // filename-based key, not a double-bucket key. The db_id
-        // prefix isolates clients in the shared bucket.
         const char *dbid = (db->db_id && db->db_id[0]) ? db->db_id : "db_unknown";
         snprintf(s3_key, sizeof(s3_key), "%s/backup.sqlite", dbid);
       } else {
