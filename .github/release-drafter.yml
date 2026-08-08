@@ -1,0 +1,54 @@
+# Release Drafter config (libsql pattern): drafts the next release notes
+# as PRs merge into main, resolves the next version from PR labels
+# (major/minor/patch), and autolabels PRs from their title prefix.
+# Releases are still published manually — this only maintains the draft;
+# the existing release.yml workflow handles build + publish on
+# `release: published`.
+name-template: 'v$RESOLVED_VERSION'
+tag-template: 'v$RESOLVED_VERSION'
+categories:
+  - title: '🚀 Features'
+    labels:
+      - 'feature'
+      - 'enhancement'
+  - title: '🐛 Bug Fixes'
+    labels:
+      - 'fix'
+      - 'bugfix'
+      - 'bug'
+  - title: '🧰 Maintenance'
+    label: 'chore'
+change-template: '- $TITLE @$AUTHOR (#$NUMBER)'
+change-title-escapes: '\<*_&' # You can add # and @ to disable mentions, and add ` to disable code blocks.
+version-resolver:
+  major:
+    labels:
+      - 'major'
+  minor:
+    labels:
+      - 'minor'
+  patch:
+    labels:
+      - 'patch'
+  default: patch
+template: |
+  ## Changes
+
+  $CHANGES
+autolabeler:
+  - label: 'feature'
+    title:
+      - '/^feat/i'
+      - '/^feat:/i'
+  - label: 'fix'
+    title:
+      - '/^fix/i'
+      - '/^fix:/i'
+      - '/^bug/i'
+  - label: 'chore'
+    title:
+      - '/^chore/i'
+      - '/^chore:/i'
+      - '/^refactor/i'
+      - '/^docs/i'
+      - '/^test/i'
