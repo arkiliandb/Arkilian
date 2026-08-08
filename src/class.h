@@ -174,19 +174,10 @@ int db_backup_capture_paused(arkilian *db);
 // light while nothing ships is a silent failure.
 int db_backup_is_healthy(arkilian *db);
 
-// ── v2 WAL Chunk Monitoring ─────────────────────────────────────────
-// Number of WAL chunks successfully flushed to S3 (cumulative counter).
 int db_backup_chunk_count(arkilian *db);
-// Milliseconds since the last successful WAL chunk S3 PUT (-1 if never).
 long long db_backup_last_chunk_flush_age_ms(arkilian *db);
-// Milliseconds since the last successful control-plane db log POST.
 long long db_backup_last_cp_echo_age_ms(arkilian *db);
 
-// ── v2 Direct S3 Utilities ───────────────────────────────────────────
-// Generate a presigned GET URL for downloading an object from S3 using
-// the handle's cached credentials.  Used by hydration to fetch manifest
-// and chunk files without a control-plane round trip.  Returns a
-// malloc'd URL string (caller frees), or NULL on failure.
 char *db_s3_presign_get(arkilian *db, const char *key, long expires_sec);
 
 #ifdef __cplusplus

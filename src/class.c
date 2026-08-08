@@ -113,13 +113,6 @@
 #define BATCH_SIZE 100
 #define POLL_INTERVAL_MS 2000
 
-// v2 WAL chunking — per-second consistency guarantee (§1, v2-upgrade-plan).
-// The flush thread accumulates rows into a wal_chunk and uploads to S3 at
-// most every CHUNK_FLUSH_INTERVAL_SEC.  A safety cap on uncompressed size
-// prevents unbounded memory use if writes arrive faster than compression
-// can drain — chunk is flushed immediately when the cap is hit, regardless
-// of the timer.  The default interval of 1 second matches the per-second
-// durability guarantee.  Override with ARKILIAN_CHUNK_INTERVAL_SEC.
 #define CHUNK_FLUSH_INTERVAL_SEC   1
 #define CHUNK_MAX_SIZE_BYTES       (4 * 1024 * 1024)   // 4 MB uncompressed
 #define CHUNK_MAX_ENTRIES          100000               // ~100K rows (belt-and-suspenders)
@@ -143,7 +136,7 @@
 
 // ── Struct Definitions ──────────────────────────────────────────────
 
-// v2 WAL chunk accumulator — batches rows for per-second S3 flush.
+// WAL chunk accumulator.
 // One chunk per flush thread; reset after each successful S3 PUT.
 // Bounded by time (CHUNK_FLUSH_INTERVAL_SEC) and size (CHUNK_MAX_SIZE_BYTES).
 typedef struct {
@@ -188,17 +181,16 @@ struct arkilian {
   char *s3_access_key;
   char *s3_secret_key;
   char *db_id;                  // tenant key prefix ("db_<hex>")
-  char *s3_tenant_prefix;        // v2 S3 key prefix ("u{userID}-{dbID}")
+  char *s3_tenant_prefix;        // S3 key prefix
   volatile int s3_creds_loaded; // 1 when credentials are cached and ready
   int backup_interval;
   volatile int backup_enabled; // runtime kill-switch (written under wake_mutex)
 
-  // v2 WAL chunking state (flush-thread only — no cross-thread access)
   wal_chunk chunk;               // current chunk accumulator
-  int chunk_interval;            // CHUNK_FLUSH_INTERVAL_SEC (configurable)
-  int chunk_enabled;             // 1 when direct-S3 chunking is active
-  time_t credential_expires_at;   // unix timestamp of scoped cred expiry
-  char *db_log_url;              // derived: <control_url>/v1/db/log
+  int chunk_interval;
+  int chunk_enabled;
+  time_t credential_expires_at;
+  char *db_log_url;
 
   // Background thread tracking & synchronization
   volatile int shutdown_requested;
@@ -1521,12 +1513,6 @@ static ship_result_t ship_to_backup(arkilian *db, CURL *curl,
   return result;
 }
 
-// ── v2 WAL Chunking ─────────────────────────────────────────────────
-// Per-second chunk accumulation + direct S3 upload.  Replaces per-row
-// POST to the control plane with batched zstd-compressed chunk PUTs to
-// S3/R2.  The chunk is timed (CHUNK_FLUSH_INTERVAL_SEC) — at most 1
-// PUT/sec per tenant regardless of write volume.
-
 static void wal_chunk_reset(wal_chunk *c) {
   free(c->buffer);
   memset(c, 0, sizeof(*c));
@@ -1826,12 +1812,11 @@ static int drain_batch(arkilian *db, CURL *ship_curl, sqlite3_stmt *select_stmt,
   return processed_any;
 }
 
-// drain_chunk — v2 alternative to drain_batch.  Reads rows from
-// _pending_backup and appends them to the current WAL chunk (memory only).
-// Rows are deleted from the outbox immediately — the chunk in memory is
-// the replication buffer; S3 is the durability target.  Returns the number
-// of rows drained.  Stops on the first row that hasn't met its backoff
-// window (preserves ordering).
+// Reads rows from
+// _pending_backup and appends them to the current WAL chunk.
+// Rows are deleted from the outbox immediately.
+// Returns the number
+// of rows drained.
 static int drain_chunk(arkilian *db, wal_chunk *c, sqlite3_stmt *select_stmt,
                         sqlite3_stmt *delete_stmt) {
   if (!db || !db->backup_db || !c) return 0;
@@ -2087,8 +2072,7 @@ void *run_wal_flush(void *arg) {
                     db->s3_access_key = strdup(t_ak);
                     db->s3_secret_key = strdup(t_sk);
                     db->db_id = strdup(t_id);
-                    // tenant prefix for S3 key scoping: use "prefix" field
-                    // from response if present, otherwise default to db_id
+                    // prefix
                     {
                       char t_prefix[256] = {0};
                       json_str_field(cr.buf, "prefix", t_prefix, sizeof(t_prefix));
@@ -2184,8 +2168,7 @@ void *run_wal_flush(void *arg) {
       }
     }
 
-    // Periodic credential refresh (every 15 min) for v2 direct-S3 path:
-    // keeps scoped credentials fresh without blocking the drain loop.
+    // Periodic credential refresh
     if (db->chunk_enabled && ARK_LOAD(&db->s3_creds_loaded)) {
       static long long last_cred_refresh_ms = 0;
       if (now_ms - last_cred_refresh_ms >= 900000) {  // 15 minutes
@@ -2195,9 +2178,6 @@ void *run_wal_flush(void *arg) {
     }
 
     int drained = 0;
-    // v2 chunk-based direct-S3 path — active when chunk_enabled AND
-    // S3 credentials are cached.  Rows are appended to the chunk
-    // accumulator in memory and flushed to S3 on the per-second timer.
     int use_chunk = db->chunk_enabled && ARK_LOAD(&db->s3_creds_loaded);
     if (ARK_LOAD(&db->backup_enabled)) {
       if (use_chunk) {
@@ -2208,8 +2188,6 @@ void *run_wal_flush(void *arg) {
       }
     }
 
-    // v2 chunk flush timer: if the chunk has accumulated data and the
-    // per-second interval has elapsed, flush to S3.
     if (use_chunk && db->chunk.entry_count > 0) {
       time_t age = time(NULL) - db->chunk.opened_at;
       if (age >= db->chunk_interval) {
@@ -2374,7 +2352,6 @@ int db_init(arkilian **db_ptr, const char *filename) {
   // (backup + signed-URL request with no sleep in between). Clamp it.
   if (db->backup_interval < 1) db->backup_interval = 1;
   ARK_STORE(&db->backup_enabled, get_env_bool_default("ARKILIAN_ENABLE_BACKUP", 1));
-  // v2 WAL chunking: direct-S3 upload when credentials are available.
   db->chunk_interval = get_env_int_default("ARKILIAN_CHUNK_INTERVAL_SEC",
                                            CHUNK_FLUSH_INTERVAL_SEC);
   if (db->chunk_interval < 1) db->chunk_interval = 1;
@@ -3403,7 +3380,7 @@ int db_backup_is_healthy(arkilian *db) {
   return 1;
 }
 
-// ── v2 WAL Chunk Monitoring ─────────────────────────────────────────
+// ── WAL Chunk Monitoring ─────────────────────────────────────────
 
 int db_backup_chunk_count(arkilian *db) {
   if (!db) return -1;
@@ -3916,9 +3893,7 @@ static char *s3_presign_put(arkilian *db, const char *key, long expires_sec) {
   return url;
 }
 
-// s3_presign_get — GET variant of s3_presign_put.  Used for downloading
-// manifest.json and chunk files from S3 directly (no control plane round
-// trip).  Same SigV4 structure, different verb.
+// GET variant of s3_presign_put.
 char *db_s3_presign_get(arkilian *db, const char *key, long expires_sec) {
   if (!db || !key || !has_direct_s3(db)) return NULL;
 
@@ -4065,10 +4040,6 @@ static void register_snapshot_with_cp(arkilian *db, const char *sha256,
   free(url);
 }
 
-// ── v2 Credential Refresh ───────────────────────────────────────────
-// Refreshes scoped storage credentials before expiry.  Checks every
-// 15 minutes; if < 1 hour remains, fetches new credentials and caches
-// them atomically.  On failure, continues with last-known-good creds.
 static int fetch_storage_credentials(arkilian *db) {
   if (!db->control_url || !db->control_url[0]) return -1;
   char *ck = api_key_snapshot(db);
@@ -4135,9 +4106,6 @@ static int fetch_storage_credentials(arkilian *db) {
   return ok;
 }
 
-// ── v2 Manifest Writer ───────────────────────────────────────────────
-// Writes manifest.json to S3 so cold-start hydration can read the hydrate
-// plan directly from the bucket (no control-plane round trip).
 static void manifest_write(arkilian *db, const char *snapshot_s3_key,
                             const char *snapshot_sha256, int64_t baseline_lsn) {
   if (!db || !snapshot_s3_key || !has_direct_s3(db)) return;
