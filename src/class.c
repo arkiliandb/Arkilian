@@ -2118,18 +2118,7 @@ void *run_wal_flush(void *arg) {
     }
   }
 
-  // One CURL handle for every ship in this thread: reset (not cleanup)
-  // between rows keeps the TCP/TLS connection pool alive — the
-  // difference between ~3 rows/sec and thousands over a WAN. Created
-  // after curl_global_init (db_init) and owned exclusively by this
-  // thread (spec §3.1).
-  CURL *ship_curl = curl_easy_init();
-  if (!ship_curl) {
-    ark_log(db, ARK_LOG_ERROR,
-            "flush thread: curl_easy_init failed — shipping disabled");
-  }
-
-  while (!ARK_LOAD(&db->shutdown_requested) && select_stmt && ship_curl) {
+  while (!ARK_LOAD(&db->shutdown_requested) && select_stmt) {
     // Liveness heartbeat (spec §9): the watchdog reads this from another
     // thread; a stale age means the thread died silently.
     long long now_ms = now_ms_mono();
@@ -2182,13 +2171,8 @@ void *run_wal_flush(void *arg) {
 
     int drained = 0;
     int use_chunk = db->chunk_enabled && ARK_LOAD(&db->s3_creds_loaded);
-    if (ARK_LOAD(&db->backup_enabled)) {
-      if (use_chunk) {
-        drained = drain_chunk(db, &db->chunk, select_stmt, delete_stmt);
-      } else if (db->push_url && strlen(db->push_url) > 0) {
-        drained = drain_batch(db, ship_curl, select_stmt, delete_stmt,
-                              update_attempts_stmt, dead_letter_stmt);
-      }
+    if (ARK_LOAD(&db->backup_enabled) && use_chunk) {
+      drained = drain_chunk(db, &db->chunk, select_stmt, delete_stmt);
     }
 
     if (use_chunk && db->chunk.entry_count > 0) {
@@ -2243,7 +2227,6 @@ void *run_wal_flush(void *arg) {
   if (delete_stmt) sqlite3_finalize(delete_stmt);
   if (update_attempts_stmt) sqlite3_finalize(update_attempts_stmt);
   if (dead_letter_stmt) sqlite3_finalize(dead_letter_stmt);
-  if (ship_curl) curl_easy_cleanup(ship_curl);
 
 #ifdef _WIN32
   return 0;

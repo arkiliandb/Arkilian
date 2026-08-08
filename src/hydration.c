@@ -1040,11 +1040,6 @@ int arkilian_hydrate_s3(const char *db_path,
     if (rc == 0) plan_ok = 1;
   }
 
-  if (!plan_ok && server_url && server_url[0]) {
-    int rc = request_hydrate_plan(server_url, api_key, &plan);
-    if (rc == 0) plan_ok = 1;
-  }
-
   if (!plan_ok) {
     hydrate_result = HYDRATION_ERR_PROTO;
     goto hydrate_done;
