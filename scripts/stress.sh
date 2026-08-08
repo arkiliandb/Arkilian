@@ -91,7 +91,7 @@ json_field() { python3 -c "import sys,json;print(json.load(sys.stdin)[\"$1\"])" 
 build_c() {
   local out="$1" src="$2" extra="${3:-}"
   # shellcheck disable=SC2086
-  cc -O2 "$src" src/class.c "$BIN/sqlite3.o" \
+  cc -O2 "$src" src/class.c src/sha256.c "$BIN/sqlite3.o" \
      -Isrc -Isrc/deps/sqlite -lcurl -lpthread -lm $extra -o "$BIN/$out"
 }
 
@@ -119,7 +119,7 @@ build_c test_virtual_tables tests/test_virtual_tables.c "-DSQLITE_ENABLE_FTS5"
 build_c test_e2e_stress tests/test_e2e_stress.c
 build_c stress_200m      tests/stress_200m.c
 # Hydration links hydration.c, not class.c
-cc -O2 tests/test_hydration.c src/hydration.c "$BIN/sqlite3.o" \
+cc -O2 tests/test_hydration.c src/hydration.c src/sha256.c "$BIN/sqlite3.o" \
    -Isrc -Isrc/deps/sqlite -lcurl -lpthread -o "$BIN/test_hydration"
 cc -O2 tools/arkilian-dlq.c "$BIN/sqlite3.o" -Isrc -Isrc/deps/sqlite -o "$BIN/arkilian-dlq"
 ok "12 binaries built"
@@ -231,12 +231,15 @@ fi
 log "Phase 5: throughput stress (stress_200m)"
 STRESS_WRITES="${STRESS_WRITES:-200000}"
 if [ "$CLIENT_ONLY" = "1" ]; then
-  # Local-only: backup/outbox machinery stays alive via SKIP_STARTUP_AUTH;
-  # no control-plane endpoints, no API key. WAL push is simply unset and
-  # rows accumulate in the outbox — exactly what the client-only CI gate
-  # is meant to exercise.
+  # Local-only: backup/outbox machinery stays fully alive — a loopback
+  # control URL (safe transport, refused connection) plus a dummy key and
+  # SKIP_STARTUP_AUTH keep backup_enabled=1, so the flush thread, retry
+  # backoff, and outbox accumulation are all exercised; every push fails
+  # fast and retries, exactly the degraded path the client must survive.
   if run_in_work env \
        ARKILIAN_ENABLE_BACKUP=1 \
+       ARKILIAN_CONTROL_URL="http://127.0.0.1:1" \
+       ARKILIAN_API_KEY="ci-dummy-token" \
        ARKILIAN_SKIP_STARTUP_AUTH=1 \
        ARKILIAN_BACKUP_INTERVAL=14400 \
        ARKILIAN_BACKUP_PATH="$WORK/stress_backup.sqlite" \
