@@ -826,6 +826,384 @@ int hydrate_replay_chunk(sqlite3 *db, const char *raw_sql, int64_t chunk_lsn) {
   return 0;
 }
 
+// ── v2 S3 Manifest Hydration ─────────────────────────────────────────
+// Reads manifest.json from S3 and builds a hydrate plan directly from it,
+// bypassing the control plane.  Falls back to CP hydrate plan if S3 is
+// unreachable or credentials are not configured.
+
+// URL-encode a single character for S3 SigV4 query params.
+static int is_unreserved_s3(char c) {
+  return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+         (c >= '0' && c <= '9') || c == '-' || c == '_' ||
+         c == '.' || c == '~';
+}
+
+static void s3_url_encode(const char *src, char *dst, size_t cap) {
+  if (!src || !dst || cap == 0) return;
+  size_t di = 0;
+  for (const unsigned char *p = (const unsigned char *)src; *p && di + 4 < cap; p++) {
+    if (is_unreserved_s3((char)*p)) {
+      dst[di++] = (char)*p;
+    } else {
+      snprintf(dst + di, cap - di, "%%%02X", *p);
+      di += 3;
+    }
+  }
+  dst[di] = '\0';
+}
+
+// Generate a presigned S3 GET URL using AWS SigV4. Local-only; no control
+// plane round trip.  Used to fetch manifest.json from the tenant's prefix.
+static char *s3_presign_get(const char *endpoint, const char *bucket,
+                             const char *region, const char *access_key,
+                             const char *secret_key, const char *key,
+                             long expires_sec) {
+  if (!endpoint || !bucket || !access_key || !secret_key || !key) return NULL;
+  if (!region) region = "us-east-1";
+
+  time_t now = time(NULL);
+  struct tm g;
+  gmtime_r(&now, &g);
+  char date_stamp[9], amz_date[17];
+  strftime(date_stamp, sizeof(date_stamp), "%Y%m%d", &g);
+  strftime(amz_date, sizeof(amz_date), "%Y%m%dT%H%M%SZ", &g);
+
+  char cred_plain[512];
+  snprintf(cred_plain, sizeof(cred_plain), "%s/%s/%s/s3/aws4_request",
+           access_key, date_stamp, region);
+  char cred_enc[2048];
+  s3_url_encode(cred_plain, cred_enc, sizeof(cred_enc));
+
+  const char *scheme = "https";
+  const char *host = endpoint;
+  if (strncmp(host, "https://", 8) == 0) host += 8;
+  else if (strncmp(host, "http://", 7) == 0) { scheme = "http"; host += 7; }
+  char host_clean[256];
+  {
+    size_t hl = strlen(host);
+    if (hl >= sizeof(host_clean)) hl = sizeof(host_clean) - 1;
+    memcpy(host_clean, host, hl);
+    while (hl > 0 && host_clean[hl - 1] == '/') hl--;
+    host_clean[hl] = '\0';
+  }
+
+  char key_enc[1024];
+  s3_url_encode(key, key_enc, sizeof(key_enc));
+  for (char *p = key_enc; *p; p++) {
+    if (p[0] == '%' && p[1] == '2' && (p[2] == 'F' || p[2] == 'f')) {
+      *p = '/'; memmove(p + 1, p + 3, strlen(p + 3) + 1);
+    }
+  }
+
+  char canonical[4096];
+  snprintf(canonical, sizeof(canonical),
+    "GET\n/%s/%s\n"
+    "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=%s&"
+    "X-Amz-Date=%s&X-Amz-Expires=%ld&X-Amz-SignedHeaders=host\n"
+    "host:%s\n\nhost\nUNSIGNED-PAYLOAD",
+    bucket, key_enc, cred_enc, amz_date, expires_sec, host_clean);
+
+  char scope[256];
+  snprintf(scope, sizeof(scope), "%s/%s/s3/aws4_request", date_stamp, region);
+  char canon_hash[65];
+  ark_sha256_hex(canonical, strlen(canonical), canon_hash);
+
+  char sts[1024];
+  snprintf(sts, sizeof(sts), "AWS4-HMAC-SHA256\n%s\n%s\n%s",
+           amz_date, scope, canon_hash);
+
+  uint8_t k_date[32], k_region[32], k_service[32], k_signing[32];
+  char kseed[512];
+  snprintf(kseed, sizeof(kseed), "AWS4%s", secret_key);
+  ark_hmac_sha256((const uint8_t *)kseed, strlen(kseed),
+                  date_stamp, strlen(date_stamp), k_date);
+  ark_hmac_sha256(k_date, 32, region, strlen(region), k_region);
+  ark_hmac_sha256(k_region, 32, "s3", 2, k_service);
+  ark_hmac_sha256(k_service, 32, "aws4_request", 12, k_signing);
+
+  char sig_hex[65];
+  ark_hmac_sha256_hex(k_signing, 32, sts, strlen(sts), sig_hex);
+  char sig_enc[256];
+  s3_url_encode(sig_hex, sig_enc, sizeof(sig_enc));
+
+  size_t url_len = strlen(scheme) + 3 + strlen(host_clean) + 1 +
+                   strlen(bucket) + 1 + strlen(key_enc) + 2048;
+  char *url = malloc(url_len);
+  if (!url) return NULL;
+  snprintf(url, url_len,
+    "%s://%s/%s/%s?X-Amz-Algorithm=AWS4-HMAC-SHA256"
+    "&X-Amz-Credential=%s&X-Amz-Date=%s&X-Amz-Expires=%ld"
+    "&X-Amz-SignedHeaders=host&X-Amz-Signature=%s",
+    scheme, host_clean, bucket, key_enc,
+    cred_enc, amz_date, expires_sec, sig_enc);
+
+  return url;
+}
+
+static int manifest_read_from_s3(const char *endpoint, const char *bucket,
+                                  const char *region, const char *access_key,
+                                  const char *secret_key, const char *prefix,
+                                  HydratePlan *plan) {
+  if (!endpoint || !bucket || !access_key || !secret_key || !prefix || !plan)
+    return -1;
+
+  // Build presigned GET for <prefix>/manifest.json
+  char manifest_key[512];
+  snprintf(manifest_key, sizeof(manifest_key), "%s/manifest.json", prefix);
+
+  char *manifest_url = s3_presign_get(endpoint, bucket, region,
+                                       access_key, secret_key,
+                                       manifest_key, 3600L);
+  if (!manifest_url) return -1;
+
+  int err = 0;
+  char *json = http_get_string(manifest_url, NULL, &err);
+  free(manifest_url);
+
+  if (!json) return -1;
+
+  memset(plan, 0, sizeof(*plan));
+  plan->snapshot_url    = json_get_string(json, "s3_key");
+  plan->snapshot_sha256 = json_get_string(json, "sha256");
+  plan->baseline_lsn    = 0;
+
+  // Parse snapshot object
+  char *snap = json_array_get(json, "snapshot", 0);
+  if (!snap) {
+    // Direct top-level fields from simplified manifest
+    plan->snapshot_url    = json_get_string(json, "snapshot_url");
+    plan->snapshot_sha256 = json_get_string(json, "snapshot_sha256");
+    plan->baseline_lsn    = json_get_int64(json, "baseline_lsn");
+  } else {
+    // Nested snapshot object from full manifest
+    char *s3_key = json_get_string(snap, "s3_key");
+    if (s3_key) {
+      plan->snapshot_url = s3_presign_get(endpoint, bucket, region,
+                                           access_key, secret_key,
+                                           s3_key, 3600L);
+      free(s3_key);
+    }
+    plan->snapshot_sha256 = json_get_string(snap, "sha256");
+    char *bl = json_get_string(snap, "baseline_lsn");
+    if (bl) { plan->baseline_lsn = (int64_t)strtoll(bl, NULL, 10); free(bl); }
+    free(snap);
+  }
+
+  plan->chunk_count = json_array_count(json, "chunks");
+  if (plan->chunk_count > 0) {
+    plan->chunks = calloc((size_t)plan->chunk_count, sizeof(HydrateChunk));
+    if (plan->chunks) {
+      for (int i = 0; i < plan->chunk_count; i++) {
+        char *elem = json_array_get(json, "chunks", i);
+        if (!elem) continue;
+        char *ckey = json_get_string(elem, "s3_key");
+        if (ckey) {
+          plan->chunks[i].url = s3_presign_get(endpoint, bucket, region,
+                                                access_key, secret_key,
+                                                ckey, 3600L);
+          free(ckey);
+        }
+        plan->chunks[i].sha256 = json_get_string(elem, "sha256");
+        char *ls = json_get_string(elem, "lsn_start");
+        if (ls) { plan->chunks[i].lsn_start = (int64_t)strtoll(ls, NULL, 10); free(ls); }
+        char *le = json_get_string(elem, "lsn_end");
+        if (le) { plan->chunks[i].lsn_end = (int64_t)strtoll(le, NULL, 10); free(le); }
+        free(elem);
+      }
+    }
+  }
+
+  plan->expires_at = (int64_t)time(NULL) + 3600;
+
+  free(json);
+  if (!plan->snapshot_url) { hydrate_plan_free(plan); return -1; }
+  return 0;
+}
+
+int arkilian_hydrate_s3(const char *db_path,
+                         const char *server_url,
+                         const char *api_key,
+                         const char *s3_endpoint,
+                         const char *s3_bucket,
+                         const char *s3_region,
+                         const char *s3_access_key,
+                         const char *s3_secret_key,
+                         const char *s3_prefix,
+                         hydration_progress_cb progress,
+                         void *user_data) {
+  if (!db_path) return HYDRATION_ERR_PROTO;
+
+  pthread_mutex_lock(&g_hydrate_mutex);
+  int hydrate_result = 0;
+
+  HydratePlan plan;
+  int plan_ok = 0;
+
+  // Try S3 manifest first
+  if (s3_endpoint && s3_endpoint[0] && s3_bucket && s3_bucket[0] &&
+      s3_access_key && s3_access_key[0] && s3_secret_key && s3_secret_key[0] &&
+      s3_prefix && s3_prefix[0]) {
+    int rc = manifest_read_from_s3(s3_endpoint, s3_bucket, s3_region,
+                                    s3_access_key, s3_secret_key, s3_prefix,
+                                    &plan);
+    if (rc == 0) plan_ok = 1;
+  }
+
+  // Fall back to CP hydrate plan
+  if (!plan_ok && server_url && server_url[0]) {
+    int rc = request_hydrate_plan(server_url, api_key, &plan);
+    if (rc == 0) plan_ok = 1;
+  }
+
+  if (!plan_ok) {
+    hydrate_result = HYDRATION_ERR_PROTO;
+    goto hydrate_done;
+  }
+
+  // ── Reuse the existing arkilian_hydrate core logic (Phase 0.5 through Phase 2) ──
+  // The plan is populated; we run the same download + replay pipeline.
+
+  if (plan.expires_at > 0 && (int64_t)time(NULL) > plan.expires_at) {
+    hydrate_plan_free(&plan);
+    hydrate_result = HYDRATION_ERR_EXPIRED;
+    goto hydrate_done;
+  }
+
+  // Phase 0.5: LSN guard
+  {
+    int64_t pre_local_lsn = 0;
+    sqlite3 *ldb = NULL;
+    if (sqlite3_open_v2(db_path, &ldb, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK)
+      pre_local_lsn = read_last_applied_lsn(ldb);
+    sqlite3_close(ldb);
+    if (pre_local_lsn > plan.baseline_lsn) {
+      fprintf(stderr,
+              "arkilian: hydration refused — local DB is at LSN %lld but the "
+              "snapshot baseline is %lld\n",
+              (long long)pre_local_lsn, (long long)plan.baseline_lsn);
+      hydrate_plan_free(&plan);
+      hydrate_result = HYDRATION_ERR_NEWER;
+      goto hydrate_done;
+    }
+  }
+
+  // Phase 0.6: Live-writer probe
+  {
+    sqlite3 *ldb = NULL;
+    if (sqlite3_open_v2(db_path, &ldb,
+                        SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX, NULL) == SQLITE_OK) {
+      char *perr = NULL;
+      int prc = sqlite3_exec(ldb, "BEGIN IMMEDIATE;", NULL, NULL, &perr);
+      if (prc != SQLITE_OK) {
+        sqlite3_free(perr);
+        sqlite3_close(ldb);
+        hydrate_plan_free(&plan);
+        hydrate_result = HYDRATION_ERR_BUSY;
+        goto hydrate_done;
+      }
+      sqlite3_exec(ldb, "ROLLBACK;", NULL, NULL, NULL);
+    }
+    sqlite3_close(ldb);
+  }
+
+  // Phase 1: Download snapshot
+  {
+    int rc = download_snapshot(plan.snapshot_url, api_key, db_path,
+                                plan.snapshot_sha256, progress, user_data);
+    if (rc != 0) { hydrate_plan_free(&plan); hydrate_result = rc; goto hydrate_done; }
+  }
+
+  // Phase 2: Open database and replay chunks
+  {
+    sqlite3 *db = NULL;
+    int rc = sqlite3_open_v2(db_path, &db,
+      SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX, NULL);
+    if (rc != SQLITE_OK) { hydrate_plan_free(&plan); hydrate_result = HYDRATION_ERR_SQL; goto hydrate_done; }
+
+    {
+      char *perr = NULL;
+      sqlite3_exec(db, "PRAGMA journal_mode=WAL;", NULL, NULL, &perr);
+      sqlite3_exec(db, "PRAGMA synchronous=NORMAL;", NULL, NULL, &perr);
+      sqlite3_exec(db, "PRAGMA foreign_keys=OFF;", NULL, NULL, &perr);
+      sqlite3_free(perr);
+    }
+
+    int64_t local_lsn = read_last_applied_lsn(db);
+    if (local_lsn == 0) local_lsn = plan.baseline_lsn;
+    else if (local_lsn < plan.baseline_lsn) {
+      fprintf(stderr,
+              "arkilian: hydration refused — snapshot LSN %lld < plan baseline %lld\n",
+              (long long)local_lsn, (long long)plan.baseline_lsn);
+      sqlite3_close(db);
+      hydrate_plan_free(&plan);
+      hydrate_result = HYDRATION_ERR_PROTO;
+      goto hydrate_done;
+    }
+
+    int chunk_total = 0;
+    for (int i = 0; i < plan.chunk_count; i++) {
+      HydrateChunk *ch = &plan.chunks[i];
+      if (ch->lsn_end <= local_lsn) continue;
+      if (ch->lsn_start > local_lsn + 1) {
+        fprintf(stderr, "arkilian: hydration LSN gap at chunk %d\n", i);
+        sqlite3_close(db);
+        hydrate_plan_free(&plan);
+        hydrate_result = HYDRATION_ERR_PROTO;
+        goto hydrate_done;
+      }
+      if (ch->expires_at > 0 && (int64_t)time(NULL) > ch->expires_at) {
+        sqlite3_close(db);
+        hydrate_plan_free(&plan);
+        hydrate_result = HYDRATION_ERR_EXPIRED;
+        goto hydrate_done;
+      }
+
+      if (!url_is_allowed_storage(ch->url)) {
+        fprintf(stderr, "arkilian: chunk %d SSRF guard refused\n", i);
+        sqlite3_close(db);
+        hydrate_plan_free(&plan);
+        hydrate_result = HYDRATION_ERR_PROTO;
+        goto hydrate_done;
+      }
+
+      int err = 0;
+      char *sql_text = http_get_string(ch->url, api_key, &err);
+      if (!sql_text) { sqlite3_close(db); hydrate_plan_free(&plan); hydrate_result = err; goto hydrate_done; }
+
+      if (ch->sha256 && ch->sha256[0]) {
+        char digest[65];
+        ark_sha256_hex(sql_text, strlen(sql_text), digest);
+        if (strcasecmp(digest, ch->sha256) != 0) {
+          fprintf(stderr, "arkilian: chunk %d SHA-256 mismatch\n", i);
+          free(sql_text);
+          sqlite3_close(db);
+          hydrate_plan_free(&plan);
+          hydrate_result = HYDRATION_ERR_PROTO;
+          goto hydrate_done;
+        }
+      }
+
+      rc = hydrate_replay_chunk(db, sql_text, ch->lsn_end);
+      free(sql_text);
+      if (rc != 0) { sqlite3_close(db); hydrate_plan_free(&plan); hydrate_result = rc; goto hydrate_done; }
+
+      local_lsn = ch->lsn_end;
+      chunk_total++;
+      if (progress) progress(2, chunk_total, plan.chunk_count, user_data);
+    }
+
+    sqlite3_exec(db, "PRAGMA synchronous=NORMAL;", NULL, NULL, NULL);
+    sqlite3_exec(db, "PRAGMA foreign_keys=ON;", NULL, NULL, NULL);
+    sqlite3_close(db);
+  }
+
+  hydrate_plan_free(&plan);
+
+hydrate_done:
+  pthread_mutex_unlock(&g_hydrate_mutex);
+  return hydrate_result;
+}
+
 // ── Public API ──────────────────────────────────────────────────────
 
 int arkilian_hydrate(const char *db_path,

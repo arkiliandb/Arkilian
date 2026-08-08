@@ -34,6 +34,15 @@ option(ARKILIAN_BUILD_TESTS "Build test programs" OFF)
 # Find CURL
 find_package(CURL REQUIRED)
 
+# Find zstd (optional — WAL chunk compression for v2 direct-to-S3 path)
+find_package(ZSTD QUIET)
+if(ZSTD_FOUND)
+  message(STATUS "zstd found — WAL chunk compression enabled")
+  add_compile_definitions(ARKILIAN_HAS_ZSTD)
+else()
+  message(STATUS "zstd NOT found — WAL chunk compression disabled (direct-S3 without compression)")
+endif()
+
 # Find Threads
 set(THREADS_PREFER_PTHREAD_FLAG ON)
 find_package(Threads REQUIRED)
@@ -98,6 +107,9 @@ if(ARKILIAN_BUILD_SHARED)
         $<INSTALL_INTERFACE:include/arkilian>
     )
     target_link_libraries(arkilian PRIVATE CURL::libcurl Threads::Threads ${ARK_LIBM})
+    if(ZSTD_FOUND)
+      target_link_libraries(arkilian PRIVATE zstd::libzstd)
+    endif()
     set_target_properties(arkilian PROPERTIES
         VERSION 1.1.0
         SOVERSION 1
@@ -115,6 +127,9 @@ if(ARKILIAN_BUILD_STATIC)
         $<INSTALL_INTERFACE:include/arkilian>
     )
     target_link_libraries(arkilian_static PRIVATE CURL::libcurl Threads::Threads ${ARK_LIBM})
+    if(ZSTD_FOUND)
+      target_link_libraries(arkilian_static PRIVATE zstd::libzstd)
+    endif()
     set_target_properties(arkilian_static PROPERTIES
         OUTPUT_NAME arkilian
         PUBLIC_HEADER "src/class.h;src/deps/sqlite/sqlite3.h"
@@ -186,6 +201,9 @@ if(CMAKE_JS_VERSION OR ARKILIAN_BUILD_NAPI)
     endif()
 
     target_link_libraries(arkilian_napi PRIVATE CURL::libcurl Threads::Threads ${ARK_LIBM})
+    if(ZSTD_FOUND)
+      target_link_libraries(arkilian_napi PRIVATE zstd::libzstd)
+    endif()
 
     # Node.js import library (needed on Windows)
     if(CMAKE_JS_LIB)
@@ -270,6 +288,9 @@ if(ARKILIAN_BUILD_TESTS)
             set(ARK_TEST_LIBS arkilian_static ${CMAKE_THREAD_LIBS_INIT} ${CURL_LIBRARIES})
         else()
             set(ARK_TEST_LIBS arkilian_static ${CMAKE_THREAD_LIBS_INIT} ${CURL_LIBRARIES} m)
+        endif()
+        if(ZSTD_FOUND)
+            list(APPEND ARK_TEST_LIBS zstd::libzstd)
         endif()
 
         # POSIX feature macros for setenv/unsetenv/clock_gettime (and the
@@ -365,6 +386,9 @@ if(ARKILIAN_BUILD_TESTS)
             target_include_directories(test_e2e_stress PRIVATE src src/deps/sqlite)
             target_link_libraries(test_e2e_stress PRIVATE ${CMAKE_THREAD_LIBS_INIT}
                                   ${CURL_LIBRARIES})
+            if(ZSTD_FOUND)
+              target_link_libraries(test_e2e_stress PRIVATE zstd::libzstd)
+            endif()
             target_compile_options(test_e2e_stress PRIVATE -UNDEBUG)
             target_compile_definitions(test_e2e_stress PRIVATE ${ARK_POSIX_DEFS})
 
@@ -393,6 +417,9 @@ if(ARKILIAN_BUILD_TESTS)
             target_include_directories(stress_200m PRIVATE src src/deps/sqlite)
             target_link_libraries(stress_200m PRIVATE ${CMAKE_THREAD_LIBS_INIT}
                                   ${CURL_LIBRARIES} m)
+            if(ZSTD_FOUND)
+              target_link_libraries(stress_200m PRIVATE zstd::libzstd)
+            endif()
             target_compile_definitions(stress_200m PRIVATE ${ARK_POSIX_DEFS})
             target_compile_options(stress_200m PRIVATE -UNDEBUG)
         endif()
