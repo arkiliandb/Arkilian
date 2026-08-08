@@ -355,7 +355,6 @@ static int get_env_int_default(const char *env_var, int default_val) {
 // Configurable via ARKILIAN_MAX_ATTEMPTS env var. Default 20 with
 // exponential backoff gives ~1 hour of retrying before dead-lettering.
 // Tests set a lower value (e.g. 3) to dead-letter quickly.
-__attribute__((unused))
 static int max_attempts(void) {
   int v = get_env_int_default("ARKILIAN_MAX_ATTEMPTS", 100);
   if (v < 1) v = 1;
@@ -1411,7 +1410,6 @@ static long curl_timeout_sec(size_t bytes, long base) {
   return t;
 }
 
-__attribute__((unused))
 static ship_result_t ship_to_backup(arkilian *db, CURL *curl,
                                     sqlite3_int64 id, const char *payload) {
   if (!payload || strlen(payload) == 0) return SHIP_OK;
@@ -1665,6 +1663,156 @@ typedef struct {
   sqlite3_int64 last_attempt_at; // unix seconds, 0 = never attempted
 } outbox_row;
 
+static int drain_batch(arkilian *db, CURL *ship_curl, sqlite3_stmt *select_stmt,
+                        sqlite3_stmt *delete_stmt, sqlite3_stmt *update_attempts_stmt,
+                        sqlite3_stmt *dead_letter_stmt) {
+  if (!db || !db->backup_db) return 0;
+
+  // Pass 1: read the batch into heap memory.
+  outbox_row rows[BATCH_SIZE];
+  int nrows = 0;
+
+  sqlite3_reset(select_stmt);
+  sqlite3_clear_bindings(select_stmt);
+  sqlite3_bind_int(select_stmt, 1, BATCH_SIZE);
+
+  for (;;) {
+    int rc = sqlite3_step(select_stmt);
+    if (rc == SQLITE_DONE) break;
+    if (rc != SQLITE_ROW) {
+      ark_log(db, ARK_LOG_ERROR, "select from _pending_backup failed: %s",
+               sqlite3_errmsg(db->backup_db));
+      break;
+    }
+    if (nrows >= BATCH_SIZE) break; // defensive; LIMIT already bounds it
+    const unsigned char *payload = sqlite3_column_text(select_stmt, 1);
+    if (!payload) continue;
+    char *copy = strdup((const char *)payload);
+    if (!copy) {
+      ark_log(db, ARK_LOG_ERROR, "OOM copying payload id=%lld",
+              (long long)sqlite3_column_int64(select_stmt, 0));
+      break;
+    }
+    rows[nrows].id = sqlite3_column_int64(select_stmt, 0);
+    rows[nrows].attempts = sqlite3_column_int(select_stmt, 2);
+    rows[nrows].last_attempt_at = sqlite3_column_int64(select_stmt, 3);
+    rows[nrows].payload = copy;
+    nrows++;
+  }
+
+  // End the SELECT's read transaction before any write statement runs.
+  sqlite3_reset(select_stmt);
+
+  // Pass 2: ship + write, one row at a time. Ordering is preserved:
+  // rows are handled strictly in id order and a retryable failure stops
+  // the pass so the first unshipped row is retried next time.
+  int processed_any = 0;
+  for (int i = 0; i < nrows; i++) {
+    sqlite3_int64 id = rows[i].id;
+    const char *payload = rows[i].payload;
+
+    // Exponential backoff: if this row recently failed, wait before
+    // retrying. Rows are ordered by id (oldest first); the oldest row
+    // has the most attempts, so if IT isn't ready, the younger rows
+    // behind it aren't either. Stop the pass and let the loop sleep.
+    if (rows[i].last_attempt_at > 0) {
+      long long now = (long long)time(NULL);
+      long long ready_at = (long long)rows[i].last_attempt_at +
+                           backoff_seconds(rows[i].attempts);
+      if (now < ready_at) {
+        processed_any = 0;
+        break;
+      }
+    }
+
+    ship_result_t result = ship_to_backup(db, ship_curl, id, payload);
+
+    if (result == SHIP_OK) {
+      sqlite3_reset(delete_stmt);
+      sqlite3_clear_bindings(delete_stmt);
+      sqlite3_bind_int64(delete_stmt, 1, id);
+      int del_rc = sqlite3_step(delete_stmt);
+      if (del_rc != SQLITE_DONE) {
+        // The row shipped but the delete failed — it will ship again next
+        // pass. Safe: delivery is at-least-once, destination must dedupe.
+        ark_log(db, ARK_LOG_ERROR,
+                 "delete after ship failed id=%lld rc=%d ext=%d: %s",
+                 (long long)id, del_rc, sqlite3_extended_errcode(db->backup_db),
+                 sqlite3_errmsg(db->backup_db));
+        break;
+      }
+      processed_any = 1;
+      continue;
+    }
+
+    int new_attempts = rows[i].attempts + 1;
+    if (new_attempts >= max_attempts()) {
+      // PII hygiene: the raw payload IS the row data (REPLACE INTO users
+      // VALUES (1, 'alice@example.com', ...)) — logging it dumps customer
+      // PII into stderr / the operator's log sink. We log the dead-letter
+      // with the payload id and reason only; the operator inspects the
+      // _dead_backup table (or the DLQ tool) with their own access controls.
+      ark_log(db, ARK_LOG_ERROR,
+              "payload id=%lld dead-lettered after %d attempts "
+              "(moved to _dead_backup; inspect via tools/arkilian-dlq)",
+              (long long)id, new_attempts);
+      sqlite3_reset(dead_letter_stmt);
+      sqlite3_clear_bindings(dead_letter_stmt);
+      sqlite3_bind_int(dead_letter_stmt, 1, new_attempts);
+      sqlite3_bind_text(dead_letter_stmt, 2, "max attempts exceeded", -1, SQLITE_STATIC);
+      sqlite3_bind_int64(dead_letter_stmt, 3, id);
+      // INSERT OR IGNORE: if a previous pass already dead-lettered this
+      // id but failed to delete the pending copy (SQLITE_BUSY), the
+      // insert would hit a PK conflict. That conflict previously left a
+      // permanent zombie row AND — because the failure path reported
+      // "work drained" — the flush loop never slept, hot-spinning on the
+      // conflict forever. OR IGNORE makes a repeat dead-letter a no-op.
+      int dl_rc = sqlite3_step(dead_letter_stmt);
+      if (dl_rc != SQLITE_DONE) {
+        // A real (non-conflict) error: leave the row pending and back
+        // off — do not spin.
+        ark_log(db, ARK_LOG_ERROR, "dead-letter insert failed id=%lld: %s",
+                (long long)id, sqlite3_errmsg(db->backup_db));
+        processed_any = 0;
+        break;
+      }
+      // The row is in _dead_backup (inserted now, or already there from
+      // a partial earlier pass). The _pending_backup copy is redundant —
+      // remove it unconditionally so no zombie row can ever loop.
+      sqlite3_reset(delete_stmt);
+      sqlite3_clear_bindings(delete_stmt);
+      sqlite3_bind_int64(delete_stmt, 1, id);
+      if (sqlite3_step(delete_stmt) != SQLITE_DONE) {
+        ark_log(db, ARK_LOG_ERROR, "delete after dead-letter failed id=%lld: %s",
+                (long long)id, sqlite3_errmsg(db->backup_db));
+        // Row stays pending this pass; the next pass dead-letters it
+        // again (OR IGNORE no-op) and retries the delete. Reporting "no
+        // work drained" makes the loop sleep instead of spinning.
+        processed_any = 0;
+        break;
+      }
+      processed_any = 1;
+      continue;
+    } else {
+      sqlite3_reset(update_attempts_stmt);
+      sqlite3_clear_bindings(update_attempts_stmt);
+      sqlite3_bind_int(update_attempts_stmt, 1, new_attempts);
+      sqlite3_bind_int64(update_attempts_stmt, 2, id);
+      if (sqlite3_step(update_attempts_stmt) != SQLITE_DONE) {
+        ark_log(db, ARK_LOG_ERROR, "update attempts failed id=%lld: %s",
+                 (long long)id, sqlite3_errmsg(db->backup_db));
+      }
+      // Back off: report "no work drained" so the flush loop waits one
+      // poll interval before retrying instead of hot-spinning on a
+      // failing endpoint and burning through MAX_ATTEMPTS instantly.
+      processed_any = 0;
+      break;
+    }
+  }
+
+  for (int i = 0; i < nrows; i++) free(rows[i].payload);
+  return processed_any;
+}
 
 // Reads rows from
 // _pending_backup and appends them to the current WAL chunk.
@@ -1970,7 +2118,18 @@ void *run_wal_flush(void *arg) {
     }
   }
 
-  while (!ARK_LOAD(&db->shutdown_requested) && select_stmt) {
+  // One CURL handle for every ship in this thread: reset (not cleanup)
+  // between rows keeps the TCP/TLS connection pool alive — the
+  // difference between ~3 rows/sec and thousands over a WAN. Created
+  // after curl_global_init (db_init) and owned exclusively by this
+  // thread (spec §3.1).
+  CURL *ship_curl = curl_easy_init();
+  if (!ship_curl) {
+    ark_log(db, ARK_LOG_ERROR,
+            "flush thread: curl_easy_init failed — shipping disabled");
+  }
+
+  while (!ARK_LOAD(&db->shutdown_requested) && select_stmt && ship_curl) {
     // Liveness heartbeat (spec §9): the watchdog reads this from another
     // thread; a stale age means the thread died silently.
     long long now_ms = now_ms_mono();
@@ -2023,8 +2182,13 @@ void *run_wal_flush(void *arg) {
 
     int drained = 0;
     int use_chunk = db->chunk_enabled && ARK_LOAD(&db->s3_creds_loaded);
-    if (ARK_LOAD(&db->backup_enabled) && use_chunk) {
-      drained = drain_chunk(db, &db->chunk, select_stmt, delete_stmt);
+    if (ARK_LOAD(&db->backup_enabled)) {
+      if (use_chunk) {
+        drained = drain_chunk(db, &db->chunk, select_stmt, delete_stmt);
+      } else if (db->push_url && strlen(db->push_url) > 0) {
+        drained = drain_batch(db, ship_curl, select_stmt, delete_stmt,
+                              update_attempts_stmt, dead_letter_stmt);
+      }
     }
 
     if (use_chunk && db->chunk.entry_count > 0) {
@@ -2079,6 +2243,7 @@ void *run_wal_flush(void *arg) {
   if (delete_stmt) sqlite3_finalize(delete_stmt);
   if (update_attempts_stmt) sqlite3_finalize(update_attempts_stmt);
   if (dead_letter_stmt) sqlite3_finalize(dead_letter_stmt);
+  if (ship_curl) curl_easy_cleanup(ship_curl);
 
 #ifdef _WIN32
   return 0;
@@ -3950,8 +4115,6 @@ static void manifest_write(arkilian *db, const char *snapshot_s3_key,
                             const char *snapshot_sha256, int64_t baseline_lsn) {
   if (!db || !snapshot_s3_key || !has_direct_s3(db)) return;
   if (!db->s3_tenant_prefix || !db->s3_tenant_prefix[0]) return;
-  if (strstr(db->s3_tenant_prefix, "..") || db->s3_tenant_prefix[0] == '/')
-    return;
   if (strstr(db->s3_tenant_prefix, "..") || db->s3_tenant_prefix[0] == '/')
     return;
 

@@ -458,6 +458,11 @@ static void test_dead_letter_zombie_cleared(void) {
   ark_setenv("ARKILIAN_ENABLE_BACKUP", "1", 1);
   ark_setenv("ARKILIAN_CONTROL_URL", "http://127.0.0.1:1", 1);
   ark_setenv("ARKILIAN_BACKUP_INTERVAL", "3600", 1);
+  // Key + skip-auth keep backup enabled so the flush thread actually runs
+  // (the api_key guard in db_init disables backup otherwise, and the
+  // zombie would never be cleaned).
+  ark_setenv("ARKILIAN_API_KEY", "test-key", 1);
+  ark_setenv("ARKILIAN_SKIP_STARTUP_AUTH", "1", 1);
   arkilian *db = NULL;
   assert(db_init(&db, "test_reg_zombie.db") == 0);
 
