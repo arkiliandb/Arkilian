@@ -100,7 +100,7 @@
 //                          (e.g. https://api.arkilian.com). The client
 //                          derives /v1/wal/push, /v1/upload/request,
 //                          and /v1/auth/validate from this base.
-//   ARKILIAN_API_KEY       The tenant's API key — the ONLY credential
+//   ARKILIAN_API_KEY       The client's API key — the ONLY credential
 //                          the client holds. Sent as
 //                          "Authorization: Bearer <api_key>" to every
 //                          control-plane endpoint. No S3 credentials,
@@ -180,8 +180,8 @@ struct arkilian {
   char *s3_region;
   char *s3_access_key;
   char *s3_secret_key;
-  char *db_id;                  // tenant key prefix ("db_<hex>")
-  char *s3_tenant_prefix;        // S3 key prefix
+  char *db_id;
+  char *s3_prefix;        // S3 key prefix
   volatile int s3_creds_loaded; // 1 when credentials are cached and ready
   int backup_interval;
   volatile int backup_enabled; // runtime kill-switch (written under wake_mutex)
@@ -254,9 +254,9 @@ volatile int capture_paused;         // sticky: set when outbox hits cap (CDC ro
   // v1 design validated the API key synchronously on the caller's main
   // thread inside db_init; if the control plane was unreachable at boot
   // the backup subsystem was disabled for the ENTIRE process lifetime
-  // (and the flush/snapshot threads were never spawned) — at 5,000 tenants
+  // (and the flush/snapshot threads were never spawned) — at 5,000 clients
   // a brief control-plane outage at deploy time meant 5,000 permanently
-  // unbacked-up databases needing per-tenant operator intervention.
+  // unbacked-up databases needing per-client operator intervention.
   //
   // v2 (this field): db_init enables backup aggressively with the
   // configured key and starts both background threads. The flush thread,
@@ -1592,8 +1592,8 @@ static void db_log_to_cp(arkilian *db, wal_chunk *c) {
 static int wal_chunk_flush_to_s3(arkilian *db, wal_chunk *c) {
   if (c->entry_count == 0) return SHIP_OK;
   if (!db->s3_endpoint || !db->s3_endpoint[0]) return SHIP_RETRY;
-  if (!db->s3_tenant_prefix || !db->s3_tenant_prefix[0]) return SHIP_RETRY;
-  if (strstr(db->s3_tenant_prefix, "..") || db->s3_tenant_prefix[0] == '/')
+  if (!db->s3_prefix || !db->s3_prefix[0]) return SHIP_RETRY;
+  if (strstr(db->s3_prefix, "..") || db->s3_prefix[0] == '/')
     return SHIP_RETRY;
 
   // 1. Compress with zstd level 3
@@ -1623,7 +1623,7 @@ static int wal_chunk_flush_to_s3(arkilian *db, wal_chunk *c) {
   char s3_key[512];
   snprintf(s3_key, sizeof(s3_key),
            "%s/chunks/lsn_%010llu_%010llu.sql.zst",
-           db->s3_tenant_prefix,
+           db->s3_prefix,
            (unsigned long long)c->lsn_start,
            (unsigned long long)c->lsn_end);
 
@@ -2068,7 +2068,7 @@ void *run_wal_flush(void *arg) {
                     if (db->s3_access_key) free(db->s3_access_key);
                     if (db->s3_secret_key) free(db->s3_secret_key);
                     if (db->db_id) free(db->db_id);
-                    if (db->s3_tenant_prefix) free(db->s3_tenant_prefix);
+                    if (db->s3_prefix) free(db->s3_prefix);
                     db->s3_endpoint = strdup(t_ep);
                     db->s3_bucket = strdup(t_bk);
                     db->s3_region = strdup(t_rg[0] ? t_rg : "us-east-1");
@@ -2079,7 +2079,7 @@ void *run_wal_flush(void *arg) {
                     {
                       char t_prefix[256] = {0};
                       json_str_field(cr.buf, "prefix", t_prefix, sizeof(t_prefix));
-                      db->s3_tenant_prefix = strdup(t_prefix[0] ? t_prefix : t_id);
+                      db->s3_prefix = strdup(t_prefix[0] ? t_prefix : t_id);
                     }
                     if (db->s3_endpoint && db->s3_bucket && db->s3_access_key && db->s3_secret_key && db->db_id) {
                       ARK_STORE(&db->s3_creds_loaded, 1);
@@ -2415,7 +2415,7 @@ int db_init(arkilian **db_ptr, const char *filename) {
   // backup eagerly with the configured key and starts both background
   // threads, so a control-plane outage at boot no longer permanently
   // disables backup for the process lifetime (the v1 failure mode that
-  // broke 5,000 tenants on deploy). The flush thread's first cycle calls
+  // broke 5,000 clients on deploy). The flush thread's first cycle calls
   // validate_api_key via run_wal_flush's async startup hook; a failed
   // async validation clears backup_enabled + alerts via the standard
   // monitoring path. See struct arkilian.startup_auth_state.
@@ -2800,7 +2800,7 @@ void db_close(arkilian *db) {
   if (db->s3_access_key) free(db->s3_access_key);
   if (db->s3_secret_key) free(db->s3_secret_key);
   if (db->db_id) free(db->db_id);
-  if (db->s3_tenant_prefix) free(db->s3_tenant_prefix);
+  if (db->s3_prefix) free(db->s3_prefix);
   if (db->db_log_url) free(db->db_log_url);
   if (db->chunk.buffer) free(db->chunk.buffer);
 
@@ -3991,7 +3991,7 @@ char *db_s3_presign_get(arkilian *db, const char *key, long expires_sec) {
 // hydrate plan knows about it. POST /v1/snapshot/register with the
 // sha256 and baseline_lsn=0; the server INSERTS into the snapshots table
 // and derives the S3 key from the authenticated db_id (never the client-
-// supplied s3_key — cross-tenant-IDOR prevention). Called ONLY after a
+// supplied s3_key — cross-client-IDOR prevention). Called ONLY after a
 // successful direct-S3 upload.
 static void register_snapshot_with_cp(arkilian *db, const char *sha256,
                                       volatile int *shutdown_flag) {
@@ -4090,7 +4090,7 @@ static int fetch_storage_credentials(arkilian *db) {
         if (db->s3_region) free(db->s3_region);
         if (db->s3_access_key) free(db->s3_access_key);
         if (db->s3_secret_key) free(db->s3_secret_key);
-        if (db->s3_tenant_prefix) free(db->s3_tenant_prefix);
+        if (db->s3_prefix) free(db->s3_prefix);
         if (db->db_id) free(db->db_id);
         db->s3_endpoint = strdup(t_ep);
         db->s3_bucket = strdup(t_bk);
@@ -4098,7 +4098,7 @@ static int fetch_storage_credentials(arkilian *db) {
         db->s3_access_key = strdup(t_ak);
         db->s3_secret_key = strdup(t_sk);
         db->db_id = strdup(t_id);
-        db->s3_tenant_prefix = strdup(t_pf[0] ? t_pf : t_id);
+        db->s3_prefix = strdup(t_pf[0] ? t_pf : t_id);
         ok = 0;
       }
     }
@@ -4114,8 +4114,8 @@ static int fetch_storage_credentials(arkilian *db) {
 static void manifest_write(arkilian *db, const char *snapshot_s3_key,
                             const char *snapshot_sha256, int64_t baseline_lsn) {
   if (!db || !snapshot_s3_key || !has_direct_s3(db)) return;
-  if (!db->s3_tenant_prefix || !db->s3_tenant_prefix[0]) return;
-  if (strstr(db->s3_tenant_prefix, "..") || db->s3_tenant_prefix[0] == '/')
+  if (!db->s3_prefix || !db->s3_prefix[0]) return;
+  if (strstr(db->s3_prefix, "..") || db->s3_prefix[0] == '/')
     return;
 
   char json_buf[4096];
@@ -4123,7 +4123,7 @@ static void manifest_write(arkilian *db, const char *snapshot_s3_key,
     "{\"version\":2,\"db_id\":\"%s\","
     "\"snapshot\":{\"s3_key\":\"%s\",\"sha256\":\"%s\",\"baseline_lsn\":%lld},"
     "\"chunks\":[]}",
-    db->s3_tenant_prefix, snapshot_s3_key,
+    db->s3_prefix, snapshot_s3_key,
     snapshot_sha256 ? snapshot_sha256 : "",
     (long long)baseline_lsn);
   if (n <= 0 || (size_t)n >= sizeof(json_buf)) return;
@@ -4137,7 +4137,7 @@ static void manifest_write(arkilian *db, const char *snapshot_s3_key,
 
   char manifest_key[512];
   snprintf(manifest_key, sizeof(manifest_key), "%s/manifest.json",
-           db->s3_tenant_prefix);
+           db->s3_prefix);
 
   char *put_url = s3_presign_put(db, manifest_key, 600L);
   if (!put_url) { unlink(tmp_path); return; }
@@ -4221,9 +4221,9 @@ void *run_hourly_backup(void *arg) {
 
       char s3_key[512];
       if (has_direct_s3(db)) {
-        // Tenant-scoped key: "db_<db_id>/backup.sqlite" — not a
+        // Client-scoped key: "db_<db_id>/backup.sqlite" — not a
         // filename-based key, not a double-bucket key. The db_id
-        // prefix isolates tenants in the shared bucket.
+        // prefix isolates clients in the shared bucket.
         const char *dbid = (db->db_id && db->db_id[0]) ? db->db_id : "db_unknown";
         snprintf(s3_key, sizeof(s3_key), "%s/backup.sqlite", dbid);
       } else {

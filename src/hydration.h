@@ -79,7 +79,7 @@ char   *json_array_get(const char *json, const char *key, int index);
 // Run the full two-phase hydration protocol.
 //   db_path      Local target database path (e.g. "mydb.db")
 //   server_url   Control Plane base URL (e.g. "https://api.arkilian.com")
-//   api_key      The tenant's API key — sent as "Authorization: Bearer
+//   api_key      The client's API key — sent as "Authorization: Bearer
 //                <api_key>" to the control plane. This is the ONLY
 //                credential; no S3 keys or JWT are used.
 //   progress     Optional progress callback (may be NULL)

@@ -693,7 +693,6 @@ static void test_hydrate_refuses_on_sha_mismatch(void) {
 // the source's data. This is the flagship-feature test — without it the
 // test suite gave false confidence that the restore path works end-to-end
 // when in fact the client never sent sha256 to the control plane and the
-// upload key was self-colliding across tenants.
 
 // Helper: create a source SQLite DB with known test data, compute sha256.
 // Caller removes the file when done.
