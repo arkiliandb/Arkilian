@@ -480,9 +480,24 @@ static void test_dead_letter_zombie_cleared(void) {
       "VALUES (42, 'REPLACE INTO \"t\" (\"id\", \"v\") VALUES (1, 1)', 10, "
       "'max attempts exceeded', 0)") == SQLITE_OK);
 
-  // Wake the flush thread and give it one pass (poll interval).
+  // Wake the flush thread and poll for the dead-letter (bounded): the
+  // cleanup runs on the async flush thread, which shares wake_cond with
+  // the snapshot thread — the single cond_signal from db_wal_flush may
+  // wake the wrong waiter, delaying the drain by up to the 2s poll
+  // interval. A fixed sleep is therefore racy across codegen/timing;
+  // poll instead and fail loudly if the zombie is never cleaned.
   db_wal_flush(db);
-  sleep(3);
+  int zombie_cleared = 0;
+  for (int wait_i = 0; wait_i < 50; wait_i++) {
+    db_prepare(db, "SELECT COUNT(*) FROM _pending_backup WHERE id = 42");
+    if (db_step(db) == SQLITE_ROW && db_column_int(db, 0) == 0) {
+      zombie_cleared = 1;
+    }
+    db_finalize(db);
+    if (zombie_cleared) break;
+    usleep(200000); // 200ms
+  }
+  assert(zombie_cleared && "zombie row 42 never dead-lettered");
 
   // The zombie must be GONE from _pending_backup (moved to dead once),
   // and _dead_backup holds exactly one copy.
