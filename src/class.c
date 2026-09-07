@@ -96,15 +96,19 @@
 // No endpoint defaults to a vendor URL — nothing phones home unless
 // explicitly configured:
 //
-//   ARKILIAN_CONTROL_URL   Base URL of the Arkilian control plane
-//                          (e.g. https://api.arkilian.com). The client
-//                          derives /v1/wal/push, /v1/upload/request,
-//                          and /v1/auth/validate from this base.
-//   ARKILIAN_API_KEY       The client's API key — the ONLY credential
-//                          the client holds. Sent as
-//                          "Authorization: Bearer <api_key>" to every
-//                          control-plane endpoint. No S3 credentials,
-//                          JWT, or separate bearer token are used.
+//   ARKILIAN_S3_ENDPOINT    Base URL of any S3-compatible endpoint
+//                           (path-style addressing, e.g. a MinIO/R2/
+//                           self-hosted server). No endpoint defaults to
+//                           a vendor URL — nothing ships anywhere unless
+//                           explicitly configured.
+//   ARKILIAN_S3_BUCKET      Destination bucket
+//   ARKILIAN_S3_REGION      Signature region (default us-east-1)
+//   ARKILIAN_S3_ACCESS_KEY / ARKILIAN_S3_SECRET_KEY
+//                           Per-database SigV4 credentials. The ONLY
+//                           credential the client holds; requests are
+//                           signed locally and no bearer token exists.
+//   ARKILIAN_S3_PREFIX      Key prefix for this database's snapshot,
+//                           chunks, and manifest (e.g. "user-42-appdb").
 
 #define DEFAULT_DB_PATH "app.sqlite"
 #define DEFAULT_BACKUP_PATH "backup.sqlite"
@@ -137,6 +141,16 @@
 // ── Struct Definitions ──────────────────────────────────────────────
 
 // WAL chunk accumulator.
+// One uploaded WAL chunk, as recorded in {prefix}/manifest.json.
+// The manifest is the client's only registry of shipped chunks — with no
+// control plane, it is what makes incremental hydration possible.
+typedef struct {
+  char     *s3_key;    // object key relative to the bucket (malloc'd)
+  char     *sha256;    // lowercase hex digest of the object body (malloc'd)
+  uint64_t  lsn_start; // first outbox row id in the chunk
+  uint64_t  lsn_end;   // last outbox row id in the chunk
+} ark_manifest_chunk;
+
 // One chunk per flush thread; reset after each successful S3 PUT.
 // Bounded by time (CHUNK_FLUSH_INTERVAL_SEC) and size (CHUNK_MAX_SIZE_BYTES).
 typedef struct {
@@ -149,7 +163,6 @@ typedef struct {
   uint64_t  byte_count;     // uncompressed bytes in this chunk
   time_t    opened_at;      // when the chunk started accumulating
   time_t    last_s3_flush;  // last successful S3 PUT (0 = never)
-  time_t    last_cp_echo;   // last successful CP log POST (0 = never)
 } wal_chunk;
 
 struct arkilian {
@@ -169,28 +182,29 @@ struct arkilian {
   int stmt_capacity;
   int stmt_current;
 
-  // Configuration
+  // Configuration — the ONLY destination is S3-compatible object storage.
+  // SigV4 requests are signed locally; no other credential exists.
   char *backup_path;
-  char *control_url;           // Base URL of the control plane (e.g. https://api.arkilian.com)
-  char *push_url;              // Derived: <control_url>/v1/wal/push
-  char *signed_url_endpoint;   // Derived: <control_url>/v1/upload/request
-  char *api_key;               // The ONLY credential — sent as Bearer to all control-plane endpoints
   char *s3_endpoint;
   char *s3_bucket;
   char *s3_region;
   char *s3_access_key;
   char *s3_secret_key;
-  char *db_id;
-  char *s3_prefix;        // S3 key prefix
-  volatile int s3_creds_loaded; // 1 when credentials are cached and ready
+  char *s3_prefix;              // S3 key prefix (ARKILIAN_S3_PREFIX)
+  volatile int s3_creds_loaded; // 1 when the S3 destination is fully configured
   int backup_interval;
   volatile int backup_enabled; // runtime kill-switch (written under wake_mutex)
 
   wal_chunk chunk;               // current chunk accumulator
   int chunk_interval;
-  int chunk_enabled;
-  time_t credential_expires_at;
-  char *db_log_url;
+
+  // Manifest registry: the client-side record of every uploaded WAL chunk,
+  // mirrored to {prefix}/manifest.json. Guarded by manifest_mutex; the
+  // flush thread appends, the snapshot thread prunes, and db_init seeds
+  // it from the last known manifest (restart safety).
+  ark_manifest_chunk *manifest_chunks;
+  int manifest_chunk_count;
+  int manifest_chunk_cap;
 
   // Background thread tracking & synchronization
   volatile int shutdown_requested;
@@ -213,11 +227,11 @@ struct arkilian {
   char wal_last_buf[1024];
 #ifdef _WIN32
   CRITICAL_SECTION payload_mutex;
-  CRITICAL_SECTION api_key_mutex;
+  CRITICAL_SECTION manifest_mutex;
   CRITICAL_SECTION log_mutex;
 #else
   pthread_mutex_t payload_mutex;
-  pthread_mutex_t api_key_mutex; // guards api_key (read/write)
+  pthread_mutex_t manifest_mutex; // guards the manifest chunk registry
   pthread_mutex_t log_mutex;     // guards log_fn/log_ctx pair
 #endif
 
@@ -250,29 +264,6 @@ struct arkilian {
 volatile int capture_paused;         // sticky: set when outbox hits cap (CDC rows
                                         // are being dropped); cleared on successful
                                         // snapshot upload (the gap is recovered)
-  // Async startup API-key validation (control-plane SPOF mitigation): the
-  // v1 design validated the API key synchronously on the caller's main
-  // thread inside db_init; if the control plane was unreachable at boot
-  // the backup subsystem was disabled for the ENTIRE process lifetime
-  // (and the flush/snapshot threads were never spawned) — at 5,000 clients
-  // a brief control-plane outage at deploy time meant 5,000 permanently
-  // unbacked-up databases needing per-client operator intervention.
-  //
-  // v2 (this field): db_init enables backup aggressively with the
-  // configured key and starts both background threads. The flush thread,
-  // on its own (asynchronous, non-blocking) startup, runs the validation
-  // once against the control plane before its first drain cycle. States:
-  //   0 = PENDING   (validation not yet attempted from the flush thread)
-  //   1 = VALIDATED (control plane confirmed the key; shipping proceeds)
-  //   2 = DEGRADED  (validation failed: bad key OR control plane down).
-  //                   Backup stays enabled — capture keeps queuing locally
-  //                   and shipping resumes automatically the moment the
-  //                   control plane is reachable again. No operator
-  //                   intervention needed. db_backup_is_healthy() +
-  //                   queue-depth monitoring surface the degraded state.
-  // Cross-thread accesses go through ARK_LOAD/ARK_STORE. Set to 0 by
-  // db_init (the default); set to 1 or 2 by run_wal_flush's first cycle.
-  volatile int startup_auth_state;
 };
 
 // ── Helper Prototypes ───────────────────────────────────────────────
@@ -281,7 +272,6 @@ static void load_env(void);
 static const char *get_env_default(const char *env_var, const char *default_val);
 static int get_env_int_default(const char *env_var, int default_val);
 static long outbox_cap(void);
-static char *api_key_snapshot(arkilian *db);
 #ifdef _WIN32
 DWORD WINAPI run_hourly_backup(LPVOID arg);
 DWORD WINAPI run_wal_flush(LPVOID arg);
@@ -289,43 +279,23 @@ DWORD WINAPI run_wal_flush(LPVOID arg);
 void *run_hourly_backup(void *arg);
 void *run_wal_flush(void *arg);
 #endif
-static size_t curl_discard_cb(void *data, size_t sz, size_t nmemb, void *userp);
 
 // v2 forward declarations (used before definition)
 static char *s3_presign_put(arkilian *db, const char *key, long expires_sec);
 static int upload_to_s3(arkilian *db, const char *signed_url,
-                          const char *file_path, const char *token);
-static int fetch_storage_credentials(arkilian *db);
+                          const char *file_path);
 static void manifest_write(arkilian *db, const char *snapshot_s3_key,
                             const char *snapshot_sha256, int64_t baseline_lsn);
+static void manifest_registry_lock(arkilian *db);
+static void manifest_registry_unlock(arkilian *db);
+static int manifest_registry_append(arkilian *db, char *s3_key, char *sha256,
+                                    uint64_t lsn_start, uint64_t lsn_end);
+static void manifest_registry_prune_upto(arkilian *db, uint64_t baseline_lsn);
+static int manifest_registry_upload(arkilian *db, const char *snapshot_key,
+                                    const char *snapshot_sha,
+                                    uint64_t baseline_lsn);
+static void manifest_registry_seed(arkilian *db);
 char *db_s3_presign_get(arkilian *db, const char *key, long expires_sec);
-
-// Tiny body-capturing curl writer for the one-shot /v1/storage/credentials
-// fetch. Response is < 1 KiB; fixed 4 KiB buffer avoids heap allocation.
-struct creds_resp { char buf[4096]; size_t len; volatile int *shutdown_flag; };
-static size_t creds_write_cb(void *data, size_t sz, size_t nmemb, void *userp) {
-  struct creds_resp *r = (struct creds_resp *)userp;
-  if (r->shutdown_flag && ARK_LOAD(r->shutdown_flag)) return 0;
-  size_t n = sz * nmemb;
-  if (r->len + n >= sizeof(r->buf)) n = sizeof(r->buf) - 1 - r->len;
-  if (n == 0) return sz * nmemb;
-  memcpy(r->buf + r->len, data, n);
-  r->len += n; r->buf[r->len] = 0;
-  return sz * nmemb;
-}
-
-// Minimal JSON string-field extractor: finds "key":"value" and copies the
-// value into dst. Handles simple S3-credentials-response JSON (no escapes).
-static void json_str_field(const char *json, const char *key, char *dst, size_t dst_cap) {
-  if (!json || !key || !dst || dst_cap == 0) { if (dst) dst[0] = 0; return; }
-  char needle[64]; snprintf(needle, sizeof(needle), "\"%s\":\"", key);
-  const char *p = strstr(json, needle);
-  if (!p) { dst[0] = 0; return; }
-  p += strlen(needle);
-  size_t i = 0;
-  while (*p && *p != '"' && i + 1 < dst_cap) dst[i++] = *p++;
-  dst[i] = 0;
-}
 
 // ── Environment Loader ──────────────────────────────────────────────
 
@@ -1302,10 +1272,6 @@ static int on_schema_authorizer(void *user_data, int action,
 
 // ── Backup Shipping & Delivery Thread ───────────────────────────────
 
-static size_t curl_discard_cb(void *data, size_t sz, size_t nmemb, void *userp) {
-  (void)data; (void)userp;
-  return sz * nmemb;
-}
 
 // Abort callback for in-flight transfers: returns non-zero when shutdown
 // is requested so db_close() never waits out a full curl timeout (10s /
@@ -1330,77 +1296,7 @@ static long backoff_seconds(int attempts) {
   return b;
 }
 
-// Join a control-plane base URL with a path suffix. Handles the case
-// where the base URL has a trailing slash. Caller frees the result.
-static char *join_url(const char *base, const char *suffix) {
-  if (!base || !suffix) return NULL;
-  size_t blen = strlen(base);
-  int need_strip = (blen > 0 && base[blen - 1] == '/');
-  size_t len = blen - (need_strip ? 1 : 0) + strlen(suffix) + 1;
-  char *out = malloc(len);
-  if (!out) return NULL;
-  if (need_strip) snprintf(out, len, "%.*s%s", (int)(blen - 1), base, suffix);
-  else snprintf(out, len, "%s%s", base, suffix);
-  return out;
-}
 
-// At startup, validate the API key against the control plane by POSTing
-// to <control_url>/v1/auth/validate. Returns 1 on success (200), 0 on
-// failure (401, network error, etc.). This is best-effort per spec §0:
-// a failure disables backup (the app keeps running) and surfaces via
-// db_backup_is_healthy(). The API key is the only credential sent.
-static int validate_api_key(arkilian *db, const char *control_url,
-                            const char *api_key) {
-  if (!control_url || strlen(control_url) == 0 || !api_key || strlen(api_key) == 0)
-    return 0;
-
-  char *validate_url = join_url(control_url, "/v1/auth/validate");
-  if (!validate_url) return 0;
-
-  CURL *curl = curl_easy_init();
-  int ok = 0;
-  if (curl) {
-    CURLcode rc = CURLE_OK;
-    rc = curl_easy_setopt(curl, CURLOPT_URL, validate_url);
-    if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_POSTFIELDS, "");
-    if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_discard_cb);
-    if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_MAXFILESIZE_LARGE, (curl_off_t)1048576);
-    if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
-    if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5L);
-    if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
-    if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
-
-    struct curl_slist *headers = NULL;
-    if (rc == CURLE_OK) {
-      headers = curl_slist_append(headers, "Content-Type: application/json");
-      if (!headers) rc = CURLE_OUT_OF_MEMORY;
-    }
-    if (rc == CURLE_OK && strlen(api_key) > 0) {
-      char auth[512];
-      snprintf(auth, sizeof(auth), "Authorization: Bearer %s", api_key);
-      headers = curl_slist_append(headers, auth);
-      if (!headers) rc = CURLE_OUT_OF_MEMORY;
-    }
-    if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-
-    if (rc == CURLE_OK) {
-      CURLcode res = curl_easy_perform(curl);
-      long http_code = 0;
-      if (res == CURLE_OK) curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
-      ok = (res == CURLE_OK && http_code >= 200 && http_code < 300) ? 1 : 0;
-      if (!ok) {
-        ark_log(db, ARK_LOG_ERROR,
-                "API key validation failed (http_code=%ld curl_rc=%d) — "
-                "backup will be disabled; check ARKILIAN_API_KEY and "
-                "ARKILIAN_CONTROL_URL", http_code, (int)res);
-      }
-    }
-    if (headers) curl_slist_free_all(headers);
-    curl_easy_cleanup(curl);
-  }
-  free(validate_url);
-  return ok;
-}
 
 // Adaptive request timeout: base seconds plus ~10s per MB of payload, so
 // large rows/snapshots aren't dead-lettered by a fixed short window.
@@ -1409,109 +1305,6 @@ static long curl_timeout_sec(size_t bytes, long base) {
   long t = base + extra;
   if (t > 600) t = 600; // hard cap: 10 minutes
   return t;
-}
-
-static ship_result_t ship_to_backup(arkilian *db, CURL *curl,
-                                    sqlite3_int64 id, const char *payload) {
-  if (!payload || strlen(payload) == 0) return SHIP_OK;
-
-#ifndef _WIN32
-  pthread_mutex_lock(&db->payload_mutex);
-#else
-  EnterCriticalSection(&db->payload_mutex);
-#endif
-  strncpy(db->last_shipped_payload, payload, sizeof(db->last_shipped_payload) - 1);
-  db->last_shipped_payload[sizeof(db->last_shipped_payload) - 1] = '\0';
-#ifndef _WIN32
-  pthread_mutex_unlock(&db->payload_mutex);
-#else
-  LeaveCriticalSection(&db->payload_mutex);
-#endif
-
-  // No push destination configured → nothing to ship. This is the
-  // realtime WAL endpoint (ARKILIAN_WAL_PUSH_URL), independent of the
-  // signed-URL endpoint used by the hourly snapshot thread.
-  // No push destination configured → nothing can be shipped. This MUST
-  // NOT report success: drain_batch deletes rows reported as shipped, so
-  // SHIP_OK here would quietly destroy captured data (spec §1). The
-  // flush loop additionally skips draining entirely when no URL is set,
-  // so rows accumulate with attempts=0 until a destination is configured.
-  const char *push_url = db->push_url;
-  if (!push_url || strlen(push_url) == 0) {
-    return SHIP_RETRY;
-  }
-
-  // The flush thread owns one CURL handle for ALL ships: curl_easy_reset
-  // between requests keeps the connection pool (TCP + TLS) alive, so a
-  // 100k-row backlog is 100k requests over one connection instead of
-  // 100k TCP+TLS handshakes. A fresh curl_easy_init per row caps
-  // real-world WAN throughput at a few rows/sec.
-  if (!curl) return SHIP_RETRY;
-  curl_easy_reset(curl);
-
-  // Every curl_easy_setopt / curl_slist_append return code is checked: a
-  // misconfigured transfer must never be shipped silently — report and
-  // retry it like any other failure.
-  ship_result_t result = SHIP_RETRY;
-  CURLcode rc = CURLE_OK;
-
-  rc = curl_easy_setopt(curl, CURLOPT_URL, push_url);
-  if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_POSTFIELDS, payload);
-  if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_TIMEOUT, curl_timeout_sec(strlen(payload), 10));
-  if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5L);
-  // The destination's control-plane response body is small and discarded;
-  // cap it so a compromised endpoint cannot stream-gigabytes OOM this
-  // process. payload sizes are bounded by row size; responses are bounded
-  // by the cap.
-  if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_MAXFILESIZE_LARGE, (curl_off_t)16777216);
-  if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
-  if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
-  if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_discard_cb);
-  if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
-  if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, curl_abort_cb);
-  if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_XFERINFODATA, (void *)&db->shutdown_requested);
-
-  struct curl_slist *headers = NULL;
-  if (rc == CURLE_OK) {
-    headers = curl_slist_append(headers, "Content-Type: application/sql");
-    if (!headers) rc = CURLE_OUT_OF_MEMORY;
-  }
-  // Idempotency key lets the receiver deduplicate retries of the same row.
-  char id_header[64];
-  snprintf(id_header, sizeof(id_header), "X-Arkilian-Payload-Id: %lld", (long long)id);
-  if (rc == CURLE_OK) {
-    headers = curl_slist_append(headers, id_header);
-    if (!headers) rc = CURLE_OUT_OF_MEMORY;
-  }
-  // Never attach our API key to a pre-signed storage URL — the
-  // signature IS the credential, and the key would leak to the host.
-  char *tok = api_key_snapshot(db);
-  if (rc == CURLE_OK && tok && !url_is_presigned(push_url)) {
-    char auth[512];
-    snprintf(auth, sizeof(auth), "Authorization: Bearer %s", tok);
-    headers = curl_slist_append(headers, auth);
-    if (!headers) rc = CURLE_OUT_OF_MEMORY;
-  }
-  free(tok);
-  if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-
-  if (rc != CURLE_OK) {
-    ark_log(db, ARK_LOG_ERROR,
-             "ship_to_backup: request setup failed: %s", curl_easy_strerror(rc));
-  } else {
-    CURLcode res = curl_easy_perform(curl);
-    long http_code = 0;
-    if (res == CURLE_OK) {
-      curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
-    }
-    // Any 2xx is a successful accept — a 202-Async destination must not
-    // be retried forever (same policy as upload_to_s3).
-    result = (res == CURLE_OK && http_code >= 200 && http_code < 300) ? SHIP_OK : SHIP_RETRY;
-  }
-
-  curl_slist_free_all(headers);
-
-  return result;
 }
 
 static void wal_chunk_reset(wal_chunk *c) {
@@ -1670,156 +1463,6 @@ typedef struct {
   sqlite3_int64 last_attempt_at; // unix seconds, 0 = never attempted
 } outbox_row;
 
-static int drain_batch(arkilian *db, CURL *ship_curl, sqlite3_stmt *select_stmt,
-                        sqlite3_stmt *delete_stmt, sqlite3_stmt *update_attempts_stmt,
-                        sqlite3_stmt *dead_letter_stmt) {
-  if (!db || !db->backup_db) return 0;
-
-  // Pass 1: read the batch into heap memory.
-  outbox_row rows[BATCH_SIZE];
-  int nrows = 0;
-
-  sqlite3_reset(select_stmt);
-  sqlite3_clear_bindings(select_stmt);
-  sqlite3_bind_int(select_stmt, 1, BATCH_SIZE);
-
-  for (;;) {
-    int rc = sqlite3_step(select_stmt);
-    if (rc == SQLITE_DONE) break;
-    if (rc != SQLITE_ROW) {
-      ark_log(db, ARK_LOG_ERROR, "select from _pending_backup failed: %s",
-               sqlite3_errmsg(db->backup_db));
-      break;
-    }
-    if (nrows >= BATCH_SIZE) break; // defensive; LIMIT already bounds it
-    const unsigned char *payload = sqlite3_column_text(select_stmt, 1);
-    if (!payload) continue;
-    char *copy = strdup((const char *)payload);
-    if (!copy) {
-      ark_log(db, ARK_LOG_ERROR, "OOM copying payload id=%lld",
-              (long long)sqlite3_column_int64(select_stmt, 0));
-      break;
-    }
-    rows[nrows].id = sqlite3_column_int64(select_stmt, 0);
-    rows[nrows].attempts = sqlite3_column_int(select_stmt, 2);
-    rows[nrows].last_attempt_at = sqlite3_column_int64(select_stmt, 3);
-    rows[nrows].payload = copy;
-    nrows++;
-  }
-
-  // End the SELECT's read transaction before any write statement runs.
-  sqlite3_reset(select_stmt);
-
-  // Pass 2: ship + write, one row at a time. Ordering is preserved:
-  // rows are handled strictly in id order and a retryable failure stops
-  // the pass so the first unshipped row is retried next time.
-  int processed_any = 0;
-  for (int i = 0; i < nrows; i++) {
-    sqlite3_int64 id = rows[i].id;
-    const char *payload = rows[i].payload;
-
-    // Exponential backoff: if this row recently failed, wait before
-    // retrying. Rows are ordered by id (oldest first); the oldest row
-    // has the most attempts, so if IT isn't ready, the younger rows
-    // behind it aren't either. Stop the pass and let the loop sleep.
-    if (rows[i].last_attempt_at > 0) {
-      long long now = (long long)time(NULL);
-      long long ready_at = (long long)rows[i].last_attempt_at +
-                           backoff_seconds(rows[i].attempts);
-      if (now < ready_at) {
-        processed_any = 0;
-        break;
-      }
-    }
-
-    ship_result_t result = ship_to_backup(db, ship_curl, id, payload);
-
-    if (result == SHIP_OK) {
-      sqlite3_reset(delete_stmt);
-      sqlite3_clear_bindings(delete_stmt);
-      sqlite3_bind_int64(delete_stmt, 1, id);
-      int del_rc = sqlite3_step(delete_stmt);
-      if (del_rc != SQLITE_DONE) {
-        // The row shipped but the delete failed — it will ship again next
-        // pass. Safe: delivery is at-least-once, destination must dedupe.
-        ark_log(db, ARK_LOG_ERROR,
-                 "delete after ship failed id=%lld rc=%d ext=%d: %s",
-                 (long long)id, del_rc, sqlite3_extended_errcode(db->backup_db),
-                 sqlite3_errmsg(db->backup_db));
-        break;
-      }
-      processed_any = 1;
-      continue;
-    }
-
-    int new_attempts = rows[i].attempts + 1;
-    if (new_attempts >= max_attempts()) {
-      // PII hygiene: the raw payload IS the row data (REPLACE INTO users
-      // VALUES (1, 'alice@example.com', ...)) — logging it dumps customer
-      // PII into stderr / the operator's log sink. We log the dead-letter
-      // with the payload id and reason only; the operator inspects the
-      // _dead_backup table (or the DLQ tool) with their own access controls.
-      ark_log(db, ARK_LOG_ERROR,
-              "payload id=%lld dead-lettered after %d attempts "
-              "(moved to _dead_backup; inspect via tools/arkilian-dlq)",
-              (long long)id, new_attempts);
-      sqlite3_reset(dead_letter_stmt);
-      sqlite3_clear_bindings(dead_letter_stmt);
-      sqlite3_bind_int(dead_letter_stmt, 1, new_attempts);
-      sqlite3_bind_text(dead_letter_stmt, 2, "max attempts exceeded", -1, SQLITE_STATIC);
-      sqlite3_bind_int64(dead_letter_stmt, 3, id);
-      // INSERT OR IGNORE: if a previous pass already dead-lettered this
-      // id but failed to delete the pending copy (SQLITE_BUSY), the
-      // insert would hit a PK conflict. That conflict previously left a
-      // permanent zombie row AND — because the failure path reported
-      // "work drained" — the flush loop never slept, hot-spinning on the
-      // conflict forever. OR IGNORE makes a repeat dead-letter a no-op.
-      int dl_rc = sqlite3_step(dead_letter_stmt);
-      if (dl_rc != SQLITE_DONE) {
-        // A real (non-conflict) error: leave the row pending and back
-        // off — do not spin.
-        ark_log(db, ARK_LOG_ERROR, "dead-letter insert failed id=%lld: %s",
-                (long long)id, sqlite3_errmsg(db->backup_db));
-        processed_any = 0;
-        break;
-      }
-      // The row is in _dead_backup (inserted now, or already there from
-      // a partial earlier pass). The _pending_backup copy is redundant —
-      // remove it unconditionally so no zombie row can ever loop.
-      sqlite3_reset(delete_stmt);
-      sqlite3_clear_bindings(delete_stmt);
-      sqlite3_bind_int64(delete_stmt, 1, id);
-      if (sqlite3_step(delete_stmt) != SQLITE_DONE) {
-        ark_log(db, ARK_LOG_ERROR, "delete after dead-letter failed id=%lld: %s",
-                (long long)id, sqlite3_errmsg(db->backup_db));
-        // Row stays pending this pass; the next pass dead-letters it
-        // again (OR IGNORE no-op) and retries the delete. Reporting "no
-        // work drained" makes the loop sleep instead of spinning.
-        processed_any = 0;
-        break;
-      }
-      processed_any = 1;
-      continue;
-    } else {
-      sqlite3_reset(update_attempts_stmt);
-      sqlite3_clear_bindings(update_attempts_stmt);
-      sqlite3_bind_int(update_attempts_stmt, 1, new_attempts);
-      sqlite3_bind_int64(update_attempts_stmt, 2, id);
-      if (sqlite3_step(update_attempts_stmt) != SQLITE_DONE) {
-        ark_log(db, ARK_LOG_ERROR, "update attempts failed id=%lld: %s",
-                 (long long)id, sqlite3_errmsg(db->backup_db));
-      }
-      // Back off: report "no work drained" so the flush loop waits one
-      // poll interval before retrying instead of hot-spinning on a
-      // failing endpoint and burning through MAX_ATTEMPTS instantly.
-      processed_any = 0;
-      break;
-    }
-  }
-
-  for (int i = 0; i < nrows; i++) free(rows[i].payload);
-  return processed_any;
-}
 
 // Reads rows from
 // _pending_backup and appends them to the current WAL chunk.
@@ -3129,49 +2772,6 @@ sqlite3_int64 db_last_insert_rowid(arkilian *db) {
   return (db && db->handle) ? sqlite3_last_insert_rowid(db->handle) : 0;
 }
 
-// Snapshot the current API key under the mutex; the caller frees the copy
-// once its curl setup is done. Readers must NEVER touch db->api_key
-// directly — db_set_api_key can swap/free it from the game thread while a
-// backup thread is mid-request (use-after-free).
-static char *api_key_snapshot(arkilian *db) {
-  if (!db) return NULL;
-  char *copy = NULL;
-#ifndef _WIN32
-  pthread_mutex_lock(&db->api_key_mutex);
-#else
-  EnterCriticalSection(&db->api_key_mutex);
-#endif
-  if (db->api_key && strlen(db->api_key) > 0) {
-    copy = strdup(db->api_key);
-  }
-#ifndef _WIN32
-  pthread_mutex_unlock(&db->api_key_mutex);
-#else
-  LeaveCriticalSection(&db->api_key_mutex);
-#endif
-  return copy;
-}
-
-int db_set_api_key(arkilian *db, const char *api_key) {
-  if (!db || !api_key) return 1;
-  char *replacement = malloc(strlen(api_key) + 1);
-  if (!replacement) return 1;
-  strcpy(replacement, api_key);
-#ifndef _WIN32
-  pthread_mutex_lock(&db->api_key_mutex);
-#else
-  EnterCriticalSection(&db->api_key_mutex);
-#endif
-  if (db->api_key) free(db->api_key);
-  db->api_key = replacement;
-#ifndef _WIN32
-  pthread_mutex_unlock(&db->api_key_mutex);
-#else
-  LeaveCriticalSection(&db->api_key_mutex);
-#endif
-  return 0;
-}
-
 // ── Transaction Control ─────────────────────────────────────────────
 
 int db_begin(arkilian *db) {
@@ -3582,118 +3182,6 @@ static size_t write_cb(void *data, size_t size, size_t nmemb, void *userp) {
   return realsize;
 }
 
-static char *get_signed_url(arkilian *db, const char *api_endpoint,
-                            const char *token, volatile int *shutdown_flag,
-                            const char *sha256) {
-  CURL *curl = curl_easy_init();
-  struct Memory chunk;
-  chunk.response = malloc(1);
-  chunk.size = 0;
-  chunk.shutdown_flag = shutdown_flag;
-  if (!chunk.response) return NULL;
-
-  // Build the POST body: {"sha256":"..."} when a digest is available,
-  // "" (empty) for legacy snapshot-branch compat.
-  char body[128];
-  if (sha256 && sha256[0]) snprintf(body, sizeof(body), "{\"sha256\":\"%s\"}", sha256);
-  else body[0] = 0;
-
-  char *result = NULL;
-  if (curl) {
-    CURLcode rc = CURLE_OK;
-    rc = curl_easy_setopt(curl, CURLOPT_URL, api_endpoint);
-    if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body);
-    if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_cb);
-    if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)&chunk);
-    // Cap the response: a signed-URL plan is a few hundred bytes. A
-    // misbehaving/compromised control plane streaming gigabytes would
-    // otherwise OOM this process before the JSON is ever parsed.
-    if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_MAXFILESIZE_LARGE, (curl_off_t)1048576);
-    if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
-    if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5L);
-    // Fail loudly on a TLS verification problem rather than silently
-    // degrading to an unauthenticated/insecure connection.
-    if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
-    if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
-    if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
-    if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, curl_abort_cb);
-    if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_XFERINFODATA, (void *)shutdown_flag);
-
-    struct curl_slist *headers = NULL;
-    if (rc == CURLE_OK && token && strlen(token) > 0) {
-      char auth_header[512];
-      snprintf(auth_header, sizeof(auth_header), "Authorization: Bearer %s", token);
-      headers = curl_slist_append(headers, auth_header);
-      if (!headers) rc = CURLE_OUT_OF_MEMORY;
-    }
-    if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-
-    if (rc != CURLE_OK) {
-      ark_log(db, ARK_LOG_ERROR, "get_signed_url: request setup failed: %s",
-               curl_easy_strerror(rc));
-    } else {
-      CURLcode res = curl_easy_perform(curl);
-      long http_code = 0;
-      if (res == CURLE_OK) curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
-
-      // Only a 200 response is a valid answer — an error body must never
-      // be mistaken for an upload URL.
-      if (res == CURLE_OK && http_code == 200 && chunk.response) {
-        char *url_key = strstr(chunk.response, "\"upload_url\":\"");
-        if (url_key) {
-          url_key += strlen("\"upload_url\":\"");
-          char *end_quote = strchr(url_key, '"');
-          if (end_quote) {
-            size_t url_len = (size_t)(end_quote - url_key);
-            char *cand = malloc(url_len + 1);
-            if (cand) {
-              memcpy(cand, url_key, url_len);
-              cand[url_len] = '\0';
-              // SSRF guard: a compromised/buggy control plane can return an
-              // upload_url pointing at cloud metadata (169.254.169.254) or
-              // an internal service; uploading the full DB there is a
-              // customer-data exfiltration. Refuse any host that is not a
-              // known storage provider, a local address, or in the
-              // operator's ARKILIAN_STORAGE_HOSTS allowlist.
-              if (!url_is_allowed_storage(cand)) {
-                ark_log(db, ARK_LOG_ERROR,
-                        "control plane returned upload_url host that is not an "
-                        "allowed storage destination (SSRF refused): %.200s — "
-                        "add it to ARKILIAN_STORAGE_HOSTS if legitimate", cand);
-                free(cand);
-                cand = NULL;
-              } else {
-                result = cand;
-              }
-            }
-          }
-          free(chunk.response);
-          chunk.response = NULL;
-        } else {
-          // Fallback: some control planes return the URL as a plain-text body.
-          if (strncmp(chunk.response, "http://", 7) == 0 ||
-              strncmp(chunk.response, "https://", 8) == 0) {
-            if (url_is_allowed_storage(chunk.response)) {
-              result = chunk.response;
-              chunk.response = NULL;
-            } else {
-              ark_log(db, ARK_LOG_ERROR,
-                      "control plane returned plain-text upload_url that is not "
-                      "an allowed storage destination (SSRF refused): %.200s",
-                      chunk.response);
-            }
-          }
-        }
-      }
-    }
-    if (headers) curl_slist_free_all(headers);
-    curl_easy_cleanup(curl);
-  }
-  free(chunk.response);
-  return result;
-}
-
-static int upload_to_s3(arkilian *db, const char *signed_url,
                        const char *file_path, const char *token) {
   // Defense-in-depth SSRF guard: even if get_signed_url's check regressed,
   // never upload the database to a host that is not an allowed storage
@@ -4015,130 +3503,6 @@ char *db_s3_presign_get(arkilian *db, const char *key, long expires_sec) {
     cred_enc, amz_date, expires_sec, sig_enc);
 
   return url;
-}
-
-// Register a direct-uploaded snapshot with the control plane so the
-// hydrate plan knows about it. POST /v1/snapshot/register with the
-// sha256 and baseline_lsn=0; the server INSERTS into the snapshots table
-// and derives the S3 key from the authenticated db_id (never the client-
-// supplied s3_key — cross-client-IDOR prevention). Called ONLY after a
-// successful direct-S3 upload.
-static void register_snapshot_with_cp(arkilian *db, const char *sha256,
-                                      volatile int *shutdown_flag) {
-  if (!db || !db->control_url || !sha256 || !sha256[0]) return;
-  char *url = join_url(db->control_url, "/v1/snapshot/register");
-  if (!url) return;
-  char *tok = api_key_snapshot(db);
-  if (!tok || strlen(tok) == 0) { free(tok); free(url); return; }
-
-  CURL *curl = curl_easy_init();
-  if (curl) {
-    char body[256];
-    snprintf(body, sizeof(body), "{\"baseline_lsn\":0,\"sha256\":\"%s\"}", sha256);
-    CURLcode rc = curl_easy_setopt(curl, CURLOPT_URL, url);
-    if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body);
-    if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_discard_cb);
-    if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
-    if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5L);
-    if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
-    if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
-    if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
-    if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, curl_abort_cb);
-    if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_XFERINFODATA, (void *)shutdown_flag);
-
-    struct curl_slist *headers = NULL;
-    if (rc == CURLE_OK) {
-      headers = curl_slist_append(headers, "Content-Type: application/json");
-      if (!headers) rc = CURLE_OUT_OF_MEMORY;
-    }
-    if (rc == CURLE_OK && tok) {
-      char auth[512]; snprintf(auth, sizeof(auth), "Authorization: Bearer %s", tok);
-      headers = curl_slist_append(headers, auth);
-      if (!headers) rc = CURLE_OUT_OF_MEMORY;
-    }
-    if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-
-    if (rc == CURLE_OK) {
-      CURLcode res = curl_easy_perform(curl);
-      long http_code = 0;
-      if (res == CURLE_OK) curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
-      if (res != CURLE_OK || http_code < 200 || http_code >= 300)
-        ark_log(db, ARK_LOG_ERROR,
-                "snapshot register with control plane failed (http=%ld curl=%d) — "
-                "hydrate plan may not include this snapshot until the next "
-                "successful upload", http_code, (int)res);
-    }
-    if (headers) curl_slist_free_all(headers);
-    curl_easy_cleanup(curl);
-  }
-  free(tok);
-  free(url);
-}
-
-static int fetch_storage_credentials(arkilian *db) {
-  if (!db->control_url || !db->control_url[0]) return -1;
-  char *ck = api_key_snapshot(db);
-  if (!ck || !ck[0]) { free(ck); return -1; }
-  char *cu = join_url(db->control_url, "/v1/storage/credentials");
-  if (!cu) { free(ck); return -1; }
-
-  CURL *fc = curl_easy_init();
-  if (!fc) { free(ck); free(cu); return -1; }
-
-  struct { char buf[4096]; size_t len; volatile int *sf; } cr = {{0},0,&db->shutdown_requested};
-  CURLcode rc = curl_easy_setopt(fc, CURLOPT_URL, cu);
-  if (rc == CURLE_OK) rc = curl_easy_setopt(fc, CURLOPT_HTTPGET, 1L);
-  if (rc == CURLE_OK) rc = curl_easy_setopt(fc, CURLOPT_WRITEFUNCTION, creds_write_cb);
-  if (rc == CURLE_OK) rc = curl_easy_setopt(fc, CURLOPT_WRITEDATA, &cr);
-  if (rc == CURLE_OK) rc = curl_easy_setopt(fc, CURLOPT_TIMEOUT, 10L);
-  if (rc == CURLE_OK) rc = curl_easy_setopt(fc, CURLOPT_CONNECTTIMEOUT, 5L);
-  if (rc == CURLE_OK) rc = curl_easy_setopt(fc, CURLOPT_SSL_VERIFYPEER, 1L);
-  if (rc == CURLE_OK) rc = curl_easy_setopt(fc, CURLOPT_SSL_VERIFYHOST, 2L);
-
-  struct curl_slist *fh = NULL;
-  if (rc == CURLE_OK) { fh = curl_slist_append(fh, "Accept: application/json"); if (!fh) rc = CURLE_OUT_OF_MEMORY; }
-  if (rc == CURLE_OK) { char ah[512]; snprintf(ah, sizeof(ah), "Authorization: Bearer %s", ck); fh = curl_slist_append(fh, ah); if (!fh) rc = CURLE_OUT_OF_MEMORY; }
-  if (rc == CURLE_OK) rc = curl_easy_setopt(fc, CURLOPT_HTTPHEADER, fh);
-
-  int ok = -1;
-  if (rc == CURLE_OK) {
-    CURLcode res = curl_easy_perform(fc);
-    long http_code = 0;
-    if (res == CURLE_OK) curl_easy_getinfo(fc, CURLINFO_RESPONSE_CODE, &http_code);
-    if (res == CURLE_OK && http_code >= 200 && http_code < 300 && cr.len > 0) {
-      char t_ep[256], t_bk[128], t_rg[64], t_ak[256], t_sk[256], t_id[128], t_pf[256];
-      json_str_field(cr.buf, "endpoint", t_ep, sizeof(t_ep));
-      json_str_field(cr.buf, "bucket", t_bk, sizeof(t_bk));
-      json_str_field(cr.buf, "region", t_rg, sizeof(t_rg));
-      json_str_field(cr.buf, "access_key", t_ak, sizeof(t_ak));
-      json_str_field(cr.buf, "secret_key", t_sk, sizeof(t_sk));
-      json_str_field(cr.buf, "db_id", t_id, sizeof(t_id));
-      json_str_field(cr.buf, "prefix", t_pf, sizeof(t_pf));
-      if (t_ep[0] && t_bk[0] && t_ak[0] && t_sk[0] && t_id[0]) {
-        if (db->s3_endpoint) free(db->s3_endpoint);
-        if (db->s3_bucket) free(db->s3_bucket);
-        if (db->s3_region) free(db->s3_region);
-        if (db->s3_access_key) free(db->s3_access_key);
-        if (db->s3_secret_key) free(db->s3_secret_key);
-        if (db->s3_prefix) free(db->s3_prefix);
-        if (db->db_id) free(db->db_id);
-        db->s3_endpoint = strdup(t_ep);
-        db->s3_bucket = strdup(t_bk);
-        db->s3_region = strdup(t_rg[0] ? t_rg : "us-east-1");
-        db->s3_access_key = strdup(t_ak);
-        db->s3_secret_key = strdup(t_sk);
-        db->db_id = strdup(t_id);
-        db->s3_prefix = strdup(t_pf[0] ? t_pf : t_id);
-        ok = 0;
-      }
-    }
-  }
-
-  if (fh) curl_slist_free_all(fh);
-  curl_easy_cleanup(fc);
-  free(ck);
-  free(cu);
-  return ok;
 }
 
 // Escape a string for embedding inside a JSON string literal: quotes and

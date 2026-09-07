@@ -32,14 +32,13 @@ typedef struct arkilian arkilian;
 //
 // `connection_url` is the on-disk database path (or NULL to use
 // ARKILIAN_DB_PATH / the default). Backup is auto-disabled (not a hard
-// failure) when WAL/trigger setup fails, the configured push endpoint is
-// not HTTPS and not a local address, or the bearer token is malformed —
-// the application keeps running; db_backup_is_healthy() surfaces the gap.
+// failure) when WAL/trigger setup fails or the S3 destination is not
+// fully configured — the application keeps running;
+// db_backup_is_healthy() surfaces the gap.
 int db_init(arkilian **db, const char *connection_url);
 void db_close(arkilian *db);
 const char* db_errmsg(arkilian *db);
 sqlite3* db_get_handle(arkilian *db);
-int db_set_api_key(arkilian *db, const char *api_key);
 
 int db_exec(arkilian *db, const char *sql);
 int db_begin(arkilian *db);
@@ -176,7 +175,6 @@ int db_backup_is_healthy(arkilian *db);
 
 int db_backup_chunk_count(arkilian *db);
 long long db_backup_last_chunk_flush_age_ms(arkilian *db);
-long long db_backup_last_cp_echo_age_ms(arkilian *db);
 
 char *db_s3_presign_get(arkilian *db, const char *key, long expires_sec);
 
