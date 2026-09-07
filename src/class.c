@@ -1550,6 +1550,11 @@ static int wal_chunk_append(wal_chunk *c, const char *sql, int sql_len,
   return (c->len >= CHUNK_MAX_SIZE_BYTES || c->entry_count >= CHUNK_MAX_ENTRIES) ? 1 : 0;
 }
 
+// Chunk-stat echo to the control plane. Its only caller lives in the
+// zstd-gated chunk path below, so gate the definition the same way —
+// a build without zstd (e.g. the node-gyp source build) would otherwise
+// flag it as an unused function under -Werror.
+#ifdef ARKILIAN_HAS_ZSTD
 static void db_log_to_cp(arkilian *db, wal_chunk *c) {
   if (!db->db_log_url || !db->db_log_url[0]) return;
 
@@ -1588,6 +1593,7 @@ static void db_log_to_cp(arkilian *db, wal_chunk *c) {
   if (headers) curl_slist_free_all(headers);
   curl_easy_cleanup(ch);
 }
+#endif /* ARKILIAN_HAS_ZSTD */
 
 #ifdef ARKILIAN_HAS_ZSTD
 static int wal_chunk_flush_to_s3(arkilian *db, wal_chunk *c) {
