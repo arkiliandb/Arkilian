@@ -56,18 +56,9 @@
   #define ARK_FSYNC(fd) fsync(fd)
 #endif
 
-// Pre-signed object-storage URLs carry their own credentials in the
-// query string — attaching our bearer token both leaks the credential
-// to the storage host and can break signature validation.
-static int url_is_presigned(const char *url) {
-  if (!url) return 0;
-  return strstr(url, "X-Amz-Signature=") != NULL ||
-         strstr(url, "X-Amz-Credential=") != NULL ||
-         strstr(url, "X-Goog-Signature=") != NULL ||
-         strstr(url, "X-Goog-Credential=") != NULL ||
-         strstr(url, "sig=") != NULL; /* Azure SAS */
-}
-
+// Pre-signed object-storage URLs carry their own authz in the query
+// string. The client never attaches any bearer token: storage auth is
+// SigV4-only, so there is no secondary credential to leak.
 static size_t url_host(const char *url, char *out, size_t out_cap) {
   if (!url || !out || out_cap == 0) return 0;
   const char *p = strstr(url, "://");
@@ -88,10 +79,9 @@ static size_t url_host(const char *url, char *out, size_t out_cap) {
 
 // Storage-safe host: excludes link-local (169.254.0.0/16 and IPv6
 // fe80::) because that range hosts the cloud instance-metadata service
-// (IMDS at 169.254.169.254 on AWS/GCP/Azure). A compromised control
-// plane returning a snapshot/chunk URL pointing at IMDS would otherwise
-// have the client download from (or, for non-presigned URLs, send the
-// API key to) the metadata service.
+// (IMDS at 169.254.169.254 on AWS/GCP/Azure). A tampered manifest
+// returning a snapshot/chunk URL pointing at IMDS would otherwise have
+// the client download from the metadata service.
 static int host_is_storage_safe(const char *host) {
   if (!host || !*host) return 0;
   if (host[0] == '[') {
@@ -129,7 +119,7 @@ static int host_is_known_storage(const char *host) {
   return 0;
 }
 
-// SSRF guard: a control plane (compromised or buggy) returning a snapshot
+// SSRF guard: a tampered manifest or bucket listing returning a snapshot
 // or chunk URL pointing at cloud metadata or an internal service would
 // otherwise have the client download the wrong content over a valid
 // pre-signed URL. Even though SHA-256 catches tampered CONTENT, refusing
@@ -287,9 +277,10 @@ typedef struct {
   struct curl_slist *headers;
 } HttpReq;
 
-static int http_init(HttpReq *r, const char *url, const char *token) {
+static int http_init(HttpReq *r, const char *url) {
   r->handle = curl_easy_init();
   if (!r->handle) return -1;
+  r->headers = NULL;
   curl_easy_setopt(r->handle, CURLOPT_URL, url);
   curl_easy_setopt(r->handle, CURLOPT_WRITEFUNCTION, curl_write_cb);
   curl_easy_setopt(r->handle, CURLOPT_TIMEOUT, 120L);
@@ -312,17 +303,10 @@ static int http_init(HttpReq *r, const char *url, const char *token) {
 #endif
   // Explicit TLS posture: system defaults are 1/2; setting them explicitly
   // documents intent and protects against a regression patch disabling
-  // verification. Hydration URLs come from the (trusted) control plane,
-  // but the storage backend body is content-authenticated via SHA-256.
+  // verification. Storage object bodies are additionally
+  // content-authenticated via SHA-256.
   curl_easy_setopt(r->handle, CURLOPT_SSL_VERIFYPEER, 1L);
   curl_easy_setopt(r->handle, CURLOPT_SSL_VERIFYHOST, 2L);
-  r->headers = NULL;
-  if (token && strlen(token) > 0 && !url_is_presigned(url)) {
-    char auth[512];
-    snprintf(auth, sizeof(auth), "Authorization: Bearer %s", token);
-    r->headers = curl_slist_append(r->headers, auth);
-    curl_easy_setopt(r->handle, CURLOPT_HTTPHEADER, r->headers);
-  }
   return 0;
 }
 
@@ -332,14 +316,14 @@ static void http_free(HttpReq *r) {
 }
 
 // GET a URL into a malloc'd string.  Returns NULL on failure.
-static char *http_get_string(const char *url, const char *token, int *err_out) {
+static char *http_get_string(const char *url, int *err_out) {
   HttpReq r;
-  if (http_init(&r, url, token) != 0) { *err_out = HYDRATION_ERR_NET; return NULL; }
+  if (http_init(&r, url) != 0) { *err_out = HYDRATION_ERR_NET; return NULL; }
 
   struct curl_buf buf = {NULL, 0, 0};
   curl_easy_setopt(r.handle, CURLOPT_WRITEDATA, &buf);
   // Cap the response size: a chunk is replayable SQL text bounded by the
-  // control plane's chunking. A compromised/buggy control plane streaming
+  // chunker (4 MB). A misbehaving/bucket-compromised object streaming
   // gigabytes would otherwise OOM this process before the SQL is parsed.
   curl_easy_setopt(r.handle, CURLOPT_MAXFILESIZE_LARGE, (curl_off_t)(256LL * 1024 * 1024));
 
@@ -376,13 +360,13 @@ static size_t file_write_cb(void *ptr, size_t sz, size_t nmemb, void *user) {
 // atomically installed.  A 404 maps to HYDRATION_ERR_NOTFOUND (cold
 // start); any other failure leaves the existing local database untouched.
 // `expected_sha256` is an optional lowercase hex digest (64 chars, no
-// dashes) authored by the uploader + control plane; NULL/empty skips
-// content verification with a warning (back-compat with older planes).
-static int http_download_file(const char *url, const char *token,
+// dashes) authored by the uploader + recorded in the manifest; NULL/empty
+// skips content verification with a warning.
+static int http_download_file(const char *url,
                                const char *local_path, const char *expected_sha256,
                                int *err_out) {
   // SSRF guard: never fetch a snapshot from a host that isn't an allowed
-  // storage destination. A compromised control plane returning a
+  // storage destination. A tampered manifest pointing at a
   // metadata-service URL has no path to the local DB even before content
   // auth runs.
   if (!url_is_allowed_storage(url)) {
@@ -393,7 +377,7 @@ static int http_download_file(const char *url, const char *token,
     return -1;
   }
   HttpReq r;
-  if (http_init(&r, url, token) != 0) { *err_out = HYDRATION_ERR_NET; return -1; }
+  if (http_init(&r, url) != 0) { *err_out = HYDRATION_ERR_NET; return -1; }
 
   char tmp_path[4096];
   int n = snprintf(tmp_path, sizeof(tmp_path), "%s.arkdl", local_path);
@@ -715,56 +699,94 @@ char *json_array_get(const char *json, const char *key, int index) {
   }
 }
 
-// ── Control Plane: request hydration plan ───────────────────────────
+// Forward decl: ark_manifest_fetch presigns the manifest GET; the SigV4
+// signer is defined further down in this file.
+static char *s3_presign_get(const char *endpoint, const char *bucket,
+                             const char *region, const char *access_key,
+                             const char *secret_key, const char *key,
+                             long expires_sec);
 
-static int request_hydrate_plan(const char *server_url, const char *api_key,
-                                 HydratePlan *plan) {
-  // The control URL is the base (e.g. https://api.arkilian.com); the
-  // hydrate plan endpoint is /v1/hydrate/plan under that base.
-  size_t url_len = strlen(server_url) + strlen("/v1/hydrate/plan") + 1;
-  char *url = malloc(url_len);
-  if (!url) return HYDRATION_ERR_MEM;
-  // Strip trailing slash from base to avoid doubles.
-  size_t blen = strlen(server_url);
-  int strip = (blen > 0 && server_url[blen - 1] == '/');
-  if (strip) snprintf(url, url_len, "%.*s/v1/hydrate/plan", (int)(blen - 1), server_url);
-  else snprintf(url, url_len, "%s/v1/hydrate/plan", server_url);
+// ── Manifest registry reader ────────────────────────────────────────
+// The manifest is maintained by the shipping side (src/class.c); this
+// reader turns it into a replay plan. Exported so class.c can seed its
+// in-memory registry from the last known manifest at init.
+
+int ark_manifest_fetch(const char *endpoint, const char *bucket,
+                        const char *region, const char *access_key,
+                        const char *secret_key, const char *prefix,
+                        HydratePlan *plan) {
+  if (!endpoint || !bucket || !access_key || !secret_key || !prefix || !plan)
+    return -1;
+
+  char manifest_key[512];
+  snprintf(manifest_key, sizeof(manifest_key), "%s/manifest.json", prefix);
+
+  char *manifest_url = s3_presign_get(endpoint, bucket, region,
+                                       access_key, secret_key,
+                                       manifest_key, 3600L);
+  if (!manifest_url) return -1;
 
   int err = 0;
-  char *json = http_get_string(url, api_key, &err);
-  free(url);
-  if (!json) return err;
+  char *json = http_get_string(manifest_url, &err);
+  free(manifest_url);
 
-  // Parse plan
+  if (!json) return -1;
+
   memset(plan, 0, sizeof(*plan));
-  plan->snapshot_url    = json_get_string(json, "snapshot_url");
-  plan->snapshot_sha256 = json_get_string(json, "snapshot_sha256");
-  plan->baseline_lsn  = json_get_int64(json, "baseline_lsn");
-  plan->expires_at    = json_get_int64(json, "expires_at");
-  plan->chunk_count   = json_array_count(json, "chunks");
+  plan->snapshot_url    = json_get_string(json, "s3_key");
+  plan->snapshot_sha256 = json_get_string(json, "sha256");
+  plan->baseline_lsn    = 0;
 
+  // Parse snapshot object
+  char *snap = json_array_get(json, "snapshot", 0);
+  if (!snap) {
+    // Direct top-level fields from simplified manifest
+    plan->snapshot_url    = json_get_string(json, "snapshot_url");
+    plan->snapshot_sha256 = json_get_string(json, "snapshot_sha256");
+    plan->baseline_lsn    = json_get_int64(json, "baseline_lsn");
+  } else {
+    // Nested snapshot object from full manifest
+    char *s3_key = json_get_string(snap, "s3_key");
+    if (s3_key) {
+      plan->snapshot_url = s3_presign_get(endpoint, bucket, region,
+                                           access_key, secret_key,
+                                           s3_key, 3600L);
+      free(s3_key);
+    }
+    plan->snapshot_sha256 = json_get_string(snap, "sha256");
+    char *bl = json_get_string(snap, "baseline_lsn");
+    if (bl) { plan->baseline_lsn = (int64_t)strtoll(bl, NULL, 10); free(bl); }
+    free(snap);
+  }
+
+  plan->chunk_count = json_array_count(json, "chunks");
   if (plan->chunk_count > 0) {
-    // calloc so a partial parse failure leaves no uninitialized
-    // pointers for hydrate_plan_free() to choke on.
     plan->chunks = calloc((size_t)plan->chunk_count, sizeof(HydrateChunk));
-    if (!plan->chunks) { free(json); hydrate_plan_free(plan); return HYDRATION_ERR_MEM; }
-
-    for (int i = 0; i < plan->chunk_count; i++) {
-      char *elem = json_array_get(json, "chunks", i);
-      if (!elem) { free(json); hydrate_plan_free(plan); return HYDRATION_ERR_PROTO; }
-      plan->chunks[i].url        = json_get_string(elem, "url");
-      plan->chunks[i].sha256     = json_get_string(elem, "sha256");
-      plan->chunks[i].lsn_start  = json_get_int64(elem, "lsn_start");
-      plan->chunks[i].lsn_end    = json_get_int64(elem, "lsn_end");
-      plan->chunks[i].expires_at = json_get_int64(elem, "expires_at");
-      free(elem);
-      if (!plan->chunks[i].url) { free(json); hydrate_plan_free(plan); return HYDRATION_ERR_PROTO; }
+    if (plan->chunks) {
+      for (int i = 0; i < plan->chunk_count; i++) {
+        char *elem = json_array_get(json, "chunks", i);
+        if (!elem) continue;
+        char *ckey = json_get_string(elem, "s3_key");
+        if (ckey) {
+          plan->chunks[i].url = s3_presign_get(endpoint, bucket, region,
+                                                access_key, secret_key,
+                                                ckey, 3600L);
+          free(ckey);
+        }
+        plan->chunks[i].sha256 = json_get_string(elem, "sha256");
+        char *ls = json_get_string(elem, "lsn_start");
+        if (ls) { plan->chunks[i].lsn_start = (int64_t)strtoll(ls, NULL, 10); free(ls); }
+        char *le = json_get_string(elem, "lsn_end");
+        if (le) { plan->chunks[i].lsn_end = (int64_t)strtoll(le, NULL, 10); free(le); }
+        free(elem);
+      }
     }
   }
 
-  free(json);
+  plan->expires_at = (int64_t)time(NULL) + 3600;
 
-  if (!plan->snapshot_url) { hydrate_plan_free(plan); return HYDRATION_ERR_PROTO; }
+  free(json);
+  if (!plan->snapshot_url) { hydrate_plan_free(plan); return -1; }
   return 0;
 }
 
@@ -782,13 +804,13 @@ void hydrate_plan_free(HydratePlan *plan) {
 
 // ── Step 1: Download & decompress snapshot ──────────────────────────
 
-static int download_snapshot(const char *snapshot_url, const char *token,
+static int download_snapshot(const char *snapshot_url,
                               const char *db_path, const char *expected_sha256,
                               hydration_progress_cb progress, void *user) {
   if (progress) progress(1, 0, 1, user);
 
   int err = 0;
-  int rc = http_download_file(snapshot_url, token, db_path, expected_sha256, &err);
+  int rc = http_download_file(snapshot_url, db_path, expected_sha256, &err);
   if (rc != 0) {
     // Only a genuine 404 means "no baseline snapshot uploaded yet"
     // (cold start).  Every other failure — network blip, expired URL,
@@ -1004,88 +1026,7 @@ static char *s3_presign_get(const char *endpoint, const char *bucket,
   return url;
 }
 
-static int manifest_read_from_s3(const char *endpoint, const char *bucket,
-                                  const char *region, const char *access_key,
-                                  const char *secret_key, const char *prefix,
-                                  HydratePlan *plan) {
-  if (!endpoint || !bucket || !access_key || !secret_key || !prefix || !plan)
-    return -1;
-
-  char manifest_key[512];
-  snprintf(manifest_key, sizeof(manifest_key), "%s/manifest.json", prefix);
-
-  char *manifest_url = s3_presign_get(endpoint, bucket, region,
-                                       access_key, secret_key,
-                                       manifest_key, 3600L);
-  if (!manifest_url) return -1;
-
-  int err = 0;
-  char *json = http_get_string(manifest_url, NULL, &err);
-  free(manifest_url);
-
-  if (!json) return -1;
-
-  memset(plan, 0, sizeof(*plan));
-  plan->snapshot_url    = json_get_string(json, "s3_key");
-  plan->snapshot_sha256 = json_get_string(json, "sha256");
-  plan->baseline_lsn    = 0;
-
-  // Parse snapshot object
-  char *snap = json_array_get(json, "snapshot", 0);
-  if (!snap) {
-    // Direct top-level fields from simplified manifest
-    plan->snapshot_url    = json_get_string(json, "snapshot_url");
-    plan->snapshot_sha256 = json_get_string(json, "snapshot_sha256");
-    plan->baseline_lsn    = json_get_int64(json, "baseline_lsn");
-  } else {
-    // Nested snapshot object from full manifest
-    char *s3_key = json_get_string(snap, "s3_key");
-    if (s3_key) {
-      plan->snapshot_url = s3_presign_get(endpoint, bucket, region,
-                                           access_key, secret_key,
-                                           s3_key, 3600L);
-      free(s3_key);
-    }
-    plan->snapshot_sha256 = json_get_string(snap, "sha256");
-    char *bl = json_get_string(snap, "baseline_lsn");
-    if (bl) { plan->baseline_lsn = (int64_t)strtoll(bl, NULL, 10); free(bl); }
-    free(snap);
-  }
-
-  plan->chunk_count = json_array_count(json, "chunks");
-  if (plan->chunk_count > 0) {
-    plan->chunks = calloc((size_t)plan->chunk_count, sizeof(HydrateChunk));
-    if (plan->chunks) {
-      for (int i = 0; i < plan->chunk_count; i++) {
-        char *elem = json_array_get(json, "chunks", i);
-        if (!elem) continue;
-        char *ckey = json_get_string(elem, "s3_key");
-        if (ckey) {
-          plan->chunks[i].url = s3_presign_get(endpoint, bucket, region,
-                                                access_key, secret_key,
-                                                ckey, 3600L);
-          free(ckey);
-        }
-        plan->chunks[i].sha256 = json_get_string(elem, "sha256");
-        char *ls = json_get_string(elem, "lsn_start");
-        if (ls) { plan->chunks[i].lsn_start = (int64_t)strtoll(ls, NULL, 10); free(ls); }
-        char *le = json_get_string(elem, "lsn_end");
-        if (le) { plan->chunks[i].lsn_end = (int64_t)strtoll(le, NULL, 10); free(le); }
-        free(elem);
-      }
-    }
-  }
-
-  plan->expires_at = (int64_t)time(NULL) + 3600;
-
-  free(json);
-  if (!plan->snapshot_url) { hydrate_plan_free(plan); return -1; }
-  return 0;
-}
-
 int arkilian_hydrate_s3(const char *db_path,
-                         const char *server_url,
-                         const char *api_key,
                          const char *s3_endpoint,
                          const char *s3_bucket,
                          const char *s3_region,
@@ -1094,7 +1035,6 @@ int arkilian_hydrate_s3(const char *db_path,
                          const char *s3_prefix,
                          hydration_progress_cb progress,
                          void *user_data) {
-  (void)server_url;
   if (!db_path) return HYDRATION_ERR_PROTO;
 
   HYDRATE_LOCK();
@@ -1106,9 +1046,9 @@ int arkilian_hydrate_s3(const char *db_path,
   if (s3_endpoint && s3_endpoint[0] && s3_bucket && s3_bucket[0] &&
       s3_access_key && s3_access_key[0] && s3_secret_key && s3_secret_key[0] &&
       s3_prefix && s3_prefix[0]) {
-    int rc = manifest_read_from_s3(s3_endpoint, s3_bucket, s3_region,
-                                    s3_access_key, s3_secret_key, s3_prefix,
-                                    &plan);
+    int rc = ark_manifest_fetch(s3_endpoint, s3_bucket, s3_region,
+                                 s3_access_key, s3_secret_key, s3_prefix,
+                                 &plan);
     if (rc == 0) plan_ok = 1;
   }
 
@@ -1165,7 +1105,7 @@ int arkilian_hydrate_s3(const char *db_path,
 
   // Phase 1: Download snapshot
   {
-    int rc = download_snapshot(plan.snapshot_url, api_key, db_path,
+    int rc = download_snapshot(plan.snapshot_url, db_path,
                                 plan.snapshot_sha256, progress, user_data);
     if (rc != 0) { hydrate_plan_free(&plan); hydrate_result = rc; goto hydrate_done; }
   }
@@ -1224,7 +1164,7 @@ int arkilian_hydrate_s3(const char *db_path,
       }
 
       int err = 0;
-      char *sql_text = http_get_string(ch->url, api_key, &err);
+      char *sql_text = http_get_string(ch->url, &err);
       if (!sql_text) { sqlite3_close(db); hydrate_plan_free(&plan); hydrate_result = err; goto hydrate_done; }
 
       if (ch->sha256 && ch->sha256[0]) {
@@ -1254,256 +1194,6 @@ int arkilian_hydrate_s3(const char *db_path,
     sqlite3_close(db);
   }
 
-  hydrate_plan_free(&plan);
-
-hydrate_done:
-  HYDRATE_UNLOCK();
-  return hydrate_result;
-}
-
-// ── Public API ──────────────────────────────────────────────────────
-
-int arkilian_hydrate(const char *db_path,
-                     const char *server_url,
-                     const char *api_key,
-                     hydration_progress_cb progress,
-                     void *user_data) {
-  if (!db_path || !server_url) return HYDRATION_ERR_PROTO;
-
-  // Single-flight: serialize concurrent hydration calls so two
-  // hydrates on the same db_path can't race on the temp file or
-  // rename(). The application must not have the DB open during
-  // hydrate (documented in hydration.h) — this guard protects against
-  // two cold-start processes racing, not against a live application.
-  HYDRATE_LOCK();
-  int hydrate_result = 0;
-
-  // ── Phase 0: Request hydration plan ──
-  HydratePlan plan;
-  int rc = request_hydrate_plan(server_url, api_key, &plan);
-  if (rc != 0) { hydrate_result = rc; goto hydrate_done; }
-
-  // A snapshot URL that is already expired can only fail — say so.
-  if (plan.expires_at > 0 && (int64_t)time(NULL) > plan.expires_at) {
-    hydrate_plan_free(&plan);
-    hydrate_result = HYDRATION_ERR_EXPIRED;
-    goto hydrate_done;
-  }
-
-  // ── Phase 0.5: Local-vs-snapshot LSN guard (data-loss protection) ──
-  // The snapshot download REPLACES the local database file, so the
-  // comparison MUST happen before any file is touched. If the local
-  // database was hydrated further than the snapshot's baseline
-  // (incremental hydration to LSN 5000 while the control plane serves a
-  // snapshot at LSN 3000), installing the snapshot would silently roll
-  // back 2000 LSNs of data. Refuse instead. Reads the local meta
-  // read-only; a missing file or missing meta reads as LSN 0 (cold
-  // start / unhydrated local DB — the explicit hydrate() call opts
-  // those in).
-  {
-    int64_t pre_local_lsn = 0;
-    sqlite3 *ldb = NULL;
-    if (sqlite3_open_v2(db_path, &ldb, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK) {
-      pre_local_lsn = read_last_applied_lsn(ldb);
-    }
-    sqlite3_close(ldb);
-    if (pre_local_lsn > plan.baseline_lsn) {
-      fprintf(stderr,
-              "arkilian: hydration refused — local DB is at LSN %lld but the "
-              "snapshot baseline is %lld; installing it would destroy %lld "
-              "LSN(s) of local data (HYDRATION_ERR_NEWER)\n",
-              (long long)pre_local_lsn, (long long)plan.baseline_lsn,
-              (long long)(pre_local_lsn - plan.baseline_lsn));
-      hydrate_plan_free(&plan);
-      hydrate_result = HYDRATION_ERR_NEWER;
-      goto hydrate_done;
-    }
-  }
-
-  // ── Phase 0.6: Live-writer probe (footgun guard) ───────────────────
-  // Installing the snapshot remove()+rename()s the file; if the
-  // application is actively writing through another connection, its
-  // writes keep landing on the orphaned inode and diverge from the
-  // restored file. A BEGIN IMMEDIATE with no busy wait detects an
-  // actively-writing connection. Best-effort: an idle-but-open
-  // connection can start writing right after the probe — callers must
-  // not hydrate a live database (documented in hydration.h).
-  {
-    sqlite3 *ldb = NULL;
-    if (sqlite3_open_v2(db_path, &ldb,
-                        SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX, NULL) == SQLITE_OK) {
-      char *perr = NULL;
-      int prc = sqlite3_exec(ldb, "BEGIN IMMEDIATE;", NULL, NULL, &perr);
-      if (prc != SQLITE_OK) {
-        fprintf(stderr,
-                "arkilian: hydration refused — the local database is locked by "
-                "another connection (application running?); refusing to clobber "
-                "a live database (HYDRATION_ERR_BUSY)\n");
-        sqlite3_free(perr);
-        sqlite3_close(ldb);
-        hydrate_plan_free(&plan);
-        hydrate_result = HYDRATION_ERR_BUSY;
-        goto hydrate_done;
-      }
-      sqlite3_exec(ldb, "ROLLBACK;", NULL, NULL, NULL);
-    }
-    sqlite3_close(ldb);
-  }
-
-  // ── Phase 1: Download baseline snapshot ──
-  rc = download_snapshot(plan.snapshot_url, api_key, db_path,
-                          plan.snapshot_sha256, progress, user_data);
-  if (rc != 0) { hydrate_plan_free(&plan); hydrate_result = rc; goto hydrate_done; }
-
-  // ── Phase 2: Open database, check LSN, replay chunks ──
-  sqlite3 *db = NULL;
-  rc = sqlite3_open_v2(db_path, &db,
-    SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX, NULL);
-  if (rc != SQLITE_OK) { hydrate_plan_free(&plan); hydrate_result = HYDRATION_ERR_SQL; goto hydrate_done; }
-
-  // Apply PRAGMAs for the replay. synchronous=NORMAL (NOT OFF) keeps the
-  // WAL durable on commit even during replay — a power loss mid-replay
-  // with synchronous=OFF can corrupt the local DB, unacceptable for a
-  // data-durability product. Best-effort: a failure slows the bulk load
-  // but must never abort the restore.
-  {
-    char *perr = NULL;
-    if (sqlite3_exec(db, "PRAGMA journal_mode=WAL;", NULL, NULL, &perr) != SQLITE_OK ||
-        sqlite3_exec(db, "PRAGMA synchronous=NORMAL;", NULL, NULL, &perr) != SQLITE_OK ||
-        sqlite3_exec(db, "PRAGMA foreign_keys=OFF;", NULL, NULL, &perr) != SQLITE_OK) {
-      fprintf(stderr, "arkilian: hydration speed pragma warning: %s\n",
-              perr ? perr : "unknown error");
-      sqlite3_free(perr);
-    }
-  }
-
-  // Read the snapshot's ACTUAL recorded LSN (it was just installed as the
-  // local db). The control plane's baseline_lsn is the authority for the
-  // EXPECTED LSN; a mismatch means the served snapshot is not the one the
-  // plan was built against.
-  int64_t local_lsn = read_last_applied_lsn(db);
-  if (local_lsn == 0) {
-    // Fresh snapshot with no recorded LSN (cold-start baseline): trust the
-    // control plane's declared baseline.
-    local_lsn = plan.baseline_lsn;
-  } else if (local_lsn < plan.baseline_lsn) {
-    // The downloaded snapshot is STALER than the control plane claims.
-    // Previously the code clamped local_lsn UP to baseline and silently
-    // skipped chunks [local_lsn+1 .. baseline] → silent data loss reported
-    // as OK. Refuse instead: the control plane or storage is inconsistent.
-    fprintf(stderr,
-            "arkilian: hydration refused — downloaded snapshot's recorded "
-            "LSN %lld is less than the plan's baseline %lld (served a stale "
-            "snapshot; control-plane or storage inconsistency)\n",
-            (long long)local_lsn, (long long)plan.baseline_lsn);
-    sqlite3_close(db);
-    hydrate_plan_free(&plan);
-    hydrate_result = HYDRATION_ERR_PROTO;
-    goto hydrate_done;
-  }
-
-  int chunk_total = 0;
-  for (int i = 0; i < plan.chunk_count; i++) {
-    HydrateChunk *ch = &plan.chunks[i];
-
-    // Skip chunks already applied
-    if (ch->lsn_end <= local_lsn) continue;
-
-    // A hole between what we have applied and what this chunk covers
-    // means permanently missing data — fail loudly, never skip silently.
-    if (ch->lsn_start > local_lsn + 1) {
-      fprintf(stderr,
-              "arkilian: hydration LSN gap — have up to %lld but chunk "
-              "starts at %lld (missing %lld LSN(s))\n",
-              (long long)local_lsn, (long long)ch->lsn_start,
-              (long long)(ch->lsn_start - local_lsn - 1));
-      sqlite3_close(db);
-      hydrate_plan_free(&plan);
-      hydrate_result = HYDRATION_ERR_PROTO;
-      goto hydrate_done;
-    }
-
-    // Check URL expiry
-    if (ch->expires_at > 0 && (int64_t)time(NULL) > ch->expires_at) {
-      sqlite3_close(db);
-      hydrate_plan_free(&plan);
-      hydrate_result = HYDRATION_ERR_EXPIRED;
-      goto hydrate_done;
-    }
-
-    // Download chunk. SSRF-guarded: never fetch a chunk from a host that
-    // isn't an allowed storage destination (a compromised control plane
-    // could otherwise point the client at cloud metadata or an internal
-    // service to read the auth header or exfiltrate state).
-    if (!url_is_allowed_storage(ch->url)) {
-      fprintf(stderr,
-              "arkilian: chunk %d download refused — host is not an "
-              "allowed storage destination (SSRF guard): %.200s\n",
-              i, ch->url);
-      sqlite3_close(db);
-      hydrate_plan_free(&plan);
-      hydrate_result = HYDRATION_ERR_PROTO;
-      goto hydrate_done;
-    }
-    int err = 0;
-    char *sql_text = http_get_string(ch->url, api_key, &err);
-    if (!sql_text) { sqlite3_close(db); hydrate_plan_free(&plan); hydrate_result = err; goto hydrate_done; }
-
-    // Content authentication: verify the chunk's SHA-256 against the
-    // control plane's recorded digest BEFORE replaying it as raw SQL
-    // against the local database. A mismatch is a tampered/broken chunk
-    // and must never reach sqlite3_exec. A missing digest is a HARD
-    // refusal — silently replaying unauthenticated content is a
-    // downgrade-attack surface, not a back-compat feature.
-    if (ch->sha256 && ch->sha256[0]) {
-      char digest[65];
-      ark_sha256_hex(sql_text, strlen(sql_text), digest);
-      if (strcasecmp(digest, ch->sha256) != 0) {
-        fprintf(stderr,
-                "arkilian: chunk %d SHA-256 MISMATCH — refusing to replay "
-                "(expected %.16s…, got %.16s…). Storage tampering\n",
-                i, ch->sha256, digest);
-        free(sql_text);
-        sqlite3_close(db);
-        hydrate_plan_free(&plan);
-        hydrate_result = HYDRATION_ERR_PROTO;
-        goto hydrate_done;
-      }
-    } else {
-      fprintf(stderr,
-              "arkilian: chunk %d sha256 NOT provided by control plane — "
-              "refusing to replay unauthenticated content (HYDRATION_ERR_PROTO)\n",
-              i);
-      free(sql_text);
-      sqlite3_close(db);
-      hydrate_plan_free(&plan);
-      hydrate_result = HYDRATION_ERR_PROTO;
-      goto hydrate_done;
-    }
-
-    // Replay
-    rc = hydrate_replay_chunk(db, sql_text, ch->lsn_end);
-    free(sql_text);
-
-    if (rc != 0) { sqlite3_close(db); hydrate_plan_free(&plan); hydrate_result = rc; goto hydrate_done; }
-
-    local_lsn = ch->lsn_end;
-    chunk_total++;
-    if (progress) progress(2, chunk_total, plan.chunk_count, user_data);
-  }
-
-  // Restore safe PRAGMAs
-  {
-    char *perr = NULL;
-    if (sqlite3_exec(db, "PRAGMA synchronous=NORMAL;", NULL, NULL, &perr) != SQLITE_OK ||
-        sqlite3_exec(db, "PRAGMA foreign_keys=ON;", NULL, NULL, &perr) != SQLITE_OK) {
-      fprintf(stderr, "arkilian: hydration restore pragma warning: %s\n",
-              perr ? perr : "unknown error");
-      sqlite3_free(perr);
-    }
-  }
-
-  sqlite3_close(db);
   hydrate_plan_free(&plan);
 
 hydrate_done:
