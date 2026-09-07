@@ -48,6 +48,12 @@
   #define strcasecmp _stricmp
   #define ARK_FILENO(f) _fileno(f)
   #define ARK_FSYNC(fd) _commit(fd)
+  #ifndef __MINGW32__
+  /* MSVC: strtok_s has the same (str, delim, *ctx) signature as strtok_r.
+     Kept in lockstep with class.c's shim — this file is compiled by the
+     Windows N-API/prebuild leg, which is MSVC. */
+  #define strtok_r strtok_s
+  #endif
 #else
   #include <pthread.h>
   #include <strings.h>
@@ -675,6 +681,34 @@ int json_array_count(const char *json, const char *key) {
   return count;
 }
 
+// Return a malloc'd copy of the raw {...} object value for `key` at the
+// top level of `json`, or NULL if the key is absent or is not an object.
+// json_find_key only matches at depth 1, so nested fields (the v3
+// manifest's "snapshot":{"s3_key",...}) are invisible to the flat
+// accessors — the caller extracts the object first, then re-scans it.
+char *json_object_get(const char *json, const char *key) {
+  const char *p = json_find_key(json, key);
+  if (!p || *p != '{') return NULL;
+  int depth = 0;
+  const char *q = p;
+  while (*q) {
+    if (*q == '"') { q = json_skip_string(q); continue; }
+    if (*q == '{' || *q == '[') depth++;
+    else if (*q == '}' || *q == ']') {
+      depth--;
+      if (depth == 0) { q++; break; }
+    }
+    q++;
+  }
+  if (depth != 0) return NULL;  // truncated / malformed object
+  size_t len = (size_t)(q - p);
+  char *copy = malloc(len + 1);
+  if (!copy) return NULL;
+  memcpy(copy, p, len);
+  copy[len] = '\0';
+  return copy;
+}
+
 // Parse the i-th element from a JSON array at key: {"key":[{...},{...}]}
 // Returns malloc'd copy of the i-th element, or NULL if out of range.
 char *json_array_get(const char *json, const char *key, int index) {
@@ -731,37 +765,57 @@ int ark_manifest_fetch(const char *endpoint, const char *bucket,
   free(manifest_url);
 
   if (!json) {
+    // Propagate the specific failure so callers can tell "no manifest yet"
+    // (a genuine cold start) from a transient error that must be retried —
+    // publishing a registry over an unreadable manifest would orphan the
+    // predecessor's chunks.
+    if (err == HYDRATION_ERR_NOTFOUND) return HYDRATION_ERR_NOTFOUND;
     fprintf(stderr, "arkilian: manifest fetch failed (err=%d)\n", err);
-    return -1;
+    return err ? err : HYDRATION_ERR_NET;
   }
 
   memset(plan, 0, sizeof(*plan));
-  plan->snapshot_s3_key = json_get_string(json, "s3_key");
-  plan->snapshot_url    = json_get_string(json, "s3_key");
-  plan->snapshot_sha256 = json_get_string(json, "sha256");
-  plan->baseline_lsn    = 0;
+  plan->baseline_lsn = 0;
 
-  // Parse snapshot object
-  char *snap = json_array_get(json, "snapshot", 0);
-  if (!snap) {
-    // Direct top-level fields from simplified manifest
+  // The v3 manifest (written by manifest_registry_upload in class.c) nests
+  // the baseline snapshot in an OBJECT:
+  //   "snapshot":{"s3_key":"...","sha256":"...","baseline_lsn":N}
+  // json_find_key only matches at depth 1, so the object is extracted
+  // first and then re-scanned with the same accessors. An empty s3_key
+  // means no snapshot has been published yet (chunks-only registry) —
+  // hydration cold-starts and replays from LSN 1.
+  char *snap = json_object_get(json, "snapshot");
+  if (!snap) snap = json_array_get(json, "snapshot", 0); // legacy array form
+  if (snap) {
+    char *s3_key = json_get_string(snap, "s3_key");
+    char *sha    = json_get_string(snap, "sha256");
+    if (!sha)    sha = json_get_string(snap, "snapshot_sha256"); // legacy
+    plan->baseline_lsn = json_get_int64(snap, "baseline_lsn");
+    if (s3_key && s3_key[0]) {
+      plan->snapshot_s3_key = s3_key;
+      // The snapshot is fetched over a locally presigned GET: the manifest
+      // never carries credentials or a remote-issued URL.
+      plan->snapshot_url = s3_presign_get(endpoint, bucket, region,
+                                          access_key, secret_key,
+                                          s3_key, 3600L);
+      if (!plan->snapshot_url) {
+        fprintf(stderr, "arkilian: failed to presign snapshot GET\n");
+        free(s3_key); free(sha); free(snap); free(json);
+        hydrate_plan_free(plan);
+        return HYDRATION_ERR_MEM;
+      }
+    } else {
+      free(s3_key);
+    }
+    if (sha && sha[0]) plan->snapshot_sha256 = sha;
+    else free(sha);
+    free(snap);
+  } else {
+    // Legacy flat form: fields at the top level of the document.
     plan->snapshot_url    = json_get_string(json, "snapshot_url");
     plan->snapshot_s3_key = json_get_string(json, "s3_key");
     plan->snapshot_sha256 = json_get_string(json, "snapshot_sha256");
     plan->baseline_lsn    = json_get_int64(json, "baseline_lsn");
-  } else {
-    // Nested snapshot object from full manifest
-    char *s3_key = json_get_string(snap, "s3_key");
-    if (s3_key) {
-      free(plan->snapshot_s3_key);
-      plan->snapshot_s3_key = s3_key;
-      plan->snapshot_url = s3_presign_get(endpoint, bucket, region,
-                                           access_key, secret_key,
-                                           s3_key, 3600L);
-    }
-    plan->snapshot_sha256 = json_get_string(snap, "sha256");
-    plan->baseline_lsn = json_get_int64(snap, "baseline_lsn");
-    free(snap);
   }
 
   plan->chunk_count = json_array_count(json, "chunks");
@@ -793,11 +847,20 @@ int ark_manifest_fetch(const char *endpoint, const char *bucket,
   free(json);
   // A manifest without a snapshot entry (published by the chunk flusher
   // before the first hourly snapshot) is still a valid registry: the
-  // chunk list alone can restore a fresh database. An entirely empty
-  // manifest (no snapshot AND no chunks) means nothing to restore.
+  // chunk list alone can restore a fresh database.
   if (!plan->snapshot_url && plan->chunk_count == 0) {
+    // The object EXISTS (we got a 200) but carries nothing usable. That is
+    // never a state this client writes — the flusher only publishes when it
+    // has a chunk record and the snapshot thread always names a snapshot —
+    // so it means a corrupt or foreign manifest. Report PROTO, NOT
+    // NOTFOUND: the shipping side must freeze its registry rather than
+    // publish over records it could not read (which would orphan objects
+    // whose outbox rows are already deleted).
+    fprintf(stderr,
+            "arkilian: manifest is present but carries no snapshot and no "
+            "chunks — refusing to treat it as a cold start\n");
     hydrate_plan_free(plan);
-    return -1;
+    return HYDRATION_ERR_PROTO;
   }
   return 0;
 }

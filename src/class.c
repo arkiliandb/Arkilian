@@ -194,7 +194,11 @@ struct arkilian {
 
   wal_chunk chunk;               // current chunk accumulator
   int chunk_interval;
-  uint64_t chunk_flushed_upto;   // highest outbox id durably PUT to S3
+  // Drain watermark: the highest outbox id whose chunk OBJECT is durably
+  // PUT. Rows at or below it are never re-chunked (that would put two
+  // overlapping LSN ranges in the manifest, which hydration replays
+  // twice). This is NOT the delete watermark — see manifest_durable_lsn.
+  uint64_t chunk_flushed_upto;
 
   // Manifest registry: the client-side record of every uploaded WAL chunk,
   // mirrored to {prefix}/manifest.json. Guarded by manifest_mutex; the
@@ -208,6 +212,20 @@ struct arkilian {
   uint64_t manifest_baseline_lsn;
   int manifest_pending;          // chunk records added since last manifest PUT
   time_t manifest_last_upload;   // last successful manifest PUT (0 = never)
+  // Delete watermark: the highest outbox id that a SUCCESSFULLY uploaded
+  // manifest.json actually records. Outbox rows are deleted only up to
+  // this point. A chunk object that is PUT but not yet in the published
+  // manifest is unreachable by hydration, so its rows must stay in the
+  // outbox until the registry that references them is itself durable —
+  // otherwise a crash in the manifest batching window loses them.
+  uint64_t manifest_durable_lsn;
+  // 1 once the startup manifest read has resolved (adopted a registry, or
+  // confirmed none exists). Until then the snapshot thread must not
+  // publish a manifest: publishing over an unreadable predecessor would
+  // orphan its chunk records, and their outbox rows are already gone.
+  // 0 = unresolved, 1 = resolved, -1 = unresolved-and-unreadable (the
+  // registry is frozen; shipping continues but nothing is published).
+  volatile int manifest_seed_resolved;
 
   // Background thread tracking & synchronization
   volatile int shutdown_requested;
@@ -549,6 +567,19 @@ static void load_env(void) {
 }
 
 // ── Small Shared Helpers ────────────────────────────────────────────
+
+// Portable UTC broken-down time: gmtime_r (POSIX) vs gmtime_s (Windows —
+// REVERSED argument order, errno_t return). Writes to *out and returns
+// out on success, NULL on failure. Kept in lockstep with hydration.c's
+// shim of the same name: both SigV4 signers need it and MSVC has no
+// gmtime_r, so the shipping path would not compile on the Windows leg.
+static struct tm *ark_gmtime_utc(const time_t *tp, struct tm *out) {
+#ifdef _WIN32
+  return (gmtime_s(out, tp) == 0) ? out : NULL;
+#else
+  return gmtime_r(tp, out);
+#endif
+}
 
 // Escape a string for embedding inside a SQL single-quoted literal
 // (doubles every single quote).  Caller frees.
@@ -2906,7 +2937,11 @@ static char *s3_presign_put(arkilian *db, const char *key, long expires_sec) {
 
   time_t now = time(NULL);
   struct tm g;
-  gmtime_r(&now, &g);
+  memset(&g, 0, sizeof(g));
+  // A failed conversion must never sign with a garbage timestamp: the
+  // resulting URL would be rejected by the endpoint and (worse) could
+  // carry a date_stamp outside the credential's validity window.
+  if (!ark_gmtime_utc(&now, &g)) return NULL;
   char date_stamp[9], amz_date[17];
   strftime(date_stamp, sizeof(date_stamp), "%Y%m%d", &g);
   strftime(amz_date, sizeof(amz_date), "%Y%m%dT%H%M%SZ", &g);
@@ -3013,7 +3048,8 @@ char *db_s3_presign_get(arkilian *db, const char *key, long expires_sec) {
 
   time_t now = time(NULL);
   struct tm g;
-  gmtime_r(&now, &g);
+  memset(&g, 0, sizeof(g));
+  if (!ark_gmtime_utc(&now, &g)) return NULL;
   char date_stamp[9], amz_date[17];
   strftime(date_stamp, sizeof(date_stamp), "%Y%m%d", &g);
   strftime(amz_date, sizeof(amz_date), "%Y%m%dT%H%M%SZ", &g);
@@ -3174,17 +3210,21 @@ static void manifest_registry_unlock(arkilian *db) {
 #endif
 }
 
-// Takes ownership of s3_key/sha256 on success; frees them on failure.
-static int manifest_registry_append(arkilian *db, char *s3_key, char *sha256,
-                                    uint64_t lsn_start, uint64_t lsn_end) {
+// Append a chunk record. Caller MUST hold manifest_mutex. Takes ownership
+// of s3_key/sha256 on success; frees them on failure. The locking wrapper
+// below is what the flush thread uses; the seed path calls this directly
+// because it already holds the lock (re-locking a non-recursive pthread
+// mutex from the same thread deadlocks).
+static int manifest_registry_append_locked(arkilian *db, char *s3_key,
+                                           char *sha256,
+                                           uint64_t lsn_start,
+                                           uint64_t lsn_end) {
   if (!db || !s3_key) { free(s3_key); free(sha256); return -1; }
-  manifest_registry_lock(db);
   if (db->manifest_chunk_count == db->manifest_chunk_cap) {
     int ncap = db->manifest_chunk_cap ? db->manifest_chunk_cap * 2 : 16;
     ark_manifest_chunk *nc =
         realloc(db->manifest_chunks, (size_t)ncap * sizeof(ark_manifest_chunk));
     if (!nc) {
-      manifest_registry_unlock(db);
       free(s3_key); free(sha256);
       return -1;
     }
@@ -3197,8 +3237,18 @@ static int manifest_registry_append(arkilian *db, char *s3_key, char *sha256,
   rec->lsn_start = lsn_start;
   rec->lsn_end = lsn_end;
   db->manifest_pending++;
-  manifest_registry_unlock(db);
   return 0;
+}
+
+// Takes ownership of s3_key/sha256 on success; frees them on failure.
+static int manifest_registry_append(arkilian *db, char *s3_key, char *sha256,
+                                    uint64_t lsn_start, uint64_t lsn_end) {
+  if (!db || !s3_key) { free(s3_key); free(sha256); return -1; }
+  manifest_registry_lock(db);
+  int rc = manifest_registry_append_locked(db, s3_key, sha256,
+                                           lsn_start, lsn_end);
+  manifest_registry_unlock(db);
+  return rc;
 }
 
 // Drop chunk records fully covered by the new baseline snapshot: their
@@ -3229,6 +3279,12 @@ static int manifest_registry_upload(arkilian *db, const char *snapshot_key,
   if (!db || !has_direct_s3(db)) return -1;
   if (!db->s3_prefix || !db->s3_prefix[0]) return -1;
   if (strstr(db->s3_prefix, "..") || db->s3_prefix[0] == '/') return -1;
+  // Never publish over a predecessor registry this process could not read.
+  // Its chunk records are the only pointers to objects whose outbox rows
+  // were already deleted, so overwriting them is unrecoverable data loss.
+  // The registry stays frozen (and loudly logged by the seed path) until
+  // the startup read resolves.
+  if (ARK_LOAD(&db->manifest_seed_resolved) != 1) return -1;
 
   manifest_registry_lock(db);
   if (snapshot_key) {
@@ -3319,6 +3375,20 @@ static int manifest_registry_upload(arkilian *db, const char *snapshot_key,
   if (rc == 0) {
     db->manifest_pending = 0;
     db->manifest_last_upload = time(NULL);
+    // Advance the DELETE watermark to the highest outbox id this manifest
+    // now durably covers. Rows up to it are reachable by hydration either
+    // through a recorded chunk or through the baseline snapshot itself
+    // (whose content includes every row at or below baseline_lsn), so only
+    // now is it safe to remove them from _pending_backup. Computed here,
+    // under the lock, from exactly the registry that was serialized — a
+    // chunk appended by the flush thread mid-upload must not be counted
+    // before the manifest that names it is durable.
+    uint64_t durable = db->manifest_baseline_lsn;
+    for (int i = 0; i < db->manifest_chunk_count; i++) {
+      if (db->manifest_chunks[i].lsn_end > durable)
+        durable = db->manifest_chunks[i].lsn_end;
+    }
+    if (durable > db->manifest_durable_lsn) db->manifest_durable_lsn = durable;
   }
   manifest_registry_unlock(db);
   return rc;
@@ -3336,6 +3406,19 @@ static void manifest_registry_maybe_upload(arkilian *db) {
   if (pending <= 0) return;
   time_t now = time(NULL);
   if (last != 0 && now - last < MANIFEST_UPLOAD_MIN_INTERVAL_SEC) return;
+  manifest_registry_upload(db, NULL, NULL, 0);
+}
+
+// Publish any pending chunk records regardless of the batching interval.
+// Used on the shutdown path: a chunk object that is PUT but not yet named
+// by the published manifest is invisible to hydration, so its outbox rows
+// must not be deleted — forcing the publish at exit keeps the registry
+// complete instead of leaving a window that only a crash would close.
+static void manifest_registry_publish_pending(arkilian *db) {
+  manifest_registry_lock(db);
+  int pending = db->manifest_pending;
+  manifest_registry_unlock(db);
+  if (pending <= 0) return;
   manifest_registry_upload(db, NULL, NULL, 0);
 }
 
