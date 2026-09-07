@@ -197,7 +197,10 @@ struct arkilian {
   // Drain watermark: the highest outbox id whose chunk OBJECT is durably
   // PUT. Rows at or below it are never re-chunked (that would put two
   // overlapping LSN ranges in the manifest, which hydration replays
-  // twice). This is NOT the delete watermark — see manifest_durable_lsn.
+  // twice). Deleting those outbox rows on flush ack is safe even though
+  // the manifest naming the chunk may lag: a crash in that window loses
+  // only the incremental *records* — the next hourly snapshot baseline
+  // re-covers every row the chunk objects could have carried.
   uint64_t chunk_flushed_upto;
 
   // Manifest registry: the client-side record of every uploaded WAL chunk,
@@ -212,19 +215,13 @@ struct arkilian {
   uint64_t manifest_baseline_lsn;
   int manifest_pending;          // chunk records added since last manifest PUT
   time_t manifest_last_upload;   // last successful manifest PUT (0 = never)
-  // Delete watermark: the highest outbox id that a SUCCESSFULLY uploaded
-  // manifest.json actually records. Outbox rows are deleted only up to
-  // this point. A chunk object that is PUT but not yet in the published
-  // manifest is unreachable by hydration, so its rows must stay in the
-  // outbox until the registry that references them is itself durable —
-  // otherwise a crash in the manifest batching window loses them.
-  uint64_t manifest_durable_lsn;
-  // 1 once the startup manifest read has resolved (adopted a registry, or
-  // confirmed none exists). Until then the snapshot thread must not
-  // publish a manifest: publishing over an unreadable predecessor would
-  // orphan its chunk records, and their outbox rows are already gone.
-  // 0 = unresolved, 1 = resolved, -1 = unresolved-and-unreadable (the
-  // registry is frozen; shipping continues but nothing is published).
+  // Startup manifest read state. Publishing is gated on it: until the
+  // read resolves, no manifest PUT may overwrite a predecessor registry
+  // this process could not read (its chunk records are the only pointers
+  // to objects whose outbox rows are already deleted). 0 = unresolved
+  // (flush loop retries), 1 = resolved (adopted a registry, or confirmed
+  // none exists), -1 = resolved-unreadable (frozen: shipping continues
+  // but nothing is published — loudly logged by the seed path).
   volatile int manifest_seed_resolved;
 
   // Background thread tracking & synchronization
@@ -315,7 +312,7 @@ static int manifest_registry_upload(arkilian *db, const char *snapshot_key,
                                     const char *snapshot_sha,
                                     uint64_t baseline_lsn);
 static void manifest_registry_maybe_upload(arkilian *db);
-static void manifest_registry_seed(arkilian *db);
+static int manifest_registry_seed(arkilian *db);
 char *db_s3_presign_get(arkilian *db, const char *key, long expires_sec);
 
 // ── Environment Loader ──────────────────────────────────────────────
@@ -1272,6 +1269,81 @@ static void wal_chunk_reset(wal_chunk *c) {
   memset(c, 0, sizeof(*c));
 }
 
+// Attempt budget before a chunk's rows are dead-lettered (moved to
+// _dead_backup for operator inspection and recovery via arkilian-dlq —
+// nothing is ever silently dropped). Configurable via ARKILIAN_MAX_ATTEMPTS.
+// Default 100 attempts: with the exponential backoff below that spans a
+// very long outage before rows leave the live outbox; operators who want
+// faster give-up set the env var lower.
+static int max_attempts(void) {
+  int m = get_env_int_default("ARKILIAN_MAX_ATTEMPTS", 100);
+  if (m < 1) m = 1;
+  if (m > 1000000) m = 1000000;
+  return m;
+}
+
+// Exponential backoff for a chunk that failed `attempts` times: 2^attempts
+// seconds, capped at 2^20 (~12 days) so a prolonged outage never hot-loops.
+// The sleep is interruptible (db_wal_flush / db_close wake it), so the
+// backoff never blocks a clean shutdown.
+static long backoff_seconds(int attempts) {
+  if (attempts <= 0) return 0;
+  if (attempts > 20) attempts = 20;
+  return 1L << attempts;
+}
+
+// Record a failed flush attempt for every row in the chunk's LSN range and,
+// once the attempt budget is exhausted, dead-letter the WHOLE chunk (move
+// its rows to _dead_backup with a failure reason and remove them from the
+// live outbox) — a permanently-rejected chunk must not pin the queue head
+// behind it forever, blocking every younger row from shipping under the
+// outbox cap. Returns the chunk's new attempt count on success (the caller
+// backs off and will retry), or -1 when the chunk was dead-lettered (the
+// caller must reset the buffer to advance the queue head).
+static int chunk_failure_logic(arkilian *db, wal_chunk *c,
+                               sqlite3_stmt *attempts_stmt,
+                               sqlite3_stmt *attempts_max_stmt,
+                               sqlite3_stmt *dead_letter_stmt,
+                               sqlite3_stmt *dlq_delete_stmt) {
+  sqlite3_reset(attempts_stmt);
+  sqlite3_clear_bindings(attempts_stmt);
+  sqlite3_bind_int64(attempts_stmt, 1, (sqlite3_int64)c->lsn_start);
+  sqlite3_bind_int64(attempts_stmt, 2, (sqlite3_int64)c->lsn_end);
+  if (sqlite3_step(attempts_stmt) != SQLITE_DONE) return 0;
+
+  sqlite3_reset(attempts_max_stmt);
+  sqlite3_clear_bindings(attempts_max_stmt);
+  sqlite3_bind_int64(attempts_max_stmt, 1, (sqlite3_int64)c->lsn_start);
+  sqlite3_bind_int64(attempts_max_stmt, 2, (sqlite3_int64)c->lsn_end);
+  int attempts = 0;
+  if (sqlite3_step(attempts_max_stmt) == SQLITE_ROW) {
+    attempts = sqlite3_column_int(attempts_max_stmt, 0);
+  }
+  if (attempts < max_attempts()) return attempts;
+
+  ark_log(db, ARK_LOG_ERROR,
+          "chunk lsn %llu..%llu dead-lettered after %d attempts — rows moved "
+          "to _dead_backup for operator recovery (arkilian-dlq --replay)",
+          (unsigned long long)c->lsn_start, (unsigned long long)c->lsn_end,
+          attempts);
+  sqlite3_reset(dead_letter_stmt);
+  sqlite3_clear_bindings(dead_letter_stmt);
+  sqlite3_bind_text(dead_letter_stmt, 1, "max attempts exceeded", -1,
+                    SQLITE_STATIC);
+  sqlite3_bind_int64(dead_letter_stmt, 2, (sqlite3_int64)c->lsn_start);
+  sqlite3_bind_int64(dead_letter_stmt, 3, (sqlite3_int64)c->lsn_end);
+  if (sqlite3_step(dead_letter_stmt) != SQLITE_DONE) return 0;
+  // INSERT OR IGNORE above absorbed any pre-existing dead copy (the
+  // "dead-letter succeeded, delete failed" zombie residue); this DELETE
+  // resolves that double state by removing the live copy.
+  sqlite3_reset(dlq_delete_stmt);
+  sqlite3_clear_bindings(dlq_delete_stmt);
+  sqlite3_bind_int64(dlq_delete_stmt, 1, (sqlite3_int64)c->lsn_start);
+  sqlite3_bind_int64(dlq_delete_stmt, 2, (sqlite3_int64)c->lsn_end);
+  sqlite3_step(dlq_delete_stmt);
+  return -1;
+}
+
 static int wal_chunk_append(wal_chunk *c, const char *sql, int sql_len,
                              uint64_t outbox_id) {
   if (c->entry_count == 0) {
@@ -1462,20 +1534,24 @@ static int drain_chunk(arkilian *db, wal_chunk *c, sqlite3_stmt *select_stmt) {
   return processed;
 }
 
-// Prepare the four outbox statements on the backup connection. Returns 1
-// when all four prepared, 0 on any failure — finalizing whatever did
+// Prepare the six outbox statements on the backup connection. Returns 1
+// when all six prepared, 0 on any failure — finalizing whatever did
 // prepare so a retry starts clean. The caller logs and retries with
 // backoff: a transient failure here (schema lock, missing outbox table)
 // must not silently disable shipping, and a silently-dead flush thread is
 // worse than a loudly retrying one.
 static int prepare_outbox_statements(sqlite3 *db, sqlite3_stmt **select_stmt,
                                      sqlite3_stmt **delete_stmt,
-                                     sqlite3_stmt **update_attempts_stmt,
-                                     sqlite3_stmt **dead_letter_stmt) {
+                                     sqlite3_stmt **attempts_stmt,
+                                     sqlite3_stmt **attempts_max_stmt,
+                                     sqlite3_stmt **dead_letter_stmt,
+                                     sqlite3_stmt **dlq_delete_stmt) {
   *select_stmt = NULL;
   *delete_stmt = NULL;
-  *update_attempts_stmt = NULL;
+  *attempts_stmt = NULL;
+  *attempts_max_stmt = NULL;
   *dead_letter_stmt = NULL;
+  *dlq_delete_stmt = NULL;
 
   if (sqlite3_prepare_v2(db,
         "SELECT id, payload, attempts, COALESCE(last_attempt_at, 0) FROM _pending_backup "
@@ -1484,20 +1560,34 @@ static int prepare_outbox_statements(sqlite3 *db, sqlite3_stmt **select_stmt,
   if (sqlite3_prepare_v2(db,
         "DELETE FROM _pending_backup WHERE id <= ?1",
         -1, delete_stmt, NULL) != SQLITE_OK) goto fail;
+  // Failed-flush bookkeeping: bump attempts for the chunk's whole LSN
+  // range, read the range's max, dead-letter the range (OR IGNORE absorbs
+  // a pre-existing copy — the zombie residue), then drop the live copy.
   if (sqlite3_prepare_v2(db,
-        "UPDATE _pending_backup SET attempts = ?1, last_attempt_at = strftime('%s','now') WHERE id = ?2",
-        -1, update_attempts_stmt, NULL) != SQLITE_OK) goto fail;
+        "UPDATE _pending_backup SET attempts = attempts + 1, "
+        "last_attempt_at = strftime('%s','now') WHERE id >= ?1 AND id <= ?2",
+        -1, attempts_stmt, NULL) != SQLITE_OK) goto fail;
+  if (sqlite3_prepare_v2(db,
+        "SELECT COALESCE(MAX(attempts), 0) FROM _pending_backup "
+        "WHERE id >= ?1 AND id <= ?2",
+        -1, attempts_max_stmt, NULL) != SQLITE_OK) goto fail;
   if (sqlite3_prepare_v2(db,
         "INSERT OR IGNORE INTO _dead_backup (id, payload, attempts, failed_reason, created_at) "
-        "SELECT id, payload, ?1, ?2, created_at FROM _pending_backup WHERE id = ?3",
+        "SELECT id, payload, attempts, ?1, strftime('%s','now') "
+        "FROM _pending_backup WHERE id >= ?2 AND id <= ?3",
         -1, dead_letter_stmt, NULL) != SQLITE_OK) goto fail;
+  if (sqlite3_prepare_v2(db,
+        "DELETE FROM _pending_backup WHERE id >= ?1 AND id <= ?2",
+        -1, dlq_delete_stmt, NULL) != SQLITE_OK) goto fail;
   return 1;
 
 fail:
   if (*select_stmt) { sqlite3_finalize(*select_stmt); *select_stmt = NULL; }
   if (*delete_stmt) { sqlite3_finalize(*delete_stmt); *delete_stmt = NULL; }
-  if (*update_attempts_stmt) { sqlite3_finalize(*update_attempts_stmt); *update_attempts_stmt = NULL; }
+  if (*attempts_stmt) { sqlite3_finalize(*attempts_stmt); *attempts_stmt = NULL; }
+  if (*attempts_max_stmt) { sqlite3_finalize(*attempts_max_stmt); *attempts_max_stmt = NULL; }
   if (*dead_letter_stmt) { sqlite3_finalize(*dead_letter_stmt); *dead_letter_stmt = NULL; }
+  if (*dlq_delete_stmt) { sqlite3_finalize(*dlq_delete_stmt); *dlq_delete_stmt = NULL; }
   return 0;
 }
 
@@ -1547,11 +1637,14 @@ void *run_wal_flush(void *arg) {
 #endif
   }
   int manifest_seeded = 0;
+  time_t next_seed_retry = 0;
 
   sqlite3_stmt *select_stmt = NULL;
   sqlite3_stmt *delete_stmt = NULL;
-  sqlite3_stmt *update_attempts_stmt = NULL;
+  sqlite3_stmt *attempts_stmt = NULL;
+  sqlite3_stmt *attempts_max_stmt = NULL;
   sqlite3_stmt *dead_letter_stmt = NULL;
+  sqlite3_stmt *dlq_delete_stmt = NULL;
 
   // Prepare once, reuse via sqlite3_reset — avoids re-parsing SQL every
   // loop. Every prepare below is checked. On failure (e.g. the outbox
@@ -1562,7 +1655,8 @@ void *run_wal_flush(void *arg) {
   int backoff_s = 1;
   while (!ARK_LOAD(&db->shutdown_requested)) {
     if (prepare_outbox_statements(db->backup_db, &select_stmt, &delete_stmt,
-                                  &update_attempts_stmt, &dead_letter_stmt)) {
+                                  &attempts_stmt, &attempts_max_stmt,
+                                  &dead_letter_stmt, &dlq_delete_stmt)) {
       break;
     }
     ark_log(db, ARK_LOG_WARN,
@@ -1580,12 +1674,18 @@ void *run_wal_flush(void *arg) {
     long long now_ms = now_ms_mono();
     ARK_STORE(&db->last_heartbeat_sec, (int)(now_ms / 1000));
 
-    // Seed the manifest registry once from the last uploaded manifest
-    // (restart safety) — async on this thread so db_init never blocks on
-    // a slow storage endpoint.
+    // Seed the manifest registry from the last uploaded manifest (restart
+    // safety) — async on this thread so db_init never blocks on a slow
+    // storage endpoint. Resolves to a terminal state (adopted registry,
+    // cold start, or frozen) in one call; only a transient net/mem failure
+    // stays unresolved and is retried here on a bounded cadence, so
+    // shipping is never blocked awaiting the seed (chunk PUTs proceed).
     if (!manifest_seeded) {
-      manifest_seeded = 1;
-      manifest_registry_seed(db);
+      time_t now = time(NULL);
+      if (now >= next_seed_retry) {
+        manifest_seeded = manifest_registry_seed(db);
+        if (!manifest_seeded) next_seed_retry = now + 5;
+      }
     }
 
     int drained = 0;
@@ -1593,13 +1693,35 @@ void *run_wal_flush(void *arg) {
       drained = drain_chunk(db, &db->chunk, select_stmt);
     }
 
-    if (ARK_LOAD(&db->s3_creds_loaded) && db->chunk.entry_count > 0) {
+    // Both the drain and the flush are gated on the kill-switch: a
+    // disabled backup must never ship rows already sitting in the buffer.
+    if (ARK_LOAD(&db->backup_enabled) && ARK_LOAD(&db->s3_creds_loaded) &&
+        db->chunk.entry_count > 0) {
       time_t age = time(NULL) - db->chunk.opened_at;
       if (age >= db->chunk_interval || db->chunk.len >= CHUNK_MAX_SIZE_BYTES) {
         int flush_rc = wal_chunk_flush_to_s3(db, &db->chunk, delete_stmt);
         if (flush_rc == SHIP_OK) {
           wal_chunk_reset(&db->chunk);
           drained = 1;  // indicate work was done (prevents unnecessary sleep)
+        } else {
+          // The chunk failed as a unit (any non-2xx, or a local failure).
+          // Record the attempt for every row it covers; once the attempt
+          // budget is exhausted, dead-letter the whole chunk so a
+          // permanently-rejected chunk (revoked credentials, deleted
+          // bucket, malformed key) never pins the queue head behind it.
+          int chunk_attempts = chunk_failure_logic(
+              db, &db->chunk, attempts_stmt, attempts_max_stmt,
+              dead_letter_stmt, dlq_delete_stmt);
+          if (chunk_attempts < 0) {
+            // Dead-lettered: the queue head advances past the poison rows.
+            wal_chunk_reset(&db->chunk);
+            drained = 1;
+          } else {
+            // Retry with interruptible exponential backoff (db_close /
+            // db_wal_flush wake it early on shutdown).
+            long b = backoff_seconds(chunk_attempts);
+            if (sleep_interruptible(db, (int)b)) break;
+          }
         }
       }
     }
@@ -1643,8 +1765,10 @@ void *run_wal_flush(void *arg) {
 
   if (select_stmt) sqlite3_finalize(select_stmt);
   if (delete_stmt) sqlite3_finalize(delete_stmt);
-  if (update_attempts_stmt) sqlite3_finalize(update_attempts_stmt);
+  if (attempts_stmt) sqlite3_finalize(attempts_stmt);
+  if (attempts_max_stmt) sqlite3_finalize(attempts_max_stmt);
   if (dead_letter_stmt) sqlite3_finalize(dead_letter_stmt);
+  if (dlq_delete_stmt) sqlite3_finalize(dlq_delete_stmt);
 
 #ifdef _WIN32
   return 0;
@@ -1734,6 +1858,32 @@ int db_init(arkilian **db_ptr, const char *filename) {
   // surfaced loudly — never a hard failure (spec §0), but shipping only
   // runs against a complete destination.
   ARK_STORE(&db->s3_creds_loaded, has_direct_s3(db) ? 1 : 0);
+
+  // (Hardening) Cleartext S3 endpoint guard: a presigned SigV4 request
+  // carries the request signature in the query string, so shipping over
+  // http:// to a NON-LOCAL host would expose replayable signatures on the
+  // wire. Mirroring the control-plane-era posture, refuse loudly at init
+  // (backup disabled; the game is unaffected, spec §0) unless the operator
+  // opts in with ARKILIAN_ALLOW_INSECURE=1 for local development only.
+  // Loopback / RFC1918 http:// endpoints (local MinIO-style test servers)
+  // remain permitted.
+  if (db->s3_endpoint && db->s3_endpoint[0] &&
+      strncmp(db->s3_endpoint, "http://", 7) == 0) {
+    char ep_host[256];
+    if (url_host(db->s3_endpoint, ep_host, sizeof(ep_host)) == 0 ||
+        !host_is_storage_safe(ep_host)) {
+      const char *allow = getenv("ARKILIAN_ALLOW_INSECURE");
+      if (!(allow && strcmp(allow, "1") == 0)) {
+        ark_log(db, ARK_LOG_ERROR,
+                "S3 endpoint '%s' is cleartext http:// to a non-local host "
+                "— presigned request signatures would travel unencrypted "
+                "and are replayable. Backup DISABLED; use https://, or set "
+                "ARKILIAN_ALLOW_INSECURE=1 for local development only",
+                db->s3_endpoint);
+        ARK_STORE(&db->backup_enabled, 0);
+      }
+    }
+  }
 
   // Config validation (spec §9's "fail loudly, never silently"): a
   // kill-switch-ON install with no destination will capture rows forever
@@ -3375,20 +3525,11 @@ static int manifest_registry_upload(arkilian *db, const char *snapshot_key,
   if (rc == 0) {
     db->manifest_pending = 0;
     db->manifest_last_upload = time(NULL);
-    // Advance the DELETE watermark to the highest outbox id this manifest
-    // now durably covers. Rows up to it are reachable by hydration either
-    // through a recorded chunk or through the baseline snapshot itself
-    // (whose content includes every row at or below baseline_lsn), so only
-    // now is it safe to remove them from _pending_backup. Computed here,
-    // under the lock, from exactly the registry that was serialized — a
-    // chunk appended by the flush thread mid-upload must not be counted
-    // before the manifest that names it is durable.
-    uint64_t durable = db->manifest_baseline_lsn;
-    for (int i = 0; i < db->manifest_chunk_count; i++) {
-      if (db->manifest_chunks[i].lsn_end > durable)
-        durable = db->manifest_chunks[i].lsn_end;
-    }
-    if (durable > db->manifest_durable_lsn) db->manifest_durable_lsn = durable;
+    // The manifest is durable: chunk records it names are now reachable by
+    // hydration. Outbox rows for those chunks were already deleted on
+    // flush ack (delete-on-flush-ack); any chunk PUT in the batching
+    // window but not yet named here is re-covered by the next hourly
+    // snapshot baseline, so nothing accumulates.
   }
   manifest_registry_unlock(db);
   return rc;
@@ -3409,38 +3550,46 @@ static void manifest_registry_maybe_upload(arkilian *db) {
   manifest_registry_upload(db, NULL, NULL, 0);
 }
 
-// Publish any pending chunk records regardless of the batching interval.
-// Used on the shutdown path: a chunk object that is PUT but not yet named
-// by the published manifest is invisible to hydration, so its outbox rows
-// must not be deleted — forcing the publish at exit keeps the registry
-// complete instead of leaving a window that only a crash would close.
-static void manifest_registry_publish_pending(arkilian *db) {
-  manifest_registry_lock(db);
-  int pending = db->manifest_pending;
-  manifest_registry_unlock(db);
-  if (pending <= 0) return;
-  manifest_registry_upload(db, NULL, NULL, 0);
-}
-
 // Seed the registry from the last uploaded manifest (restart safety): a
 // process that restarts between snapshots must adopt its predecessor's
-// chunk records, or hydration would never replay them. Best-effort — a
-// cold start has no manifest yet, which is not an error.
-static void manifest_registry_seed(arkilian *db) {
-  if (!db || !has_direct_s3(db)) return;
-  if (!db->s3_prefix || !db->s3_prefix[0]) return;
+// chunk records, or hydration would never replay them. Also resolves the
+// startup manifest read that gates ALL manifest publishes:
+//   - success or HYDRATION_ERR_NOTFOUND (genuine cold start) → resolved:
+//     registry adopted, or confirmed empty — publishing may proceed
+//   - HYDRATION_ERR_PROTO (present but corrupt/foreign) → frozen: never
+//     overwrite a registry this process could not read (its chunk records
+//     are the only pointers to objects whose outbox rows are already
+//     deleted)
+//   - transient net/mem failure → stays unresolved; the flush loop retries
+//     on a bounded cadence, and NO manifest is published until then
+// Returns 1 once resolved (terminal), 0 while still pending.
+static int manifest_registry_seed(arkilian *db) {
+  if (!db || !has_direct_s3(db)) return 1;
+  if (!db->s3_prefix || !db->s3_prefix[0]) return 1;
   HydratePlan plan;
-  if (ark_manifest_fetch(db->s3_endpoint, db->s3_bucket, db->s3_region,
-                         db->s3_access_key, db->s3_secret_key,
-                         db->s3_prefix, &plan) != 0)
-    return;
+  int rc = ark_manifest_fetch(db->s3_endpoint, db->s3_bucket, db->s3_region,
+                              db->s3_access_key, db->s3_secret_key,
+                              db->s3_prefix, &plan);
+  if (rc != 0) {
+    if (rc == HYDRATION_ERR_NOTFOUND) {
+      ARK_STORE(&db->manifest_seed_resolved, 1);  // cold start, nothing to adopt
+    } else if (rc == HYDRATION_ERR_PROTO) {
+      ARK_STORE(&db->manifest_seed_resolved, -1); // frozen; see comment above
+    } else {
+      return 0; // transient (net/mem) — retried by the flush loop
+    }
+    return 1;
+  }
   manifest_registry_lock(db);
   for (int i = 0; i < plan.chunk_count; i++) {
     HydrateChunk *ch = &plan.chunks[i];
     if (!ch->s3_key || !ch->s3_key[0]) continue;
-    manifest_registry_append(db, strdup(ch->s3_key),
-                             ch->sha256 ? strdup(ch->sha256) : NULL,
-                             (uint64_t)ch->lsn_start, (uint64_t)ch->lsn_end);
+    // _locked variant: this path already holds manifest_mutex (calling the
+    // plain wrapper here would deadlock the non-recursive mutex).
+    manifest_registry_append_locked(db, strdup(ch->s3_key),
+                                    ch->sha256 ? strdup(ch->sha256) : NULL,
+                                    (uint64_t)ch->lsn_start,
+                                    (uint64_t)ch->lsn_end);
   }
   if (plan.snapshot_s3_key) {
     free(db->manifest_snapshot_key);
@@ -3453,7 +3602,9 @@ static void manifest_registry_seed(arkilian *db) {
   db->manifest_pending = 0;
   db->manifest_last_upload = time(NULL);
   manifest_registry_unlock(db);
+  ARK_STORE(&db->manifest_seed_resolved, 1);
   hydrate_plan_free(&plan);
+  return 1;
 }
 
 #ifdef _WIN32
@@ -3523,6 +3674,12 @@ void *run_hourly_backup(void *arg) {
     manifest_registry_lock(db);
     if (db->manifest_chunk_count > 0)
       snapshot_upto = db->manifest_chunks[db->manifest_chunk_count - 1].lsn_end;
+    // Monotone baseline: the previously published baseline is the floor
+    // even after its chunk records were pruned, so a later snapshot never
+    // REPUBLISHES a LOWER baseline over a durable higher one (which would
+    // make hydration believe every row between the two was missing).
+    if (db->manifest_baseline_lsn > snapshot_upto)
+      snapshot_upto = db->manifest_baseline_lsn;
     manifest_registry_unlock(db);
 
     if (status == SQLITE_OK && has_direct_s3(db)) {

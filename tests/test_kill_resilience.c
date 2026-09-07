@@ -107,11 +107,19 @@ static void *rec_server_run(void *arg) {
         if (n <= 0) break;
         have += n;
       }
-      char *pid = strstr(buf, "X-Arkilian-Payload-Id:");
-      if (pid) {
-        long long v = atoll(pid + strlen("X-Arkilian-Payload-Id:"));
-        if (s->count < (int)(sizeof(s->ids) / sizeof(s->ids[0]))) {
-          s->ids[s->count++] = (sqlite3_int64)v;
+      // Chunked S3 shipping: each PUT carries a whole LSN range in its
+      // object key (chunks/lsn_<start>_<end>.sql). Record every id in the
+      // range — the same at-least-once delivery evidence as the old
+      // per-payload header, now in chunk form. Overlapping ranges (after a
+      // restart re-chunk) collapse later in make_set().
+      char *lsn = strstr(buf, "chunks/lsn_");
+      if (lsn) {
+        long long lo = 0, hi = 0;
+        if (sscanf(lsn + strlen("chunks/lsn_"),
+                   "%lld_%lld.sql", &lo, &hi) == 2) {
+          for (long long id = lo; id <= hi && s->count < (int)(sizeof(s->ids) / sizeof(s->ids[0])); id++) {
+            s->ids[s->count++] = (sqlite3_int64)id;
+          }
         }
       }
       s->requests++;

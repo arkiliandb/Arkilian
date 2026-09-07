@@ -496,10 +496,10 @@ static void test_dead_letter_zombie_cleared(void) {
   setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
   setenv("ARKILIAN_S3_PREFIX", "test-prefix", 1);
   ark_setenv("ARKILIAN_BACKUP_INTERVAL", "3600", 1);
-  // Key + skip-auth keep backup enabled so the flush thread actually runs
-  // (the api_key guard in db_init disables backup otherwise, and the
-  // zombie would never be cleaned).
-  ark_setenv("ARKILIAN_S3_ACCESS_KEY", "test-key", 1);
+  // Tight attempt budget so the crafted zombie (10 attempts) is at the
+  // limit on the FIRST pass — dead-lettering then runs immediately. The
+  // flush thread must actually attempt-and-fail (127.0.0.1:1 refuses).
+  ark_setenv("ARKILIAN_MAX_ATTEMPTS", "10", 1);
   arkilian *db = NULL;
   assert(db_init(&db, "test_reg_zombie.db") == 0);
 

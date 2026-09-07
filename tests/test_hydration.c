@@ -290,7 +290,10 @@ static void test_roundtrip(void) {
   // thread to re-baseline all 50 rows so the restore is deterministic.
   assert(wait_for_key("manifest.json", 15));
   assert(wait_for_key("/chunks/", 15));
-  assert(wait_for_baseline(50, 15));
+  // All 50 rows covered. The baseline LSN is the highest flushed OUTBOX
+  // id: id 1 is the CREATE TABLE DDL capture, so the 50th INSERT ends at
+  // outbox id 51.
+  assert(wait_for_baseline(51, 15));
   db_close(db);
 
   // Restore into a fresh file.

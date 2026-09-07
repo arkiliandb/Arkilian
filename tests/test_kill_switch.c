@@ -225,9 +225,13 @@ static void test_runtime_kill_switch(void) {
     snprintf(sql, sizeof(sql), "INSERT INTO t (v) VALUES ('row%d')", i);
     assert(db_exec(db, sql) == SQLITE_OK);
   }
-  assert(wait_queue_empty(db, 10000) == 0);
+  assert(wait_queue_empty(db, 10000) == 0); // drained ⇒ every row 2xx-acked
   int shipped_enabled = srv.requests;
-  assert(shipped_enabled >= 5);
+  // Chunked S3 shipping: one PUT carries the whole batch, so assert the
+  // deliverable invariant (queue drained ⇒ ≥1 chunk request reached the
+  // destination), not a per-row request count from the push-per-row
+  // protocol the mock originally counted.
+  assert(shipped_enabled >= 1);
 
   // Let the flush thread finish its pass and fall asleep in cond-wait
   // before flipping the switch, so no drain is mid-flight across the
@@ -254,7 +258,7 @@ static void test_runtime_kill_switch(void) {
   db_backup_set_enabled(db, 1);
   assert(db_backup_is_enabled(db) == 1);
   assert(wait_queue_empty(db, 10000) == 0);
-  assert(srv.requests >= shipped_enabled + 5);
+  assert(srv.requests > shipped_enabled); // resumed: ≥1 new chunk request
 
   db_close(db);
   mock_server_stop(&srv);
