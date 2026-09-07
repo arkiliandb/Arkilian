@@ -9,11 +9,24 @@ int main(void) {
   printf("=== Testing Cold-Start Hydration from MinIO / Control Plane ===\n");
   remove("hydrated_stress.db");
 
-  const char *server_url = getenv("CONTROL_PLANE_URL");
-  if (!server_url) server_url = "http://localhost:8080/v1";
+  const char *endpoint    = getenv("ARKILIAN_S3_ENDPOINT");
+  const char *bucket      = getenv("ARKILIAN_S3_BUCKET");
+  const char *region      = getenv("ARKILIAN_S3_REGION");
+  const char *access_key  = getenv("ARKILIAN_S3_ACCESS_KEY");
+  const char *secret_key  = getenv("ARKILIAN_S3_SECRET_KEY");
+  const char *prefix      = getenv("ARKILIAN_S3_PREFIX");
+  if (!endpoint || !bucket || !access_key || !secret_key || !prefix) {
+    printf("Set ARKILIAN_S3_ENDPOINT/BUCKET/REGION/ACCESS_KEY/SECRET_KEY/PREFIX "
+           "(target the MinIO instance populated by test_minio_setup).\\n");
+    return 1;
+  }
+  if (!region) region = "us-east-1";
 
-  printf("Requesting hydration plan from %s...\n", server_url);
-  int rc = arkilian_hydrate("hydrated_stress.db", server_url, "dummy-token", NULL, NULL);
+  printf("Requesting hydration from %s (prefix %s)...\n", endpoint, prefix);
+  int rc = arkilian_hydrate_s3(
+      "hydrated_stress.db",
+      endpoint, bucket, region, access_key, secret_key, prefix,
+      NULL, NULL);
 
   if (rc == 0) {
     printf("Hydration completed successfully (rc=0)!\n");

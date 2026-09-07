@@ -182,11 +182,17 @@ static void test_writes_survive_503_backpressure(void) {
   char url[128];
   snprintf(url, sizeof(url), "http://127.0.0.1:%d/push", srv.port);
   ark_setenv("ARKILIAN_ENABLE_BACKUP", "1", 1);
-  ark_setenv("ARKILIAN_API_KEY", "test-key", 1);
-  ark_setenv("ARKILIAN_SKIP_STARTUP_AUTH", "1", 1);
-  ark_setenv("ARKILIAN_CONTROL_URL", url, 1);
+  ark_setenv("ARKILIAN_S3_ACCESS_KEY", "test-key", 1);
+  ark_setenv("ARKILIAN_S3_ENDPOINT", url, 1);
+  ark_setenv("ARKILIAN_S3_BUCKET", "test-bucket", 1);
+  ark_setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
+  ark_setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
+  ark_setenv("ARKILIAN_S3_PREFIX", "test-prefix", 1);
+  setenv("ARKILIAN_S3_BUCKET", "test-bucket", 1);
+  setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
+  setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
+  setenv("ARKILIAN_S3_PREFIX", "test-prefix", 1);
   ark_setenv("ARKILIAN_BACKUP_INTERVAL", "3600", 1);
-  ark_setenv("ARKILIAN_MAX_ATTEMPTS", "100", 1); // don't dead-letter during test
 
   arkilian *db = NULL;
   assert(db_init(&db, db_path) == 0);
@@ -230,7 +236,6 @@ static void test_writes_survive_503_backpressure(void) {
   db_close(db);
   mock_503_stop(&srv);
   cleanup(db_path);
-  ark_setenv("ARKILIAN_MAX_ATTEMPTS", "3", 1); // restore for other tests
 }
 
 // 2. The outbox cap (ARKILIAN_MAX_QUEUE_DEPTH) is respected under 503
@@ -247,11 +252,17 @@ static void test_outbox_cap_respected_under_503(void) {
   char url[128];
   snprintf(url, sizeof(url), "http://127.0.0.1:%d/push", srv.port);
   ark_setenv("ARKILIAN_ENABLE_BACKUP", "1", 1);
-  ark_setenv("ARKILIAN_API_KEY", "test-key", 1);
-  ark_setenv("ARKILIAN_SKIP_STARTUP_AUTH", "1", 1);
-  ark_setenv("ARKILIAN_CONTROL_URL", url, 1);
+  ark_setenv("ARKILIAN_S3_ACCESS_KEY", "test-key", 1);
+  ark_setenv("ARKILIAN_S3_ENDPOINT", url, 1);
+  ark_setenv("ARKILIAN_S3_BUCKET", "test-bucket", 1);
+  ark_setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
+  ark_setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
+  ark_setenv("ARKILIAN_S3_PREFIX", "test-prefix", 1);
+  setenv("ARKILIAN_S3_BUCKET", "test-bucket", 1);
+  setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
+  setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
+  setenv("ARKILIAN_S3_PREFIX", "test-prefix", 1);
   ark_setenv("ARKILIAN_BACKUP_INTERVAL", "3600", 1);
-  ark_setenv("ARKILIAN_MAX_ATTEMPTS", "100", 1);
   ark_setenv("ARKILIAN_MAX_QUEUE_DEPTH", "10", 1); // tight cap
 
   arkilian *db = NULL;
@@ -282,7 +293,6 @@ static void test_outbox_cap_respected_under_503(void) {
   mock_503_stop(&srv);
   cleanup(db_path);
   ark_setenv("ARKILIAN_MAX_QUEUE_DEPTH", "100000", 1); // restore default
-  ark_setenv("ARKILIAN_MAX_ATTEMPTS", "3", 1);
 }
 
 // 3. When the destination recovers (flips from 503 to 200), the backlog
@@ -298,11 +308,17 @@ static void test_backlog_drains_on_recovery(void) {
   char url[128];
   snprintf(url, sizeof(url), "http://127.0.0.1:%d/push", srv.port);
   ark_setenv("ARKILIAN_ENABLE_BACKUP", "1", 1);
-  ark_setenv("ARKILIAN_API_KEY", "test-key", 1);
-  ark_setenv("ARKILIAN_SKIP_STARTUP_AUTH", "1", 1);
-  ark_setenv("ARKILIAN_CONTROL_URL", url, 1);
+  ark_setenv("ARKILIAN_S3_ACCESS_KEY", "test-key", 1);
+  ark_setenv("ARKILIAN_S3_ENDPOINT", url, 1);
+  ark_setenv("ARKILIAN_S3_BUCKET", "test-bucket", 1);
+  ark_setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
+  ark_setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
+  ark_setenv("ARKILIAN_S3_PREFIX", "test-prefix", 1);
+  setenv("ARKILIAN_S3_BUCKET", "test-bucket", 1);
+  setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
+  setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
+  setenv("ARKILIAN_S3_PREFIX", "test-prefix", 1);
   ark_setenv("ARKILIAN_BACKUP_INTERVAL", "3600", 1);
-  ark_setenv("ARKILIAN_MAX_ATTEMPTS", "100", 1);
 
   arkilian *db = NULL;
   assert(db_init(&db, db_path) == 0);
@@ -338,16 +354,13 @@ static void test_backlog_drains_on_recovery(void) {
   db_close(db);
   mock_503_stop(&srv);
   cleanup(db_path);
-  ark_setenv("ARKILIAN_MAX_ATTEMPTS", "3", 1);
 }
 
 // ── Main ────────────────────────────────────────────────────────────
 
 int main(void) {
   signal(SIGPIPE, SIG_IGN);
-  ark_setenv("ARKILIAN_API_KEY", "test-key", 1);
-  ark_setenv("ARKILIAN_SKIP_STARTUP_AUTH", "1", 1);
-  ark_setenv("ARKILIAN_MAX_ATTEMPTS", "3", 1);
+  ark_setenv("ARKILIAN_S3_ACCESS_KEY", "test-key", 1);
 
   printf("=== Arkilian Destination Backpressure Tests ===\n\n");
   RUN_TEST(test_writes_survive_503_backpressure);

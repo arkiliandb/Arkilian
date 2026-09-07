@@ -38,21 +38,13 @@ option(ARKILIAN_BUILD_TESTS "Build test programs" OFF)
 # Find CURL
 find_package(CURL REQUIRED)
 
-# Find zstd (optional — WAL chunk compression for v2 direct-to-S3 path)
-find_package(ZSTD QUIET)
-if(ZSTD_FOUND)
-  message(STATUS "zstd found — WAL chunk compression enabled")
-  add_compile_definitions(ARKILIAN_HAS_ZSTD)
-else()
-  message(STATUS "zstd NOT found — WAL chunk compression disabled (direct-S3 without compression)")
-endif()
 
 # Find Threads
 set(THREADS_PREFER_PTHREAD_FLAG ON)
 find_package(Threads REQUIRED)
 
 # Common source files
-set(ARKILIAN_SOURCES src/class.c src/sha256.c src/deps/sqlite/sqlite3.c)
+set(ARKILIAN_SOURCES src/class.c src/hydration.c src/sha256.c src/deps/sqlite/sqlite3.c)
 
 # Compile-time SQLite options required by Arkilian. The preupdate hook
 # drives deterministic-capture tests; FTS5 must be enabled in the
@@ -111,13 +103,10 @@ if(ARKILIAN_BUILD_SHARED)
         $<INSTALL_INTERFACE:include/arkilian>
     )
     target_link_libraries(arkilian PRIVATE CURL::libcurl Threads::Threads ${ARK_LIBM})
-    if(ZSTD_FOUND)
-      target_link_libraries(arkilian PRIVATE zstd::libzstd)
-    endif()
     set_target_properties(arkilian PROPERTIES
-        VERSION 1.4.0
+        VERSION 2.0.0
         SOVERSION 1
-        PUBLIC_HEADER "src/class.h;src/deps/sqlite/sqlite3.h"
+        PUBLIC_HEADER "src/class.h;src/hydration.h;src/deps/sqlite/sqlite3.h"
     )
 endif()
 
@@ -131,12 +120,9 @@ if(ARKILIAN_BUILD_STATIC)
         $<INSTALL_INTERFACE:include/arkilian>
     )
     target_link_libraries(arkilian_static PRIVATE CURL::libcurl Threads::Threads ${ARK_LIBM})
-    if(ZSTD_FOUND)
-      target_link_libraries(arkilian_static PRIVATE zstd::libzstd)
-    endif()
     set_target_properties(arkilian_static PROPERTIES
         OUTPUT_NAME arkilian
-        PUBLIC_HEADER "src/class.h;src/deps/sqlite/sqlite3.h"
+        PUBLIC_HEADER "src/class.h;src/hydration.h;src/deps/sqlite/sqlite3.h"
     )
     # On Windows the shared target's import library is also named
     # arkilian.lib. Give the static archive a distinct name so a release
@@ -205,9 +191,6 @@ if(CMAKE_JS_VERSION OR ARKILIAN_BUILD_NAPI)
     endif()
 
     target_link_libraries(arkilian_napi PRIVATE CURL::libcurl Threads::Threads ${ARK_LIBM})
-    if(ZSTD_FOUND)
-      target_link_libraries(arkilian_napi PRIVATE zstd::libzstd)
-    endif()
 
     # Node.js import library (needed on Windows)
     if(CMAKE_JS_LIB)
@@ -293,9 +276,6 @@ if(ARKILIAN_BUILD_TESTS)
         else()
             set(ARK_TEST_LIBS arkilian_static ${CMAKE_THREAD_LIBS_INIT} ${CURL_LIBRARIES} m)
         endif()
-        if(ZSTD_FOUND)
-            list(APPEND ARK_TEST_LIBS zstd::libzstd)
-        endif()
 
         # POSIX feature macros for setenv/unsetenv/clock_gettime (and the
         # BSD types macOS headers need: u_int, u_short, etc). _DARWIN_C_SOURCE
@@ -349,7 +329,7 @@ if(ARKILIAN_BUILD_TESTS)
         # POSIX-only — MinGW-w64 provides no <sys/socket.h>.
         if(NOT WIN32)
             add_executable(test_hydration tests/test_hydration.c
-                           src/hydration.c src/sha256.c src/deps/sqlite/sqlite3.c)
+                           src/class.c src/hydration.c src/sha256.c src/deps/sqlite/sqlite3.c)
             target_include_directories(test_hydration PRIVATE src src/deps/sqlite)
             target_link_libraries(test_hydration PRIVATE ${CMAKE_THREAD_LIBS_INIT}
                                   ${CURL_LIBRARIES})
@@ -385,17 +365,6 @@ if(ARKILIAN_BUILD_TESTS)
         # them so a build breakage is caught; run them out-of-band via
         # ARKILIAN_HYDRATION_URL=… ctest -R e2e — or just invoke manually. ──
         if(NOT WIN32)
-            add_executable(test_e2e_stress tests/test_e2e_stress.c
-                           src/class.c src/sha256.c src/deps/sqlite/sqlite3.c)
-            target_include_directories(test_e2e_stress PRIVATE src src/deps/sqlite)
-            target_link_libraries(test_e2e_stress PRIVATE ${CMAKE_THREAD_LIBS_INIT}
-                                  ${CURL_LIBRARIES})
-            if(ZSTD_FOUND)
-              target_link_libraries(test_e2e_stress PRIVATE zstd::libzstd)
-            endif()
-            target_compile_options(test_e2e_stress PRIVATE -UNDEBUG)
-            target_compile_definitions(test_e2e_stress PRIVATE ${ARK_POSIX_DEFS})
-
             add_executable(test_minio_hydrate tests/test_minio_hydrate.c
                            src/hydration.c src/sha256.c src/deps/sqlite/sqlite3.c)
             target_include_directories(test_minio_hydrate PRIVATE src src/deps/sqlite)
@@ -417,13 +386,10 @@ if(ARKILIAN_BUILD_TESTS)
             target_compile_definitions(bench_1m PRIVATE ${ARK_POSIX_DEFS})
 
             add_executable(stress_200m tests/stress_200m.c
-                           src/class.c src/sha256.c src/deps/sqlite/sqlite3.c)
+                           src/class.c src/hydration.c src/sha256.c src/deps/sqlite/sqlite3.c)
             target_include_directories(stress_200m PRIVATE src src/deps/sqlite)
             target_link_libraries(stress_200m PRIVATE ${CMAKE_THREAD_LIBS_INIT}
                                   ${CURL_LIBRARIES} m)
-            if(ZSTD_FOUND)
-              target_link_libraries(stress_200m PRIVATE zstd::libzstd)
-            endif()
             target_compile_definitions(stress_200m PRIVATE ${ARK_POSIX_DEFS})
             target_compile_options(stress_200m PRIVATE -UNDEBUG)
         endif()

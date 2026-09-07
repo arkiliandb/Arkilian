@@ -525,14 +525,6 @@ Napi::Value db_resync_triggers(const Napi::CallbackInfo& info) {
   return Napi::Number::New(env, db_resync_triggers(dl.db));
 }
 
-Napi::Value db_set_api_key(const Napi::CallbackInfo& info) {
-  Napi::Env env = info.Env();
-  DbLock dl = lockDb(info);
-  if (!dl || info.Length() < 2 || !info[1].IsString()) return env.Null();
-  std::string key = info[1].As<Napi::String>().Utf8Value();
-  return Napi::Number::New(env, db_set_api_key(dl.db, key.c_str()));
-}
-
 Napi::Value db_changes(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   DbLock dl = lockDb(info);
@@ -619,22 +611,35 @@ Napi::Value db_all_native(const Napi::CallbackInfo& info) {
 // Exposed as a standalone function (not on a handle) because hydration
 // must run from a cold process — before db_init() opens the database.
 //   arg0: db_path (string)
-//   arg1: control_url (string, e.g. "https://api.arkilian.com")
-//   arg2: api_key (string)
+//   arg1: s3_endpoint (string, path-style S3-compatible endpoint)
+//   arg2: s3_bucket (string)
+//   arg3: s3_region (string, e.g. "us-east-1")
+//   arg4: s3_access_key (string)
+//   arg5: s3_secret_key (string)
+//   arg6: s3_prefix (string — this database's key prefix)
 // Returns: HYDRATION_OK (0) on success, negative error code on failure.
 
-Napi::Value db_hydrate(const Napi::CallbackInfo& info) {
+Napi::Value db_hydrate_s3(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
-  if (info.Length() < 3 || !info[0].IsString() || !info[1].IsString() || !info[2].IsString()) {
-    Napi::TypeError::New(env, "Expected (dbPath, controlUrl, apiKey)").ThrowAsJavaScriptException();
+  if (info.Length() < 7 || !info[0].IsString() || !info[1].IsString() ||
+      !info[2].IsString() || !info[3].IsString() || !info[4].IsString() ||
+      !info[5].IsString() || !info[6].IsString()) {
+    Napi::TypeError::New(env, "Expected (dbPath, endpoint, bucket, region, accessKey, secretKey, prefix)")
+        .ThrowAsJavaScriptException();
     return env.Null();
   }
-  std::string dbPath = info[0].As<Napi::String>().Utf8Value();
-  std::string controlUrl = info[1].As<Napi::String>().Utf8Value();
-  std::string apiKey = info[2].As<Napi::String>().Utf8Value();
+  std::string dbPath      = info[0].As<Napi::String>().Utf8Value();
+  std::string endpoint    = info[1].As<Napi::String>().Utf8Value();
+  std::string bucket      = info[2].As<Napi::String>().Utf8Value();
+  std::string region      = info[3].As<Napi::String>().Utf8Value();
+  std::string accessKey   = info[4].As<Napi::String>().Utf8Value();
+  std::string secretKey   = info[5].As<Napi::String>().Utf8Value();
+  std::string prefix      = info[6].As<Napi::String>().Utf8Value();
 
-  int rc = arkilian_hydrate(dbPath.c_str(), controlUrl.c_str(), apiKey.c_str(),
-                             NULL, NULL);
+  int rc = arkilian_hydrate_s3(dbPath.c_str(), endpoint.c_str(), bucket.c_str(),
+                               region.c_str(), accessKey.c_str(),
+                               secretKey.c_str(), prefix.c_str(),
+                               NULL, NULL);
   if (rc != HYDRATION_OK) {
     std::string msg = "hydration failed (error code " + std::to_string(rc) + ")";
     Napi::Error::New(env, msg).ThrowAsJavaScriptException();
@@ -687,11 +692,11 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
   exports.Set("db_set_auto_resync_triggers", Napi::Function::New<db_set_auto_resync_triggers>(env));
   exports.Set("db_get_auto_resync_triggers", Napi::Function::New<db_get_auto_resync_triggers>(env));
   exports.Set("db_resync_triggers", Napi::Function::New<db_resync_triggers>(env));
-  exports.Set("db_set_api_key", Napi::Function::New<db_set_api_key>(env));
+  exports.Set("db_hydrate_s3", Napi::Function::New<db_hydrate_s3>(env));
   exports.Set("db_changes", Napi::Function::New<db_changes>(env));
   exports.Set("db_last_insert_rowid", Napi::Function::New<db_last_insert_rowid>(env));
   exports.Set("db_all_native", Napi::Function::New<db_all_native>(env));
-  exports.Set("db_hydrate", Napi::Function::New<db_hydrate>(env));
+  
 
   exports.Set("SQLITE_OK", Napi::Number::New(env, 0));
   exports.Set("SQLITE_ROW", Napi::Number::New(env, 100));

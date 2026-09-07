@@ -53,9 +53,16 @@ static void cleanup(const char *path) {
 static arkilian *open_db(const char *path) {
   cleanup(path); // idempotent across re-runs
   ark_setenv("ARKILIAN_ENABLE_BACKUP", "0", 1);
-  ark_setenv("ARKILIAN_API_KEY", "test-key", 1);
-  ark_setenv("ARKILIAN_SKIP_STARTUP_AUTH", "1", 1);
-  ark_setenv("ARKILIAN_CONTROL_URL", "http://127.0.0.1:1", 1);
+  ark_setenv("ARKILIAN_S3_ACCESS_KEY", "test-key", 1);
+  ark_setenv("ARKILIAN_S3_ENDPOINT", "http://127.0.0.1:1", 1);
+  ark_setenv("ARKILIAN_S3_BUCKET", "test-bucket", 1);
+  ark_setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
+  ark_setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
+  ark_setenv("ARKILIAN_S3_PREFIX", "test-prefix", 1);
+  setenv("ARKILIAN_S3_BUCKET", "test-bucket", 1);
+  setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
+  setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
+  setenv("ARKILIAN_S3_PREFIX", "test-prefix", 1);
   arkilian *db = NULL;
   int rc = db_init(&db, path);
   assert(rc == 0 && "db_init failed");
@@ -320,7 +327,7 @@ static void test_sync_success_leaves_errmsg_clean(void) {
 
 // ── No destination configured → rows must survive ───────────────────
 // Regression for a proven data-loss bug: ship_to_backup reported
-// SHIP_OK when ARKILIAN_CONTROL_URL was unset, so the drain loop
+// SHIP_OK when ARKILIAN_S3_ENDPOINT was unset, so the drain loop
 // DELETED every captured row. Backup is enabled by default — the
 // default configuration was quietly destroying data.
 
@@ -334,10 +341,17 @@ static void test_no_destination_rows_survive(void) {
   // db_init's load_env re-injected it from ./.env → push_url became
   // non-empty → the flush thread shipped and incremented attempts,
   // breaking the assert that none were attempted.
-  ark_setenv("ARKILIAN_CONTROL_URL", "", 1);
+  ark_setenv("ARKILIAN_S3_ENDPOINT", "", 1);
+  ark_setenv("ARKILIAN_S3_BUCKET", "test-bucket", 1);
+  ark_setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
+  ark_setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
+  ark_setenv("ARKILIAN_S3_PREFIX", "test-prefix", 1);
+  setenv("ARKILIAN_S3_BUCKET", "test-bucket", 1);
+  setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
+  setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
+  setenv("ARKILIAN_S3_PREFIX", "test-prefix", 1);
   ark_setenv("ARKILIAN_ENABLE_BACKUP", "1", 1);
   ark_setenv("ARKILIAN_BACKUP_INTERVAL", "3600", 1);
-  ark_setenv("ARKILIAN_SKIP_STARTUP_AUTH", "1", 1);
   arkilian *db = NULL;
   assert(db_init(&db, "test_reg_nodest.db") == 0);
   assert(db_exec(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)") == SQLITE_OK);
@@ -366,7 +380,15 @@ static void test_no_destination_rows_survive(void) {
 static void test_text_pk_replay_fidelity(void) {
   cleanup("test_reg_fid.db");
   ark_setenv("ARKILIAN_ENABLE_BACKUP", "1", 1);
-  ark_setenv("ARKILIAN_CONTROL_URL", "http://127.0.0.1:1", 1); // keep rows in outbox
+  ark_setenv("ARKILIAN_S3_ENDPOINT", "http://127.0.0.1:1", 1);
+  ark_setenv("ARKILIAN_S3_BUCKET", "test-bucket", 1);
+  ark_setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
+  ark_setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
+  ark_setenv("ARKILIAN_S3_PREFIX", "test-prefix", 1);
+  setenv("ARKILIAN_S3_BUCKET", "test-bucket", 1);
+  setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
+  setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
+  setenv("ARKILIAN_S3_PREFIX", "test-prefix", 1); // keep rows in outbox
   ark_setenv("ARKILIAN_BACKUP_INTERVAL", "3600", 1);
   arkilian *db = NULL;
   assert(db_init(&db, "test_reg_fid.db") == 0);
@@ -420,7 +442,15 @@ static void test_text_pk_replay_fidelity(void) {
 static void test_keyless_table_skipped(void) {
   cleanup("test_reg_keyless.db");
   ark_setenv("ARKILIAN_ENABLE_BACKUP", "1", 1);
-  ark_setenv("ARKILIAN_CONTROL_URL", "http://127.0.0.1:1", 1);
+  ark_setenv("ARKILIAN_S3_ENDPOINT", "http://127.0.0.1:1", 1);
+  ark_setenv("ARKILIAN_S3_BUCKET", "test-bucket", 1);
+  ark_setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
+  ark_setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
+  ark_setenv("ARKILIAN_S3_PREFIX", "test-prefix", 1);
+  setenv("ARKILIAN_S3_BUCKET", "test-bucket", 1);
+  setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
+  setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
+  setenv("ARKILIAN_S3_PREFIX", "test-prefix", 1);
   ark_setenv("ARKILIAN_BACKUP_INTERVAL", "3600", 1);
   arkilian *db = NULL;
   assert(db_init(&db, "test_reg_keyless.db") == 0);
@@ -456,13 +486,20 @@ static void test_keyless_table_skipped(void) {
 static void test_dead_letter_zombie_cleared(void) {
   cleanup("test_reg_zombie.db");
   ark_setenv("ARKILIAN_ENABLE_BACKUP", "1", 1);
-  ark_setenv("ARKILIAN_CONTROL_URL", "http://127.0.0.1:1", 1);
+  ark_setenv("ARKILIAN_S3_ENDPOINT", "http://127.0.0.1:1", 1);
+  ark_setenv("ARKILIAN_S3_BUCKET", "test-bucket", 1);
+  ark_setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
+  ark_setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
+  ark_setenv("ARKILIAN_S3_PREFIX", "test-prefix", 1);
+  setenv("ARKILIAN_S3_BUCKET", "test-bucket", 1);
+  setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
+  setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
+  setenv("ARKILIAN_S3_PREFIX", "test-prefix", 1);
   ark_setenv("ARKILIAN_BACKUP_INTERVAL", "3600", 1);
   // Key + skip-auth keep backup enabled so the flush thread actually runs
   // (the api_key guard in db_init disables backup otherwise, and the
   // zombie would never be cleaned).
-  ark_setenv("ARKILIAN_API_KEY", "test-key", 1);
-  ark_setenv("ARKILIAN_SKIP_STARTUP_AUTH", "1", 1);
+  ark_setenv("ARKILIAN_S3_ACCESS_KEY", "test-key", 1);
   arkilian *db = NULL;
   assert(db_init(&db, "test_reg_zombie.db") == 0);
 
@@ -560,9 +597,16 @@ static void test_local_fs_capture_not_disabled(void) {
   // Explicit empty URL: no destination, no background shipping, yet backup
   // stays "enabled" (capture runs; the flush loop just has nowhere to ship).
   ark_setenv("ARKILIAN_ENABLE_BACKUP", "1", 1);
-  ark_setenv("ARKILIAN_CONTROL_URL", "", 1);
-  ark_setenv("ARKILIAN_SKIP_STARTUP_AUTH", "1", 1);
-  ark_setenv("ARKILIAN_API_KEY", "test-key", 1);
+  ark_setenv("ARKILIAN_S3_ENDPOINT", "", 1);
+  ark_setenv("ARKILIAN_S3_BUCKET", "test-bucket", 1);
+  ark_setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
+  ark_setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
+  ark_setenv("ARKILIAN_S3_PREFIX", "test-prefix", 1);
+  setenv("ARKILIAN_S3_BUCKET", "test-bucket", 1);
+  setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
+  setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
+  setenv("ARKILIAN_S3_PREFIX", "test-prefix", 1);
+  ark_setenv("ARKILIAN_S3_ACCESS_KEY", "test-key", 1);
   ark_setenv("ARKILIAN_BACKUP_INTERVAL", "3600", 1);
   arkilian *db = NULL;
   assert(db_init(&db, "test_reg_fstype.db") == 0);
@@ -654,9 +698,16 @@ static void test_capture_paused_at_cap(void) {
   cleanup("test_reg_paused.db");
   // No destination → flush thread can't drain → queue fills to cap.
   ark_setenv("ARKILIAN_ENABLE_BACKUP", "1", 1);
-  ark_setenv("ARKILIAN_CONTROL_URL", "", 1);
-  ark_setenv("ARKILIAN_SKIP_STARTUP_AUTH", "1", 1);
-  ark_setenv("ARKILIAN_API_KEY", "test-key", 1);
+  ark_setenv("ARKILIAN_S3_ENDPOINT", "", 1);
+  ark_setenv("ARKILIAN_S3_BUCKET", "test-bucket", 1);
+  ark_setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
+  ark_setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
+  ark_setenv("ARKILIAN_S3_PREFIX", "test-prefix", 1);
+  setenv("ARKILIAN_S3_BUCKET", "test-bucket", 1);
+  setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
+  setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
+  setenv("ARKILIAN_S3_PREFIX", "test-prefix", 1);
+  ark_setenv("ARKILIAN_S3_ACCESS_KEY", "test-key", 1);
   ark_setenv("ARKILIAN_BACKUP_INTERVAL", "3600", 1);
   ark_setenv("ARKILIAN_MAX_QUEUE_DEPTH", "5", 1); // tight cap
   arkilian *db = NULL;
@@ -692,7 +743,6 @@ static void test_capture_paused_at_cap(void) {
 // ── Main ────────────────────────────────────────────────────────────
 
 int main(void) {
-  ark_setenv("ARKILIAN_MAX_ATTEMPTS", "3", 1); // fast dead-lettering for tests
   printf("=== Arkilian Audit Regression Tests ===\n\n");
 
   printf("[WITHOUT ROWID]\n");

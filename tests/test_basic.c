@@ -649,40 +649,6 @@ static void test_bind_double_null_db(void) {
   assert(rc == SQLITE_ERROR);
 }
 
-// ---------------------------------------------------------------------------
-// Token Management Tests
-// ---------------------------------------------------------------------------
-
-static void test_set_token(void) {
-  arkilian *db = open_test_db();
-  int rc = db_set_api_key(db, "my-secret-api-key");
-  assert(rc == 0);
-  db_close(db);
-  cleanup_files();
-}
-
-static void test_set_token_null_db(void) {
-  int rc = db_set_api_key(NULL, "api_key");
-  assert(rc == 1);
-}
-
-static void test_set_token_null_token(void) {
-  arkilian *db = open_test_db();
-  int rc = db_set_api_key(db, NULL);
-  assert(rc == 1);
-  db_close(db);
-  cleanup_files();
-}
-
-static void test_set_token_replaces_previous(void) {
-  arkilian *db = open_test_db();
-  int rc = db_set_api_key(db, "first-key");
-  assert(rc == 0);
-  rc = db_set_api_key(db, "second-key");
-  assert(rc == 0);
-  db_close(db);
-  cleanup_files();
-}
 
 // ---------------------------------------------------------------------------
 // Integration Workflows
@@ -805,10 +771,6 @@ int main(void) {
   RUN_TEST(test_bind_double_null_db);
 
   printf("\n[Token Management]\n");
-  RUN_TEST(test_set_token);
-  RUN_TEST(test_set_token_null_db);
-  RUN_TEST(test_set_token_null_token);
-  RUN_TEST(test_set_token_replaces_previous);
 
   printf("\n[Integration Workflows]\n");
   RUN_TEST(test_iterate_multiple_rows);

@@ -24,50 +24,42 @@ const SQLITE_ROW = 100;
 const SQLITE_DONE = 101;
 
 class Arkilian {
-  constructor(apiKey, dbPath = "app.sqlite") {
-    if (!apiKey) throw new Error("Your API key is required");
-    // db_init reads ARKILIAN_API_KEY from the environment to decide
-    // whether to enable backup (src/class.c disables it when the key is
-    // absent) and to run startup auth validation against the control
-    // plane. If the JS wrapper calls setApiKey AFTER db_init — as it did
-    // before — the key arrives too late: backup is already permanently
-    // disabled for the process and the startup validation never ran, so
-    // `new Arkilian('your-api-key', 'app.sqlite')` silently ran without
-    // backup. Sync the env from the constructor argument BEFORE db_init so
-    // the documented constructor apiKey drives both enablement and
-    // validation; db_set_api_key then keeps the in-memory key in lockstep.
-    if (!process.env.ARKILIAN_API_KEY) {
-      process.env.ARKILIAN_API_KEY = apiKey;
-    }
+  constructor(dbPath = "app.sqlite") {
+    // Backup destination is S3-compatible object storage, configured via
+    // ARKILIAN_S3_* environment variables (or a ./.env file). No API key
+    // and no control plane exist in the client; requests are SigV4-signed
+    // locally with the per-database credentials.
     this.id = native.db_init(dbPath);
     if (!this.id) {
       throw new Error("Failed to initialize database");
     }
-    this.setApiKey(apiKey);
   }
 
-  static async open(apiKey, dbPath = "app.sqlite") {
-    return new Arkilian(apiKey, dbPath);
+  static async open(dbPath = "app.sqlite") {
+    return new Arkilian(dbPath);
   }
 
-  // Cold-start restore from the control plane. MUST be called from a
+  // Cold-start restore from S3-compatible storage. MUST be called from a
   // cold process (before db_init opens the database). Downloads the
-  // latest snapshot + replays incremental chunks via pre-signed URLs.
-  //   dbPath     — local database file path
-  //   controlUrl — control plane base URL (e.g. "https://api.arkilian.com")
-  //   apiKey     — the tenant's API key
-  static hydrate(dbPath, controlUrl, apiKey) {
-    const rc = native.db_hydrate(dbPath, controlUrl, apiKey);
+  // manifest, installs the baseline snapshot and replays incremental
+  // chunks via locally presigned GETs.
+  //   dbPath   — local database file path
+  //   s3       — { endpoint, bucket, region, accessKey, secretKey, prefix }
+  static hydrateS3(dbPath, s3) {
+    if (!s3 || typeof s3 !== "object") {
+      throw new Error("hydrateS3 requires an S3 config object");
+    }
+    const { endpoint, bucket, region = "us-east-1", accessKey, secretKey, prefix } = s3;
+    if (!endpoint || !bucket || !accessKey || !secretKey || !prefix) {
+      throw new Error(
+        "hydrateS3 requires endpoint, bucket, accessKey, secretKey and prefix",
+      );
+    }
+    const rc = native.db_hydrate_s3(
+      dbPath, endpoint, bucket, region, accessKey, secretKey, prefix,
+    );
     if (rc !== true) throw new Error(`Hydration failed (see logs for error code)`);
     return true;
-  }
-
-  setApiKey(apiKey) {
-    const result = native.db_set_api_key(this.id, apiKey);
-    if (result !== SQLITE_OK) {
-      throw new Error("Failed to set API key");
-    }
-    return this;
   }
 
   // Runtime kill-switch (spec §1): stops all outbound backup activity

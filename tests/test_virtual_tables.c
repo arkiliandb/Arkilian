@@ -30,9 +30,16 @@ static void cleanup(const char *path) {
 static void test_fts5_virtual_table_does_not_break_init(void) {
   cleanup("test_fts.db");
   ark_setenv("ARKILIAN_ENABLE_BACKUP", "1", 1);
-  ark_setenv("ARKILIAN_API_KEY", "test-key", 1);
-  ark_setenv("ARKILIAN_SKIP_STARTUP_AUTH", "1", 1);
-  ark_setenv("ARKILIAN_CONTROL_URL", "http://127.0.0.1:1", 1);
+  ark_setenv("ARKILIAN_S3_ACCESS_KEY", "test-key", 1);
+  ark_setenv("ARKILIAN_S3_ENDPOINT", "http://127.0.0.1:1", 1);
+  ark_setenv("ARKILIAN_S3_BUCKET", "test-bucket", 1);
+  ark_setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
+  ark_setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
+  ark_setenv("ARKILIAN_S3_PREFIX", "test-prefix", 1);
+  setenv("ARKILIAN_S3_BUCKET", "test-bucket", 1);
+  setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
+  setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
+  setenv("ARKILIAN_S3_PREFIX", "test-prefix", 1);
   ark_setenv("ARKILIAN_BACKUP_INTERVAL", "3600", 1);
 
   arkilian *db = NULL;

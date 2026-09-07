@@ -39,9 +39,16 @@ static arkilian *open_test_db(void) {
   ark_setenv("ARKILIAN_ENABLE_BACKUP", "0", 1);
   // Set a dummy push URL so the double-buffer accumulates entries.
   // The flush thread will start but fail-fast on this non-routable address.
-  ark_setenv("ARKILIAN_API_KEY", "test-key", 1);
-  ark_setenv("ARKILIAN_SKIP_STARTUP_AUTH", "1", 1);
-  ark_setenv("ARKILIAN_CONTROL_URL", "http://127.0.0.1:1", 1);
+  ark_setenv("ARKILIAN_S3_ACCESS_KEY", "test-key", 1);
+  ark_setenv("ARKILIAN_S3_ENDPOINT", "http://127.0.0.1:1", 1);
+  ark_setenv("ARKILIAN_S3_BUCKET", "test-bucket", 1);
+  ark_setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
+  ark_setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
+  ark_setenv("ARKILIAN_S3_PREFIX", "test-prefix", 1);
+  setenv("ARKILIAN_S3_BUCKET", "test-bucket", 1);
+  setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
+  setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
+  setenv("ARKILIAN_S3_PREFIX", "test-prefix", 1);
   arkilian *db = NULL;
   int rc = db_init(&db, TEST_DB);
   assert(rc == 0 && "db_init failed");
@@ -685,7 +692,15 @@ static void test_perf_select_1000_reads(void) {
 int main(void) {
   ark_setenv("ARKILIAN_ENABLE_BACKUP", "0", 1);
   ark_setenv("ARKILIAN_OUTBOX_DURABLE", "0", 1); // test expects synchronous=NORMAL
-  ark_setenv("ARKILIAN_CONTROL_URL", "http://127.0.0.1:1", 1);
+  ark_setenv("ARKILIAN_S3_ENDPOINT", "http://127.0.0.1:1", 1);
+  ark_setenv("ARKILIAN_S3_BUCKET", "test-bucket", 1);
+  ark_setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
+  ark_setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
+  ark_setenv("ARKILIAN_S3_PREFIX", "test-prefix", 1);
+  setenv("ARKILIAN_S3_BUCKET", "test-bucket", 1);
+  setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
+  setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
+  setenv("ARKILIAN_S3_PREFIX", "test-prefix", 1);
 
   printf("=== Arkilian Write Interception Tests (ring buffer) ===\n\n");
 

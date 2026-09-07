@@ -205,9 +205,12 @@ static void test_load_contention(void) {
   char url[128];
   snprintf(url, sizeof(url), "http://127.0.0.1:%d/push", srv.port);
   setenv("ARKILIAN_ENABLE_BACKUP", "1", 1);
-  setenv("ARKILIAN_API_KEY", "test-key", 1);
-  setenv("ARKILIAN_SKIP_STARTUP_AUTH", "1", 1);
-  setenv("ARKILIAN_CONTROL_URL", url, 1);
+  setenv("ARKILIAN_S3_ACCESS_KEY", "test-key", 1);
+  setenv("ARKILIAN_S3_ENDPOINT", url, 1);
+  setenv("ARKILIAN_S3_BUCKET", "test-bucket", 1);
+  setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
+  setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
+  setenv("ARKILIAN_S3_PREFIX", "test-prefix", 1);
   setenv("ARKILIAN_BACKUP_INTERVAL", "3600", 1); // hermetic: no .env dependence
 
   arkilian *db = NULL;

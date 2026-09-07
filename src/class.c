@@ -194,6 +194,7 @@ struct arkilian {
 
   wal_chunk chunk;               // current chunk accumulator
   int chunk_interval;
+  uint64_t chunk_flushed_upto;   // highest outbox id durably PUT to S3
 
   // Manifest registry: the client-side record of every uploaded WAL chunk,
   // mirrored to {prefix}/manifest.json. Guarded by manifest_mutex; the
@@ -1226,16 +1227,6 @@ typedef enum { SHIP_OK = 0, SHIP_RETRY = 1 } ship_result_t;
 // Exponential backoff: seconds to wait before retrying a row that has
 // failed `attempts` times. Caps at 5 minutes so a prolonged outage
 // retries for ~1 hour (20 attempts) instead of dead-lettering after 20s.
-static long backoff_seconds(int attempts) {
-  if (attempts <= 0) return 0;
-  if (attempts > 20) attempts = 20;
-  long b = 1L << attempts; // 2^attempts
-  if (b > 300) b = 300;
-  return b;
-}
-
-
-
 // Adaptive request timeout: base seconds plus ~10s per MB of payload, so
 // large rows/snapshots aren't dead-lettered by a fixed short window.
 static long curl_timeout_sec(size_t bytes, long base) {
@@ -1282,7 +1273,11 @@ static int wal_chunk_append(wal_chunk *c, const char *sql, int sql_len,
 // Flush the accumulated WAL chunk to object storage as a plain replayable
 // SQL object, then record it in the manifest registry. This is the ONLY
 // realtime shipping path — there is no control plane and no fallback.
-static int wal_chunk_flush_to_s3(arkilian *db, wal_chunk *c) {
+// On success the covered outbox rows are deleted (delete-on-flush-ack):
+// until the PUT returns 2xx, every captured row stays in _pending_backup,
+// so a crash can never lose an acknowledged-capture write.
+static int wal_chunk_flush_to_s3(arkilian *db, wal_chunk *c,
+                                 sqlite3_stmt *delete_stmt) {
   if (c->entry_count == 0) return SHIP_OK;
   if (!has_direct_s3(db)) return SHIP_RETRY;
   if (!db->s3_prefix || !db->s3_prefix[0]) return SHIP_RETRY;
@@ -1324,6 +1319,21 @@ static int wal_chunk_flush_to_s3(arkilian *db, wal_chunk *c) {
 
   if (rc != SHIP_OK) return rc;
 
+  // Durability ack: the chunk object is durable — delete the covered
+  // outbox rows and advance the flush watermark.
+  if (delete_stmt) {
+    sqlite3_reset(delete_stmt);
+    sqlite3_clear_bindings(delete_stmt);
+    sqlite3_bind_int64(delete_stmt, 1, (sqlite3_int64)c->lsn_end);
+    if (sqlite3_step(delete_stmt) != SQLITE_DONE) {
+      ark_log(db, ARK_LOG_ERROR,
+              "outbox delete after chunk flush failed: %s",
+              sqlite3_errmsg(db->backup_db));
+      // The object IS durable; the stale rows are replay-safe duplicates
+      // (REPLACE/DELETE semantics) that the next flush cycle re-deletes.
+    }
+  }
+  db->chunk_flushed_upto = c->lsn_end;
   c->last_s3_flush = time(NULL);
   ARK_STORE(&db->capture_paused, 0);
 
@@ -1368,8 +1378,7 @@ typedef struct {
 // Rows are deleted from the outbox immediately.
 // Returns the number
 // of rows drained.
-static int drain_chunk(arkilian *db, wal_chunk *c, sqlite3_stmt *select_stmt,
-                        sqlite3_stmt *delete_stmt) {
+static int drain_chunk(arkilian *db, wal_chunk *c, sqlite3_stmt *select_stmt) {
   if (!db || !db->backup_db || !c) return 0;
 
   outbox_row rows[BATCH_SIZE];
@@ -1377,7 +1386,13 @@ static int drain_chunk(arkilian *db, wal_chunk *c, sqlite3_stmt *select_stmt,
 
   sqlite3_reset(select_stmt);
   sqlite3_clear_bindings(select_stmt);
-  sqlite3_bind_int(select_stmt, 1, BATCH_SIZE);
+  // Only rows NOT yet durably shipped AND not already sitting in the
+  // chunk buffer: the watermark is the higher of the last flushed id
+  // (delete-on-flush-ack) and the buffer's own last appended id.
+  uint64_t watermark = db->chunk_flushed_upto;
+  if (c->lsn_end > watermark) watermark = c->lsn_end;
+  sqlite3_bind_int64(select_stmt, 1, (sqlite3_int64)watermark);
+  sqlite3_bind_int(select_stmt, 2, BATCH_SIZE);
 
   for (;;) {
     int rc = sqlite3_step(select_stmt);
@@ -1398,22 +1413,14 @@ static int drain_chunk(arkilian *db, wal_chunk *c, sqlite3_stmt *select_stmt,
 
   int processed = 0;
   for (int i = 0; i < nrows; i++) {
-    if (rows[i].last_attempt_at > 0) {
-      long long now_ts = (long long)time(NULL);
-      long long ready_at = (long long)rows[i].last_attempt_at +
-                           backoff_seconds(rows[i].attempts);
-      if (now_ts < ready_at) break;
-    }
-
     int full = wal_chunk_append(c, rows[i].payload,
                                  (int)strlen(rows[i].payload),
                                  (uint64_t)rows[i].id);
     if (full < 0) break;  // allocation failure — stop, rows stay in outbox
 
-    sqlite3_reset(delete_stmt);
-    sqlite3_clear_bindings(delete_stmt);
-    sqlite3_bind_int64(delete_stmt, 1, rows[i].id);
-    sqlite3_step(delete_stmt);
+    // NOTE: the outbox row is NOT deleted here. It is deleted only after
+    // the chunk containing it is durably PUT (see wal_chunk_flush_to_s3)
+    // — a crash between capture and upload can then never lose the row.
 
     processed++;
 
@@ -1440,10 +1447,11 @@ static int prepare_outbox_statements(sqlite3 *db, sqlite3_stmt **select_stmt,
   *dead_letter_stmt = NULL;
 
   if (sqlite3_prepare_v2(db,
-        "SELECT id, payload, attempts, COALESCE(last_attempt_at, 0) FROM _pending_backup ORDER BY id LIMIT ?1",
+        "SELECT id, payload, attempts, COALESCE(last_attempt_at, 0) FROM _pending_backup "
+        "WHERE id > ?1 ORDER BY id LIMIT ?2",
         -1, select_stmt, NULL) != SQLITE_OK) goto fail;
   if (sqlite3_prepare_v2(db,
-        "DELETE FROM _pending_backup WHERE id = ?1",
+        "DELETE FROM _pending_backup WHERE id <= ?1",
         -1, delete_stmt, NULL) != SQLITE_OK) goto fail;
   if (sqlite3_prepare_v2(db,
         "UPDATE _pending_backup SET attempts = ?1, last_attempt_at = strftime('%s','now') WHERE id = ?2",
@@ -1551,13 +1559,13 @@ void *run_wal_flush(void *arg) {
 
     int drained = 0;
     if (ARK_LOAD(&db->backup_enabled) && ARK_LOAD(&db->s3_creds_loaded)) {
-      drained = drain_chunk(db, &db->chunk, select_stmt, delete_stmt);
+      drained = drain_chunk(db, &db->chunk, select_stmt);
     }
 
     if (ARK_LOAD(&db->s3_creds_loaded) && db->chunk.entry_count > 0) {
       time_t age = time(NULL) - db->chunk.opened_at;
       if (age >= db->chunk_interval || db->chunk.len >= CHUNK_MAX_SIZE_BYTES) {
-        int flush_rc = wal_chunk_flush_to_s3(db, &db->chunk);
+        int flush_rc = wal_chunk_flush_to_s3(db, &db->chunk, delete_stmt);
         if (flush_rc == SHIP_OK) {
           wal_chunk_reset(&db->chunk);
           drained = 1;  // indicate work was done (prevents unnecessary sleep)
@@ -1598,7 +1606,7 @@ void *run_wal_flush(void *arg) {
   }
 
   if (db->chunk.entry_count > 0) {
-    wal_chunk_flush_to_s3(db, &db->chunk);
+    wal_chunk_flush_to_s3(db, &db->chunk, delete_stmt);
     wal_chunk_reset(&db->chunk);
   }
 

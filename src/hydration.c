@@ -730,7 +730,10 @@ int ark_manifest_fetch(const char *endpoint, const char *bucket,
   char *json = http_get_string(manifest_url, &err);
   free(manifest_url);
 
-  if (!json) return -1;
+  if (!json) {
+    fprintf(stderr, "arkilian: manifest fetch failed (err=%d)\n", err);
+    return -1;
+  }
 
   memset(plan, 0, sizeof(*plan));
   plan->snapshot_s3_key = json_get_string(json, "s3_key");
@@ -757,8 +760,7 @@ int ark_manifest_fetch(const char *endpoint, const char *bucket,
                                            s3_key, 3600L);
     }
     plan->snapshot_sha256 = json_get_string(snap, "sha256");
-    char *bl = json_get_string(snap, "baseline_lsn");
-    if (bl) { plan->baseline_lsn = (int64_t)strtoll(bl, NULL, 10); free(bl); }
+    plan->baseline_lsn = json_get_int64(snap, "baseline_lsn");
     free(snap);
   }
 
@@ -777,10 +779,10 @@ int ark_manifest_fetch(const char *endpoint, const char *bucket,
                                                 ckey, 3600L);
         }
         plan->chunks[i].sha256 = json_get_string(elem, "sha256");
-        char *ls = json_get_string(elem, "lsn_start");
-        if (ls) { plan->chunks[i].lsn_start = (int64_t)strtoll(ls, NULL, 10); free(ls); }
-        char *le = json_get_string(elem, "lsn_end");
-        if (le) { plan->chunks[i].lsn_end = (int64_t)strtoll(le, NULL, 10); free(le); }
+        // LSN values are JSON numbers in the v3 manifest (see
+        // manifest_registry_upload) — parse them as integers.
+        plan->chunks[i].lsn_start = json_get_int64(elem, "lsn_start");
+        plan->chunks[i].lsn_end   = json_get_int64(elem, "lsn_end");
         free(elem);
       }
     }
@@ -789,7 +791,14 @@ int ark_manifest_fetch(const char *endpoint, const char *bucket,
   plan->expires_at = (int64_t)time(NULL) + 3600;
 
   free(json);
-  if (!plan->snapshot_url) { hydrate_plan_free(plan); return -1; }
+  // A manifest without a snapshot entry (published by the chunk flusher
+  // before the first hourly snapshot) is still a valid registry: the
+  // chunk list alone can restore a fresh database. An entirely empty
+  // manifest (no snapshot AND no chunks) means nothing to restore.
+  if (!plan->snapshot_url && plan->chunk_count == 0) {
+    hydrate_plan_free(plan);
+    return -1;
+  }
   return 0;
 }
 
@@ -809,6 +818,35 @@ void hydrate_plan_free(HydratePlan *plan) {
 
 // ── Step 1: Download & decompress snapshot ──────────────────────────
 
+// Cold-start initialization shared by "snapshot 404" and "manifest has
+// no snapshot yet": create a clean local database with the hydration
+// meta table so chunk replay can proceed from LSN 0.
+static int hydration_cold_start(const char *db_path) {
+  struct stat st;
+  if (stat(db_path, &st) != 0) {
+    // No local DB: clear any orphaned sidecars from a previously
+    // deleted database, then create a fresh one.
+    hydration_remove_db_files(db_path);
+  }
+  sqlite3 *db = NULL;
+  if (sqlite3_open_v2(db_path, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX, NULL) == SQLITE_OK) {
+    char *perr = NULL;
+    int prc = sqlite3_exec(db,
+        "CREATE TABLE IF NOT EXISTS _arkilian_meta (k TEXT PRIMARY KEY, v TEXT);",
+        NULL, NULL, &perr);
+    if (prc != SQLITE_OK) {
+      fprintf(stderr, "arkilian: cold-start meta init failed: %s\n",
+              perr ? perr : sqlite3_errmsg(db));
+      sqlite3_free(perr);
+      sqlite3_close(db);
+      return HYDRATION_ERR_SQL;
+    }
+    sqlite3_close(db);
+    return 0;
+  }
+  return HYDRATION_ERR_DISK;
+}
+
 static int download_snapshot(const char *snapshot_url,
                               const char *db_path, const char *expected_sha256,
                               hydration_progress_cb progress, void *user) {
@@ -826,30 +864,10 @@ static int download_snapshot(const char *snapshot_url,
 
     // Cold start: initialize a clean target so chunks replay from
     // LSN 0.  Never destroy an existing local database in the process.
-    struct stat st;
-    if (stat(db_path, &st) != 0) {
-      // No local DB: clear any orphaned sidecars from a previously
-      // deleted database, then create a fresh one.
-      hydration_remove_db_files(db_path);
-    }
-    sqlite3 *db = NULL;
-    if (sqlite3_open_v2(db_path, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX, NULL) == SQLITE_OK) {
-      char *perr = NULL;
-      int prc = sqlite3_exec(db,
-          "CREATE TABLE IF NOT EXISTS _arkilian_meta (k TEXT PRIMARY KEY, v TEXT);",
-          NULL, NULL, &perr);
-      if (prc != SQLITE_OK) {
-        fprintf(stderr, "arkilian: cold-start meta init failed: %s\n",
-                perr ? perr : sqlite3_errmsg(db));
-        sqlite3_free(perr);
-        sqlite3_close(db);
-        return HYDRATION_ERR_SQL;
-      }
-      sqlite3_close(db);
-      if (progress) progress(1, 1, 1, user);
-      return 0;
-    }
-    return HYDRATION_ERR_DISK;
+    int cs = hydration_cold_start(db_path);
+    if (cs != 0) return cs;
+    if (progress) progress(1, 1, 1, user);
+    return 0;
   }
 
   if (progress) progress(1, 1, 1, user);
@@ -1108,11 +1126,29 @@ int arkilian_hydrate_s3(const char *db_path,
     sqlite3_close(ldb);
   }
 
-  // Phase 1: Download snapshot
+  // Phase 1: Download snapshot — or cold-start when the manifest has
+  // chunks but no snapshot object yet (the chunk flusher publishes the
+  // manifest before the first hourly snapshot). A non-zero baseline
+  // without a snapshot object is an inconsistent storage state.
   {
-    int rc = download_snapshot(plan.snapshot_url, db_path,
-                                plan.snapshot_sha256, progress, user_data);
-    if (rc != 0) { hydrate_plan_free(&plan); hydrate_result = rc; goto hydrate_done; }
+    if (plan.snapshot_url) {
+      int rc = download_snapshot(plan.snapshot_url, db_path,
+                                 plan.snapshot_sha256, progress, user_data);
+      if (rc != 0) { hydrate_plan_free(&plan); hydrate_result = rc; goto hydrate_done; }
+    } else {
+      if (plan.baseline_lsn > 0) {
+        fprintf(stderr,
+                "arkilian: hydration refused — manifest records baseline "
+                "LSN %lld but no snapshot object exists\n",
+                (long long)plan.baseline_lsn);
+        hydrate_plan_free(&plan);
+        hydrate_result = HYDRATION_ERR_PROTO;
+        goto hydrate_done;
+      }
+      int cs = hydration_cold_start(db_path);
+      if (cs != 0) { hydrate_plan_free(&plan); hydrate_result = cs; goto hydrate_done; }
+      if (progress) progress(1, 1, 1, user_data);
+    }
   }
 
   // Phase 2: Open database and replay chunks

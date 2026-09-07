@@ -6,7 +6,7 @@
 // Run:
 //   ./bench_1m                    (full: ~5-10 min)
 //   ./bench_1m 10000              (quick: 10K ops, ~30 sec)
-//   ARKILIAN_CONTROL_URL=... ./bench_1m  (with streaming)
+//   ARKILIAN_S3_ENDPOINT=... ./bench_1m  (with streaming)
 //
 // Every benchmark runs BOTH raw SQLite and Arkilian on the same connection,
 // same data, same operations — so every row in the output table is a
@@ -659,10 +659,13 @@ int main(int argc, char **argv) {
   }
 
   WARMUP = OPS < 10000 ? OPS / 2 : 10000;
-  setenv("ARKILIAN_API_KEY", "test-key", 1);
-  setenv("ARKILIAN_SKIP_STARTUP_AUTH", "1", 1);
-  setenv("ARKILIAN_CONTROL_URL", "http://localhost:8080", 1);
-  setenv("ARKILIAN_API_KEY",
+  setenv("ARKILIAN_S3_ACCESS_KEY", "test-key", 1);
+  setenv("ARKILIAN_S3_ENDPOINT", "http://localhost:8080", 1);
+  setenv("ARKILIAN_S3_BUCKET", "test-bucket", 1);
+  setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
+  setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
+  setenv("ARKILIAN_S3_PREFIX", "test-prefix", 1);
+  setenv("ARKILIAN_S3_ACCESS_KEY",
          "ak_db_d25e9ea4cb93_7c3872fc11e9f12feb644a68533529445124668a0f7ab1c1c5b1157c6ae64bc8", 1);
   setenv("ARKILIAN_ENABLE_BACKUP", "0", 1);
   remove("bench_1m.db");
@@ -1000,7 +1003,7 @@ int main(int argc, char **argv) {
     printf(
         "  │   Ring buffer is LAZILY ALLOCATED — zero cost unless        │\n");
     printf(
-        "  │   ARKILIAN_CONTROL_URL is configured                       │\n");
+        "  │   ARKILIAN_S3_ENDPOINT is configured                       │\n");
     printf(
         "  └────────────────────────────────────────────────────────────┘\n");
   }

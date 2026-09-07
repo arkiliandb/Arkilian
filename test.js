@@ -7,14 +7,11 @@ import { fileURLToPath } from "url";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = join(__filename, "..");
 
-// Skip startup auth validation — this test has no running control plane.
-process.env.ARKILIAN_SKIP_STARTUP_AUTH = "1";
-process.env.ARKILIAN_API_KEY = "test-key";
-
-console.log("Testing Arkilian Node.js bindings...\n");
-
+// No API key exists in the S3-only client; the backup destination is
+// configured via ARKILIAN_S3_* environment variables (a ./.env file works
+// too). This test runs without any destination — capture-only.
 const dbPath = join(__dirname, "test.db");
-const db = new Arkilian("test-key", dbPath);
+const db = new Arkilian(dbPath);
 
 console.log("1. Drop old table if exists and recreate...");
 await db.exec("DROP TABLE IF EXISTS users");
@@ -104,7 +101,7 @@ const { Worker } = await import("worker_threads");
 const workerCode = `
   const { parentPort } = require("worker_threads");
   const Arkilian = require(${JSON.stringify(join(__dirname, "index.js"))}).default;
-  const db = new Arkilian("test-key",
+  const db = new Arkilian(
     ${JSON.stringify(dbPath)});
   try {
     for (let i = 0; i < 500; i++) {

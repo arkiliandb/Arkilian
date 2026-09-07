@@ -37,7 +37,7 @@ import { Arkilian } from "../index.js";
 const dbPath = process.argv[2] || "app.sqlite";
 const port = parseInt(process.argv[3] || "9100", 10);
 
-const db = new Arkilian(process.env.ARKILIAN_API_KEY || "monitoring", dbPath);
+const db = new Arkilian(dbPath);
 
 // Prometheus text exposition format. Every metric is GAUGE type (the
 // Arkilian signals are instantaneous snapshots, not counters) unless
