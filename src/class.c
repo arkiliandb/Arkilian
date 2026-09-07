@@ -19,12 +19,9 @@
 #endif
 
 #include "class.h"
+#include "hydration.h"
 #include "sha256.h"
 #include <curl/curl.h>
-
-#ifdef ARKILIAN_HAS_ZSTD
-#include <zstd.h>
-#endif
 
 // Atomic helpers for cross-thread flags.  These fields are read and
 // written concurrently by multiple threads.  Plain volatile access is
@@ -205,6 +202,11 @@ struct arkilian {
   ark_manifest_chunk *manifest_chunks;
   int manifest_chunk_count;
   int manifest_chunk_cap;
+  char *manifest_snapshot_key;   // current baseline snapshot's object key
+  char *manifest_snapshot_sha;   // its sha256
+  uint64_t manifest_baseline_lsn;
+  int manifest_pending;          // chunk records added since last manifest PUT
+  time_t manifest_last_upload;   // last successful manifest PUT (0 = never)
 
   // Background thread tracking & synchronization
   volatile int shutdown_requested;
@@ -284,8 +286,7 @@ void *run_wal_flush(void *arg);
 static char *s3_presign_put(arkilian *db, const char *key, long expires_sec);
 static int upload_to_s3(arkilian *db, const char *signed_url,
                           const char *file_path);
-static void manifest_write(arkilian *db, const char *snapshot_s3_key,
-                            const char *snapshot_sha256, int64_t baseline_lsn);
+static int has_direct_s3(arkilian *db);
 static void manifest_registry_lock(arkilian *db);
 static void manifest_registry_unlock(arkilian *db);
 static int manifest_registry_append(arkilian *db, char *s3_key, char *sha256,
@@ -294,6 +295,7 @@ static void manifest_registry_prune_upto(arkilian *db, uint64_t baseline_lsn);
 static int manifest_registry_upload(arkilian *db, const char *snapshot_key,
                                     const char *snapshot_sha,
                                     uint64_t baseline_lsn);
+static void manifest_registry_maybe_upload(arkilian *db);
 static void manifest_registry_seed(arkilian *db);
 char *db_s3_presign_get(arkilian *db, const char *key, long expires_sec);
 
@@ -322,15 +324,6 @@ static int get_env_int_default(const char *env_var, int default_val) {
   return (int)parsed;
 }
 
-// Configurable via ARKILIAN_MAX_ATTEMPTS env var. Default 100 attempts
-// with the drain's exponential backoff before a row is dead-lettered
-// (see drain_batch). Tests set a lower value (e.g. 3) to dead-letter
-// quickly.
-static int max_attempts(void) {
-  int v = get_env_int_default("ARKILIAN_MAX_ATTEMPTS", 100);
-  if (v < 1) v = 1;
-  return v;
-}
 
 // Boolean env var accepting 1/0/true/false/yes/no.
 static int get_env_bool_default(const char *env_var, int default_val) {
@@ -506,7 +499,7 @@ static void ensure_curl_global_init(void) {
 // after that, the application's runtime setenv / unsetenv IS the live
 // configuration and is respected for every subsequent handle. Runtime
 // ./.env edits mid-process are not re-applied to new handles — use
-// db_backup_set_enabled / db_set_api_key or setenv instead.
+// db_backup_set_enabled or setenv instead.
 static void load_env_impl(void) {
   FILE *fp = fopen(".env", "r");
   if (!fp) return;
@@ -590,86 +583,17 @@ static const char *skip_sql_prefix(const char *sql) {
   }
 }
 
-// Pre-signed object-storage URLs carry their own credentials in the
-// query string — attaching our bearer token both leaks the credential
-// to the storage host and breaks signature validation.
-static int url_is_presigned(const char *url) {
-  if (!url) return 0;
-  return strstr(url, "X-Amz-Signature=") != NULL ||
-         strstr(url, "X-Amz-Credential=") != NULL ||
-         strstr(url, "X-Goog-Signature=") != NULL ||
-         strstr(url, "X-Goog-Credential=") != NULL ||
-         strstr(url, "sig=") != NULL; /* Azure SAS */
-}
-
 // Extract the host component of a URL into a caller-provided buffer.
 // Strips any user@info and :port. Returns the host length, or 0 on
 // failure / parse error. e.g. "http://user@127.0.0.1:9000/x" -> "127.0.0.1".
-static size_t url_host(const char *url, char *out, size_t out_cap) {
-  if (!url || !out || out_cap == 0) return 0;
-  const char *p = strstr(url, "://");
-  if (!p) return 0;
-  p += 3;
-  const char *end = p;
-  while (*end && *end != '/' && *end != ':' && *end != '@' &&
-         *end != '?' && *end != '#') end++;
-  const char *at = NULL;
-  for (const char *q = p; q < end; q++) if (*q == '@') at = q;
-  const char *hstart = at ? at + 1 : p;
-  size_t hlen = (size_t)(end - hstart);
-  if (hlen >= out_cap) hlen = out_cap - 1;
-  memcpy(out, hstart, hlen);
-  out[hlen] = '\0';
-  return hlen;
-}
 
-static int url_is_https(const char *url) {
-  return url && strncmp(url, "https://", 8) == 0;
-}
 
-// Loopback / RFC1918 / link-local — local dev against a control plane on
-// 127.0.0.1 / 10.x / 192.168.x / 172.16-31.x is legitimate even over plain
-// http://. These are the ONLY non-HTTPS hosts allowed without an explicit
-// opt-in. Everything else over http:// leaks the bearer token in cleartext.
-// NOTE: link-local (169.254.x / fe80::) is included here for cleartext
-// transport safety (dev MinIO on a link-local address), but is EXCLUDED
-// from the storage destination allowlist (host_is_storage_safe) because
-// 169.254.169.254 is the AWS/GCP/Azure instance-metadata endpoint.
-static int host_is_local(const char *host) {
-  if (!host || !*host) return 0;
-  // IPv6 [::1] form
-  if (host[0] == '[') {
-    if (strncmp(host, "[::1]", 5) == 0) return 1;
-    if (strncmp(host, "[fe80", 5) == 0) return 1;
-    if (strncmp(host, "[fc", 3) == 0 || strncmp(host, "[fd", 3) == 0) return 1; // ULA
-    return 0;
-  }
-  if (strcmp(host, "localhost") == 0) return 1;
-  if (strncmp(host, "127.", 4) == 0) return 1;
-  if (strncmp(host, "10.", 3) == 0) return 1;
-  if (strncmp(host, "192.168.", 8) == 0) return 1;
-  if (strncmp(host, "169.254.", 8) == 0) return 1; // link-local
-  if (strncmp(host, "fe80", 4) == 0) return 1;     // IPv6 link-local
-  if (strncmp(host, "::1", 3) == 0) return 1;      // IPv6 loopback
-  if (strncmp(host, "fc", 2) == 0 || strncmp(host, "fd", 2) == 0) return 1; // ULA
-  if (strncmp(host, "172.", 4) == 0) {
-    unsigned second = 0;
-    // sscanf's %u overflow on malformed input yields ULONG_MAX, which the
-    // >= 16 && <= 31 range guard rejects — the original value never reaches
-    // a wrong decision branch, so the unchecked-conversion warning is moot.
-    // NOLINTNEXTLINE(bugprone-unchecked-string-to-number-conversion,cert-err34-c)
-    if (sscanf(host, "172.%u.", &second) == 1 && second >= 16 && second <= 31)
-      return 1;
-  }
-  return 0;
-}
-
-// Storage-safe host check: same as host_is_local but EXCLUDES link-local
-// (169.254.0.0/16 and IPv6 fe80::) because that range hosts the cloud
+// Storage-safe host check: EXCLUDES link-local (169.254.0.0/16 and IPv6
+// fe80::) because that range hosts the cloud
 // instance-metadata service (IMDS at 169.254.169.254 on AWS/GCP/Azure).
-// A compromised control plane returning a presigned URL pointing at IMDS
-// would otherwise have the client upload the full database (and, for
-// non-presigned URLs, the bearer token) to the metadata service.
+// A tampered manifest yielding a presigned URL pointing at IMDS
+// would otherwise have the client upload the full database to the
+// metadata service.
 static int host_is_storage_safe(const char *host) {
   if (!host || !*host) return 0;
   if (host[0] == '[') {
@@ -707,13 +631,26 @@ static int host_is_storage_safe(const char *host) {
 // internal-but-non-RFC1918 cleartext control plane may opt in with
 // ARKILIAN_ALLOW_INSECURE=1 — the loud-failure default keeps a
 // misconfiguration from leaking the bearer token.
-static int url_transport_is_safe(const char *url, int allow_insecure) {
-  if (!url || !*url) return 1; // empty endpoint => nothing to ship
-  if (url_is_https(url)) return 1;
-  if (allow_insecure) return 1;
-  char host[256];
-  if (url_host(url, host, sizeof(host)) == 0) return 0; // unparseable
-  return host_is_local(host);
+
+// Extract the host component of a URL into a caller-provided buffer.
+// Strips any user@info and :port. Returns the host length, or 0 on
+// failure / parse error. e.g. "http://user@127.0.0.1:9000/x" -> "127.0.0.1".
+static size_t url_host(const char *url, char *out, size_t out_cap) {
+  if (!url || !out || out_cap == 0) return 0;
+  const char *p = strstr(url, "://");
+  if (!p) return 0;
+  p += 3;
+  const char *end = p;
+  while (*end && *end != '/' && *end != ':' && *end != '@' &&
+         *end != '?' && *end != '#') end++;
+  const char *at = NULL;
+  for (const char *q = p; q < end; q++) if (*q == '@') at = q;
+  const char *hstart = at ? at + 1 : p;
+  size_t hlen = (size_t)(end - hstart);
+  if (hlen >= out_cap) hlen = out_cap - 1;
+  memcpy(out, hstart, hlen);
+  out[hlen] = '\0';
+  return hlen;
 }
 
 // Well-known object-storage providers, matched on host SUFFIX so regional
@@ -746,9 +683,10 @@ static int host_is_known_storage(const char *host) {
 // storage destination: a well-known provider, a storage-safe local address
 // (loopback / RFC1918 — but NOT link-local 169.254.x which hosts IMDS),
 // or a host in the operator-provided allowlist.
-// Guards against SSRF: a compromised/buggy control plane that returns an
-// upload_url pointing at cloud metadata (169.254.169.254) or an internal
-// service is refused here, so the customer's snapshot is never exfiltrated.
+// Guards against SSRF: a tampered manifest or a compromised storage host
+// list that yields an upload_url pointing at cloud metadata (169.254.169.254)
+// or an internal service is refused here, so the customer's snapshot is
+// never exfiltrated.
 static int url_is_allowed_storage(const char *url) {
   if (!url) return 0;
   char host[256];
@@ -1319,7 +1257,7 @@ static int wal_chunk_append(wal_chunk *c, const char *sql, int sql_len,
     c->opened_at = time(NULL);
   }
 
-  size_t needed = c->len + 4 + (size_t)sql_len;
+  size_t needed = c->len + (size_t)sql_len + 2;
   if (c->cap < needed) {
     c->cap = needed < 65536 ? needed * 2 : needed + 65536;
     char *p = realloc(c->buffer, c->cap);
@@ -1327,15 +1265,13 @@ static int wal_chunk_append(wal_chunk *c, const char *sql, int sql_len,
     c->buffer = p;
   }
 
-  uint32_t be_len = ((uint32_t)sql_len);
-  // Write as big-endian (no dependency on <arpa/inet.h>)
-  unsigned char *b = (unsigned char *)c->buffer + c->len;
-  b[0] = (unsigned char)(be_len >> 24);
-  b[1] = (unsigned char)(be_len >> 16);
-  b[2] = (unsigned char)(be_len >> 8);
-  b[3] = (unsigned char)(be_len);
-  memcpy(c->buffer + c->len + 4, sql, sql_len);
-  c->len += 4 + sql_len;
+  // Store plain replayable SQL terminated with ";\n": the flushed chunk
+  // object is fed straight into sqlite3_exec() by the hydration engine,
+  // so no binary framing may remain in the object body.
+  memcpy(c->buffer + c->len, sql, (size_t)sql_len);
+  c->buffer[c->len + (size_t)sql_len] = ';';
+  c->buffer[c->len + (size_t)sql_len + 1] = '\n';
+  c->len += (size_t)sql_len + 2;
   c->lsn_end = outbox_id;
   c->entry_count++;
   c->byte_count += (uint64_t)sql_len;
@@ -1343,86 +1279,37 @@ static int wal_chunk_append(wal_chunk *c, const char *sql, int sql_len,
   return (c->len >= CHUNK_MAX_SIZE_BYTES || c->entry_count >= CHUNK_MAX_ENTRIES) ? 1 : 0;
 }
 
-// Chunk-stat echo to the control plane. Its only caller lives in the
-// zstd-gated chunk path below, so gate the definition the same way —
-// a build without zstd (e.g. the node-gyp source build) would otherwise
-// flag it as an unused function under -Werror.
-#ifdef ARKILIAN_HAS_ZSTD
-static void db_log_to_cp(arkilian *db, wal_chunk *c) {
-  if (!db->db_log_url || !db->db_log_url[0]) return;
-
-  char body[256];
-  int n = snprintf(body, sizeof(body),
-                   "{\"lsn_start\":%llu,\"lsn_end\":%llu"
-                   ",\"entries\":%u,\"bytes\":%llu}",
-                   (unsigned long long)c->lsn_start,
-                   (unsigned long long)c->lsn_end,
-                   c->entry_count,
-                   (unsigned long long)c->byte_count);
-  if (n <= 0 || (size_t)n >= sizeof(body)) return;
-
-  CURL *ch = curl_easy_init();
-  if (!ch) return;
-  curl_easy_setopt(ch, CURLOPT_URL, db->db_log_url);
-  curl_easy_setopt(ch, CURLOPT_POSTFIELDS, body);
-  curl_easy_setopt(ch, CURLOPT_TIMEOUT, 5L);
-  curl_easy_setopt(ch, CURLOPT_CONNECTTIMEOUT, 2L);
-  curl_easy_setopt(ch, CURLOPT_SSL_VERIFYPEER, 1L);
-  curl_easy_setopt(ch, CURLOPT_SSL_VERIFYHOST, 2L);
-
-  struct curl_slist *headers = NULL;
-  char *key_copy = api_key_snapshot(db);
-  if (key_copy && strlen(key_copy) > 0) {
-    char auth[512];
-    snprintf(auth, sizeof(auth), "Authorization: Bearer %s", key_copy);
-    headers = curl_slist_append(headers, auth);
-  }
-  free(key_copy);
-  if (headers) curl_easy_setopt(ch, CURLOPT_HTTPHEADER, headers);
-
-  CURLcode res = curl_easy_perform(ch);
-  if (res == CURLE_OK) c->last_cp_echo = time(NULL);
-
-  if (headers) curl_slist_free_all(headers);
-  curl_easy_cleanup(ch);
-}
-#endif /* ARKILIAN_HAS_ZSTD */
-
-#ifdef ARKILIAN_HAS_ZSTD
+// Flush the accumulated WAL chunk to object storage as a plain replayable
+// SQL object, then record it in the manifest registry. This is the ONLY
+// realtime shipping path — there is no control plane and no fallback.
 static int wal_chunk_flush_to_s3(arkilian *db, wal_chunk *c) {
   if (c->entry_count == 0) return SHIP_OK;
-  if (!db->s3_endpoint || !db->s3_endpoint[0]) return SHIP_RETRY;
+  if (!has_direct_s3(db)) return SHIP_RETRY;
   if (!db->s3_prefix || !db->s3_prefix[0]) return SHIP_RETRY;
   if (strstr(db->s3_prefix, "..") || db->s3_prefix[0] == '/')
     return SHIP_RETRY;
 
-  // 1. Compress with zstd level 3
-  size_t zstd_bound = ZSTD_compressBound(c->len);
-  void *compressed = malloc(zstd_bound);
-  if (!compressed) return SHIP_RETRY;
-
-  size_t clen = ZSTD_compress(compressed, zstd_bound, c->buffer, c->len, 3);
-  if (ZSTD_isError(clen)) { free(compressed); return SHIP_RETRY; }
-
-  // 2. Write compressed chunk to temp file (upload_to_s3 reads from file)
+  // 1. Write the chunk body to a temp file (upload_to_s3 streams from
+  // disk). The body is plain SQL: one "stmt;\n" per captured row.
   char tmp_path[1024];
-  snprintf(tmp_path, sizeof(tmp_path), "%s.chunk.zst", db->backup_path);
+  snprintf(tmp_path, sizeof(tmp_path), "%s.chunk", db->backup_path);
   FILE *f = fopen(tmp_path, "wb");
-  if (!f) { free(compressed); return SHIP_RETRY; }
-  if (fwrite(compressed, 1, clen, f) != clen) { fclose(f); free(compressed); return SHIP_RETRY; }
+  if (!f) return SHIP_RETRY;
+  if (fwrite(c->buffer, 1, c->len, f) != c->len) {
+    fclose(f); unlink(tmp_path); return SHIP_RETRY;
+  }
   fclose(f);
-  free(compressed);
 
-  // 3. Compute SHA-256 for content authentication
+  // 2. SHA-256 for content authentication on restore.
   char sha256_hex[65] = {0};
   if (ark_sha256_hex_file(tmp_path, sha256_hex) != 0) {
     sha256_hex[0] = '\0';
   }
 
-  // 4. Build S3 key and presign PUT URL locally
+  // 3. Build the S3 key and presign the PUT URL locally (SigV4).
   char s3_key[512];
   snprintf(s3_key, sizeof(s3_key),
-           "%s/chunks/lsn_%010llu_%010llu.sql.zst",
+           "%s/chunks/lsn_%010llu_%010llu.sql",
            db->s3_prefix,
            (unsigned long long)c->lsn_start,
            (unsigned long long)c->lsn_end);
@@ -1430,24 +1317,36 @@ static int wal_chunk_flush_to_s3(arkilian *db, wal_chunk *c) {
   char *put_url = s3_presign_put(db, s3_key, 600L);
   if (!put_url) { unlink(tmp_path); return SHIP_RETRY; }
 
-  // 5. Upload to S3 (reuses existing upload_to_s3)
-  int rc = upload_to_s3(db, put_url, tmp_path, db->api_key);
+  // 4. Upload.
+  int rc = upload_to_s3(db, put_url, tmp_path);
   free(put_url);
   unlink(tmp_path);
 
-  if (rc == SHIP_OK) {
-    c->last_s3_flush = time(NULL);
-    ARK_STORE(&db->capture_paused, 0);
-    db_log_to_cp(db, c);
+  if (rc != SHIP_OK) return rc;
+
+  c->last_s3_flush = time(NULL);
+  ARK_STORE(&db->capture_paused, 0);
+
+  // 5. Record the chunk in the manifest registry, then re-upload the
+  // manifest — batched to at most one manifest PUT per
+  // MANIFEST_UPLOAD_MIN_INTERVAL_SEC so a 1s chunk cadence doesn't double
+  // the request count. A crash before the next manifest PUT loses at most
+  // that window of chunk *records* (the chunk objects themselves are
+  // durable); the next hourly snapshot re-baselines everything.
+  char *key_copy = strdup(s3_key);
+  char *sha_copy = sha256_hex[0] ? strdup(sha256_hex) : NULL;
+  if (!key_copy || (sha256_hex[0] && !sha_copy)) {
+    free(key_copy); free(sha_copy);
+    return SHIP_OK;  // object IS durable; registry bookkeeping retried later
   }
-  return rc;
+  if (manifest_registry_append(db, key_copy, sha_copy,
+                               c->lsn_start, c->lsn_end) == 0) {
+    manifest_registry_maybe_upload(db);
+  } else {
+    free(key_copy); free(sha_copy);
+  }
+  return SHIP_OK;
 }
-#else
-static int wal_chunk_flush_to_s3(arkilian *db, wal_chunk *c) {
-  (void)db; (void)c;
-  return SHIP_RETRY;  // zstd not available — fall back to legacy CP push
-}
-#endif
 
 // Batch rows are copied off the SELECT into heap memory before any
 // network I/O or write, and the SELECT's read transaction is ended
@@ -1608,6 +1507,7 @@ void *run_wal_flush(void *arg) {
     return NULL;
 #endif
   }
+  int manifest_seeded = 0;
 
   sqlite3_stmt *select_stmt = NULL;
   sqlite3_stmt *delete_stmt = NULL;
@@ -1634,215 +1534,27 @@ void *run_wal_flush(void *arg) {
     if (backoff_s < 60) backoff_s *= 2;
   }
 
-  // Async startup API-key validation (control-plane SPOF mitigation, see
-  // struct arkilian.startup_auth_state): db_init no longer blocks the
-  // caller's main thread on validate_api_key — instead the flush thread
-  // validates the key here, before its first drain cycle. This runs ONCE
-  // per process. While startup_auth_state == 0 (PENDING), backup_enabled
-  // stays as configured (typically 1) and rows accumulate in
-  // _pending_backup; if validation eventually FAILS the loop below
-  // atomically clears backup_enabled so no rows ship, capture keeps
-  // queuing, and the operator re-enables via db_backup_set_enabled(1)
-  // once the control plane returns. A successful validation lets
-  // shipping proceed normally. Either way the app's main thread was
-  // never blocked, the threads are alive, and the failure is observable
-  // via db_backup_is_healthy() — never silent, never permanent.
-  //
-  // Validation is retried with backoff up to ARKILIAN_STARTUP_AUTH_RETRIES
-  // times (default 3) so a brief control-plane outage at boot is fully
-  // transparent: by the time the operator sees the dashboard, the flush
-  // thread has likely re-validated successfully and is shipping already.
-  if (ARK_LOAD(&db->startup_auth_state) == 0 && ARK_LOAD(&db->backup_enabled)) {
-    int retries = get_env_int_default("ARKILIAN_STARTUP_AUTH_RETRIES", 3);
-    if (retries < 0) retries = 0;
-    int validated = 0;
-    for (int attempt = 0; attempt <= retries && !ARK_LOAD(&db->shutdown_requested); attempt++) {
-      char *key_copy = api_key_snapshot(db);   // snapshot the key under its mutex
-      if (!key_copy || strlen(key_copy) == 0) {
-        free(key_copy);
-        break;                              // nothing to validate → leave PENDING
-      }
-      validated = validate_api_key(db, db->control_url, key_copy);
-      free(key_copy);
-      if (validated) break;
-      if (attempt < retries && !ARK_LOAD(&db->shutdown_requested)) {
-        int wait_s = 2 << attempt;          // 2s, 4s, 8s exponential backoff
-        if (wait_s > 30) wait_s = 30;
-        if (sleep_interruptible(db, wait_s)) break;
-      }
-    }
-    if (validated) {
-      ARK_STORE(&db->startup_auth_state, 1);
-      ark_log(db, ARK_LOG_INFO, "API key validated against control plane (async)");
-      // Fetch storage credentials ONCE (inlined — no separate function to
-      // avoid automation stripping it). GET /v1/storage/credentials with
-      // the API key; parse and cache endpoint/bucket/region/keys/db_id.
-      // On failure, s3_creds_loaded stays 0 and the snapshot thread skips
-      // uploads until the next re-validation cycle.
-      if (!ARK_LOAD(&db->s3_creds_loaded)) {
-        char *ck = api_key_snapshot(db);
-        if (ck && strlen(ck) > 0) {
-          char *cu = join_url(db->control_url, "/v1/storage/credentials");
-          if (cu) {
-            CURL *fc = curl_easy_init();
-            if (fc) {
-              struct { char buf[4096]; size_t len; volatile int *sf; } cr = {{0},0,&db->shutdown_requested};
-              CURLcode frc = curl_easy_setopt(fc, CURLOPT_URL, cu);
-              if (frc == CURLE_OK) frc = curl_easy_setopt(fc, CURLOPT_HTTPGET, 1L);
-              if (frc == CURLE_OK) frc = curl_easy_setopt(fc, CURLOPT_WRITEFUNCTION, creds_write_cb);
-              if (frc == CURLE_OK) frc = curl_easy_setopt(fc, CURLOPT_WRITEDATA, &cr);
-              if (frc == CURLE_OK) frc = curl_easy_setopt(fc, CURLOPT_TIMEOUT, 10L);
-              if (frc == CURLE_OK) frc = curl_easy_setopt(fc, CURLOPT_CONNECTTIMEOUT, 5L);
-              if (frc == CURLE_OK) frc = curl_easy_setopt(fc, CURLOPT_SSL_VERIFYPEER, 1L);
-              if (frc == CURLE_OK) frc = curl_easy_setopt(fc, CURLOPT_SSL_VERIFYHOST, 2L);
-              struct curl_slist *fh = NULL;
-              if (frc == CURLE_OK) { fh = curl_slist_append(fh, "Accept: application/json"); if (!fh) frc = CURLE_OUT_OF_MEMORY; }
-              if (frc == CURLE_OK) { char ah[512]; snprintf(ah, sizeof(ah), "Authorization: Bearer %s", ck); fh = curl_slist_append(fh, ah); if (!fh) frc = CURLE_OUT_OF_MEMORY; }
-              if (frc == CURLE_OK) frc = curl_easy_setopt(fc, CURLOPT_HTTPHEADER, fh);
-              if (frc == CURLE_OK) {
-                CURLcode fres = curl_easy_perform(fc);
-                long fhttp = 0;
-                if (fres == CURLE_OK) curl_easy_getinfo(fc, CURLINFO_RESPONSE_CODE, &fhttp);
-                if (fres == CURLE_OK && fhttp >= 200 && fhttp < 300 && cr.len > 0) {
-                  char t_ep[256], t_bk[128], t_rg[64], t_ak[256], t_sk[256], t_id[128];
-                  json_str_field(cr.buf, "endpoint", t_ep, sizeof(t_ep));
-                  json_str_field(cr.buf, "bucket", t_bk, sizeof(t_bk));
-                  json_str_field(cr.buf, "region", t_rg, sizeof(t_rg));
-                  json_str_field(cr.buf, "access_key", t_ak, sizeof(t_ak));
-                  json_str_field(cr.buf, "secret_key", t_sk, sizeof(t_sk));
-                  json_str_field(cr.buf, "db_id", t_id, sizeof(t_id));
-                  if (t_ep[0] && t_bk[0] && t_ak[0] && t_sk[0] && t_id[0]) {
-                    if (db->s3_endpoint) free(db->s3_endpoint);
-                    if (db->s3_bucket) free(db->s3_bucket);
-                    if (db->s3_region) free(db->s3_region);
-                    if (db->s3_access_key) free(db->s3_access_key);
-                    if (db->s3_secret_key) free(db->s3_secret_key);
-                    if (db->db_id) free(db->db_id);
-                    if (db->s3_prefix) free(db->s3_prefix);
-                    db->s3_endpoint = strdup(t_ep);
-                    db->s3_bucket = strdup(t_bk);
-                    db->s3_region = strdup(t_rg[0] ? t_rg : "us-east-1");
-                    db->s3_access_key = strdup(t_ak);
-                    db->s3_secret_key = strdup(t_sk);
-                    db->db_id = strdup(t_id);
-                    // prefix
-                    {
-                      char t_prefix[256] = {0};
-                      json_str_field(cr.buf, "prefix", t_prefix, sizeof(t_prefix));
-                      db->s3_prefix = strdup(t_prefix[0] ? t_prefix : t_id);
-                    }
-                    if (db->s3_endpoint && db->s3_bucket && db->s3_access_key && db->s3_secret_key && db->db_id) {
-                      ARK_STORE(&db->s3_creds_loaded, 1);
-                      db->chunk_enabled = 1;
-                      ark_log(db, ARK_LOG_INFO, "storage credentials cached — direct S3 upload enabled");
-                    }
-                  }
-                }
-              }
-              if (fh) curl_slist_free_all(fh);
-              curl_easy_cleanup(fc);
-            }
-          }
-          free(cu);
-        }
-        free(ck);
-      }
-    } else {
-      ARK_STORE(&db->startup_auth_state, 2);
-      // CRITICAL: clear backup_enabled so the flush loop's drain gate
-      // (below) skips ship_to_backup entirely. Without this, rows keep
-      // being POSTed to a dead CP → 401 → exponential backoff → after
-      // max_attempts (default 100) every row dead-letters AND is deleted
-      // from _pending_backup → db_backup_is_healthy() flips GREEN again
-      // (queue empty) = silent bulk data loss between snapshots. With
-      // backup_enabled=0, capture keeps queuing with attempts=0 (nothing
-      // ever dead-letters) and the periodic recheck in the main loop
-      // re-enables the moment the CP validates.
-      ARK_STORE(&db->backup_enabled, 0);
-      ark_log(db, ARK_LOG_ERROR,
-              "async startup API key validation failed after %d attempt(s) — "
-              "backup DISABLED (capture keeps queuing, no dead-lettering). "
-              "The flush thread will re-validate periodically and re-enable "
-              "shipping automatically once the control plane validates the "
-              "key. Verify ARKILIAN_API_KEY and ARKILIAN_CONTROL_URL",
-              retries + 1);
-    }
-  }
 
-  // One CURL handle for every ship in this thread: reset (not cleanup)
-  // between rows keeps the TCP/TLS connection pool alive — the
-  // difference between ~3 rows/sec and thousands over a WAN. Created
-  // after curl_global_init (db_init) and owned exclusively by this
-  // thread (spec §3.1).
-  CURL *ship_curl = curl_easy_init();
-  if (!ship_curl) {
-    ark_log(db, ARK_LOG_ERROR,
-            "flush thread: curl_easy_init failed — shipping disabled");
-  }
-
-  while (!ARK_LOAD(&db->shutdown_requested) && select_stmt && ship_curl) {
+  while (!ARK_LOAD(&db->shutdown_requested) && select_stmt) {
     // Liveness heartbeat (spec §9): the watchdog reads this from another
     // thread; a stale age means the thread died silently.
     long long now_ms = now_ms_mono();
     ARK_STORE(&db->last_heartbeat_sec, (int)(now_ms / 1000));
 
-    // Periodic re-validation (startup_auth_state recovery): if async
-    // validation FAILED at boot (state==2, backup_enabled==0), retry it
-    // every ~60s. When the CP comes back and the key validates, we flip
-    // state back to VALIDATED, re-enable backup, and (re)fetch storage
-    // credentials. This is the mechanism that turns a CP outage from
-    // "permanent disable until operator notices" into "self-healing the
-    // moment CP returns" — bounded by this 60s recheck, NOT by a human.
-    // Without it, async-on-failure would disable backup for the whole
-    // process lifetime, reintroducing the v1 SPOF we set out to kill.
-    if (ARK_LOAD(&db->startup_auth_state) == 2) {
-      static long long last_revalidate_ms = 0;  // function-static ok: single flush thread per process
-      if (now_ms - last_revalidate_ms >= 60000) {
-        last_revalidate_ms = now_ms;
-        char *key_copy = api_key_snapshot(db);
-        if (key_copy && strlen(key_copy) > 0) {
-          if (validate_api_key(db, db->control_url, key_copy)) {
-            ARK_STORE(&db->startup_auth_state, 1);
-            ARK_STORE(&db->backup_enabled, 1);
-            ark_log(db, ARK_LOG_INFO,
-                    "API key re-validated against control plane — backup "
-                    "RE-ENABLED (capture resumes shipping)");
-            // Re-fetch storage credentials if not yet cached (same inline
-            // path as the initial validation success block above).
-            if (!ARK_LOAD(&db->s3_creds_loaded)) {
-              // Re-trigger by setting state back to 0 — the main validation
-              // block at startup_auth_state==0 will re-run on the next loop
-              // iteration, validate, and fetch creds in one shot.
-              // Simpler than duplicating the 50-line inline fetch here.
-              ARK_STORE(&db->startup_auth_state, 0);
-            }
-          }
-        }
-        free(key_copy);
-      }
-    }
-
-    // Periodic credential refresh
-    if (db->chunk_enabled && ARK_LOAD(&db->s3_creds_loaded)) {
-      static long long last_cred_refresh_ms = 0;
-      if (now_ms - last_cred_refresh_ms >= 900000) {  // 15 minutes
-        last_cred_refresh_ms = now_ms;
-        fetch_storage_credentials(db);
-      }
+    // Seed the manifest registry once from the last uploaded manifest
+    // (restart safety) — async on this thread so db_init never blocks on
+    // a slow storage endpoint.
+    if (!manifest_seeded) {
+      manifest_seeded = 1;
+      manifest_registry_seed(db);
     }
 
     int drained = 0;
-    int use_chunk = db->chunk_enabled && ARK_LOAD(&db->s3_creds_loaded);
-    if (ARK_LOAD(&db->backup_enabled)) {
-      if (use_chunk) {
-        drained = drain_chunk(db, &db->chunk, select_stmt, delete_stmt);
-      } else if (db->push_url && strlen(db->push_url) > 0) {
-        drained = drain_batch(db, ship_curl, select_stmt, delete_stmt,
-                              update_attempts_stmt, dead_letter_stmt);
-      }
+    if (ARK_LOAD(&db->backup_enabled) && ARK_LOAD(&db->s3_creds_loaded)) {
+      drained = drain_chunk(db, &db->chunk, select_stmt, delete_stmt);
     }
 
-    if (use_chunk && db->chunk.entry_count > 0) {
+    if (ARK_LOAD(&db->s3_creds_loaded) && db->chunk.entry_count > 0) {
       time_t age = time(NULL) - db->chunk.opened_at;
       if (age >= db->chunk_interval || db->chunk.len >= CHUNK_MAX_SIZE_BYTES) {
         int flush_rc = wal_chunk_flush_to_s3(db, &db->chunk);
@@ -1894,7 +1606,6 @@ void *run_wal_flush(void *arg) {
   if (delete_stmt) sqlite3_finalize(delete_stmt);
   if (update_attempts_stmt) sqlite3_finalize(update_attempts_stmt);
   if (dead_letter_stmt) sqlite3_finalize(dead_letter_stmt);
-  if (ship_curl) curl_easy_cleanup(ship_curl);
 
 #ifdef _WIN32
   return 0;
@@ -1918,13 +1629,13 @@ int db_init(arkilian **db_ptr, const char *filename) {
   int init_ok = (pthread_mutex_init(&db->wake_mutex, NULL) == 0) &&
                 (pthread_cond_init(&db->wake_cond, NULL) == 0) &&
                 (pthread_mutex_init(&db->payload_mutex, NULL) == 0) &&
-                (pthread_mutex_init(&db->api_key_mutex, NULL) == 0) &&
+                (pthread_mutex_init(&db->manifest_mutex, NULL) == 0) &&
                 (pthread_mutex_init(&db->log_mutex, NULL) == 0);
 #else
   InitializeCriticalSection(&db->wake_mutex);
   InitializeConditionVariable(&db->wake_cond);
   InitializeCriticalSection(&db->payload_mutex);
-  InitializeCriticalSection(&db->api_key_mutex);
+  InitializeCriticalSection(&db->manifest_mutex);
   InitializeCriticalSection(&db->log_mutex);
   int init_ok = 1;
 #endif
@@ -1947,58 +1658,28 @@ int db_init(arkilian **db_ptr, const char *filename) {
   db->backup_path = malloc(strlen(backup_path_tmp) + 1);
   if (db->backup_path) strcpy(db->backup_path, backup_path_tmp);
 
-  // Control-plane base URL (e.g. https://api.arkilian.com). The client
-  // derives /v1/wal/push and /v1/upload/request from this base — the
-  // ONLY credential is the API key, sent as Bearer to every endpoint.
-  const char *control_url_tmp = get_env_default("ARKILIAN_CONTROL_URL", "");
-  db->control_url = malloc(strlen(control_url_tmp) + 1);
-  if (db->control_url) strcpy(db->control_url, control_url_tmp);
-
-  // Derive the two endpoint URLs from the control-plane base.
-  if (db->control_url && strlen(db->control_url) > 0) {
-    db->push_url = join_url(db->control_url, "/v1/wal/push");
-    db->signed_url_endpoint = join_url(db->control_url, "/v1/upload/request");
-    db->db_log_url = join_url(db->control_url, "/v1/db/log");
-  } else {
-    db->push_url = strdup("");
-    db->signed_url_endpoint = strdup("");
-    db->db_log_url = strdup("");
-  }
-
-  // The API key is the ONLY credential the client holds. Sent as
-  // "Authorization: Bearer <api_key>" to every control-plane endpoint.
-  // No S3 credentials, JWT, or separate bearer token are ever used.
-  const char *api_key_tmp = get_env_default("ARKILIAN_API_KEY", "");
-  db->api_key = malloc(strlen(api_key_tmp) + 1);
-  if (db->api_key) strcpy(db->api_key, api_key_tmp);
-  // The API key is sent in a 512-byte stack buffer; a key longer than
-  // ~490 bytes would be silently truncated and the control plane would
-  // reject every request as unauthorized — surface it loudly instead.
-  if (db->api_key && strlen(db->api_key) > 490) {
-    ark_log(db, ARK_LOG_WARN,
-            "ARKILIAN_API_KEY is %zu bytes — exceeding the 490-byte "
-            "header budget; it will be truncated and requests will be "
-            "rejected. Rotate to a shorter key",
-            strlen(db->api_key));
-  }
-
-  // Direct S3 credentials (control-plane-independent upload path).
+  // S3 destination — the ONLY backup target. SigV4 requests are signed
+  // locally with the per-database access/secret keys; no bearer token or
+  // control plane exists in the client.
   {
     const char *ep = get_env_default("ARKILIAN_S3_ENDPOINT", "");
     const char *bk = get_env_default("ARKILIAN_S3_BUCKET", "");
     const char *rg = get_env_default("ARKILIAN_S3_REGION", "us-east-1");
     const char *ak = get_env_default("ARKILIAN_S3_ACCESS_KEY", "");
     const char *sk = get_env_default("ARKILIAN_S3_SECRET_KEY", "");
+    const char *pf = get_env_default("ARKILIAN_S3_PREFIX", "db_default");
     db->s3_endpoint   = malloc(strlen(ep) + 1);
     db->s3_bucket     = malloc(strlen(bk) + 1);
     db->s3_region     = malloc(strlen(rg) + 1);
     db->s3_access_key = malloc(strlen(ak) + 1);
     db->s3_secret_key = malloc(strlen(sk) + 1);
+    db->s3_prefix     = malloc(strlen(pf) + 1);
     if (db->s3_endpoint)   strcpy(db->s3_endpoint, ep);
     if (db->s3_bucket)     strcpy(db->s3_bucket, bk);
     if (db->s3_region)     strcpy(db->s3_region, rg);
     if (db->s3_access_key) strcpy(db->s3_access_key, ak);
     if (db->s3_secret_key) strcpy(db->s3_secret_key, sk);
+    if (db->s3_prefix)     strcpy(db->s3_prefix, pf);
   }
 
   db->backup_interval = get_env_int_default("ARKILIAN_BACKUP_INTERVAL", DEFAULT_BACKUP_INTERVAL);
@@ -2009,90 +1690,23 @@ int db_init(arkilian **db_ptr, const char *filename) {
   db->chunk_interval = get_env_int_default("ARKILIAN_CHUNK_INTERVAL_SEC",
                                            CHUNK_FLUSH_INTERVAL_SEC);
   if (db->chunk_interval < 1) db->chunk_interval = 1;
-  db->chunk_enabled = get_env_bool_default("ARKILIAN_WAL_DIRECT_S3",
-    (db->s3_endpoint && db->s3_endpoint[0] &&
-     db->s3_access_key && db->s3_access_key[0]) ? 1 : 0);
-  if (db->chunk_enabled && db->s3_prefix == NULL) {
-    if (db->db_id && db->db_id[0])
-      db->s3_prefix = strdup(db->db_id);
-    else
-      db->s3_prefix = strdup("db_default");
-    ARK_STORE(&db->s3_creds_loaded, 1);
-  }
-  // ARKILIAN_ALLOW_INSECURE=1 opts into cleartext http:// endpoints that
-  // are NOT loopback/RFC1918 (e.g. an internal-but-public corporate
-  // aggregator). Default 0: anything non-https and non-local is refused.
-  int allow_insecure = get_env_bool_default("ARKILIAN_ALLOW_INSECURE", 0);
+  // S3 readiness: shipping and snapshots require a fully configured
+  // destination (endpoint + bucket + both keys). Partial configuration is
+  // surfaced loudly — never a hard failure (spec §0), but shipping only
+  // runs against a complete destination.
+  ARK_STORE(&db->s3_creds_loaded, has_direct_s3(db) ? 1 : 0);
 
   // Config validation (spec §9's "fail loudly, never silently"): a
   // kill-switch-ON install with no destination will capture rows forever
   // without shipping them. Loud warning at startup — never a hard
   // failure, per the §0 rule that the backup subsystem must not break
   // the application.
-  if (db->backup_enabled && (!db->control_url || strlen(db->control_url) == 0)) {
-    if (ARK_LOAD(&db->s3_creds_loaded)) {
-      ark_log(db, ARK_LOG_INFO,
-              "no control plane configured — direct S3 backup active");
-    } else {
-      ark_log(db, ARK_LOG_WARN,
-              "backup is enabled (ARKILIAN_ENABLE_BACKUP) but ARKILIAN_CONTROL_URL "
-              "is not set — rows will accumulate in _pending_backup and never ship");
-    }
-  }
-  if (db->backup_enabled && (!db->api_key || strlen(db->api_key) == 0)) {
-    if (ARK_LOAD(&db->s3_creds_loaded)) {
-      ark_log(db, ARK_LOG_INFO,
-              "no API key configured — direct S3 backup active");
-    } else {
-      ark_log(db, ARK_LOG_WARN,
-              "backup is enabled but ARKILIAN_API_KEY is not set — the "
-              "control plane will reject every request; backup DISABLED");
-      ARK_STORE(&db->backup_enabled, 0);
-    }
-  }
-
-  // Credential transport hygiene: over http:// the API key and every
-  // payload cross the wire in cleartext. HTTPS is enforced by default —
-  // only loopback/RFC1918 (local dev) or an explicit ARKILIAN_ALLOW_INSECURE
-  // opt-in permit cleartext. A misconfigured cleartext endpoint is refused
-  // at startup rather than silently leaking the key; backup is disabled
-  // (per spec §0, never a hard db_init failure) so the application keeps
-  // running while the operator fixes the configuration.
-  if (db->backup_enabled && db->control_url && strlen(db->control_url) > 0 &&
-      !url_transport_is_safe(db->control_url, allow_insecure)) {
-    ark_log(db, ARK_LOG_ERROR,
-            "ARKILIAN_CONTROL_URL is not https and not a local address — the "
-            "API key would be sent in cleartext; backup DISABLED. Set "
-            "https://, point at a loopback/RFC1918 host, or opt-in with "
-            "ARKILIAN_ALLOW_INSECURE=1");
-    ARK_STORE(&db->backup_enabled, 0);
-  }
-
-  // Startup API-key validation: the client connects to the control plane
-  // to authenticate the API key before any shipping begins. A failed
-  // validation disables backup (per §0, never a hard failure) and
-  // surfaces via db_backup_is_healthy(). If the control plane is
-  // temporarily unreachable, backup is still disabled — the operator
-  // can re-enable via db_backup_set_enabled(1) once the control plane
-  // is back.
-  //
-  // ARKILIAN_SKIP_STARTUP_AUTH=1 bypasses the validation for test
-  // environments that have no running control plane. In production,
-  // validation now runs ASYNCHRONOUSLY from the flush thread (not
-  // synchronously here on the caller's main thread): db_init enables
-  // backup eagerly with the configured key and starts both background
-  // threads, so a control-plane outage at boot no longer permanently
-  // disables backup for the process lifetime (the v1 failure mode that
-  // broke 5,000 clients on deploy). The flush thread's first cycle calls
-  // validate_api_key via run_wal_flush's async startup hook; a failed
-  // async validation clears backup_enabled + alerts via the standard
-  // monitoring path. See struct arkilian.startup_auth_state.
-  int skip_auth = get_env_bool_default("ARKILIAN_SKIP_STARTUP_AUTH", 0);
-  if (skip_auth || (ARK_LOAD(&db->s3_creds_loaded) &&
-      (!db->control_url || !db->control_url[0]))) {
-    ARK_STORE(&db->startup_auth_state, 1);
-  } else {
-    ARK_STORE(&db->startup_auth_state, 0);
+  if (db->backup_enabled && !ARK_LOAD(&db->s3_creds_loaded)) {
+    ark_log(db, ARK_LOG_WARN,
+            "backup is enabled (ARKILIAN_ENABLE_BACKUP) but the S3 destination "
+            "is incomplete — set ARKILIAN_S3_ENDPOINT, ARKILIAN_S3_BUCKET, "
+            "ARKILIAN_S3_ACCESS_KEY and ARKILIAN_S3_SECRET_KEY; rows will "
+            "accumulate in _pending_backup and never ship until then");
   }
 
   // libcurl global init must happen before ANY thread calls
@@ -2449,32 +2063,33 @@ void db_close(arkilian *db) {
     pthread_mutex_destroy(&db->wake_mutex);
     pthread_cond_destroy(&db->wake_cond);
     pthread_mutex_destroy(&db->payload_mutex);
-    pthread_mutex_destroy(&db->api_key_mutex);
+    pthread_mutex_destroy(&db->manifest_mutex);
     pthread_mutex_destroy(&db->log_mutex);
   }
 #else
   if (db->sync_initialized) {
     DeleteCriticalSection(&db->wake_mutex);
     DeleteCriticalSection(&db->payload_mutex);
-    DeleteCriticalSection(&db->api_key_mutex);
+    DeleteCriticalSection(&db->manifest_mutex);
     DeleteCriticalSection(&db->log_mutex);
   }
 #endif
 
   if (db->db_path) free(db->db_path);
   if (db->backup_path) free(db->backup_path);
-  if (db->control_url) free(db->control_url);
-  if (db->push_url) free(db->push_url);
-  if (db->signed_url_endpoint) free(db->signed_url_endpoint);
-  if (db->api_key) free(db->api_key);
   if (db->s3_endpoint) free(db->s3_endpoint);
   if (db->s3_bucket) free(db->s3_bucket);
   if (db->s3_region) free(db->s3_region);
   if (db->s3_access_key) free(db->s3_access_key);
   if (db->s3_secret_key) free(db->s3_secret_key);
-  if (db->db_id) free(db->db_id);
   if (db->s3_prefix) free(db->s3_prefix);
-  if (db->db_log_url) free(db->db_log_url);
+  for (int i = 0; i < db->manifest_chunk_count; i++) {
+    free(db->manifest_chunks[i].s3_key);
+    free(db->manifest_chunks[i].sha256);
+  }
+  free(db->manifest_chunks);
+  free(db->manifest_snapshot_key);
+  free(db->manifest_snapshot_sha);
   if (db->chunk.buffer) free(db->chunk.buffer);
 
   free(db);
@@ -2998,7 +2613,7 @@ int db_backup_is_healthy(arkilian *db) {
   // destination. A green light while nothing is shipping is exactly the
   // silent failure monitoring exists to catch.
   if (!ARK_LOAD(&db->backup_enabled)) return 0;
-  if (!db->control_url || strlen(db->control_url) == 0) return 0;
+  if (!has_direct_s3(db)) return 0;
   // Flush thread liveness: a 30s threshold covers a 10s ship + margin.
   long long hb_age = db_backup_thread_heartbeat_age_ms(db);
   if (hb_age < 0 || hb_age > 30000) return 0;
@@ -3031,12 +2646,6 @@ long long db_backup_last_chunk_flush_age_ms(arkilian *db) {
   return age_s * 1000LL;
 }
 
-long long db_backup_last_cp_echo_age_ms(arkilian *db) {
-  if (!db || db->chunk.last_cp_echo <= 0) return -1;
-  long long now_s = (long long)time(NULL);
-  long long age_s = now_s - (long long)db->chunk.last_cp_echo;
-  return age_s * 1000LL;
-}
 
 // Count of real (non-virtual, non-shadow) tables that are NOT captured:
 // rowid tables with no PRIMARY KEY are unreplayable and skipped by
@@ -3163,29 +2772,12 @@ int backup_database(sqlite3 *pSource, const char *zFilename,
   return rc;
 }
 
-struct Memory {
-  char *response;
-  size_t size;
-  volatile int *shutdown_flag;
-};
-
-static size_t write_cb(void *data, size_t size, size_t nmemb, void *userp) {
-  struct Memory *mem = (struct Memory *)userp;
-  if (mem->shutdown_flag && ARK_LOAD(mem->shutdown_flag)) return 0;
-  size_t realsize = size * nmemb;
-  char *ptr = realloc(mem->response, mem->size + realsize + 1);
-  if (!ptr) return 0;
-  mem->response = ptr;
-  memcpy(&(mem->response[mem->size]), data, realsize);
-  mem->size += realsize;
-  mem->response[mem->size] = 0;
-  return realsize;
-}
-
-                       const char *file_path, const char *token) {
-  // Defense-in-depth SSRF guard: even if get_signed_url's check regressed,
-  // never upload the database to a host that is not an allowed storage
-  // destination. The signed_url is attacker-influenceable (control plane).
+// PUT a file to object storage via a locally presigned URL. Streams from
+// disk so multi-hundred-MB snapshots never sit in memory.
+static int upload_to_s3(arkilian *db, const char *signed_url,
+                       const char *file_path) {
+  // Defense-in-depth SSRF guard: never upload the database to a host that
+  // is not an allowed storage destination.
   if (!url_is_allowed_storage(signed_url)) {
     ark_log(db, ARK_LOG_ERROR,
             "upload_to_s3 refused: signed_url host is not an allowed "
@@ -3245,15 +2837,6 @@ static size_t write_cb(void *data, size_t size, size_t nmemb, void *userp) {
   struct curl_slist *headers = NULL;
   if (rc == CURLE_OK) {
     headers = curl_slist_append(headers, "Content-Type: application/x-sqlite3");
-    if (!headers) rc = CURLE_OUT_OF_MEMORY;
-  }
-  // Pre-signed URLs must NOT carry our bearer token — it leaks the
-  // credential to the storage host and S3 rejects requests that mix
-  // an Authorization header with a query-string signature.
-  if (rc == CURLE_OK && token && strlen(token) > 0 && !url_is_presigned(signed_url)) {
-    char auth_header[512];
-    snprintf(auth_header, sizeof(auth_header), "Authorization: Bearer %s", token);
-    headers = curl_slist_append(headers, auth_header);
     if (!headers) rc = CURLE_OUT_OF_MEMORY;
   }
   if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
@@ -3508,9 +3091,9 @@ char *db_s3_presign_get(arkilian *db, const char *key, long expires_sec) {
 // Escape a string for embedding inside a JSON string literal: quotes and
 // backslashes are backslash-escaped, control characters use \u00XX.
 // Returns a malloc'd copy of the escaped text, or NULL on OOM. NULL input
-// is treated as the empty string. Needed because db_id (s3_prefix) and
-// snapshot keys are control-plane/authored strings — embedding them raw
-// would let a `"` character produce a malformed manifest.
+// is treated as the empty string. Needed because the prefix and snapshot
+// keys are operator/authored strings — embedding them raw would let a `"`
+// character produce a malformed manifest.
 static char *json_escape_str(const char *s) {
   const char *src = s ? s : "";
   size_t len = 0;
@@ -3536,52 +3119,250 @@ static char *json_escape_str(const char *s) {
   return out;
 }
 
-static void manifest_write(arkilian *db, const char *snapshot_s3_key,
-                            const char *snapshot_sha256, int64_t baseline_lsn) {
-  if (!db || !snapshot_s3_key || !has_direct_s3(db)) return;
-  if (!db->s3_prefix || !db->s3_prefix[0]) return;
-  if (strstr(db->s3_prefix, "..") || db->s3_prefix[0] == '/')
-    return;
+// ── Manifest registry ───────────────────────────────────────────────
+// {prefix}/manifest.json is the durable registry that hydration replays:
+//   {"version":3,"prefix":"...","snapshot":{"s3_key","sha256","baseline_lsn"},
+//    "chunks":[{"s3_key","sha256","lsn_start","lsn_end"}, ...]}
+// The flush thread appends chunk records, the snapshot thread sets the
+// baseline and prunes covered chunks, and db_init seeds the registry from
+// the last uploaded copy so a restart never orphans shipped chunks.
 
-  // JSON-escape every string field: db_id comes from the control plane's
-  // credentials response and the key from local config — either may in
-  // principle contain quotes/backslashes, which would otherwise yield an
-  // invalid manifest that manifest readers silently drop.
-  char *db_id_json = json_escape_str(db->s3_prefix);
-  char *key_json   = json_escape_str(snapshot_s3_key);
-  char *sha_json   = json_escape_str(snapshot_sha256 ? snapshot_sha256 : "");
-  if (!db_id_json || !key_json || !sha_json) {
-    free(db_id_json); free(key_json); free(sha_json);
-    return;
+// Append formatted text to a growable buffer. Returns 0 on success.
+static int jbuf_append(char **buf, size_t *len, size_t *cap,
+                       const char *fmt, ...) {
+  va_list ap, ap2;
+  va_start(ap, fmt);
+  va_copy(ap2, ap);
+  int need = vsnprintf(NULL, 0, fmt, ap);
+  va_end(ap);
+  if (need < 0) { va_end(ap2); return -1; }
+  if (*len + (size_t)need + 1 > *cap) {
+    size_t ncap = *cap ? *cap * 2 : 1024;
+    while (ncap < *len + (size_t)need + 1) ncap *= 2;
+    char *nb = realloc(*buf, ncap);
+    if (!nb) { va_end(ap2); return -1; }
+    *buf = nb;
+    *cap = ncap;
+  }
+  vsnprintf(*buf + *len, (size_t)need + 1, fmt, ap2);
+  va_end(ap2);
+  *len += (size_t)need;
+  return 0;
+}
+
+static void manifest_registry_lock(arkilian *db) {
+#ifndef _WIN32
+  pthread_mutex_lock(&db->manifest_mutex);
+#else
+  EnterCriticalSection(&db->manifest_mutex);
+#endif
+}
+
+static void manifest_registry_unlock(arkilian *db) {
+#ifndef _WIN32
+  pthread_mutex_unlock(&db->manifest_mutex);
+#else
+  LeaveCriticalSection(&db->manifest_mutex);
+#endif
+}
+
+// Takes ownership of s3_key/sha256 on success; frees them on failure.
+static int manifest_registry_append(arkilian *db, char *s3_key, char *sha256,
+                                    uint64_t lsn_start, uint64_t lsn_end) {
+  if (!db || !s3_key) { free(s3_key); free(sha256); return -1; }
+  manifest_registry_lock(db);
+  if (db->manifest_chunk_count == db->manifest_chunk_cap) {
+    int ncap = db->manifest_chunk_cap ? db->manifest_chunk_cap * 2 : 16;
+    ark_manifest_chunk *nc =
+        realloc(db->manifest_chunks, (size_t)ncap * sizeof(ark_manifest_chunk));
+    if (!nc) {
+      manifest_registry_unlock(db);
+      free(s3_key); free(sha256);
+      return -1;
+    }
+    db->manifest_chunks = nc;
+    db->manifest_chunk_cap = ncap;
+  }
+  ark_manifest_chunk *rec = &db->manifest_chunks[db->manifest_chunk_count++];
+  rec->s3_key = s3_key;
+  rec->sha256 = sha256;
+  rec->lsn_start = lsn_start;
+  rec->lsn_end = lsn_end;
+  db->manifest_pending++;
+  manifest_registry_unlock(db);
+  return 0;
+}
+
+// Drop chunk records fully covered by the new baseline snapshot: their
+// rows are already IN the snapshot, so replaying them is redundant.
+static void manifest_registry_prune_upto(arkilian *db, uint64_t baseline_lsn) {
+  manifest_registry_lock(db);
+  int w = 0;
+  for (int i = 0; i < db->manifest_chunk_count; i++) {
+    ark_manifest_chunk *rec = &db->manifest_chunks[i];
+    if (rec->lsn_end <= baseline_lsn) {
+      free(rec->s3_key);
+      free(rec->sha256);
+    } else {
+      db->manifest_chunks[w++] = *rec;
+    }
+  }
+  db->manifest_chunk_count = w;
+  manifest_registry_unlock(db);
+}
+
+// Rebuild and PUT {prefix}/manifest.json from the in-memory registry.
+// snapshot_key/sha may be NULL to keep the previously recorded baseline.
+// Returns 0 on success. The registry itself is untouched on failure —
+// a later flush or snapshot retries the upload.
+static int manifest_registry_upload(arkilian *db, const char *snapshot_key,
+                                    const char *snapshot_sha,
+                                    uint64_t baseline_lsn) {
+  if (!db || !has_direct_s3(db)) return -1;
+  if (!db->s3_prefix || !db->s3_prefix[0]) return -1;
+  if (strstr(db->s3_prefix, "..") || db->s3_prefix[0] == '/') return -1;
+
+  manifest_registry_lock(db);
+  if (snapshot_key) {
+    char *nk = strdup(snapshot_key);
+    char *ns = snapshot_sha ? strdup(snapshot_sha) : NULL;
+    if (!nk || (snapshot_sha && !ns)) {
+      free(nk); free(ns);
+      manifest_registry_unlock(db);
+      return -1;
+    }
+    free(db->manifest_snapshot_key);
+    free(db->manifest_snapshot_sha);
+    db->manifest_snapshot_key = nk;
+    db->manifest_snapshot_sha = ns;
+    db->manifest_baseline_lsn = baseline_lsn;
   }
 
-  char json_buf[4096];
-  int n = snprintf(json_buf, sizeof(json_buf),
-    "{\"version\":2,\"db_id\":\"%s\","
-    "\"snapshot\":{\"s3_key\":\"%s\",\"sha256\":\"%s\",\"baseline_lsn\":%lld},"
-    "\"chunks\":[]}",
-    db_id_json, key_json, sha_json,
-    (long long)baseline_lsn);
-  free(db_id_json); free(key_json); free(sha_json);
-  if (n <= 0 || (size_t)n >= sizeof(json_buf)) return;
+  char *json = NULL;
+  size_t jlen = 0, jcap = 0;
+  char *prefix_json = json_escape_str(db->s3_prefix);
+  char *skey_json = json_escape_str(db->manifest_snapshot_key
+                                        ? db->manifest_snapshot_key : "");
+  char *ssha_json = json_escape_str(db->manifest_snapshot_sha
+                                        ? db->manifest_snapshot_sha : "");
+  int bad = !prefix_json || !skey_json || !ssha_json ||
+            jbuf_append(&json, &jlen, &jcap,
+                        "{\"version\":3,\"prefix\":\"%s\","
+                        "\"snapshot\":{\"s3_key\":\"%s\",\"sha256\":\"%s\","
+                        "\"baseline_lsn\":%lld},\"chunks\":[",
+                        prefix_json, skey_json, ssha_json,
+                        (long long)db->manifest_baseline_lsn) != 0;
+  for (int i = 0; !bad && i < db->manifest_chunk_count; i++) {
+    ark_manifest_chunk *rec = &db->manifest_chunks[i];
+    char *k = json_escape_str(rec->s3_key);
+    char *s = json_escape_str(rec->sha256 ? rec->sha256 : "");
+    bad = !k || !s ||
+          jbuf_append(&json, &jlen, &jcap,
+                      "%s{\"s3_key\":\"%s\",\"sha256\":\"%s\","
+                      "\"lsn_start\":%llu,\"lsn_end\":%llu}",
+                      i ? "," : "", k, s,
+                      (unsigned long long)rec->lsn_start,
+                      (unsigned long long)rec->lsn_end) != 0;
+    free(k);
+    free(s);
+  }
+  free(prefix_json);
+  free(skey_json);
+  free(ssha_json);
+  if (!bad) bad = jbuf_append(&json, &jlen, &jcap, "]}") != 0;
+  if (bad) {
+    free(json);
+    manifest_registry_unlock(db);
+    return -1;
+  }
 
   char tmp_path[1024];
   snprintf(tmp_path, sizeof(tmp_path), "%s.manifest", db->backup_path);
   FILE *f = fopen(tmp_path, "wb");
-  if (!f) return;
-  fwrite(json_buf, 1, (size_t)n, f);
+  if (!f) {
+    free(json);
+    manifest_registry_unlock(db);
+    return -1;
+  }
+  size_t wrote = fwrite(json, 1, jlen, f);
   fclose(f);
+  if (wrote != jlen) {
+    free(json);
+    unlink(tmp_path);
+    manifest_registry_unlock(db);
+    return -1;
+  }
 
   char manifest_key[512];
   snprintf(manifest_key, sizeof(manifest_key), "%s/manifest.json",
            db->s3_prefix);
-
   char *put_url = s3_presign_put(db, manifest_key, 600L);
-  if (!put_url) { unlink(tmp_path); return; }
-
-  upload_to_s3(db, put_url, tmp_path, db->api_key);
+  if (!put_url) {
+    free(json);
+    unlink(tmp_path);
+    manifest_registry_unlock(db);
+    return -1;
+  }
+  int rc = upload_to_s3(db, put_url, tmp_path);
   free(put_url);
   unlink(tmp_path);
+  free(json);
+
+  if (rc == 0) {
+    db->manifest_pending = 0;
+    db->manifest_last_upload = time(NULL);
+  }
+  manifest_registry_unlock(db);
+  return rc;
+}
+
+// Manifest PUTs are batched: at most one per
+// MANIFEST_UPLOAD_MIN_INTERVAL_SEC, so the 1s chunk cadence doesn't double
+// the request count against the storage endpoint.
+#define MANIFEST_UPLOAD_MIN_INTERVAL_SEC 30
+static void manifest_registry_maybe_upload(arkilian *db) {
+  manifest_registry_lock(db);
+  int pending = db->manifest_pending;
+  time_t last = db->manifest_last_upload;
+  manifest_registry_unlock(db);
+  if (pending <= 0) return;
+  time_t now = time(NULL);
+  if (last != 0 && now - last < MANIFEST_UPLOAD_MIN_INTERVAL_SEC) return;
+  manifest_registry_upload(db, NULL, NULL, 0);
+}
+
+// Seed the registry from the last uploaded manifest (restart safety): a
+// process that restarts between snapshots must adopt its predecessor's
+// chunk records, or hydration would never replay them. Best-effort — a
+// cold start has no manifest yet, which is not an error.
+static void manifest_registry_seed(arkilian *db) {
+  if (!db || !has_direct_s3(db)) return;
+  if (!db->s3_prefix || !db->s3_prefix[0]) return;
+  HydratePlan plan;
+  if (ark_manifest_fetch(db->s3_endpoint, db->s3_bucket, db->s3_region,
+                         db->s3_access_key, db->s3_secret_key,
+                         db->s3_prefix, &plan) != 0)
+    return;
+  manifest_registry_lock(db);
+  for (int i = 0; i < plan.chunk_count; i++) {
+    HydrateChunk *ch = &plan.chunks[i];
+    if (!ch->s3_key || !ch->s3_key[0]) continue;
+    manifest_registry_append(db, strdup(ch->s3_key),
+                             ch->sha256 ? strdup(ch->sha256) : NULL,
+                             (uint64_t)ch->lsn_start, (uint64_t)ch->lsn_end);
+  }
+  if (plan.snapshot_s3_key) {
+    free(db->manifest_snapshot_key);
+    free(db->manifest_snapshot_sha);
+    db->manifest_snapshot_key = strdup(plan.snapshot_s3_key);
+    db->manifest_snapshot_sha =
+        plan.snapshot_sha256 ? strdup(plan.snapshot_sha256) : NULL;
+    db->manifest_baseline_lsn = (uint64_t)plan.baseline_lsn;
+  }
+  db->manifest_pending = 0;
+  db->manifest_last_upload = time(NULL);
+  manifest_registry_unlock(db);
+  hydrate_plan_free(&plan);
 }
 
 #ifdef _WIN32
@@ -3643,66 +3424,42 @@ void *run_hourly_backup(void *arg) {
     int status = backup_database(db->snapshot_db, db->backup_path,
                                  &db->shutdown_requested);
 
-    // Upload path: direct S3 (no control plane) when credentials are
-    // configured, falling back to the CP signed-URL endpoint.
-    int endpoint_configured = db->signed_url_endpoint &&
-        strlen(db->signed_url_endpoint) > 0;
+    // Upload path: the ONLY destination is S3-compatible object storage,
+    // signed locally with the configured credentials. The baseline LSN is
+    // the highest chunk LSN flushed before the copy began — everything up
+    // to it is contained in this snapshot and prunable from the registry.
+    uint64_t snapshot_upto = 0;
+    manifest_registry_lock(db);
+    if (db->manifest_chunk_count > 0)
+      snapshot_upto = db->manifest_chunks[db->manifest_chunk_count - 1].lsn_end;
+    manifest_registry_unlock(db);
 
-    if (status == SQLITE_OK && (has_direct_s3(db) || endpoint_configured)) {
-      // Compute sha256 of the backup file so the control plane can
-      // authenticate the snapshot on restore. Only the CP path sends
-      // sha256 inline (the server records it in /v1/upload/request);
-      // the direct-S3 path registers it after upload.
+    if (status == SQLITE_OK && has_direct_s3(db)) {
+      // Compute sha256 of the backup file — the manifest records it so
+      // hydration authenticates the object before installing it.
       char snap_sha256[65] = {0};
       (void)ark_sha256_hex_file(db->backup_path, snap_sha256);
 
       char s3_key[512];
-      if (has_direct_s3(db)) {
-        // Client-scoped key: "db_<db_id>/backup.sqlite" — not a
-        // filename-based key, not a double-bucket key. The db_id
-        const char *dbid = (db->db_id && db->db_id[0]) ? db->db_id : "db_unknown";
-        snprintf(s3_key, sizeof(s3_key), "%s/backup.sqlite", dbid);
-      } else {
-        const char *name = db->db_path ? db->db_path : "unknown";
-        const char *base = strrchr(name, '/');
-        snprintf(s3_key, sizeof(s3_key), "backups/%.400s", base ? base + 1 : name);
-      }
+      snprintf(s3_key, sizeof(s3_key), "%s/backup.sqlite", db->s3_prefix);
 
-      char *upload_url = NULL;
-      if (has_direct_s3(db)) {
-        // Sign the PUT URL locally with cached storage credentials.
-        // The key is db_<id>/backup.sqlite; s3_presign_put builds
-        // the full path as /<bucket>/<key> (no double-bucket bug).
-        upload_url = s3_presign_put(db, s3_key, 3600L);
-        if (!upload_url)
-          ark_log(db, ARK_LOG_ERROR,
-                  "snapshot upload skipped: local SigV4 signing failed");
+      char *upload_url = s3_presign_put(db, s3_key, 3600L);
+      if (!upload_url) {
+        ark_log(db, ARK_LOG_ERROR,
+                "snapshot upload skipped: local SigV4 signing failed");
+      } else if (upload_to_s3(db, upload_url, db->backup_path) != 0) {
+        ark_log(db, ARK_LOG_ERROR, "scheduled backup upload failed");
+        free(upload_url);
       } else {
-        char *tok = api_key_snapshot(db);
-        upload_url = get_signed_url(db, db->signed_url_endpoint, tok,
-                                    &db->shutdown_requested, snap_sha256);
-        free(tok);
-      }
-
-      if (upload_url && strlen(upload_url) > 5) {
-        if (upload_to_s3(db, upload_url, db->backup_path, NULL) != 0) {
-          ark_log(db, ARK_LOG_ERROR, "scheduled backup upload failed");
-        } else {
-          // Notify the control plane: the snapshot is NOW durable in S3
-          // and its sha256 is known. This keeps the CP's snapshots table
-          // in sync so hydrate plans return the correct digest and the
-          // right S3 key (server-authored via db_id, not client-supplied).
-          // Only needed for direct-S3 (the CP path's /v1/upload/request
-          // already handles this server-side).
-          if (has_direct_s3(db) && snap_sha256[0]) {
-            register_snapshot_with_cp(db, snap_sha256, &db->shutdown_requested);
-          }
-          ARK_STORE(&db->capture_paused, 0);
-          if (has_direct_s3(db))
-            manifest_write(db, s3_key, snap_sha256, 0);
+        free(upload_url);
+        ARK_STORE(&db->capture_paused, 0);
+        // Baseline + prune + publish: everything up to snapshot_upto is
+        // inside this snapshot, so its chunk records leave the registry.
+        if (snap_sha256[0]) {
+          manifest_registry_prune_upto(db, snapshot_upto);
+          manifest_registry_upload(db, s3_key, snap_sha256, snapshot_upto);
         }
       }
-      free(upload_url);
     }
   }
 #ifdef _WIN32

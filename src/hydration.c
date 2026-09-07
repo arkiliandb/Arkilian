@@ -733,6 +733,7 @@ int ark_manifest_fetch(const char *endpoint, const char *bucket,
   if (!json) return -1;
 
   memset(plan, 0, sizeof(*plan));
+  plan->snapshot_s3_key = json_get_string(json, "s3_key");
   plan->snapshot_url    = json_get_string(json, "s3_key");
   plan->snapshot_sha256 = json_get_string(json, "sha256");
   plan->baseline_lsn    = 0;
@@ -742,16 +743,18 @@ int ark_manifest_fetch(const char *endpoint, const char *bucket,
   if (!snap) {
     // Direct top-level fields from simplified manifest
     plan->snapshot_url    = json_get_string(json, "snapshot_url");
+    plan->snapshot_s3_key = json_get_string(json, "s3_key");
     plan->snapshot_sha256 = json_get_string(json, "snapshot_sha256");
     plan->baseline_lsn    = json_get_int64(json, "baseline_lsn");
   } else {
     // Nested snapshot object from full manifest
     char *s3_key = json_get_string(snap, "s3_key");
     if (s3_key) {
+      free(plan->snapshot_s3_key);
+      plan->snapshot_s3_key = s3_key;
       plan->snapshot_url = s3_presign_get(endpoint, bucket, region,
                                            access_key, secret_key,
                                            s3_key, 3600L);
-      free(s3_key);
     }
     plan->snapshot_sha256 = json_get_string(snap, "sha256");
     char *bl = json_get_string(snap, "baseline_lsn");
@@ -768,10 +771,10 @@ int ark_manifest_fetch(const char *endpoint, const char *bucket,
         if (!elem) continue;
         char *ckey = json_get_string(elem, "s3_key");
         if (ckey) {
+          plan->chunks[i].s3_key = ckey;
           plan->chunks[i].url = s3_presign_get(endpoint, bucket, region,
                                                 access_key, secret_key,
                                                 ckey, 3600L);
-          free(ckey);
         }
         plan->chunks[i].sha256 = json_get_string(elem, "sha256");
         char *ls = json_get_string(elem, "lsn_start");
@@ -793,9 +796,11 @@ int ark_manifest_fetch(const char *endpoint, const char *bucket,
 void hydrate_plan_free(HydratePlan *plan) {
   if (!plan) return;
   free(plan->snapshot_url);
+  free(plan->snapshot_s3_key);
   free(plan->snapshot_sha256);
   for (int i = 0; i < plan->chunk_count; i++) {
     free(plan->chunks[i].url);
+    free(plan->chunks[i].s3_key);
     free(plan->chunks[i].sha256);
   }
   free(plan->chunks);

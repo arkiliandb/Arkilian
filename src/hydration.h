@@ -42,6 +42,8 @@ extern "C" {
 // A single signed URL with its LSN range.
 typedef struct {
   char   *url;          // Pre-Signed GET URL (caller frees)
+  char   *s3_key;       // Raw object key (no signature) when the source is
+                        // a manifest record (caller frees; may be NULL)
   char   *sha256;       // Optional content digest (hex, no dashes) authored by
                         // the uploader + control plane; verified by the client
                         // after download. NULL/empty => not provided (older
@@ -54,6 +56,8 @@ typedef struct {
 // The complete hydration plan returned by the Control Plane.
 typedef struct {
   char   *snapshot_url;    // Pre-Signed GET URL for the baseline .snapshot
+  char   *snapshot_s3_key; // Raw object key of the baseline snapshot when
+                           // known (manifest-sourced; caller frees)
   char   *snapshot_sha256; // Optional content digest of the snapshot (hex)
   int64_t baseline_lsn;    // LSN embedded in the snapshot
   int64_t expires_at;      // when snapshot URL expires (0 = no expiry)
