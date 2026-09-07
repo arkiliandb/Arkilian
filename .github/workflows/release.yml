@@ -220,7 +220,29 @@ jobs:
         echo "CXX=aarch64-linux-gnu-g++" >> "$GITHUB_ENV"
         echo "npm_config_arch=arm64" >> "$GITHUB_ENV"
 
+    # Windows: node-gyp cannot resolve vcpkg's transitive libcurl
+    # dependencies (zlib, bcrypt, normaliz, …) from binding.gyp alone, so
+    # the win32-x64 prebuild is produced with cmake-js + the vcpkg
+    # toolchain — the same combination the `build` job uses, where
+    # find_package(CURL) links every transitive dependency via
+    # CURL::libcurl. The finished addon is staged at the exact
+    # node-gyp-build location prebuildify would have produced
+    # (prebuilds/win32-x64/node.napi.node).
+    # NOTE cmake-js's --CD syntax: "--CD<KEY>=<VALUE>" as ONE token (a
+    # space-separated "--CD KEY=VALUE" is silently ignored).
+    - name: Build prebuild (Windows — cmake-js with vcpkg curl)
+      if: matrix.platform == 'win32'
+      shell: pwsh
+      run: |
+        npx cmake-js compile -a ${{ matrix.arch }} -T arkilian_napi `
+          --CDCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT\scripts\buildsystems\vcpkg.cmake" `
+          --CDVCPKG_TARGET_TRIPLET=x64-windows-static-md `
+          --CDARKILIAN_BUILD_NAPI=ON
+        New-Item -ItemType Directory -Force -Path prebuilds/win32-x64 | Out-Null
+        Copy-Item build/Release/arkilian.node prebuilds/win32-x64/node.napi.node
+
     - name: Build prebuild
+      if: matrix.platform != 'win32'
       run: npx prebuildify --napi --strip --arch ${{ matrix.arch }}
       env:
         npm_config_arch: ${{ matrix.arch }}

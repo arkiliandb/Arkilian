@@ -9,6 +9,18 @@
 // credential is used. The control plane issues pre-signed S3 GET URLs
 // for snapshot/chunk downloads — the API key is never sent to S3.
 
+// Feature-test macros MUST precede every system include: this file is
+// compiled standalone (N-API addon, test TUs) with CMake's strict
+// -std=c99 (extensions OFF), where glibc hides gmtime_r/strcasecmp/
+// O_DIRECTORY behind _DEFAULT_SOURCE/_POSIX_C_SOURCE unless they are
+// defined here. class.c does the same for the same reason.
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#endif
+#ifndef _DEFAULT_SOURCE
+#define _DEFAULT_SOURCE
+#endif
+
 #include "hydration.h"
 #include "sha256.h"
 #include <curl/curl.h>
@@ -186,6 +198,11 @@ static void hydration_remove_sidecars(const char *db_path) {
 // directory fsync. Best-effort: a failure is logged but does not abort,
 // since the data is already written; only the rename's directory entry
 // metadata could be at risk on an immediately-following crash.
+// O_DIRECTORY is Linux-specific: absent on some POSIX builds, where
+// opening the directory O_RDONLY alone is sufficient for fsync().
+#ifndef O_DIRECTORY
+#define O_DIRECTORY 0
+#endif
 static void fsync_parent_dir(const char *path) {
   if (!path) return;
   char dir[4096];

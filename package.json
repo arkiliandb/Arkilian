@@ -5,8 +5,9 @@
   "main": "index.js",
   "type": "module",
   "scripts": {
-    "install": "node-gyp-build || node-gyp configure && node-gyp build",
+    "install": "node-gyp-build",
     "build": "node-gyp configure && node-gyp build",
+    "build:cmake": "cmake-js compile -T arkilian_napi",
     "clean": "node-gyp clean",
     "test": "node test.js",
     "prebuildify": "prebuildify --napi --strip"
@@ -31,6 +32,7 @@
     "node-gyp-build": "^4.8.4"
   },
   "devDependencies": {
+    "cmake-js": "^8.0.0",
     "node-gyp": "^10.0.0",
     "prebuildify": "^6.0.0"
   },

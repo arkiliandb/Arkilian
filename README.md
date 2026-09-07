@@ -189,7 +189,15 @@ Lambda, and serverless environments that lack a build toolchain.
 
 If no prebuilt binary matches your platform (e.g. a rare arch/libc
 combination), the install script falls back to a source build via
-`node-gyp`, which requires `gcc`/`clang` and `libcurl-dev`.
+`node-gyp`, which requires `gcc`/`clang` and `libcurl-dev`. On Windows,
+provide libcurl through vcpkg and point MSVC at it before installing:
+
+```pwsh
+vcpkg install curl:x64-windows-static-md
+$env:INCLUDE = "$env:VCPKG_ROOT\installed\x64-windows-static-md\include;$env:INCLUDE"
+$env:LIB      = "$env:VCPKG_ROOT\installed\x64-windows-static-md\lib;$env:LIB"
+npm install arkilian --build-from-source
+```
 
 ## Real-World Examples
 
