@@ -352,9 +352,10 @@ static int get_env_int_default(const char *env_var, int default_val) {
   return (int)parsed;
 }
 
-// Configurable via ARKILIAN_MAX_ATTEMPTS env var. Default 20 with
-// exponential backoff gives ~1 hour of retrying before dead-lettering.
-// Tests set a lower value (e.g. 3) to dead-letter quickly.
+// Configurable via ARKILIAN_MAX_ATTEMPTS env var. Default 100 attempts
+// with the drain's exponential backoff before a row is dead-lettered
+// (see drain_batch). Tests set a lower value (e.g. 3) to dead-letter
+// quickly.
 static int max_attempts(void) {
   int v = get_env_int_default("ARKILIAN_MAX_ATTEMPTS", 100);
   if (v < 1) v = 1;
@@ -4134,6 +4135,37 @@ static int fetch_storage_credentials(arkilian *db) {
   return ok;
 }
 
+// Escape a string for embedding inside a JSON string literal: quotes and
+// backslashes are backslash-escaped, control characters use \u00XX.
+// Returns a malloc'd copy of the escaped text, or NULL on OOM. NULL input
+// is treated as the empty string. Needed because db_id (s3_prefix) and
+// snapshot keys are control-plane/authored strings — embedding them raw
+// would let a `"` character produce a malformed manifest.
+static char *json_escape_str(const char *s) {
+  const char *src = s ? s : "";
+  size_t len = 0;
+  for (const char *p = src; *p; p++) {
+    unsigned char c = (unsigned char)*p;
+    len += (c == '"' || c == '\\') ? 2 : (c < 0x20) ? 6 : 1;
+  }
+  char *out = malloc(len + 1);
+  if (!out) return NULL;
+  static const char hex[] = "0123456789abcdef";
+  char *w = out;
+  for (const char *p = src; *p; p++) {
+    unsigned char c = (unsigned char)*p;
+    if (c == '"' || c == '\\') { *w++ = '\\'; *w++ = (char)c; }
+    else if (c < 0x20) {
+      *w++ = '\\'; *w++ = 'u'; *w++ = '0'; *w++ = '0';
+      *w++ = hex[(c >> 4) & 0xf]; *w++ = hex[c & 0xf];
+    } else {
+      *w++ = (char)c;
+    }
+  }
+  *w = '\0';
+  return out;
+}
+
 static void manifest_write(arkilian *db, const char *snapshot_s3_key,
                             const char *snapshot_sha256, int64_t baseline_lsn) {
   if (!db || !snapshot_s3_key || !has_direct_s3(db)) return;
@@ -4141,14 +4173,26 @@ static void manifest_write(arkilian *db, const char *snapshot_s3_key,
   if (strstr(db->s3_prefix, "..") || db->s3_prefix[0] == '/')
     return;
 
+  // JSON-escape every string field: db_id comes from the control plane's
+  // credentials response and the key from local config — either may in
+  // principle contain quotes/backslashes, which would otherwise yield an
+  // invalid manifest that manifest readers silently drop.
+  char *db_id_json = json_escape_str(db->s3_prefix);
+  char *key_json   = json_escape_str(snapshot_s3_key);
+  char *sha_json   = json_escape_str(snapshot_sha256 ? snapshot_sha256 : "");
+  if (!db_id_json || !key_json || !sha_json) {
+    free(db_id_json); free(key_json); free(sha_json);
+    return;
+  }
+
   char json_buf[4096];
   int n = snprintf(json_buf, sizeof(json_buf),
     "{\"version\":2,\"db_id\":\"%s\","
     "\"snapshot\":{\"s3_key\":\"%s\",\"sha256\":\"%s\",\"baseline_lsn\":%lld},"
     "\"chunks\":[]}",
-    db->s3_prefix, snapshot_s3_key,
-    snapshot_sha256 ? snapshot_sha256 : "",
+    db_id_json, key_json, sha_json,
     (long long)baseline_lsn);
+  free(db_id_json); free(key_json); free(sha_json);
   if (n <= 0 || (size_t)n >= sizeof(json_buf)) return;
 
   char tmp_path[1024];

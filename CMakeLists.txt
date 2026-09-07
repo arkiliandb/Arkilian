@@ -9,7 +9,11 @@ set(CMAKE_C_EXTENSIONS OFF)
 # Enable strict warnings
 if(CMAKE_C_COMPILER_ID MATCHES "MSVC")
     add_compile_options(/W4 /WX)
-    add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
+    # _CRT_SECURE_NO_WARNINGS silences the "use the _s function" warnings;
+    # _CRT_NONSTDC_NO_WARNINGS keeps the POSIX spellings (open/close/fileno/
+    # stat) used by src/hydration.c's fsync paths resolving instead of
+    # deprecation-warning (which /WX would turn into an error).
+    add_compile_definitions(_CRT_SECURE_NO_WARNINGS _CRT_NONSTDC_NO_WARNINGS)
 else()
     add_compile_options(-Wall -Wextra -Wpedantic -Werror)
     # Hardened build posture for production cloud deployments: stack
@@ -111,7 +115,7 @@ if(ARKILIAN_BUILD_SHARED)
       target_link_libraries(arkilian PRIVATE zstd::libzstd)
     endif()
     set_target_properties(arkilian PROPERTIES
-        VERSION 1.1.0
+        VERSION 1.4.0
         SOVERSION 1
         PUBLIC_HEADER "src/class.h;src/deps/sqlite/sqlite3.h"
     )

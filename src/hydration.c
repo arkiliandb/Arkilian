@@ -15,13 +15,33 @@
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <time.h>
-#include <unistd.h>
+
+// ── Platform shims ──────────────────────────────────────────────────
+// Windows (MSVC and MinGW) has no POSIX layer: the single-flight mutex
+// becomes a CRITICAL_SECTION, gmtime_r becomes gmtime_s (REVERSED
+// argument order), and fsync becomes _commit. The POSIX open/close/
+// fileno spellings used by fsync_parent_dir resolve through <io.h>
+// because both builds (CMake and node-gyp) define
+// _CRT_NONSTDC_NO_WARNINGS. Keep this list in lockstep with class.c's
+// shims.
+#ifdef _WIN32
+  #include <windows.h>
+  #include <io.h>
+  #define strcasecmp _stricmp
+  #define ARK_FILENO(f) _fileno(f)
+  #define ARK_FSYNC(fd) _commit(fd)
+#else
+  #include <pthread.h>
+  #include <strings.h>
+  #include <unistd.h>
+  #define ARK_FILENO(f) fileno(f)
+  #define ARK_FSYNC(fd) fsync(fd)
+#endif
 
 // Pre-signed object-storage URLs carry their own credentials in the
 // query string — attaching our bearer token both leaks the credential
@@ -195,7 +215,29 @@ static void fsync_parent_dir(const char *path) {
 // would truncate each other's temp file and race on rename(). A process-
 // global mutex serializes all hydration calls — acceptable for a cold-
 // restore path (the application must not have the DB open during hydrate).
+// POSIX uses a statically-initialized pthread mutex; Windows has no
+// static initializer for CRITICAL_SECTION, so it is created once via
+// INIT_ONCE (the same one-time-init pattern class.c uses for libcurl).
+#ifdef _WIN32
+static INIT_ONCE g_hydrate_once = INIT_ONCE_STATIC_INIT;
+static CRITICAL_SECTION g_hydrate_mutex;
+static BOOL CALLBACK hydrate_mutex_init(PINIT_ONCE once, PVOID param,
+                                        PVOID *ctx) {
+  (void)once; (void)param; (void)ctx;
+  InitializeCriticalSection(&g_hydrate_mutex);
+  return TRUE;
+}
+#define HYDRATE_LOCK()                                                     \
+  do {                                                                     \
+    InitOnceExecuteOnce(&g_hydrate_once, hydrate_mutex_init, NULL, NULL);  \
+    EnterCriticalSection(&g_hydrate_mutex);                                \
+  } while (0)
+#define HYDRATE_UNLOCK() LeaveCriticalSection(&g_hydrate_mutex)
+#else
 static pthread_mutex_t g_hydrate_mutex = PTHREAD_MUTEX_INITIALIZER;
+#define HYDRATE_LOCK()   pthread_mutex_lock(&g_hydrate_mutex)
+#define HYDRATE_UNLOCK() pthread_mutex_unlock(&g_hydrate_mutex)
+#endif
 
 struct curl_buf {
   uint8_t *data;
@@ -354,7 +396,7 @@ static int http_download_file(const char *url, const char *token,
 
   int io_failed = ferror(f);
   if (fflush(f) != 0) io_failed = 1;
-  if (fsync(fileno(f)) != 0) io_failed = 1;
+  if (ARK_FSYNC(ARK_FILENO(f)) != 0) io_failed = 1;
   if (fclose(f) != 0) io_failed = 1;
 
   if (rc != CURLE_OK || http_code != 200 || io_failed) {
@@ -847,6 +889,17 @@ static void s3_url_encode(const char *src, char *dst, size_t cap) {
   dst[di] = '\0';
 }
 
+// Portable UTC broken-down time: gmtime_r (POSIX) vs gmtime_s (Windows —
+// REVERSED argument order, errno_t return). Writes to *out and returns
+// out on success, NULL on failure.
+static struct tm *ark_gmtime_utc(const time_t *tp, struct tm *out) {
+#ifdef _WIN32
+  return (gmtime_s(out, tp) == 0) ? out : NULL;
+#else
+  return gmtime_r(tp, out);
+#endif
+}
+
 static char *s3_presign_get(const char *endpoint, const char *bucket,
                              const char *region, const char *access_key,
                              const char *secret_key, const char *key,
@@ -856,7 +909,7 @@ static char *s3_presign_get(const char *endpoint, const char *bucket,
 
   time_t now = time(NULL);
   struct tm g;
-  gmtime_r(&now, &g);
+  if (!ark_gmtime_utc(&now, &g)) return NULL;
   char date_stamp[9], amz_date[17];
   strftime(date_stamp, sizeof(date_stamp), "%Y%m%d", &g);
   strftime(amz_date, sizeof(amz_date), "%Y%m%dT%H%M%SZ", &g);
@@ -1026,7 +1079,7 @@ int arkilian_hydrate_s3(const char *db_path,
   (void)server_url;
   if (!db_path) return HYDRATION_ERR_PROTO;
 
-  pthread_mutex_lock(&g_hydrate_mutex);
+  HYDRATE_LOCK();
   int hydrate_result = 0;
 
   HydratePlan plan;
@@ -1186,7 +1239,7 @@ int arkilian_hydrate_s3(const char *db_path,
   hydrate_plan_free(&plan);
 
 hydrate_done:
-  pthread_mutex_unlock(&g_hydrate_mutex);
+  HYDRATE_UNLOCK();
   return hydrate_result;
 }
 
@@ -1204,7 +1257,7 @@ int arkilian_hydrate(const char *db_path,
   // rename(). The application must not have the DB open during
   // hydrate (documented in hydration.h) — this guard protects against
   // two cold-start processes racing, not against a live application.
-  pthread_mutex_lock(&g_hydrate_mutex);
+  HYDRATE_LOCK();
   int hydrate_result = 0;
 
   // ── Phase 0: Request hydration plan ──
@@ -1436,6 +1489,6 @@ int arkilian_hydrate(const char *db_path,
   hydrate_plan_free(&plan);
 
 hydrate_done:
-  pthread_mutex_unlock(&g_hydrate_mutex);
+  HYDRATE_UNLOCK();
   return hydrate_result;
 }

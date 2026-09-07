@@ -41,16 +41,15 @@
           "libraries": ["-lcurl"]
         }],
         ["OS=='win'", {
-          "defines": ["_CRT_SECURE_NO_WARNINGS"],
-          "libraries": ["-lwinhttp", "-lws2_32", "-lcrypt32"],
+          "defines": ["_CRT_SECURE_NO_WARNINGS", "_CRT_NONSTDC_NO_WARNINGS"],
+          "libraries": ["libcurl.lib", "zlib.lib", "ws2_32.lib",
+                        "crypt32.lib", "advapi32.lib", "bcrypt.lib",
+                        "normaliz.lib"],
           "msvs_settings": {
             "VCCLCompilerTool": {
               "ExceptionHandling": 1
             }
-          },
-          "include_dirs": [
-            "deps/curl/include"
-          ]
+          }
         }]
       ]
     }
