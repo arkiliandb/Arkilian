@@ -76,12 +76,20 @@ int64_t json_get_int64(const char *json, const char *key);
 int     json_array_count(const char *json, const char *key);
 char   *json_array_get(const char *json, const char *key, int index);
 
-// Run the full two-phase hydration protocol.
+// Download and parse {prefix}/manifest.json via a locally presigned GET.
+// The manifest is the client's persistent registry: the baseline snapshot
+// plus every uploaded WAL chunk with its LSN range and content digest.
+// On success *plan holds the snapshot key/digest/baseline LSN and the
+// ordered chunk list (caller frees with hydrate_plan_free). Returns 0 on
+// success, -1 when the manifest is absent or unparsable (a cold start has
+// no manifest yet — callers treat -1 as an empty registry, not an error).
+int ark_manifest_fetch(const char *endpoint, const char *bucket,
+                       const char *region, const char *access_key,
+                       const char *secret_key, const char *prefix,
+                       HydratePlan *plan);
+
+// Run the full two-phase hydration protocol (S3-only).
 //   db_path      Local target database path (e.g. "mydb.db")
-//   server_url   Control Plane base URL (e.g. "https://api.arkilian.com")
-//   api_key      The client's API key — sent as "Authorization: Bearer
-//                <api_key>" to the control plane. This is the ONLY
-//                credential; no S3 keys or JWT are used.
 //   progress     Optional progress callback (may be NULL)
 //
 // DANGER — must not be called while the application has the database
@@ -104,15 +112,7 @@ char   *json_array_get(const char *json, const char *key, int index);
 //     installed or replayed)
 //
 // Returns HYDRATION_OK on success, or a negative error code.
-int arkilian_hydrate(const char *db_path,
-                     const char *server_url,
-                     const char *api_key,
-                     hydration_progress_cb progress,
-                     void *user_data);
-
 int arkilian_hydrate_s3(const char *db_path,
-                         const char *server_url,
-                         const char *api_key,
                          const char *s3_endpoint,
                          const char *s3_bucket,
                          const char *s3_region,

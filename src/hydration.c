@@ -4,10 +4,11 @@
 // via Pre-Signed URLs, plays them back with sqlite3_exec() inside
 // explicit transactions.  No binary WAL frame manipulation needed.
 //
-// Auth model: the client uses ONLY the API key (ARKILIAN_API_KEY) as
-// "Authorization: Bearer <api_key>" to the control plane. No other
-// credential is used. The control plane issues pre-signed S3 GET URLs
-// for snapshot/chunk downloads — the API key is never sent to S3.
+// Auth model: SigV4 only. The client holds a per-database S3 access/
+// secret key pair, presigns every GET locally, and never sends a bearer
+// token anywhere. The manifest at {prefix}/manifest.json — maintained by
+// the shipping side (src/class.c) — is the registry of the baseline
+// snapshot and every WAL chunk with its LSN range and SHA-256 digest.
 
 // Feature-test macros MUST precede every system include: this file is
 // compiled standalone (N-API addon, test TUs) with CMake's strict
