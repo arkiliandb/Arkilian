@@ -112,6 +112,19 @@ static void *rec_server_run(void *arg) {
       if (strcasestr(buf, "expect: 100-continue")) {
         send(fd, "HTTP/1.1 100 Continue\r\n\r\n", 25, 0);
       }
+      // Parse method/path for manifest handling
+      char method[8] = {0}, path[1024] = {0};
+      sscanf(buf, "%7s %1023s", method, path);
+      char *q = strchr(path, '?');
+      if (q) *q = '\0';
+      // For S3 manifest GET, return 404 cold-start (not 200 OK with bad
+      // body) so ark_manifest_fetch gets NOTFOUND not PROTO/frozen.
+      if (strcasecmp(method, "GET") == 0 && strstr(path, "manifest.json")) {
+        const char *resp = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        send(fd, resp, strlen(resp), 0);
+        close(fd);
+        continue;
+      }
       long body_len = 0;
       char *cl = strcasestr(buf, "Content-Length:");
       if (cl) body_len = atol(cl + 15);

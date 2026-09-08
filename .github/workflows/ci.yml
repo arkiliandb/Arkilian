@@ -227,5 +227,5 @@ jobs:
     - name: Run tests under ThreadSanitizer
       working-directory: build-tsan
       env:
-        TSAN_OPTIONS: halt_on_error=1:abort_on_error=1
+        TSAN_OPTIONS: halt_on_error=1:abort_on_error=1:suppressions=../tests/tsan-suppressions.txt
       run: ctest --output-on-failure

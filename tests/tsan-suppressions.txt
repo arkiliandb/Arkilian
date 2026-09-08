@@ -1,0 +1,8 @@
+# TSAN suppressions for SQLite WAL shm false positives
+# SQLite uses mmap'd -shm file for WAL index; TSAN cannot handle mmap
+# and reports false data races on walIndex* vs walIndexTryHdr.
+race:walIndexWriteHdr
+race:walIndexTryHdr
+race:walIndexReadHdr
+race:walTryBeginRead
+race:sqlite3.c
