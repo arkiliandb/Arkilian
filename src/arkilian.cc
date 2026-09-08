@@ -350,7 +350,7 @@ Napi::Value db_column_int64(const Napi::CallbackInfo& info) {
   int col = info[1].As<Napi::Number>().Int32Value();
   sqlite3_int64 v = db_column_int64(dl.db, col);
   if (v > 9007199254740991LL || v < -9007199254740991LL)
-    return Napi::BigInt::New(env, v);
+    return Napi::BigInt::New(env, static_cast<int64_t>(v));
   return Napi::Number::New(env, (double)v);
 }
 
@@ -571,7 +571,7 @@ Napi::Value db_all_native(const Napi::CallbackInfo& info) {
       if (type == SQLITE_INTEGER) {
         sqlite3_int64 v = db_column_int64(dl.db, i);
         if (v > 9007199254740991LL || v < -9007199254740991LL)
-          row.Set(col_names[i], Napi::BigInt::New(env, v));
+          row.Set(col_names[i], Napi::BigInt::New(env, static_cast<int64_t>(v)));
         else
           row.Set(col_names[i], Napi::Number::New(env, (double)v));
       } else if (type == SQLITE_FLOAT) {
