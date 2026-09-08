@@ -21,8 +21,7 @@ static inline int ark_setenv(const char *name, const char *val, int overwrite) {
 }
 
 static inline int ark_unsetenv(const char *name) {
-    /* _putenv with a bare name (no `=`) deletes the entry -> getenv() == NULL */
-    return _putenv(name);
+    return _putenv_s(name, "");
 }
 
 #else   /* POSIX: getenv/setenv are always present */

@@ -93,18 +93,37 @@ static void *rec_server_run(void *arg) {
     int on = 1;
     setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof(on));
 #endif
-    char buf[16384];
-    ssize_t n = recv(fd, buf, sizeof(buf) - 1, 0);
+    char buf[32768];
+    size_t got = 0;
+    // Read headers byte-by-byte until \r\n\r\n to handle split packets
+    // and Expect: 100-continue.
+    while (got < sizeof(buf) - 1) {
+      char c;
+      ssize_t r = recv(fd, &c, 1, 0);
+      if (r != 1) break;
+      buf[got++] = c;
+      if (got >= 4 && memcmp(buf + got - 4, "\r\n\r\n", 4) == 0) break;
+    }
+    buf[got] = '\0';
     if (s->stop) { close(fd); break; } // stop-kick connection: exit now
-    if (n > 0) {
-      buf[n] = '\0';
+    if (got > 0) {
+      // libcurl sends Expect: 100-continue for >1 KiB payloads (chunks);
+      // answer it or curl stalls 1s per upload.
+      if (strcasestr(buf, "expect: 100-continue")) {
+        send(fd, "HTTP/1.1 100 Continue\r\n\r\n", 25, 0);
+      }
       long body_len = 0;
-      char *cl = strstr(buf, "Content-Length:");
+      char *cl = strcasestr(buf, "Content-Length:");
       if (cl) body_len = atol(cl + 15);
       char *hdr_end = strstr(buf, "\r\n\r\n");
-      long have = hdr_end ? n - (hdr_end + 4 - buf) : 0;
+      long have = hdr_end ? (long)(got - (hdr_end + 4 - buf)) : 0;
+      // Already have may include part of body if client sent it with headers
+      // after 100-continue, otherwise read remaining.
+      char dummy[8192];
       while (have < body_len) {
-        n = recv(fd, buf, sizeof(buf) - 1, 0);
+        long need = body_len - have;
+        if (need > (long)sizeof(dummy)) need = sizeof(dummy);
+        ssize_t n = recv(fd, dummy, (size_t)need, 0);
         if (n <= 0) break;
         have += n;
       }

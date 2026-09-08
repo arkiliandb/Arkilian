@@ -15,6 +15,7 @@
 #include <netinet/in.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -35,8 +36,8 @@ typedef struct {
 static stub_object g_objects[STUB_MAX_OBJECTS];
 static int         g_object_count = 0;
 static pthread_mutex_t g_store_mutex = PTHREAD_MUTEX_INITIALIZER;
-static int         g_port = 0;
-static volatile int g_server_up = 0;
+static atomic_int  g_port = 0;
+static atomic_int  g_server_up = 0;
 
 static void stub_put(const char *key, const char *data, size_t len) {
   pthread_mutex_lock(&g_store_mutex);
@@ -63,8 +64,10 @@ static int stub_get(const char *key, char **out, size_t *out_len) {
   pthread_mutex_lock(&g_store_mutex);
   for (int i = 0; i < g_object_count; i++) {
     if (strcmp(g_objects[i].key, key) == 0) {
-      *out = malloc(g_objects[i].len ? g_objects[i].len : 1);
+      *out = malloc(g_objects[i].len + 1);
+      if (!*out) { pthread_mutex_unlock(&g_store_mutex); return 0; }
       memcpy(*out, g_objects[i].data, g_objects[i].len);
+      (*out)[g_objects[i].len] = '\0';
       *out_len = g_objects[i].len;
       pthread_mutex_unlock(&g_store_mutex);
       return 1;
@@ -162,10 +165,10 @@ static void *stub_server_thread(void *arg) {
   assert(bind(srv, (struct sockaddr *)&addr, sizeof(addr)) == 0);
   socklen_t alen = sizeof(addr);
   assert(getsockname(srv, (struct sockaddr *)&addr, &alen) == 0);
-  g_port = ntohs(addr.sin_port);
+  atomic_store(&g_port, ntohs(addr.sin_port));
   assert(listen(srv, 16) == 0);
-  g_server_up = 1;
-  while (g_server_up) {
+  atomic_store(&g_server_up, 1);
+  while (atomic_load(&g_server_up)) {
     int fd = accept(srv, NULL, NULL);
     if (fd < 0) break;
     stub_handle(fd);
@@ -184,8 +187,8 @@ static void stub_start(void) {
   signal(SIGPIPE, SIG_IGN);
   pthread_t t;
   pthread_create(&t, NULL, stub_server_thread, NULL);
-  while (!g_server_up) usleep(1000);
-  snprintf(g_endpoint, sizeof(g_endpoint), "http://127.0.0.1:%d", g_port);
+  while (!atomic_load(&g_server_up)) usleep(1000);
+  snprintf(g_endpoint, sizeof(g_endpoint), "http://127.0.0.1:%d", atomic_load(&g_port));
 }
 
 static void set_s3_env(void) {
