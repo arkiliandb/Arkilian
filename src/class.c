@@ -271,10 +271,11 @@ struct arkilian {
   // Schema-change authorizer (Risk #1 / spec §1): set when DDL bypasses
   // our wrapper via the raw handle returned by db_get_handle(). The next
   // wrapped dispatch (or db_resync_triggers) clears it after re-syncing
-  // the capture triggers. game-thread only.
+  // the capture triggers. Accessed concurrently by multiple db_exec threads
+  // and the authorizer callback, so all accesses use ARK_LOAD/STORE.
   volatile int triggers_dirty;
-  int trigger_sync_in_progress;         // guards authorizer vs our own sync
-  int in_wrapped_dispatch;             // db_exec/db_step in progress: suppress
+  volatile int trigger_sync_in_progress; // guards authorizer vs our own sync
+  volatile int in_wrapped_dispatch;     // db_exec/db_step in progress: suppress
                                        // the raw-DDL warning for DDL the wrapper
                                        // already auto-re-syncs (see on_schema_authorizer)
   volatile int auto_resync_triggers;   // opt-in: resync on next wrapped dispatch
@@ -1215,14 +1216,14 @@ static int on_schema_authorizer(void *user_data, int action,
       // tables carry no capture triggers, so their DDL is ignored —
       // flagging it would only trigger a wasteful no-op resync on the
       // game thread.
-      if (db->trigger_sync_in_progress) return SQLITE_OK;
+      if (ARK_LOAD(&db->trigger_sync_in_progress)) return SQLITE_OK;
       if (detail1 && is_reserved_table(detail1)) return SQLITE_OK;
-      db->triggers_dirty = 1;
+      ARK_STORE(&db->triggers_dirty, 1);
       // DDL routed through db_exec / db_prepare+db_step is re-synced
       // automatically by apply_ddl_capture; only DDL that bypassed the
       // wrapper (raw handle from db_get_handle) leaves the capture stale,
       // so warn only there. The wrapped path is silent here.
-      if (!db->in_wrapped_dispatch) {
+      if (!ARK_LOAD(&db->in_wrapped_dispatch)) {
         ark_log(db, ARK_LOG_WARN,
                 "schema change bypassed the backup wrapper (action=%d, "
                 "object=%s) — likely DDL on the raw handle from "
@@ -2081,9 +2082,9 @@ int db_init(arkilian **db_ptr, const char *filename) {
   // visible instead of silent.
   if (capture_ok) {
     char *trigger_err = NULL;
-    db->trigger_sync_in_progress = 1;
+    ARK_STORE(&db->trigger_sync_in_progress, 1);
     int sync_rc = sync_backup_triggers(db->handle, &trigger_err);
-    db->trigger_sync_in_progress = 0;
+    ARK_STORE(&db->trigger_sync_in_progress, 0);
     if (sync_rc != SQLITE_OK) {
       ark_log(db, ARK_LOG_ERROR,
               "backup trigger sync FAILED — capture disabled: %s",
@@ -2093,7 +2094,7 @@ int db_init(arkilian **db_ptr, const char *filename) {
     if (trigger_err) sqlite3_free(trigger_err);
     // Init sync establishes full coverage: clear any transient dirty flag
     // the authorizer may have raised before the guard took effect.
-    db->triggers_dirty = 0;
+    ARK_STORE(&db->triggers_dirty, 0);
   }
 
   // Internal-schema version check: an outbox written by a NEWER release
@@ -2305,9 +2306,9 @@ sqlite3 *db_get_handle(arkilian *db) { return db ? db->handle : NULL; }
 // are logged loudly and capture of other tables keeps working.
 static void apply_ddl_capture(arkilian *db, const char *sql) {
   char *terr = NULL;
-  db->trigger_sync_in_progress = 1;
+  ARK_STORE(&db->trigger_sync_in_progress, 1);
   int sync_rc = sync_backup_triggers(db->handle, &terr);
-  db->trigger_sync_in_progress = 0;
+  ARK_STORE(&db->trigger_sync_in_progress, 0);
   if (sync_rc != SQLITE_OK) {
     snprintf(db->last_error_msg, sizeof(db->last_error_msg),
              "backup trigger sync failed after DDL: %s", terr ? terr : "unknown error");
@@ -2315,7 +2316,7 @@ static void apply_ddl_capture(arkilian *db, const char *sql) {
   } else {
     // Wrapped DDL re-established full trigger coverage: a previously-
     // flagged raw-handle desync is now repaired too.
-    db->triggers_dirty = 0;
+    ARK_STORE(&db->triggers_dirty, 0);
   }
   if (terr) sqlite3_free(terr);
 
@@ -2346,7 +2347,7 @@ int db_exec(arkilian *db, const char *sql) {
   // the raw DDL's transaction committed), on the game thread, never
   // inside a SQLite hook. A resync failure logs + leaves dirty set;
   // it never rolls back app work (spec §0).
-  if (db->auto_resync_triggers && db->triggers_dirty) {
+  if (ARK_LOAD(&db->auto_resync_triggers) && ARK_LOAD(&db->triggers_dirty)) {
     db_resync_triggers(db);
   }
 
@@ -2355,9 +2356,9 @@ int db_exec(arkilian *db, const char *sql) {
   // DDL (if any) will be auto-re-synced by apply_ddl_capture below — it
   // stays silent and lets the wrapper handle it, instead of warning about
   // a bypass that did not happen.
-  db->in_wrapped_dispatch = 1;
+  ARK_STORE(&db->in_wrapped_dispatch, 1);
   int rc = sqlite3_exec(db->handle, sql, NULL, NULL, &errmsg);
-  db->in_wrapped_dispatch = 0;
+  ARK_STORE(&db->in_wrapped_dispatch, 0);
   if (rc != SQLITE_OK) {
     if (errmsg) {
       strncpy(db->last_error_msg, errmsg, sizeof(db->last_error_msg) - 1);
@@ -2455,7 +2456,7 @@ int db_step(arkilian *db) {
   // (Risk #1) Opt-in auto-resync: same as db_exec — if raw-handle DDL
   // set triggers_dirty, repair before the step runs. Post-commit, game
   // thread, never inside a hook.
-  if (db->auto_resync_triggers && db->triggers_dirty) {
+  if (ARK_LOAD(&db->auto_resync_triggers) && ARK_LOAD(&db->triggers_dirty)) {
     db_resync_triggers(db);
   }
 
@@ -2465,9 +2466,9 @@ int db_step(arkilian *db) {
   int is_ddl = (db->stmt_is_ddl &&
                 db->stmt_current >= 0 && db->stmt_current < db->stmt_count &&
                 db->stmt_is_ddl[db->stmt_current]);
-  if (is_ddl) db->in_wrapped_dispatch = 1;
+  if (is_ddl) ARK_STORE(&db->in_wrapped_dispatch, 1);
   int rc = sqlite3_step(stmt);
-  if (is_ddl) db->in_wrapped_dispatch = 0;
+  if (is_ddl) ARK_STORE(&db->in_wrapped_dispatch, 0);
   // DDL executed through prepare/step used to bypass trigger resync —
   // a table created this way was never captured (spec §1). Resync once
   // the statement completes successfully. The flag check is one
@@ -2861,16 +2862,16 @@ int db_backup_skipped_table_count(arkilian *db) {
 int db_resync_triggers(arkilian *db) {
   if (!db || !db->handle) return SQLITE_ERROR;
   char *err = NULL;
-  db->trigger_sync_in_progress = 1;
+  ARK_STORE(&db->trigger_sync_in_progress, 1);
   int rc = sync_backup_triggers(db->handle, &err);
-  db->trigger_sync_in_progress = 0;
+  ARK_STORE(&db->trigger_sync_in_progress, 0);
   if (rc != SQLITE_OK) {
     ark_log(db, ARK_LOG_ERROR, "trigger resync failed: %s",
             err ? err : "unknown error");
     // resync failed — the schema may still be stale; leave the dirty flag
     // as-is so monitoring keeps surfacing the gap.
   } else {
-    db->triggers_dirty = 0;
+    ARK_STORE(&db->triggers_dirty, 0);
   }
   if (err) sqlite3_free(err);
   return rc;
@@ -2881,7 +2882,7 @@ int db_resync_triggers(arkilian *db) {
 // monitoring can detect the gap between DDL happening and the operator
 // repairing it (or the next wrapped dispatch auto-repairing).
 int db_backup_triggers_dirty(arkilian *db) {
-  return (db && db->triggers_dirty) ? 1 : 0;
+  return (db && ARK_LOAD(&db->triggers_dirty)) ? 1 : 0;
 }
 
 // (Risk #1) Opt-in post-commit auto-resync. When enabled, the next wrapped
@@ -2892,11 +2893,11 @@ int db_backup_triggers_dirty(arkilian *db) {
 // legitimate app work (spec §0).
 void db_set_auto_resync_triggers(arkilian *db, int enabled) {
   if (!db) return;
-  db->auto_resync_triggers = enabled ? 1 : 0;
+  ARK_STORE(&db->auto_resync_triggers, enabled ? 1 : 0);
 }
 
 int db_get_auto_resync_triggers(arkilian *db) {
-  return (db && db->auto_resync_triggers) ? 1 : 0;
+  return (db && ARK_LOAD(&db->auto_resync_triggers)) ? 1 : 0;
 }
 
 // Sticky capture-paused signal. Set by the flush thread when outbox depth
