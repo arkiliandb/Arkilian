@@ -35,7 +35,7 @@ run() {
 run_hydration() {
   echo "── test_hydration ──"
   cc -O2 -Wall -Wextra tests/test_hydration.c \
-     src/hydration.c src/sha256.c src/deps/sqlite/sqlite3.c \
+     src/class.c src/hydration.c src/sha256.c src/deps/sqlite/sqlite3.c \
      -Isrc -Isrc/deps/sqlite -lcurl -lpthread -lm \
      -o test_hydration
   ./test_hydration
