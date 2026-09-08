@@ -1,6 +1,6 @@
 <svg width="100%" viewBox="0 0 680 580" role="img" xmlns="http://www.w3.org/2000/svg">
   <title>Arkilian Architecture</title>
-  <desc>Your app calls into the arkilian connection. Write triggers automatically populate the internal _pending_backup outbox table. An independent Flush Thread reads batches from the outbox and POSTs them to the push endpoint. The Snapshot Thread independently triggers an hourly online backup to S3/GCS using presigned URLs requested from the control plane API.</desc>
+  <desc>Your app calls into the arkilian connection. Write triggers automatically populate the internal _pending_backup outbox table. An independent Flush Thread reads batches from the outbox, chunks them, and PUTs each chunk to S3-compatible object storage via a locally presigned URL. The Snapshot Thread independently performs an hourly online backup to S3-compatible storage. The manifest at {prefix}/manifest.json is the durable registry that hydration replays.</desc>
   <defs>
     <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
       <path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
@@ -76,14 +76,14 @@
   <g class="text-base">
     <rect x="95" y="470" width="220" height="56" rx="8" stroke-width="0.5" style="fill:rgb(250, 236, 231);stroke:rgb(153, 60, 29);"/>
     <text x="205" y="488" class="text-title" style="fill:rgb(113, 43, 19);">Snapshot thread</text>
-    <text x="205" y="506" class="text-desc" style="fill:rgb(153, 60, 29);">hourly online backup to GCS/S3</text>
+    <text x="205" y="506" class="text-desc" style="fill:rgb(153, 60, 29);">hourly snapshot upload to S3 storage</text>
   </g>
 
   <!-- Flush Thread -->
   <g class="text-base">
     <rect x="365" y="470" width="220" height="56" rx="8" stroke-width="0.5" style="fill:rgb(250, 236, 231);stroke:rgb(153, 60, 29);"/>
     <text x="475" y="488" class="text-title" style="fill:rgb(113, 43, 19);">Flush thread</text>
-    <text x="475" y="506" class="text-desc" style="fill:rgb(153, 60, 29);">POSTs CDC batches to endpoint</text>
+    <text x="475" y="506" class="text-desc" style="fill:rgb(153, 60, 29);">chunks rows, PUTs to S3 storage</text>
   </g>
 
   <!-- Connectors from Outbox and SQLite Engine to Threads -->

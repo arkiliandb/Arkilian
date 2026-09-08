@@ -333,7 +333,7 @@ static void test_sync_success_leaves_errmsg_clean(void) {
 
 static void test_no_destination_rows_survive(void) {
   cleanup("test_reg_nodest.db");
-  // An EXPLICITLY EMPTY control URL — not a missing one — is "no
+  // An EXPLICITLY EMPTY S3 endpoint — not a missing one — is "no
   // destination" in a way that survives the ./.env file the repo ships
   // (load_env only sets a key when getenv returns NULL; "" is non-NULL so
   // .env cannot override it). This was the root cause of the Task-27

@@ -139,8 +139,8 @@
 
 // WAL chunk accumulator.
 // One uploaded WAL chunk, as recorded in {prefix}/manifest.json.
-// The manifest is the client's only registry of shipped chunks — with no
-// control plane, it is what makes incremental hydration possible.
+// The manifest is the client's only registry of shipped chunks — without
+// it, incremental hydration would have no index of what was uploaded.
 typedef struct {
   char     *s3_key;    // object key relative to the bucket (malloc'd)
   char     *sha256;    // lowercase hex digest of the object body (malloc'd)
@@ -630,9 +630,10 @@ static int host_is_storage_safe(const char *host) {
     // NO [fc / [fd ULA — AWS IMDSv2 is reachable at fd00:ec2::254 and
     // must never be treated as a safe storage destination. ULA prefixes
     // are NOT metadata-endpoint boundaries; rejecting them closes the
-    // exfiltration path where a compromised control plane returns a
-    // presigned URL pointing at fd00:ec2::254 and the client uploads
-    // the full database to the cloud instance-metadata service.
+    // exfiltration path where a tampered manifest or misconfigured
+    // storage configuration supplies a presigned URL pointing at
+    // fd00:ec2::254 and the client uploads the full database to the
+    // cloud instance-metadata service.
     return 0;
   }
   if (strcmp(host, "localhost") == 0) return 1;
@@ -657,9 +658,9 @@ static int host_is_storage_safe(const char *host) {
 
 // A URL is "transport-safe" iff it is HTTPS, OR it points at a local
 // address (loopback / RFC1918 / link-local) for dev. Operators with an
-// internal-but-non-RFC1918 cleartext control plane may opt in with
+// internal-but-non-RFC1918 cleartext storage endpoint may opt in with
 // ARKILIAN_ALLOW_INSECURE=1 — the loud-failure default keeps a
-// misconfiguration from leaking the bearer token.
+// misconfiguration from leaking request signatures on the wire.
 
 // Extract the host component of a URL into a caller-provided buffer.
 // Strips any user@info and :port. Returns the host length, or 0 on
@@ -1375,7 +1376,7 @@ static int wal_chunk_append(wal_chunk *c, const char *sql, int sql_len,
 
 // Flush the accumulated WAL chunk to object storage as a plain replayable
 // SQL object, then record it in the manifest registry. This is the ONLY
-// realtime shipping path — there is no control plane and no fallback.
+// realtime shipping path — there is no fallback.
 // On success the covered outbox rows are deleted (delete-on-flush-ack):
 // until the PUT returns 2xx, every captured row stays in _pending_backup,
 // so a crash can never lose an acknowledged-capture write.
@@ -1822,8 +1823,8 @@ int db_init(arkilian **db_ptr, const char *filename) {
   if (db->backup_path) strcpy(db->backup_path, backup_path_tmp);
 
   // S3 destination — the ONLY backup target. SigV4 requests are signed
-  // locally with the per-database access/secret keys; no bearer token or
-  // control plane exists in the client.
+  // locally with the per-database access/secret keys; no other credential
+  // exists in the client.
   {
     const char *ep = get_env_default("ARKILIAN_S3_ENDPOINT", "");
     const char *bk = get_env_default("ARKILIAN_S3_BUCKET", "");
@@ -1862,7 +1863,7 @@ int db_init(arkilian **db_ptr, const char *filename) {
   // (Hardening) Cleartext S3 endpoint guard: a presigned SigV4 request
   // carries the request signature in the query string, so shipping over
   // http:// to a NON-LOCAL host would expose replayable signatures on the
-  // wire. Mirroring the control-plane-era posture, refuse loudly at init
+  // wire. Refuse loudly at init
   // (backup disabled; the game is unaffected, spec §0) unless the operator
   // opts in with ARKILIAN_ALLOW_INSECURE=1 for local development only.
   // Loopback / RFC1918 http:// endpoints (local MinIO-style test servers)
@@ -3058,8 +3059,8 @@ static int upload_to_s3(arkilian *db, const char *signed_url,
 // ── Direct S3 upload helpers ───────────────────────────────────────
 // When ARKILIAN_S3_ENDPOINT / _BUCKET / _ACCESS_KEY / _SECRET_KEY are
 // configured, the snapshot thread signs presigned PUT URLs locally using
-// AWS Signature V4 and uploads directly to S3. The control plane is
-// never involved in the data write path — purely an observability layer.
+// AWS Signature V4 and uploads directly to S3 — no intermediate service
+// in the data write path.
 
 static int has_direct_s3(arkilian *db) {
   return db &&

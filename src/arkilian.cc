@@ -607,7 +607,7 @@ Napi::Value db_all_native(const Napi::CallbackInfo& info) {
   return results;
 }
 
-// ── Hydration: cold-start restore from the control plane ────────────
+// ── Hydration: cold-start restore from S3-compatible storage ─────────
 // Exposed as a standalone function (not on a handle) because hydration
 // must run from a cold process — before db_init() opens the database.
 //   arg0: db_path (string)

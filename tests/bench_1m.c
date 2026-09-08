@@ -1019,7 +1019,7 @@ int main(int argc, char **argv) {
   printf(
       "    + write mutex serialization + per-row WAL push to ring buffer.\n");
   printf(
-      "  • WAL entries are shipped to the Control Plane via HTTP POST.\n");
+      "  • WAL chunks are shipped to S3-compatible storage via presigned PUTs.\n");
   printf(
       "  • Deterministic seed (xorshift32, seed=42) — results reproducible.\n");
   printf(

@@ -4,7 +4,7 @@
 // without dropping local database performance".)
 //
 // A mock HTTP server that always returns 503 Service Unavailable stands in
-// for an overwhelmed control plane. The test proves:
+// for an overwhelmed storage endpoint. The test proves:
 //
 //   1. Every application write succeeds (spec §0: backup never breaks the
 //      app) — even while the flush thread is retrying against the 503.
@@ -71,7 +71,7 @@ static void cleanup(const char *path) {
 
 // ── Mock 503 destination ────────────────────────────────────────────
 // Always returns 503 Service Unavailable, simulating an overwhelmed
-// control-plane ingestion layer. Records request count so the test can
+// storage destination. Records request count so the test can
 // verify the flush thread IS retrying (not silently dead).
 
 typedef struct {

@@ -1,16 +1,18 @@
-// Arkilian Hydration Engine v2 — Logical, Client-Driven Cloud Model
+// Arkilian Hydration Engine v2 — Logical, Client-Driven S3 Model
 //
 // Cold-start recovery via signed-URL snapshot + incremental log chunk replay.
-// The client never touches the server's bandwidth — all heavy transfers go
-// directly through Pre-Signed S3 URLs issued by the Control Plane API.
+// The client never touches a server's bandwidth — all heavy transfers go
+// directly through locally pre-signed S3 URLs (AWS SigV4).
 //
 // Phases:
-//   1. Request hydrate plan from Control Plane → signed URLs + baseline LSN
-//   2. Download .snapshot via signed GET → decompress → save as local .db
+//   1. Read {prefix}/manifest.json (the shipper's durable registry) via a
+//      locally presigned GET → snapshot key + SHA-256 + baseline LSN + chunks
+//   2. Download the baseline .sqlite snapshot via signed GET → verify digest
+//      → validate → install as the local .db
 //   3. Open DB, query _arkilian_meta for last_applied_lsn
-//   4. Iterate incremental log chunks via signed GET → decompress → replay SQL
+//   4. Iterate incremental SQL chunks via signed GET → verify digest → replay
 //
-//   arkilian_hydrate("mydb.db", "https://control-plane/v1", "token");
+//   arkilian_hydrate_s3("mydb.db", endpoint, bucket, region, ak, sk, prefix);
 //
 #ifndef ARKILIAN_HYDRATION_H
 #define ARKILIAN_HYDRATION_H
@@ -29,7 +31,7 @@ extern "C" {
 #define HYDRATION_ERR_NET       -1   // HTTP / network failure
 #define HYDRATION_ERR_DISK      -2   // local file I/O failure
 #define HYDRATION_ERR_MEM       -3   // out of memory
-#define HYDRATION_ERR_PROTO     -4   // control plane returned unexpected response
+#define HYDRATION_ERR_PROTO     -4   // manifest or protocol violation
 #define HYDRATION_ERR_SQL       -5   // SQL replay failed
 #define HYDRATION_ERR_DECOMP    -6   // decompression failure
 #define HYDRATION_ERR_EXPIRED   -7   // signed URL expired, caller should retry
@@ -44,16 +46,16 @@ typedef struct {
   char   *url;          // Pre-Signed GET URL (caller frees)
   char   *s3_key;       // Raw object key (no signature) when the source is
                         // a manifest record (caller frees; may be NULL)
-  char   *sha256;       // Optional content digest (hex, no dashes) authored by
-                        // the uploader + control plane; verified by the client
-                        // after download. NULL/empty => not provided (older
-                        // control plane); verification is skipped with a warn.
+  char   *sha256;       // Content digest (hex, no dashes) recorded by the
+                        // shipper in the manifest; verified by the client
+                        // after download. NULL/empty => not provided;
+                        // verification is a hard refusal.
   int64_t lsn_start;    // first LSN in this chunk (inclusive)
   int64_t lsn_end;      // last  LSN in this chunk (inclusive)
   int64_t expires_at;   // unix timestamp when URL expires (0 = no expiry)
 } HydrateChunk;
 
-// The complete hydration plan returned by the Control Plane.
+// The complete hydration plan built from {prefix}/manifest.json.
 typedef struct {
   char   *snapshot_url;    // Pre-Signed GET URL for the baseline .snapshot
   char   *snapshot_s3_key; // Raw object key of the baseline snapshot when

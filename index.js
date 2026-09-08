@@ -27,8 +27,8 @@ class Arkilian {
   constructor(dbPath = "app.sqlite") {
     // Backup destination is S3-compatible object storage, configured via
     // ARKILIAN_S3_* environment variables (or a ./.env file). No API key
-    // and no control plane exist in the client; requests are SigV4-signed
-    // locally with the per-database credentials.
+    // exists in the client; requests are SigV4-signed locally with the
+    // per-database credentials.
     this.id = native.db_init(dbPath);
     if (!this.id) {
       throw new Error("Failed to initialize database");

@@ -31,33 +31,7 @@ services:
       exit 0;
       "
 
-  # 3. Arkilian Go Control Plane API
-  control-plane:
-    build:
-      context: ./server
-      dockerfile: Dockerfile
-    container_name: arkilian-control-plane
-    ports:
-      - "8080:8080"
-    environment:
-      PORT: "8080"
-      JWT_SECRET: "stress-test-secret-key-32-bytes"
-      S3_ENDPOINT: "http://minio:9000"
-      S3_BUCKET: "arkilian-backups"
-      S3_KEY: "minioadmin"
-      S3_SECRET: "minioadmin"
-      S3_REGION: "us-east-1"
-      ARKILIAN_DB_PATH: "/data/control_plane.db"
-    depends_on:
-      createbucket:
-        condition: service_completed_successfully
-    healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:8080/health"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
-
-  # 4. 200M Write / 200M Read / Hydration Stress Test Runner
+  # 3. 200M Write / 200M Read / Hydration Stress Test Runner
   stress-runner:
     build:
       context: .
@@ -74,10 +48,13 @@ services:
       ARKILIAN_DB_PATH: "stress_game.db"
       ARKILIAN_BACKUP_PATH: "stress_game_backup.sqlite"
       ARKILIAN_BACKUP_INTERVAL: "14400" # 4 Hours Backup Interval
-      ARKILIAN_SIGNED_URL_ENDPOINT: "http://control-plane:8080/v1/upload/request"
-      ARKILIAN_WAL_PUSH_URL: "http://control-plane:8080/v1/wal/push"
       ARKILIAN_ENABLE_BACKUP: "1"
-      CONTROL_PLANE_URL: "http://control-plane:8080"
+      ARKILIAN_S3_ENDPOINT: "http://minio:9000"
+      ARKILIAN_S3_BUCKET: "arkilian-backups"
+      ARKILIAN_S3_REGION: "us-east-1"
+      ARKILIAN_S3_ACCESS_KEY: "minioadmin"
+      ARKILIAN_S3_SECRET_KEY: "minioadmin"
+      ARKILIAN_S3_PREFIX: "db_stress"
     depends_on:
-      control-plane:
-        condition: service_healthy
+      createbucket:
+        condition: service_completed_successfully

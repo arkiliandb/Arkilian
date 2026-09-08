@@ -1,8 +1,8 @@
 // Arkilian Hardening Regression Tests
 //
 // Validates the production-readiness fixes:
-//   1. HTTPS enforcement — a cleartext non-local push URL disables backup
-//      at init (the bearer token must not be leaked in cleartext).
+//   1. HTTPS enforcement — a cleartext non-local endpoint disables backup
+//      at init (request signatures must not be leaked in cleartext).
 //   2. ARKILIAN_ALLOW_INSECURE=1 opts back into cleartext.
 //   3. ARKILIAN_MAX_QUEUE_DEPTH hard cap: capture trigger pauses INSERTs
 //      once the queue reaches the cap, so the application's writes still
@@ -63,7 +63,7 @@ static void test_cleartext_non_local_push_url_disables_backup(void) {
   int rc = db_init(&db, "test_hard_http.db");
   // db_init is never a hard failure (spec §0); the app keeps running.
   assert(rc == 0);
-  // Backup MUST be disabled — the bearer token would be sent in cleartext.
+  // Backup MUST be disabled — the request signature would be sent in cleartext.
   assert(db_backup_is_enabled(db) == 0);
   assert(db_backup_is_healthy(db) == 0); // a green light while idle is the silent failure
   db_close(db);

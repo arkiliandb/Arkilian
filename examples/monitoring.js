@@ -66,7 +66,7 @@ function renderMetrics() {
     "# TYPE arkilian_backup_enabled gauge",
     `arkilian_backup_enabled ${enabled}`,
     "",
-    "# HELP arkilian_queue_depth Rows in _pending_backup not yet delivered to the control plane.",
+    "# HELP arkilian_queue_depth Rows in _pending_backup not yet shipped to S3-compatible storage.",
     "# TYPE arkilian_queue_depth gauge",
     `arkilian_queue_depth ${queueDepth}`,
     "",

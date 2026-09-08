@@ -1,8 +1,8 @@
 // Arkilian SHA-256 — minimal, dependency-free FIPS 180-4 implementation.
 //
-// Used to authenticate hydration payloads: the control plane records the
-// SHA-256 of each snapshot/chunk it stored, returns it in the hydrate
-// plan, and the client recomputes the digest of what it downloaded and
+// Used to authenticate hydration payloads: the shipper records the
+// SHA-256 of each snapshot/chunk it stored, the manifest carries it, and
+// the client recomputes the digest of what it downloaded and
 // refuses on mismatch. This closes the "pre-signed URL authorizes WHO can
 // read but not WHAT was stored" gap: a tampered object body (e.g. from a
 // leaked bucket-write credential) is detected before any SQL is replayed

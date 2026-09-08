@@ -4,7 +4,7 @@
 //   - 200,000,000 Writes (Batched & Concurrent)
 //   - 200,000,000 Reads (Concurrent Point & Range Queries)
 //   - 4-Hour Database Backup Interval (ARKILIAN_BACKUP_INTERVAL=14400)
-//   - Continuous WAL streaming via HTTP POST to MinIO-backed Control Plane
+//   - Continuous WAL streaming via local SigV4 PUTs to MinIO/S3
 //   - Cold-Start Hydration Verification (Downloading snapshot & replaying log)
 
 #include "class.h"
@@ -123,7 +123,7 @@ int main(int argc, char **argv) {
          read_count, total_read_time, (double)read_count / total_read_time);
 
   // 4. Force WAL Flush & Outbox Verification
-  printf("Phase 3: Flushing Outbox to Control Plane & MinIO...\n");
+  printf("Phase 3: Flushing Outbox to S3-compatible storage & MinIO...\n");
   db_wal_flush(db);
 
   int pending = db_wal_pending(db);

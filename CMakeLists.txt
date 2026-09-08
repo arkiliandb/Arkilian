@@ -360,10 +360,10 @@ if(ARKILIAN_BUILD_TESTS)
         endif()
         add_test(NAME test_dlq COMMAND test_dlq)
 
-        # ── e2e/stress tests that need a live control plane: built but NOT
-        # registered with ctest (they require external services). Compile
-        # them so a build breakage is caught; run them out-of-band via
-        # ARKILIAN_HYDRATION_URL=… ctest -R e2e — or just invoke manually. ──
+        # ── e2e/stress tests that need a live S3-compatible endpoint: built ──
+        # but NOT registered with ctest (they require external services).
+        # Compile them so a build breakage is caught; run them out-of-band
+        # via ARKILIAN_S3_ENDPOINT=… ctest -R e2e — or just invoke manually. ──
         if(NOT WIN32)
             add_executable(test_minio_hydrate tests/test_minio_hydrate.c
                            src/hydration.c src/sha256.c src/deps/sqlite/sqlite3.c)

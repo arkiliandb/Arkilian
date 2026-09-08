@@ -421,8 +421,8 @@ static int http_download_file(const char *url,
   // there: a leaked bucket-write credential lets an attacker swap the
   // object body. quick_check catches a malformed SQLite file, but a
   // valid-looking SQLite file with a different schema/contents would
-  // still pass it. Verifying the downloaded bytes against the control
-  // plane's recorded digest is the strongest available content guarantee,
+  // still pass it. Verifying the downloaded bytes against the
+  // manifest's recorded digest is the strongest available content guarantee,
   // so it runs BEFORE the structural quick_check — a tampered-but-valid
   // SQLite file is refused here. A missing digest is a HARD refusal: for
   // a cloud product, silently installing unauthenticated content is a
@@ -447,8 +447,8 @@ static int http_download_file(const char *url,
     }
   } else {
     fprintf(stderr,
-            "arkilian: snapshot SHA-256 digest NOT provided by control "
-            "plane — refusing to install unauthenticated content "
+            "arkilian: snapshot SHA-256 digest NOT provided by the "
+            "manifest — refusing to install unauthenticated content "
             "(HYDRATION_ERR_PROTO)\n");
     remove(tmp_path);
     *err_out = HYDRATION_ERR_PROTO;
@@ -510,7 +510,7 @@ static int http_download_file(const char *url,
 
 // ── Minimal JSON helpers (no external library) ──────────────────────
 //
-// These are deliberately small but CORRECT for the control-plane
+// These are deliberately small but CORRECT for the manifest
 // contract: string-aware scanning (braces/brackets inside string
 // values never confuse structure), full escape handling, and exact
 // key matching at the top level of the object.

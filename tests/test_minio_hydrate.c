@@ -1,4 +1,4 @@
-// Test cold-start hydration from MinIO / Control Plane into a fresh SQLite DB
+// Test cold-start hydration from MinIO / S3-compatible storage into a fresh SQLite DB
 #include "hydration.h"
 #include "deps/sqlite/sqlite3.h"
 #include <assert.h>
@@ -6,7 +6,7 @@
 #include <stdlib.h>
 
 int main(void) {
-  printf("=== Testing Cold-Start Hydration from MinIO / Control Plane ===\n");
+  printf("=== Testing Cold-Start Hydration from MinIO / S3-compatible storage ===\n");
   remove("hydrated_stress.db");
 
   const char *endpoint    = getenv("ARKILIAN_S3_ENDPOINT");
@@ -44,7 +44,7 @@ int main(void) {
       sqlite3_close(db);
     }
   } else {
-    printf("Hydration returned rc=%d (Control plane snapshot test)\n", rc);
+    printf("Hydration returned rc=%d (S3 snapshot test)\n", rc);
   }
 
   return 0;
