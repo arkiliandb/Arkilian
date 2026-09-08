@@ -50,7 +50,7 @@ int main(int argc, char **argv) {
   printf("  Target Reads       : %llu\n", read_target);
   printf("  Backup Interval    : %s seconds (4 Hours)\n",
          getenv("ARKILIAN_BACKUP_INTERVAL") ? getenv("ARKILIAN_BACKUP_INTERVAL") : "14400");
-  printf("  WAL Push Endpoint  : %s\n",
+  printf("  S3 Endpoint        : %s\n",
          getenv("ARKILIAN_S3_ENDPOINT") ? getenv("ARKILIAN_S3_ENDPOINT") : "Disabled");
   printf("===============================================================\n\n");
 

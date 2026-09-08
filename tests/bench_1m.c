@@ -262,7 +262,7 @@ static bench_result bench_insert_arkilian(arkilian *db, int n) {
     db_bind_null(db, 8);
     db_bind_int64(db, 9, d.now);
     db_bind_int64(db, 10, d.now);
-    db_step(db);       // executes INSERT, preupdate hook fires, WAL pushed
+    db_step(db);       // executes INSERT; preupdate hook captures to outbox
     db_reset(db);      // reset for next row
 
     lat_record(&lat, now_ns() - op_t0);
@@ -1015,9 +1015,9 @@ int main(int argc, char **argv) {
       "  • Both sides use sqlite3_prepare_v2 + bind/step/reset\n");
   printf("    (production best practice — one compile, many resets).\n");
   printf(
-      "  • Arkilian adds: preupdate hook (deterministic SQL expansion),\n");
+      "  • Arkilian adds: preupdate hook (deterministic SQL expansion)\n");
   printf(
-      "    + write mutex serialization + per-row WAL push to ring buffer.\n");
+      "    + write mutex serialization + chunked WAL shipping to S3.\n");
   printf(
       "  • WAL chunks are shipped to S3-compatible storage via presigned PUTs.\n");
   printf(

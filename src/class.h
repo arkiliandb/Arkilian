@@ -11,7 +11,7 @@ extern "C" {
 // Public C API for Arkilian Managed SQLite Database Engine
 //
 // Thread-safety: the backup subsystem is thread-safe by design for its
-// internal state (kill-switch, monitoring flags, API key, payload log).
+// internal state (kill-switch, monitoring flags, manifest registry).
 // The statement cursor (db_prepare/db_step/db_bind_*/db_column_*) is a
 // single per-handle cursor: C callers using the cursor from multiple
 // threads must serialize those calls themselves. The N-API bindings

@@ -168,7 +168,7 @@ struct arkilian {
   sqlite3 *snapshot_db;       // Dedicated connection (hourly snapshot thread)
   char *db_path;
   int is_open;
-  int sync_initialized;        // 1 once wake/payload/api-key/log mutexes are initialized
+  int sync_initialized;        // 1 once wake/payload/manifest/log mutexes are initialized
   int last_error_code;
   char last_error_msg[256];
 

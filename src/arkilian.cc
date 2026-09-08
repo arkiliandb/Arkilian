@@ -397,7 +397,7 @@ Napi::Value db_errmsg(const Napi::CallbackInfo& info) {
   return msg ? Napi::String::New(env, msg) : env.Null();
 }
 
-// ── Kill-switch, API key, monitoring (all use lockDb — no UAF) ──────
+// ── Kill-switch, monitoring (all use lockDb — no UAF) ───────────────
 
 Napi::Value db_backup_set_enabled(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
