@@ -168,8 +168,6 @@ if(CMAKE_JS_VERSION OR ARKILIAN_BUILD_NAPI)
     add_library(arkilian_napi SHARED
         src/arkilian.cc
         ${ARKILIAN_SOURCES}
-        src/hydration.c
-        src/sha256.c
         ${CMAKE_JS_SRC_FILES}
     )
     target_compile_definitions(arkilian_napi PRIVATE ${ARKILIAN_SQLITE_DEFS})

@@ -24,8 +24,8 @@ cd "$repo_root"
 run() {
   local name="$1" src="$2" ; shift 2
   echo "── $name ──"
-  cc -O2 -Wall -Wextra "$src" src/class.c src/deps/sqlite/sqlite3.c \
-     -Isrc -Isrc/deps/sqlite -lcurl -lpthread \
+  cc -O2 -Wall -Wextra "$src" src/class.c src/hydration.c src/sha256.c src/deps/sqlite/sqlite3.c \
+     -Isrc -Isrc/deps/sqlite -lcurl -lpthread -lm \
      -DSQLITE_ENABLE_PREUPDATE_HOOK -DSQLITE_ENABLE_FTS5 \
      "$@" -o "$name"
   ./"$name"
@@ -75,7 +75,7 @@ run_dlq
 # Benchmarks: built + run, but they assert correctness internally. Not
 # part of the pass/fail gate (they're too long-running for default CI).
 echo "── bench_1m (benchmark, not gated) ──"
-cc -O2 tests/bench_1m.c src/class.c src/deps/sqlite/sqlite3.c \
+cc -O2 tests/bench_1m.c src/class.c src/hydration.c src/sha256.c src/deps/sqlite/sqlite3.c \
    -Isrc -Isrc/deps/sqlite -lcurl -lpthread -lm \
    -DSQLITE_ENABLE_PREUPDATE_HOOK -DSQLITE_ENABLE_FTS5 -o bench_1m || {
      echo "bench_1m build failed" ; exit 1 ; }
