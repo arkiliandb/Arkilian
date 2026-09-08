@@ -73,7 +73,7 @@ build_c stress_200m      tests/stress_200m.c
 # Hydration test uses both the wrapper (db_init/db_exec/db_close) and the
 # hydration engine (arkilian_hydrate_s3 / ark_manifest_fetch) — link all three.
 cc -O2 tests/test_hydration.c src/class.c src/hydration.c src/sha256.c \
-   "$BIN/sqlite3.o" -Isrc -Isrc/deps/sqlite -lcurl -lpthread -o "$BIN/test_hydration"
+   "$BIN/sqlite3.o" -Isrc -Isrc/deps/sqlite -lcurl -lpthread -lm -o "$BIN/test_hydration"
 cc -O2 tools/arkilian-dlq.c "$BIN/sqlite3.o" -Isrc -Isrc/deps/sqlite -o "$BIN/arkilian-dlq"
 ok "11 binaries built"
 

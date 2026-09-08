@@ -320,7 +320,7 @@ static void test_roundtrip(void) {
 static void test_sha_mismatch(void) {
   cleanup_files();
   const char *snap_body = "CREATE TABLE t (id INTEGER PRIMARY KEY);\n";
-  char snap_key[512], manifest[1024];
+  char snap_key[512], manifest[2048];
   snprintf(snap_key, sizeof(snap_key), "%s/backup.sqlite", PREFIX);
   stub_put(snap_key, snap_body, strlen(snap_body));
   // Digest of some OTHER content — mismatch is guaranteed.
@@ -336,7 +336,8 @@ static void test_sha_mismatch(void) {
   int rc = arkilian_hydrate_s3("hydrate_dst.db", g_endpoint, BUCKET,
                                "us-east-1", "test-access", "test-secret",
                                PREFIX, NULL, NULL);
-  if (rc != HYDRATION_ERR_PROTO) fprintf(stderr, "DIAG rc=%d\n", rc); assert(rc == HYDRATION_ERR_PROTO);
+  if (rc != HYDRATION_ERR_PROTO) fprintf(stderr, "DIAG rc=%d\n", rc);
+  assert(rc == HYDRATION_ERR_PROTO);
   cleanup_files();
   printf("  sha256 mismatch refusal: OK\n");
 }
@@ -346,7 +347,7 @@ static void test_sha_mismatch(void) {
 static void test_lsn_gap(void) {
   cleanup_files();
   const char *snap_body = "CREATE TABLE t (id INTEGER PRIMARY KEY);\n";
-  char snap_key[512], chunk_key[512], manifest[1024];
+  char snap_key[512], chunk_key[512], manifest[2048];
   snprintf(snap_key, sizeof(snap_key), "%s/backup.sqlite", PREFIX);
   snprintf(chunk_key, sizeof(chunk_key),
            "%s/chunks/lsn_0000000005_0000000010.sql", PREFIX);
@@ -365,7 +366,8 @@ static void test_lsn_gap(void) {
   int rc = arkilian_hydrate_s3("hydrate_dst.db", g_endpoint, BUCKET,
                                "us-east-1", "test-access", "test-secret",
                                PREFIX, NULL, NULL);
-  if (rc != HYDRATION_ERR_PROTO) fprintf(stderr, "DIAG rc=%d\n", rc); assert(rc == HYDRATION_ERR_PROTO);
+  if (rc != HYDRATION_ERR_PROTO) fprintf(stderr, "DIAG rc=%d\n", rc);
+  assert(rc == HYDRATION_ERR_PROTO);
   cleanup_files();
   printf("  LSN gap refusal: OK\n");
 }
@@ -379,7 +381,8 @@ static void test_no_manifest(void) {
   int rc = arkilian_hydrate_s3("hydrate_dst.db", g_endpoint, BUCKET,
                                "us-east-1", "test-access", "test-secret",
                                PREFIX, NULL, NULL);
-  if (rc != HYDRATION_ERR_PROTO) fprintf(stderr, "DIAG rc=%d\n", rc); assert(rc == HYDRATION_ERR_PROTO);
+  if (rc != HYDRATION_ERR_PROTO) fprintf(stderr, "DIAG rc=%d\n", rc);
+  assert(rc == HYDRATION_ERR_PROTO);
   cleanup_files();
   printf("  absent-manifest refusal: OK\n");
 }

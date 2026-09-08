@@ -46,10 +46,10 @@ static arkilian *open_test_db(void) {
   ark_setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
   ark_setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
   ark_setenv("ARKILIAN_S3_PREFIX", "test-prefix", 1);
-  setenv("ARKILIAN_S3_BUCKET", "test-bucket", 1);
-  setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
-  setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
-  setenv("ARKILIAN_S3_PREFIX", "test-prefix", 1);
+  ark_setenv("ARKILIAN_S3_BUCKET", "test-bucket", 1);
+  ark_setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
+  ark_setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
+  ark_setenv("ARKILIAN_S3_PREFIX", "test-prefix", 1);
   arkilian *db = NULL;
   int rc = db_init(&db, TEST_DB);
   ASSERT(rc == 0);

@@ -467,8 +467,8 @@ static int http_download_file(const char *url,
       sqlite3_stmt *q = NULL;
       if (sqlite3_prepare_v2(chk, "PRAGMA quick_check", -1, &q, NULL) == SQLITE_OK &&
           sqlite3_step(q) == SQLITE_ROW) {
-        const char *r = (const char *)sqlite3_column_text(q, 0);
-        ok = r && strcmp(r, "ok") == 0;
+        const char *cell = (const char *)sqlite3_column_text(q, 0);
+        ok = cell && strcmp(cell, "ok") == 0;
       }
       sqlite3_finalize(q);
       sqlite3_close(chk);

@@ -54,10 +54,10 @@ static void test_cleartext_non_local_push_url_disables_backup(void) {
   ark_setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
   ark_setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
   ark_setenv("ARKILIAN_S3_PREFIX", "test-prefix", 1);
-  setenv("ARKILIAN_S3_BUCKET", "test-bucket", 1);
-  setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
-  setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
-  setenv("ARKILIAN_S3_PREFIX", "test-prefix", 1);
+  ark_setenv("ARKILIAN_S3_BUCKET", "test-bucket", 1);
+  ark_setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
+  ark_setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
+  ark_setenv("ARKILIAN_S3_PREFIX", "test-prefix", 1);
 
   arkilian *db = NULL;
   int rc = db_init(&db, "test_hard_http.db");
@@ -80,10 +80,10 @@ static void test_https_push_url_keeps_backup_enabled(void) {
   ark_setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
   ark_setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
   ark_setenv("ARKILIAN_S3_PREFIX", "test-prefix", 1);
-  setenv("ARKILIAN_S3_BUCKET", "test-bucket", 1);
-  setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
-  setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
-  setenv("ARKILIAN_S3_PREFIX", "test-prefix", 1);
+  ark_setenv("ARKILIAN_S3_BUCKET", "test-bucket", 1);
+  ark_setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
+  ark_setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
+  ark_setenv("ARKILIAN_S3_PREFIX", "test-prefix", 1);
 
   arkilian *db = NULL;
   assert(db_init(&db, "test_hard_https.db") == 0);
@@ -102,10 +102,10 @@ static void test_loopback_cleartart_is_permitted(void) {
   ark_setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
   ark_setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
   ark_setenv("ARKILIAN_S3_PREFIX", "test-prefix", 1);
-  setenv("ARKILIAN_S3_BUCKET", "test-bucket", 1);
-  setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
-  setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
-  setenv("ARKILIAN_S3_PREFIX", "test-prefix", 1);
+  ark_setenv("ARKILIAN_S3_BUCKET", "test-bucket", 1);
+  ark_setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
+  ark_setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
+  ark_setenv("ARKILIAN_S3_PREFIX", "test-prefix", 1);
 
   arkilian *db = NULL;
   assert(db_init(&db, "test_hard_loopback.db") == 0);
@@ -125,10 +125,10 @@ static void test_rfc1918_cleartext_is_permitted(void) {
   ark_setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
   ark_setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
   ark_setenv("ARKILIAN_S3_PREFIX", "test-prefix", 1);
-  setenv("ARKILIAN_S3_BUCKET", "test-bucket", 1);
-  setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
-  setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
-  setenv("ARKILIAN_S3_PREFIX", "test-prefix", 1);
+  ark_setenv("ARKILIAN_S3_BUCKET", "test-bucket", 1);
+  ark_setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
+  ark_setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
+  ark_setenv("ARKILIAN_S3_PREFIX", "test-prefix", 1);
 
   arkilian *db = NULL;
   assert(db_init(&db, "test_hard_rfc1918.db") == 0);
@@ -147,10 +147,10 @@ static void test_allow_insecure_opt_in(void) {
   ark_setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
   ark_setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
   ark_setenv("ARKILIAN_S3_PREFIX", "test-prefix", 1);
-  setenv("ARKILIAN_S3_BUCKET", "test-bucket", 1);
-  setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
-  setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
-  setenv("ARKILIAN_S3_PREFIX", "test-prefix", 1);
+  ark_setenv("ARKILIAN_S3_BUCKET", "test-bucket", 1);
+  ark_setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
+  ark_setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
+  ark_setenv("ARKILIAN_S3_PREFIX", "test-prefix", 1);
   ark_setenv("ARKILIAN_ALLOW_INSECURE", "1", 1);
 
   arkilian *db = NULL;
@@ -171,10 +171,10 @@ static void test_max_queue_depth_caps_capture(void) {
   ark_setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
   ark_setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
   ark_setenv("ARKILIAN_S3_PREFIX", "test-prefix", 1);
-  setenv("ARKILIAN_S3_BUCKET", "test-bucket", 1);
-  setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
-  setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
-  setenv("ARKILIAN_S3_PREFIX", "test-prefix", 1); // refuse to connect
+  ark_setenv("ARKILIAN_S3_BUCKET", "test-bucket", 1);
+  ark_setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
+  ark_setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
+  ark_setenv("ARKILIAN_S3_PREFIX", "test-prefix", 1); // refuse to connect
   ark_setenv("ARKILIAN_MAX_QUEUE_DEPTH", "5", 1);
 
   arkilian *db = NULL;

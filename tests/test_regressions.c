@@ -59,10 +59,10 @@ static arkilian *open_db(const char *path) {
   ark_setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
   ark_setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
   ark_setenv("ARKILIAN_S3_PREFIX", "test-prefix", 1);
-  setenv("ARKILIAN_S3_BUCKET", "test-bucket", 1);
-  setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
-  setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
-  setenv("ARKILIAN_S3_PREFIX", "test-prefix", 1);
+  ark_setenv("ARKILIAN_S3_BUCKET", "test-bucket", 1);
+  ark_setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
+  ark_setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
+  ark_setenv("ARKILIAN_S3_PREFIX", "test-prefix", 1);
   arkilian *db = NULL;
   int rc = db_init(&db, path);
   assert(rc == 0 && "db_init failed");
@@ -346,10 +346,10 @@ static void test_no_destination_rows_survive(void) {
   ark_setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
   ark_setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
   ark_setenv("ARKILIAN_S3_PREFIX", "test-prefix", 1);
-  setenv("ARKILIAN_S3_BUCKET", "test-bucket", 1);
-  setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
-  setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
-  setenv("ARKILIAN_S3_PREFIX", "test-prefix", 1);
+  ark_setenv("ARKILIAN_S3_BUCKET", "test-bucket", 1);
+  ark_setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
+  ark_setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
+  ark_setenv("ARKILIAN_S3_PREFIX", "test-prefix", 1);
   ark_setenv("ARKILIAN_ENABLE_BACKUP", "1", 1);
   ark_setenv("ARKILIAN_BACKUP_INTERVAL", "3600", 1);
   arkilian *db = NULL;
@@ -385,10 +385,10 @@ static void test_text_pk_replay_fidelity(void) {
   ark_setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
   ark_setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
   ark_setenv("ARKILIAN_S3_PREFIX", "test-prefix", 1);
-  setenv("ARKILIAN_S3_BUCKET", "test-bucket", 1);
-  setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
-  setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
-  setenv("ARKILIAN_S3_PREFIX", "test-prefix", 1); // keep rows in outbox
+  ark_setenv("ARKILIAN_S3_BUCKET", "test-bucket", 1);
+  ark_setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
+  ark_setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
+  ark_setenv("ARKILIAN_S3_PREFIX", "test-prefix", 1); // keep rows in outbox
   ark_setenv("ARKILIAN_BACKUP_INTERVAL", "3600", 1);
   arkilian *db = NULL;
   assert(db_init(&db, "test_reg_fid.db") == 0);
@@ -447,10 +447,10 @@ static void test_keyless_table_skipped(void) {
   ark_setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
   ark_setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
   ark_setenv("ARKILIAN_S3_PREFIX", "test-prefix", 1);
-  setenv("ARKILIAN_S3_BUCKET", "test-bucket", 1);
-  setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
-  setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
-  setenv("ARKILIAN_S3_PREFIX", "test-prefix", 1);
+  ark_setenv("ARKILIAN_S3_BUCKET", "test-bucket", 1);
+  ark_setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
+  ark_setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
+  ark_setenv("ARKILIAN_S3_PREFIX", "test-prefix", 1);
   ark_setenv("ARKILIAN_BACKUP_INTERVAL", "3600", 1);
   arkilian *db = NULL;
   assert(db_init(&db, "test_reg_keyless.db") == 0);
@@ -491,10 +491,10 @@ static void test_dead_letter_zombie_cleared(void) {
   ark_setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
   ark_setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
   ark_setenv("ARKILIAN_S3_PREFIX", "test-prefix", 1);
-  setenv("ARKILIAN_S3_BUCKET", "test-bucket", 1);
-  setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
-  setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
-  setenv("ARKILIAN_S3_PREFIX", "test-prefix", 1);
+  ark_setenv("ARKILIAN_S3_BUCKET", "test-bucket", 1);
+  ark_setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
+  ark_setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
+  ark_setenv("ARKILIAN_S3_PREFIX", "test-prefix", 1);
   ark_setenv("ARKILIAN_BACKUP_INTERVAL", "3600", 1);
   // Tight attempt budget so the crafted zombie (10 attempts) is at the
   // limit on the FIRST pass — dead-lettering then runs immediately. The
@@ -602,10 +602,10 @@ static void test_local_fs_capture_not_disabled(void) {
   ark_setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
   ark_setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
   ark_setenv("ARKILIAN_S3_PREFIX", "test-prefix", 1);
-  setenv("ARKILIAN_S3_BUCKET", "test-bucket", 1);
-  setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
-  setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
-  setenv("ARKILIAN_S3_PREFIX", "test-prefix", 1);
+  ark_setenv("ARKILIAN_S3_BUCKET", "test-bucket", 1);
+  ark_setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
+  ark_setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
+  ark_setenv("ARKILIAN_S3_PREFIX", "test-prefix", 1);
   ark_setenv("ARKILIAN_S3_ACCESS_KEY", "test-key", 1);
   ark_setenv("ARKILIAN_BACKUP_INTERVAL", "3600", 1);
   arkilian *db = NULL;
@@ -703,10 +703,10 @@ static void test_capture_paused_at_cap(void) {
   ark_setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
   ark_setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
   ark_setenv("ARKILIAN_S3_PREFIX", "test-prefix", 1);
-  setenv("ARKILIAN_S3_BUCKET", "test-bucket", 1);
-  setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
-  setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
-  setenv("ARKILIAN_S3_PREFIX", "test-prefix", 1);
+  ark_setenv("ARKILIAN_S3_BUCKET", "test-bucket", 1);
+  ark_setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
+  ark_setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
+  ark_setenv("ARKILIAN_S3_PREFIX", "test-prefix", 1);
   ark_setenv("ARKILIAN_S3_ACCESS_KEY", "test-key", 1);
   ark_setenv("ARKILIAN_BACKUP_INTERVAL", "3600", 1);
   ark_setenv("ARKILIAN_MAX_QUEUE_DEPTH", "5", 1); // tight cap
