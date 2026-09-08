@@ -80,7 +80,7 @@ func TestSimulation(t *testing.T) {
 			break
 		}
 	}
-	os.Setenv("ARKILIAN_WAL_PUSH_URL", baseURL+"/v1/wal/push")
+	os.Setenv("ARKILIAN_S3_ENDPOINT", baseURL)
 
 	t.Logf("╔══════════════════════════════════════════╗")
 	t.Logf("║  Arkilian Production Simulation          ║")

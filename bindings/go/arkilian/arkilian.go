@@ -43,9 +43,14 @@ type DB struct {
 }
 
 func init() {
-	// Debug mode: set localhost endpoints automatically
+	// Debug mode: point at a local MinIO automatically
 	if os.Getenv("ARKILIAN_DEBUG") == "true" {
-		os.Setenv("ARKILIAN_WAL_PUSH_URL", "http://localhost:8080/v1/wal/push")
+		os.Setenv("ARKILIAN_S3_ENDPOINT", "http://localhost:9000")
+		os.Setenv("ARKILIAN_S3_BUCKET", "arkilian-backups")
+		os.Setenv("ARKILIAN_S3_REGION", "us-east-1")
+		os.Setenv("ARKILIAN_S3_ACCESS_KEY", "minioadmin")
+		os.Setenv("ARKILIAN_S3_SECRET_KEY", "minioadmin")
+		os.Setenv("ARKILIAN_S3_PREFIX", "db_default")
 	}
 	// Disable hourly backup by default in Go binding
 	if os.Getenv("ARKILIAN_ENABLE_BACKUP") == "" {
@@ -53,8 +58,10 @@ func init() {
 	}
 }
 
-// Open initializes an Arkilian database.  token is the API key for
-// WAL push / hydration.  dbPath is the local SQLite file path.
+// Open initializes an Arkilian database.  dbPath is the local SQLite
+// file path.  Storage is configured via ARKILIAN_S3_* environment
+// variables (or a ./.env file); `token` is retained for API
+// compatibility with older releases.
 func Open(token, dbPath string) (*DB, error) {
 	cPath := C.CString(dbPath)
 	defer C.free(unsafe.Pointer(cPath))

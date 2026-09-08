@@ -2,24 +2,21 @@
 # Arkilian Production Stress Suite — local + Docker/MinIO on this machine.
 #
 # Phases:
-#   0. Build every C binary (tests, stress, e2e validator)
+#   0. Build every C binary (tests, stress)
 #   1. Local C test suites (unit, regression, kill-switch, load, kill-resilience)
-#   2. Stack: MinIO + control plane via docker compose (falls back to a
-#      local control-plane binary when Docker is unavailable)
-#   3. Tenant setup (register → create database → api_key)
-#   4. End-to-end stress: real client -> control plane -> MinIO,
-#      with server-side wal_entries + hydrate-plan verification
-#   5. Throughput stress (stress_200m, configurable size)
-#   6. Server-side totals + dashboard smoke check
-#   7. Teardown
+#   2. Dead-letter tool (arkilian-dlq) count/list/replay smoke
+#   3. Throughput stress (stress_200m, configurable size)
+#   4. Teardown
 #
-# With `--client-only`, Phases 2-6 are skipped (the control plane is a
-# private codebase that never runs against public CI); the suite becomes
-# build + C suites + DLQ tool + local throughput stress. The GitHub
-# `stress` workflow drives this mode on every src/tests change.
+# Shipping is S3-only: the throughput phase points the client at a
+# connection-refusing loopback S3 endpoint (with dummy credentials) so
+# every flush attempt fails fast and retries — exercising the degraded
+# path (retry backoff, outbox accumulation) the client must survive.
+# Point ARKILIAN_S3_ENDPOINT at a real MinIO (see
+# docker-compose.stress.yml) to also exercise the happy path (chunk PUTs,
+# manifest publishing, snapshot uploads).
 #
 # Tuning env vars:
-#   E2E_WRITES=10000     writes for the end-to-end validator
 #   STRESS_WRITES=200000 writes for the throughput stress
 #
 # Exit 0 = everything green. Any failure = exit 1 with logs.
@@ -30,61 +27,17 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 WORK="$(mktemp -d /tmp/arkilian-stress.XXXXXX)"
 BIN="$WORK/bin"
 mkdir -p "$BIN"
-CP_PID=""
-COMPOSE_UP=0
-CP_URL=""
-
-# CI client-only mode (`--client-only`): the control plane is a private
-# business codebase that never runs against public CI. This mode runs the
-# client-only phases — build, C suites, DLQ tool, local throughput stress
-# with outbox/backup machinery alive (ARKILIAN_SKIP_STARTUP_AUTH=1) but no
-# control-plane endpoints. Phases 2-6 are skipped entirely.
-CLIENT_ONLY=0
-case "${1:-}" in
-  --client-only) CLIENT_ONLY=1 ;;
-esac
 
 log() { printf '\n\033[1;34m=== %s ===\033[0m\n' "$*"; }
 ok()  { printf '\033[1;32m  OK\033[0m %s\n' "$*"; }
 fail(){ printf '\033[1;31m  FAIL\033[0m %s\n' "$*"; exit 1; }
 
 cleanup() {
-  if [ "$COMPOSE_UP" = "1" ]; then
-    log "Teardown: docker compose down"
-    docker compose -f "$ROOT/docker-compose.stress.yml" down -v 2>/dev/null || true
-  fi
-  if [ -n "$CP_PID" ]; then kill "$CP_PID" 2>/dev/null || true; fi
   rm -rf "$WORK"
 }
 trap cleanup EXIT
 
 # ── Helpers ─────────────────────────────────────────────────────────
-
-# docker_available: bounded check — `docker info` can hang while the
-# Desktop VM boots; give it up to 15s then give up.
-docker_available() {
-  local pid
-  (docker info >/dev/null 2>&1) &
-  pid=$!
-  for _ in $(seq 1 15); do
-    if ! kill -0 "$pid" 2>/dev/null; then wait "$pid" 2>/dev/null; return 0; fi
-    sleep 1
-  done
-  kill -9 "$pid" 2>/dev/null || true
-  wait "$pid" 2>/dev/null || true
-  return 1
-}
-
-wait_for_http() {
-  local url="$1" tries="$2" i=0
-  while ! curl -sf -o /dev/null "$url" 2>/dev/null; do
-    i=$((i + 1))
-    if [ "$i" -ge "$tries" ]; then return 1; fi
-    sleep 1
-  done
-}
-
-json_field() { python3 -c "import sys,json;print(json.load(sys.stdin)[\"$1\"])" 2>/dev/null || echo ""; }
 
 # The sqlite3 amalgamation is 9.4MB — compile it ONCE into an object and
 # link every test against it, otherwise the build phase takes ~20 minutes.
@@ -116,13 +69,12 @@ build_c test_load_contention tests/test_load_contention.c
 build_c test_kill_resilience tests/test_kill_resilience.c
 build_c test_monitoring    tests/test_monitoring.c
 build_c test_virtual_tables tests/test_virtual_tables.c "-DSQLITE_ENABLE_FTS5"
-build_c test_e2e_stress tests/test_e2e_stress.c
 build_c stress_200m      tests/stress_200m.c
 # Hydration links hydration.c, not class.c
 cc -O2 tests/test_hydration.c src/hydration.c src/sha256.c "$BIN/sqlite3.o" \
    -Isrc -Isrc/deps/sqlite -lcurl -lpthread -o "$BIN/test_hydration"
 cc -O2 tools/arkilian-dlq.c "$BIN/sqlite3.o" -Isrc -Isrc/deps/sqlite -o "$BIN/arkilian-dlq"
-ok "12 binaries built"
+ok "11 binaries built"
 
 # ── Phase 1: local test suites ──────────────────────────────────────
 
@@ -156,135 +108,33 @@ PN="$(sqlite3 "$DLQ_DB" "SELECT COUNT(*) FROM _pending_backup;")"
 [ "$PN" = "2" ] || fail "dlq replay queued $PN rows (expected 2)"
 ok "arkilian-dlq count/list/replay verified"
 
-# ── Phase 2: stack (MinIO via docker, control plane local) ──────────
+# ── Phase 3: throughput stress ───────────────────────────────────────
 
-if [ "$CLIENT_ONLY" = "1" ]; then
-  log "Phase 2: client-only mode — MinIO + control plane stack skipped"
-else
-  log "Phase 2: infrastructure stack"
-  if docker_available && docker compose -f "$ROOT/docker-compose.stress.yml" \
-       up -d --build minio createbucket > "$WORK/compose.log" 2>&1; then
-    COMPOSE_UP=1
-    ok "MinIO up (docker, :9000/:9001, bucket 'arkilian-backups')"
-  else
-    log "Docker unavailable/failed — running without MinIO (S3 mirror + snapshots will log errors, WAL path unaffected)"
-  fi
-
-  # Control plane always runs as a local binary: the compose image build
-  # needs to download a full Go toolchain (go.mod requires go 1.25), which
-  # is slow and network-fragile on first run. Run it from $WORK so no
-  # repo-root .env can inject credentials, and use the ARKILIAN_AWS_* var
-  # names (the server prefers them over S3_*).
-  log "Building control plane (local Go binary)"
-  (cd "$ROOT/server" && go build -o "$BIN/arkilian-server" .)
-  (cd "$WORK" && ARKILIAN_DB_PATH="$WORK/cp.db" \
-  ARKILIAN_AWS_ENDPOINT_URL="http://localhost:9000" ARKILIAN_AWS_BUCKET="arkilian-backups" \
-  ARKILIAN_AWS_ACCESS_KEY_ID="minioadmin" ARKILIAN_AWS_SECRET_ACCESS_KEY="minioadmin" \
-  S3_REGION="us-east-1" PORT=18080 "$BIN/arkilian-server" > "$WORK/cp.log" 2>&1) &
-  CP_PID=$!
-  if wait_for_http "http://localhost:18080/health" 30; then
-    CP_URL="http://localhost:18080"
-    ok "control plane on :18080 (MinIO at :9000)"
-  else
-    tail -30 "$WORK/cp.log"
-    fail "control plane did not start"
-  fi
-fi
-
-# ── Phase 3: tenant setup ───────────────────────────────────────────
-
-if [ "$CLIENT_ONLY" = "0" ]; then
-  log "Phase 3: tenant setup"
-  EMAIL="stress@arkilian.local"
-  PASS="secret123"
-  # Registration may already exist on re-runs — 409 is fine.
-  curl -s -o /dev/null -X POST "$CP_URL/v1/auth/register" \
-    -H 'Content-Type: application/json' -d "{\"email\":\"$EMAIL\",\"password\":\"$PASS\"}" || true
-  LOGIN="$(curl -s -X POST "$CP_URL/v1/auth/login" \
-    -H 'Content-Type: application/json' -d "{\"email\":\"$EMAIL\",\"password\":\"$PASS\"}")"
-  TOKEN="$(echo "$LOGIN" | json_field token)"
-  [ -n "$TOKEN" ] || fail "login failed: $LOGIN"
-  CREATE="$(curl -s -X POST "$CP_URL/v1/db/create" \
-    -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
-    -d '{"name":"stress-e2e"}')"
-  API_KEY="$(echo "$CREATE" | json_field api_key)"
-  DB_ID="$(echo "$CREATE" | json_field db_id)"
-  [ -n "$API_KEY" ] && [ -n "$DB_ID" ] || fail "db create failed: $CREATE"
-  ok "tenant $EMAIL / db $DB_ID"
-fi
-
-# ── Phase 4: end-to-end stress ──────────────────────────────────────
-
-if [ "$CLIENT_ONLY" = "0" ]; then
-  log "Phase 4: end-to-end stress (client -> control plane -> storage)"
-  E2E_WRITES="${E2E_WRITES:-10000}"
-  if run_in_work "$BIN/test_e2e_stress" --url "$CP_URL" --key "$API_KEY" \
-       --db "$DB_ID" --writes "$E2E_WRITES"; then
-    ok "e2e stress passed ($E2E_WRITES writes)"
-  else
-    fail "e2e stress"
-  fi
-fi
-
-# ── Phase 5: throughput stress ──────────────────────────────────────
-
-log "Phase 5: throughput stress (stress_200m)"
+log "Phase 3: throughput stress (stress_200m)"
 STRESS_WRITES="${STRESS_WRITES:-200000}"
-if [ "$CLIENT_ONLY" = "1" ]; then
-  # Local-only: backup/outbox machinery stays fully alive — a loopback
-  # control URL (safe transport, refused connection) plus a dummy key and
-  # SKIP_STARTUP_AUTH keep backup_enabled=1, so the flush thread, retry
-  # backoff, and outbox accumulation are all exercised; every push fails
-  # fast and retries, exactly the degraded path the client must survive.
-  if run_in_work env \
-       ARKILIAN_ENABLE_BACKUP=1 \
-       ARKILIAN_CONTROL_URL="http://127.0.0.1:1" \
-       ARKILIAN_API_KEY="ci-dummy-token" \
-       ARKILIAN_SKIP_STARTUP_AUTH=1 \
-       ARKILIAN_BACKUP_INTERVAL=14400 \
-       ARKILIAN_BACKUP_PATH="$WORK/stress_backup.sqlite" \
-       "$BIN/stress_200m" "$STRESS_WRITES"; then
-    ok "throughput stress passed ($STRESS_WRITES ops, client-only)"
-  else
-    fail "throughput stress"
-  fi
+# The loopback endpoint is permitted cleartext by the hardening guard, so
+# backup stays enabled; every flush attempt fails fast (connection
+# refused) and retries with backoff — exercising exactly the degraded
+# path the client must survive: flush-thread liveness, attempt tracking,
+# outbox accumulation, and dead-lettering. Point ARKILIAN_S3_ENDPOINT at
+# a real MinIO (see docker-compose.stress.yml) to instead exercise the
+# happy path — chunk PUTs, manifest publishing, snapshot uploads.
+if run_in_work env \
+     ARKILIAN_ENABLE_BACKUP=1 \
+     ARKILIAN_S3_ENDPOINT="${ARKILIAN_S3_ENDPOINT:-http://127.0.0.1:1}" \
+     ARKILIAN_S3_BUCKET="${ARKILIAN_S3_BUCKET:-stress-bucket}" \
+     ARKILIAN_S3_REGION="us-east-1" \
+     ARKILIAN_S3_ACCESS_KEY="${ARKILIAN_S3_ACCESS_KEY:-stress-access}" \
+     ARKILIAN_S3_SECRET_KEY="${ARKILIAN_S3_SECRET_KEY:-stress-secret}" \
+     ARKILIAN_S3_PREFIX="db_stress" \
+     ARKILIAN_BACKUP_INTERVAL=14400 \
+     ARKILIAN_BACKUP_PATH="$WORK/stress_backup.sqlite" \
+     "$BIN/stress_200m" "$STRESS_WRITES"; then
+  ok "throughput stress passed ($STRESS_WRITES ops)"
 else
-  if run_in_work env \
-       ARKILIAN_ENABLE_BACKUP=1 \
-       ARKILIAN_WAL_PUSH_URL="$CP_URL/v1/wal/push" \
-       ARKILIAN_DATABASE_TOKEN="$API_KEY" \
-       ARKILIAN_BACKUP_INTERVAL=14400 \
-       ARKILIAN_BACKUP_PATH="$WORK/stress_backup.sqlite" \
-       "$BIN/stress_200m" "$STRESS_WRITES"; then
-    ok "throughput stress passed ($STRESS_WRITES ops)"
-  else
-    fail "throughput stress"
-  fi
+  fail "throughput stress"
 fi
 
-# ── Phase 6: server-side verification ───────────────────────────────
+# ── Phase 4: teardown (EXIT trap) ───────────────────────────────────
 
-if [ "$CLIENT_ONLY" = "0" ]; then
-  log "Phase 6: server-side totals + dashboard smoke"
-  COUNT="$(curl -s "$CP_URL/v1/wal/count" -H "Authorization: Bearer $API_KEY" | json_field count)"
-  ok "control plane wal_entries for $DB_ID: $COUNT"
-  SUMMARY="$(curl -s "$CP_URL/v1/monitor/summary" -H "Authorization: Bearer $TOKEN")"
-  ok "dashboard summary: $SUMMARY"
-  # The e2e phase ran with a 5s snapshot interval — at least one snapshot
-  # must have been registered AND uploaded to MinIO through a signed URL.
-  SNAPS="$(echo "$SUMMARY" | python3 -c 'import sys,json;d=json.load(sys.stdin);print(sum(x.get("snapshots",0) for x in d))')"
-  if [ "${SNAPS:-0}" -ge 1 ]; then
-    ok "S3 snapshot round-trip confirmed ($SNAPS snapshot(s) registered)"
-  else
-    fail "no snapshots registered — S3 signed-URL path broken"
-  fi
-  HTTP_CODE="$(curl -s -o /dev/null -w '%{http_code}' "$CP_URL/")"
-  [ "$HTTP_CODE" = "200" ] || fail "dashboard / returned $HTTP_CODE"
-  ok "dashboard served (HTTP $HTTP_CODE)"
-fi
-
-if [ "$CLIENT_ONLY" = "1" ]; then
-  log "=== CLIENT-ONLY STRESS SUITE PASSED — all phases green ==="
-else
-  log "=== STRESS SUITE PASSED — all phases green ==="
-fi
+log "=== STRESS SUITE PASSED — all phases green ==="

@@ -15,9 +15,10 @@
 //   3. Mid-ship              — same invariants while a network ship is
 //      in flight to a slow destination (at-least-once redelivery).
 //
-// The destination is a mock HTTP server that records every
-// X-Arkilian-Payload-Id it receives, so the parent can prove that the
-// union of all deliveries equals the exact set of captured rows.
+// The destination is a mock HTTP server that records every outbox id
+// shipped in each chunk object's key (chunks/lsn_<start>_<end>.sql),
+// so the parent can prove that the union of all deliveries equals the
+// exact set of captured rows.
 //
 // Compile (macOS/Linux):
 //   cc tests/test_kill_resilience.c src/class.c src/deps/sqlite/sqlite3.c -Isrc -Isrc/deps/sqlite -lcurl -lpthread -o test_kill_resilience
@@ -69,8 +70,8 @@ static void cleanup(const char *path) {
 }
 
 // ── Recording mock destination ──────────────────────────────────────
-// Answers 200 (optionally after a delay) and records every payload id
-// from the X-Arkilian-Payload-Id header.
+// Answers 200 (optionally after a delay) and records every outbox id in
+// the LSN range parsed from the chunk object key (chunks/lsn_*.sql).
 
 typedef struct {
   int listen_fd;

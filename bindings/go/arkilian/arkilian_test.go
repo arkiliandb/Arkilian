@@ -1,7 +1,7 @@
 // Arkilian Go bindings — integration test.
 //
-// Requires the Control Plane server running on localhost:8080.
-// Set ARKILIAN_DEBUG=true to auto-configure localhost endpoints.
+// Requires a local S3-compatible endpoint (e.g. MinIO on localhost:9000).
+// Set ARKILIAN_DEBUG=true to auto-configure localhost storage.
 //
 // Run:
 //   cd bindings/go
@@ -235,10 +235,10 @@ func TestIntegrationFullFlow(t *testing.T) {
 	}
 	t.Logf("prepared query returned %d rows", count)
 
-	// 11. Check WAL push was configured
-	if os.Getenv("ARKILIAN_WAL_PUSH_URL") != "http://localhost:8080/v1/wal/push" {
-		t.Fatalf("expected WAL push URL to be set, got: %s",
-			os.Getenv("ARKILIAN_WAL_PUSH_URL"))
+	// 11. Check S3 storage was configured
+	if os.Getenv("ARKILIAN_S3_ENDPOINT") != "http://localhost:9000" {
+		t.Fatalf("expected S3 endpoint to be set, got: %s",
+			os.Getenv("ARKILIAN_S3_ENDPOINT"))
 	}
 
 	// 12. Verify WAL entries exist
@@ -250,15 +250,15 @@ func TestIntegrationFullFlow(t *testing.T) {
 
 func TestDebugModeAutoConfig(t *testing.T) {
 	os.Setenv("ARKILIAN_DEBUG", "true")
-	os.Unsetenv("ARKILIAN_WAL_PUSH_URL")
+	os.Unsetenv("ARKILIAN_S3_ENDPOINT")
 
 	// Simulate what init() does
 	if os.Getenv("ARKILIAN_DEBUG") == "true" {
-		os.Setenv("ARKILIAN_WAL_PUSH_URL", "http://localhost:8080/v1/wal/push")
+		os.Setenv("ARKILIAN_S3_ENDPOINT", "http://localhost:9000")
 	}
 
-	if os.Getenv("ARKILIAN_WAL_PUSH_URL") != "http://localhost:8080/v1/wal/push" {
-		t.Fatal("ARKILIAN_DEBUG=true should set WAL push URL")
+	if os.Getenv("ARKILIAN_S3_ENDPOINT") != "http://localhost:9000" {
+		t.Fatal("ARKILIAN_DEBUG=true should set the S3 endpoint")
 	}
 }
 
@@ -323,7 +323,7 @@ func TestWALPending(t *testing.T) {
 	os.Remove(dbPath)
 	defer os.Remove(dbPath)
 
-	_ = os.Setenv("ARKILIAN_WAL_PUSH_URL", "http://127.0.0.1:1")
+	_ = os.Setenv("ARKILIAN_S3_ENDPOINT", "http://127.0.0.1:1")
 
 	db, _ := Open("test-key", dbPath)
 	defer db.Close()

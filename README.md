@@ -62,22 +62,28 @@ default to empty; nothing phones home unless explicitly configured.
 | `ARKILIAN_DB_PATH` | `app.sqlite` | Path to the SQLite database file |
 | `ARKILIAN_BACKUP_PATH` | `backup.sqlite` | Local path for hourly snapshot copies |
 | `ARKILIAN_BACKUP_INTERVAL` | `3600` | Hourly snapshot interval in seconds (min 1) |
-| `ARKILIAN_WAL_PUSH_URL` | (none) | Realtime destination for row changes — every write is shipped here as replayable SQL (e.g. control plane `POST /v1/wal/push`) |
-| `ARKILIAN_SIGNED_URL_ENDPOINT` | (none) | Signed-URL issuer for hourly snapshot uploads (e.g. control plane `POST /v1/upload/request`). Independent of `ARKILIAN_WAL_PUSH_URL` — they are different endpoints |
-| `ARKILIAN_API_KEY` | (none) | Bearer token sent with both endpoints (never attached to pre-signed storage URLs) |
+| `ARKILIAN_S3_ENDPOINT` | (none) | Base URL of the S3-compatible endpoint (path-style addressing, e.g. `https://s3.amazonaws.com` or `https://minio.internal:9000`). No default — nothing ships until it is configured |
+| `ARKILIAN_S3_BUCKET` | (none) | Bucket holding the `backup.sqlite` snapshot, `chunks/…`, and `manifest.json` objects |
+| `ARKILIAN_S3_REGION` | `us-east-1` | Signature region used in AWS SigV4 request signing |
+| `ARKILIAN_S3_ACCESS_KEY` | (none) | SigV4 access key — requests are signed locally |
+| `ARKILIAN_S3_SECRET_KEY` | (none) | SigV4 secret key — used only for local signing, never transmitted |
+| `ARKILIAN_S3_PREFIX` | `db_default` | Per-database key prefix (e.g. `user-42-appdb`) — isolates tenants in a shared bucket |
 | `ARKILIAN_ENABLE_BACKUP` | `1` | `0`/`false` disables outbound backup at startup; can be toggled at runtime with `db_backup_set_enabled()` |
 | `ARKILIAN_MAX_QUEUE_DEPTH` | `100000` | Soft ceiling on `_pending_backup` rows. Once the queue reaches this depth the capture triggers pause INSERTs into the outbox (the application's own writes are unaffected, per the spec §0 "backup must never break the application" rule), and `db_backup_is_healthy()` flips to 0 so the loss of capture is visible via monitoring. Shipping drains the queue and capture resumes automatically when the depth drops back below the cap |
-| `ARKILIAN_ALLOW_INSECURE` | `0` | Opt-in for cleartext `http://` endpoints that are NOT loopback / RFC1918 (e.g. an internal-but-public corporate aggregator). Default `0`: a non-HTTPS non-local endpoint is refused at startup and backup is disabled, so a misconfiguration cannot leak the bearer token in cleartext. Loopback (`127.x`, `::1`, `localhost`) and RFC1918 / link-local / ULA addresses are always permitted for dev without opt-in |
-| `ARKILIAN_STORAGE_HOSTS` | (none) | Comma-separated suffix-allowlist of self-hosted storage hosts (e.g. `minio.internal.corp,s3.example.com`). The SSRF guard refuses to upload a snapshot or download a hydration chunk to/from a host that is not a well-known storage provider (AWS S3, GCS, Azure Blob, Backblaze B2, Cloudflare R2, Wasabi, DigitalOcean Spaces), a loopback / RFC1918 address, or in this allowlist. Prevents a compromised control plane from exfiltrating the database to cloud metadata or an internal service |
+| `ARKILIAN_ALLOW_INSECURE` | `0` | Opt-in for cleartext `http://` endpoints that are NOT loopback / RFC1918 (e.g. an internal S3-compatible endpoint). Default `0`: a non-HTTPS non-local endpoint is refused at startup and backup is disabled, so a misconfiguration cannot leak request signatures in cleartext. Loopback (`127.x`, `::1`, `localhost`) and RFC1918 / link-local / ULA addresses are always permitted for dev without opt-in |
+| `ARKILIAN_STORAGE_HOSTS` | (none) | Comma-separated suffix-allowlist of self-hosted storage hosts (e.g. `minio.internal.corp,s3.example.com`). The SSRF guard refuses to upload a snapshot or download a hydration chunk to/from a host that is not a well-known storage provider (AWS S3, GCS, Azure Blob, Backblaze B2, Cloudflare R2, Wasabi, DigitalOcean Spaces), a loopback / RFC1918 address, or in this allowlist. Prevents a tampered manifest or compromised storage configuration from exfiltrating the database to cloud metadata or an internal service |
 
 Example `.env` file:
 ```
 ARKILIAN_DB_PATH=myapp.db
 ARKILIAN_BACKUP_PATH=/backups/myapp-backup.db
 ARKILIAN_BACKUP_INTERVAL=7200
-ARKILIAN_WAL_PUSH_URL=https://api.example.com/v1/wal/push
-ARKILIAN_SIGNED_URL_ENDPOINT=https://api.example.com/v1/upload/request
-ARKILIAN_API_KEY=ak_...
+ARKILIAN_S3_ENDPOINT=https://s3.amazonaws.com
+ARKILIAN_S3_BUCKET=myapp-backups
+ARKILIAN_S3_REGION=us-east-1
+ARKILIAN_S3_ACCESS_KEY=AKIA...
+ARKILIAN_S3_SECRET_KEY=...
+ARKILIAN_S3_PREFIX=myapp
 ARKILIAN_ENABLE_BACKUP=1
 ```
 
@@ -154,8 +160,15 @@ db.bindText(1, 'Alice');
 db.step();
 db.finalize();
 
-// Cold-start restore from the control plane (call before new Arkilian())
-Arkilian.hydrate('app.sqlite', 'https://api.arkilian.com', 'your-api-key');
+// Cold-start restore from S3-compatible storage (call before new Arkilian())
+Arkilian.hydrateS3('app.sqlite', {
+  endpoint: 'https://s3.amazonaws.com',
+  bucket: 'myapp-backups',
+  region: 'us-east-1',
+  accessKey: 'AKIA...',
+  secretKey: '...',
+  prefix: 'myapp',
+});
 
 db.close();
 ```
@@ -204,7 +217,7 @@ npm install arkilian --build-from-source
 ### 1 — Multi-tenant SaaS: one database per tenant, zero ops
 
 Each tenant gets their own isolated SQLite file. Arkilian runs inside every
-Cloud Run instance and streams row changes to your control plane in real time.
+Cloud Run instance and streams row changes to S3-compatible storage in real time.
 If an instance is torn down, the next cold start calls `Arkilian.hydrate()` and
 is back to the exact state it left off — including every write that shipped
 while the old instance was live.
@@ -213,9 +226,8 @@ while the old instance was live.
 // server.js
 import Arkilian from 'arkilian';
 
-// Get your API token from https://arkilian.com
-const API_TOKEN = process.env.ARKILIAN_API_KEY;
-const db = new Arkilian(API_TOKEN, 'app.sqlite');
+// Configuration: ARKILIAN_S3_* env vars (see Configuration above)
+const db = new Arkilian('app.sqlite');
 
 // Schema is auto-created; capture triggers are wired automatically.
 db.exec(`CREATE TABLE IF NOT EXISTS orders (
@@ -248,14 +260,13 @@ process.on('SIGTERM', () => db.close());
 
 ### 2 — Real-time CDC Pipeline
 
-Configure the background worker with your `ARKILIAN_API_KEY` and endpoints obtained from [arkilian.com](https://arkilian.com) to stream raw row operations in real time.
+Configure the background worker with the `ARKILIAN_S3_*` environment variables (see Configuration above) to stream raw row operations to S3-compatible storage in real time.
 
 ```js
 import Arkilian from 'arkilian';
 
-// Get your configuration and API token from https://arkilian.com
-const token = process.env.ARKILIAN_API_KEY;
-const db = new Arkilian(token, 'app.sqlite');
+// Configuration comes from ARKILIAN_S3_* env vars (or ./.env)
+const db = new Arkilian('app.sqlite');
 
 db.exec(`CREATE TABLE IF NOT EXISTS users (
   id    INTEGER PRIMARY KEY,
@@ -315,8 +326,8 @@ Manage backups dynamically without restarting the application process.
 ```js
 import Arkilian from 'arkilian';
 
-// Retrieve your API token from https://arkilian.com
-const db = new Arkilian(process.env.ARKILIAN_API_KEY, 'app.sqlite');
+// Configuration comes from ARKILIAN_S3_* env vars (or ./.env)
+const db = new Arkilian('app.sqlite');
 
 // Pause all outbound backup traffic instantly during an upstream outage.
 db.setBackupEnabled(false);
@@ -340,10 +351,10 @@ Unlike complex distributed SQLite systems (e.g., LiteFS or rqlite), Arkilian emb
   retried first (never skip-and-continue). This is a reviewed decision
   (spec §8.1): if your destination does not require ordering,
   skip-and-continue is the higher-throughput alternative.
-* **Delivery** — at-least-once. A crash between destination ack and
-  local delete re-ships the row. The destination MUST dedupe on the
-  `X-Arkilian-Payload-Id` header (the bundled control plane does:
-  `ON CONFLICT(db_id, payload_id) DO NOTHING`).
+* **Delivery** — at-least-once. A crash between the storage ack and the
+  local outbox delete re-ships the rows in a new chunk. Replay is
+  idempotent (chunks are REPLACE/DELETE statements), so overlapping LSN
+  ranges after a restart are safe to replay twice.
 * **Durability** — `PRAGMA synchronous=NORMAL` (WAL): durable across
   process crashes; the most recent transactions can be lost on OS
   crash/power loss (spec §3.2). If that window is unacceptable for your
