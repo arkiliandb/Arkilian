@@ -1126,7 +1126,7 @@ int arkilian_hydrate_s3(const char *db_path,
   HYDRATE_LOCK();
   int hydrate_result = 0;
 
-  HydratePlan plan;
+  HydratePlan plan = {0};
   int plan_ok = 0;
 
   if (s3_endpoint && s3_endpoint[0] && s3_bucket && s3_bucket[0] &&

@@ -74,7 +74,7 @@ build_c stress_200m      tests/stress_200m.c
 # hydration engine (arkilian_hydrate_s3 / ark_manifest_fetch) — link all three.
 cc -O2 tests/test_hydration.c src/class.c src/hydration.c src/sha256.c \
    "$BIN/sqlite3.o" -Isrc -Isrc/deps/sqlite -lcurl -lpthread -lm -o "$BIN/test_hydration"
-cc -O2 tools/arkilian-dlq.c "$BIN/sqlite3.o" -Isrc -Isrc/deps/sqlite -o "$BIN/arkilian-dlq"
+cc -O2 tools/arkilian-dlq.c "$BIN/sqlite3.o" -Isrc -Isrc/deps/sqlite -lm -o "$BIN/arkilian-dlq"
 ok "11 binaries built"
 
 # ── Phase 1: local test suites ──────────────────────────────────────
