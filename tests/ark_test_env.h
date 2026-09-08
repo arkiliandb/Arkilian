@@ -21,7 +21,10 @@ static inline int ark_setenv(const char *name, const char *val, int overwrite) {
 }
 
 static inline int ark_unsetenv(const char *name) {
-    return _putenv_s(name, "");
+    char buf[1024];
+    int n = snprintf(buf, sizeof(buf), "%s=", name);
+    if (n < 0 || (size_t)n >= sizeof(buf)) return -1;
+    return _putenv(buf);
 }
 
 #else   /* POSIX: getenv/setenv are always present */
