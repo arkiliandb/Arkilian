@@ -740,26 +740,62 @@ static int run_s3_hardened_verification(int ops) {
   printf("  after %d inserts queue=%d healthy=%d pending=%d\n", n, db_backup_queue_depth(db), db_backup_is_healthy(db), db_wal_pending(db));
 
   // Poll for S3 objects: chunks, snapshot, manifest + HMAC
-  printf("  Polling S3 for chunks/manifest/snapshot...\n");
+  // For the S3 verification we need the full dataset to be recoverable:
+  // wait until the outbox is drained (queue==0) and the manifest lists
+  // all chunks. This ensures hydration will see the complete history,
+  // not just the first chunk.
+  printf("  Polling S3 for chunks/manifest/snapshot (waiting for queue drain)...\n");
   int have_chunks = 0, have_manifest = 0, have_sig = 0, have_snap = 0;
+  // First, wait for the outbox to drain (all rows shipped)
+  for (int i = 0; i < 200; i++) {
+    if (db_backup_queue_depth(db) == 0) break;
+    if (i % 20 == 0) printf("  drain poll %d: queue=%d PUTs=%d\n", i, db_backup_queue_depth(db), atomic_load(&g_stub_put_count));
+    usleep(100000);
+  }
+  printf("  post-drain queue=%d\n", db_backup_queue_depth(db));
   for (int i = 0; i < 200; i++) {
     if (!have_chunks && stub_contains("/chunks/")) { have_chunks = 1; printf("  S3: chunks found (poll %d, PUTs=%d)\n", i, atomic_load(&g_stub_put_count)); }
     if (!have_manifest && stub_contains("manifest.json")) { have_manifest = 1; printf("  S3: manifest.json found (poll %d)\n", i); }
     if (!have_sig && stub_contains("manifest.sig")) { have_sig = 1; printf("  S3: manifest.sig found (poll %d)\n", i); }
     if (!have_snap && stub_contains("backup.sqlite")) { have_snap = 1; printf("  S3: snapshot found (poll %d)\n", i); }
-    // Also check that manifest actually lists chunks (not just that a chunk object exists)
-    // The manifest is the source of truth for hydration; a chunk object without a manifest entry is not recoverable.
+    // Also check that manifest actually lists chunks and that the last LSN covers all rows
     if (have_chunks) {
       char mkey[512];
       snprintf(mkey, sizeof(mkey), "%s/manifest.json", PREFIX);
       char *mbody=NULL; size_t mlen=0;
       if (stub_get(mkey, &mbody, &mlen) && mbody) {
         int has_chunk_entry = strstr(mbody, "\"chunks\":[") && !strstr(mbody, "\"chunks\":[]");
+        // Also check that the manifest's last lsn_end covers the expected rows
+        // For the verification we expect at least 1000 rows, so need lsn_end >= 1001 (1 DDL + 1000 rows)
+        int has_full = has_chunk_entry;
+        if (has_chunk_entry) {
+          // Find the last lsn_end in the manifest
+          char *last = strstr(mbody, "\"lsn_end\":");
+          char *tmp = last;
+          while (tmp) {
+            char *next = strstr(tmp + 1, "\"lsn_end\":");
+            if (next) last = next;
+            else break;
+            tmp = next;
+          }
+          if (last) {
+            long long le = atoll(last + 10);
+            if (le >= 1001) has_full = 1;
+            else has_full = 0;
+          }
+        }
         free(mbody);
-        if (has_chunk_entry && have_manifest && have_sig) break;
+        if (has_full && have_manifest && have_sig) break;
       }
     }
-    if (have_chunks && have_manifest && have_sig) break;
+    if (have_chunks && have_manifest && have_sig) {
+      // Check if queue is drained and manifest is full, but still need to wait a bit for snapshot
+      if (db_backup_queue_depth(db) == 0) {
+        // Give a moment for the final manifest PUT to land
+        usleep(200000);
+        break;
+      }
+    }
     if (i % 20 == 0) {
       printf("  poll %d: queue=%d PUTs=%d GETs=%d keys=", i, db_backup_queue_depth(db), atomic_load(&g_stub_put_count), atomic_load(&g_stub_get_count));
       pthread_mutex_lock(&g_stub_store_mutex);

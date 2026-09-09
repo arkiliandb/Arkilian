@@ -336,8 +336,15 @@ struct arkilian {
   // appends the exact SQL here (no DB work inside the hook), and
   // db_resync_triggers drains it into _pending_backup so the remote
   // does not diverge. Guarded by pending_ddl_mutex.
+  // Transaction-aware: statements inside an explicit transaction are
+  // buffered in txn_head/tail and only moved to the durable queue
+  // on COMMIT; ROLLBACK discards them. This prevents replicating
+  // rolled-back DDL and ensures crash during uncommitted txn does
+  // not promote uncommitted SQL via the sidecar.
   struct pending_ddl *pending_ddl_head;
   struct pending_ddl *pending_ddl_tail;
+  struct pending_ddl *txn_head;
+  struct pending_ddl *txn_tail;
 #ifdef _WIN32
   CRITICAL_SECTION pending_ddl_mutex;
 #else
@@ -747,17 +754,29 @@ static void pending_ddl_append(arkilian *db, const char *sql) {
     return;
   }
   node->next = NULL;
-  PENDING_DDL_LOCK(db);
-  if (db->pending_ddl_tail) {
-    db->pending_ddl_tail->next = node;
-    db->pending_ddl_tail = node;
+  // Transaction-aware buffering: if inside an explicit transaction,
+  // buffer in txn queue; commit hook will move to durable main queue.
+  // Otherwise (autocommit), enqueue directly to main queue + sidecar.
+  int in_txn = db->handle && !sqlite3_get_autocommit(db->handle);
+  if (in_txn) {
+    PENDING_DDL_LOCK(db);
+    if (db->txn_tail) {
+      db->txn_tail->next = node;
+      db->txn_tail = node;
+    } else {
+      db->txn_head = db->txn_tail = node;
+    }
+    PENDING_DDL_UNLOCK(db);
   } else {
-    db->pending_ddl_head = db->pending_ddl_tail = node;
-  }
-  PENDING_DDL_UNLOCK(db);
-  // Durable spill: also append to a sidecar file that survives crash.
-  // Best-effort, fsynced, truncated on successful drain.
-  {
+    PENDING_DDL_LOCK(db);
+    if (db->pending_ddl_tail) {
+      db->pending_ddl_tail->next = node;
+      db->pending_ddl_tail = node;
+    } else {
+      db->pending_ddl_head = db->pending_ddl_tail = node;
+    }
+    PENDING_DDL_UNLOCK(db);
+    // Durable spill for autocommit DDL/DML: fsynced sidecar, truncated on drain.
     char qpath[4096];
     snprintf(qpath, sizeof(qpath), "%s.arkddlqueue", db->db_path ? db->db_path : "app.sqlite");
     FILE *qf = fopen(qpath, "ab");
@@ -783,7 +802,8 @@ static void pending_ddl_drain_and_capture(arkilian *db) {
   head = db->pending_ddl_head;
   db->pending_ddl_head = db->pending_ddl_tail = NULL;
   PENDING_DDL_UNLOCK(db);
-  int drained = 0;
+  int total = 0, drained = 0;
+  for (struct pending_ddl *n = head; n; n = n->next) total++;
   for (struct pending_ddl *node = head; node; ) {
     // Enqueue exactly as apply_ddl_capture would for a wrapped DDL,
     // but without re-running sync (we already synced at the top of
@@ -803,13 +823,15 @@ static void pending_ddl_drain_and_capture(arkilian *db) {
     free(node);
     node = next;
   }
-  // Truncate durable sidecar only after successful drain (at least one row)
-  // or if the queue was non-empty but drain succeeded (even if zero rows
-  // due to cap, we still consider the DDLs durable via outbox). Best-effort.
-  if (head) {
+  // Only truncate durable sidecar if ALL enqueues succeeded; otherwise
+  // keep it for retry (prevents P0 #2 partial-drain loss where
+  // enqueue B fails after A succeeded and sidecar is deleted).
+  if (head && drained == total) {
     char qpath[4096];
     snprintf(qpath, sizeof(qpath), "%s.arkddlqueue", db->db_path ? db->db_path : "app.sqlite");
     remove(qpath);
+  } else if (head && drained != total) {
+    ark_log(db, ARK_LOG_ERROR, "pending_ddl drain partial (%d/%d) — sidecar retained for retry", drained, total);
   }
   (void)drained;
 }
@@ -827,14 +849,61 @@ static int trace_raw_ddl(unsigned trace, void *ctx, void *p, void *x) {
   return 0;
 }
 
+static int commit_hook_cb(void *arg) {
+  arkilian *db = (arkilian *)arg;
+  if (!db) return 0;
+  // On COMMIT, move the transaction-local buffer to the durable main queue.
+  // This makes the queue transaction-aware: uncommitted DDL/DML never
+  // reaches the sidecar or _pending_backup, and ROLLBACK discards it.
+  struct pending_ddl *txn = NULL;
+  PENDING_DDL_LOCK(db);
+  txn = db->txn_head;
+  db->txn_head = db->txn_tail = NULL;
+  // Append txn chain to main queue tail
+  if (txn) {
+    if (db->pending_ddl_tail) {
+      db->pending_ddl_tail->next = txn;
+      // Find new tail
+      struct pending_ddl *t = txn;
+      while (t->next) t = t->next;
+      db->pending_ddl_tail = t;
+    } else {
+      db->pending_ddl_head = txn;
+      struct pending_ddl *t = txn;
+      while (t->next) t = t->next;
+      db->pending_ddl_tail = t;
+    }
+    // Durable spill for the committed txn: append each SQL to sidecar
+    char qpath[4096];
+    snprintf(qpath, sizeof(qpath), "%s.arkddlqueue", db->db_path ? db->db_path : "app.sqlite");
+    FILE *qf = fopen(qpath, "ab");
+    if (qf) {
+      for (struct pending_ddl *n = txn; n; n = n->next) {
+        uint32_t len = (uint32_t)strlen(n->sql);
+        fwrite(&len, 1, sizeof(len), qf);
+        fwrite(n->sql, 1, len, qf);
+      }
+      fflush(qf);
+#ifdef _WIN32
+      _commit(_fileno(qf));
+#else
+      fsync(fileno(qf));
+#endif
+      fclose(qf);
+    }
+  }
+  PENDING_DDL_UNLOCK(db);
+  return 0;
+}
+
 static void rollback_hook_cb(void *arg) {
   arkilian *db = (arkilian *)arg;
   if (!db) return;
-  // A ROLLBACK discards any DDL/DML that was queued for that transaction.
-  // Clear both the heap queue and the durable sidecar.
+  // ROLLBACK must discard ONLY the transaction-local buffer, not the
+  // already-committed main queue (previous fix cleared everything).
   PENDING_DDL_LOCK(db);
-  struct pending_ddl *head = db->pending_ddl_head;
-  db->pending_ddl_head = db->pending_ddl_tail = NULL;
+  struct pending_ddl *head = db->txn_head;
+  db->txn_head = db->txn_tail = NULL;
   PENDING_DDL_UNLOCK(db);
   for (struct pending_ddl *n = head; n; ) {
     struct pending_ddl *nx = n->next;
@@ -842,9 +911,7 @@ static void rollback_hook_cb(void *arg) {
     free(n);
     n = nx;
   }
-  char qpath[4096];
-  snprintf(qpath, sizeof(qpath), "%s.arkddlqueue", db->db_path ? db->db_path : "app.sqlite");
-  remove(qpath);
+  // Do NOT remove the sidecar — it contains only committed txns.
 }
 
 // Extract the host component of a URL into a caller-provided buffer.
@@ -2356,7 +2423,9 @@ int db_init(arkilian **db_ptr, const char *filename) {
   // visible (Risk #1 / spec §1). Never blocks, performs no I/O.
   sqlite3_set_authorizer(db->handle, on_schema_authorizer, db);
   // P0 #2: transaction-aware DDL/DML capture for raw handle.
-  // ROLLBACK must discard any queued DDL/DML for that txn.
+  // COMMIT moves txn-local queue to durable main queue; ROLLBACK
+  // discards it. This makes the sidecar transactionally correct.
+  sqlite3_commit_hook(db->handle, commit_hook_cb, db);
   sqlite3_rollback_hook(db->handle, rollback_hook_cb, db);
   // Durable sidecar reload: if previous process crashed after queueing
   // raw DDL/DML but before drain, the sidecar file survives. Reload it
@@ -2556,18 +2625,22 @@ void db_close(arkilian *db) {
     db->handle = NULL;
   }
 
-  // Drain and free any pending raw DDL queue (P0 #2)
+  // Drain and free any pending raw DDL queues (P0 #2) — both
+  // committed main queue and uncommitted txn buffer (the latter
+  // would be discarded on ROLLBACK anyway, but db_close must not leak).
   {
-    struct pending_ddl *head = NULL;
+    struct pending_ddl *head = NULL, *txn = NULL;
 #ifdef _WIN32
     if (db->sync_initialized) EnterCriticalSection(&db->pending_ddl_mutex);
     head = db->pending_ddl_head;
-    db->pending_ddl_head = db->pending_ddl_tail = NULL;
+    txn = db->txn_head;
+    db->pending_ddl_head = db->pending_ddl_tail = db->txn_head = db->txn_tail = NULL;
     if (db->sync_initialized) LeaveCriticalSection(&db->pending_ddl_mutex);
 #else
     if (db->sync_initialized) pthread_mutex_lock(&db->pending_ddl_mutex);
     head = db->pending_ddl_head;
-    db->pending_ddl_head = db->pending_ddl_tail = NULL;
+    txn = db->txn_head;
+    db->pending_ddl_head = db->pending_ddl_tail = db->txn_head = db->txn_tail = NULL;
     if (db->sync_initialized) pthread_mutex_unlock(&db->pending_ddl_mutex);
 #endif
     for (struct pending_ddl *n = head; n; ) {
@@ -2575,6 +2648,20 @@ void db_close(arkilian *db) {
       free(n->sql);
       free(n);
       n = nx;
+    }
+    for (struct pending_ddl *n = txn; n; ) {
+      struct pending_ddl *nx = n->next;
+      free(n->sql);
+      free(n);
+      n = nx;
+    }
+    // Sidecar file is per-db_path; remove it on clean close (if it
+    // still exists, it will be reloaded on next open, but a clean close
+    // with no pending queue should not leave it).
+    if (db->db_path) {
+      char qpath[4096];
+      snprintf(qpath, sizeof(qpath), "%s.arkddlqueue", db->db_path);
+      remove(qpath);
     }
   }
 
