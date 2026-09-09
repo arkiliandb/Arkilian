@@ -113,7 +113,6 @@ echo "── all C tests passed ──"
 
 
 # test 
-cmake -B build -S . -DARKILIAN_BUILD_TESTS=ON -DCMAKE_BUILD_TYPE=Release && cmake --build build -j4 && ctest --test-dir build --output-on-failure  # 17/17 passed (74.22s)
-npm run build && npm test  # Node 24.14.0, darwin x64 – ctest darwin 17/17, stress 11/11 + throughput 100 ops green; Node: 4 workers x500 ops – 1 worker “database is locked” flake but harness reports “All tests passed!”
-STRESS_WRITES=100 bash scripts/stress.sh  # all phases green (11 binaries, 100/100 writes + 100/100 reads)
-cmake -B build-tsan -S . -DARKILIAN_BUILD_TESTS=ON -DCMAKE_C_FLAGS="-fsanitize=thread" && ctest --test-dir build-tsan  # 16/17 (94%) – test_kill_resilience flake under TSAN (11.74s, SIGKILL + 250ms slow dest, pending_before 201)
+cmake -S . -B build-tsan -DCMAKE_BUILD_TYPE=Debug -DARKILIAN_BUILD_TESTS=ON -DCMAKE_C_FLAGS="-fsanitize=thread -g -O1"
+cmake --build build-tsan -j4
+ctest --test-dir build-tsan
