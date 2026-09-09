@@ -47,6 +47,7 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <stdatomic.h>
 
 static int tests_run = 0;
 static int tests_passed = 0;
@@ -78,10 +79,10 @@ typedef struct {
   int listen_fd;
   int port;
   pthread_t thread;
-  volatile int stop;
-  volatile int requests;
-  volatile int return_503; // 1 = 503, 0 = 200 (for flip-to-healthy test)
-  volatile int accepted;   // requests answered with 200 after recovery
+  atomic_int stop;
+  atomic_int requests;
+  atomic_int return_503; // 1 = 503, 0 = 200 (for flip-to-healthy test)
+  atomic_int accepted;   // requests answered with 200 after recovery
 } mock_503_server;
 
 static void *mock_503_run(void *arg) {
