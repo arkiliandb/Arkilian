@@ -307,7 +307,7 @@ if(ARKILIAN_BUILD_TESTS)
         # socket headers, so those stay on the POSIX CI legs.
         foreach(t test_basic test_interception test_regressions test_monitoring
                  test_deterministic test_virtual_tables test_hardening
-                 test_health_flags)
+                 test_health_flags test_p0_hardening)
             ark_add_test(${t} tests/${t}.c)
         endforeach()
 
