@@ -232,6 +232,10 @@ int main(void) {
       assert(db_exec(db, sql) == SQLITE_OK);
     }
     // Wait for chunk + manifest + signature to land in the stub.
+    for (int i = 0; i < 200; i++) {
+      if (stub_contains("/chunks/")) break;
+      usleep(50000);
+    }
     assert(stub_contains("/chunks/"));
     for (int i = 0; i < 400; i++) {
       char skey[512];

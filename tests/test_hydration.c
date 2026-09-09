@@ -350,25 +350,44 @@ static void test_sha_mismatch(void) {
 // missing data — hydration must refuse loudly instead of skipping.
 static void test_lsn_gap(void) {
   cleanup_files();
-  const char *snap_body = "CREATE TABLE t (id INTEGER PRIMARY KEY);\n";
+  // Snapshot must be a valid SQLite file (hydration does PRAGMA quick_check
+  // before replay). Create a minimal DB file and use its bytes.
+  const char *tmp_snap = "tmp_lsn_gap_snapshot.db";
+  remove(tmp_snap);
+  {
+    sqlite3 *tmp = NULL;
+    assert(sqlite3_open(tmp_snap, &tmp) == SQLITE_OK);
+    assert(sqlite3_exec(tmp, "CREATE TABLE t (id INTEGER PRIMARY KEY);", NULL, NULL, NULL) == SQLITE_OK);
+    sqlite3_close(tmp);
+  }
+  FILE *sf = fopen(tmp_snap, "rb");
+  assert(sf);
+  fseek(sf, 0, SEEK_END);
+  long snap_len = ftell(sf);
+  fseek(sf, 0, SEEK_SET);
+  char *snap_body = malloc((size_t)snap_len);
+  assert(snap_body && fread(snap_body, 1, (size_t)snap_len, sf) == (size_t)snap_len);
+  fclose(sf);
   const char *chunk_body = "REPLACE INTO t (id) VALUES (6);\n";
   char snap_key[512], chunk_key[512], manifest[2048], chunk_sha[65];
   snprintf(snap_key, sizeof(snap_key), "%s/backup.sqlite", PREFIX);
   snprintf(chunk_key, sizeof(chunk_key),
            "%s/chunks/lsn_0000000005_0000000010.sql", PREFIX);
-  stub_put(snap_key, snap_body, strlen(snap_body));
+  stub_put(snap_key, snap_body, (size_t)snap_len);
   stub_put(chunk_key, chunk_body, strlen(chunk_body));
   // Real digests: manifest validation requires well-formed digests now,
   // so the refusal below must come from the LSN-gap check itself — not
   // from digest shape (which would mask the regression this test guards).
   ark_sha256_hex(chunk_body, strlen(chunk_body), chunk_sha);
   char snap_sha[65];
-  ark_sha256_hex(snap_body, strlen(snap_body), snap_sha);
+  ark_sha256_hex(snap_body, (size_t)snap_len, snap_sha);
   snprintf(manifest, sizeof(manifest),
            "{\"version\":3,\"prefix\":\"%s\",\"snapshot\":{\"s3_key\":\"%s\","
            "\"sha256\":\"%s\",\"baseline_lsn\":0},\"chunks\":[{"
            "\"s3_key\":\"%s\",\"sha256\":\"%s\",\"lsn_start\":5,\"lsn_end\":10}]}",
            PREFIX, snap_key, snap_sha, chunk_key, chunk_sha);
+  free(snap_body);
+  remove(tmp_snap);
   char mkey[512];
   snprintf(mkey, sizeof(mkey), "%s/manifest.json", PREFIX);
   stub_put(mkey, manifest, strlen(manifest));

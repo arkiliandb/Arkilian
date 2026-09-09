@@ -24,12 +24,13 @@ static void hermetic_env(void) {
   ark_unsetenv("ARKILIAN_MAX_QUEUE_DEPTH");
   ark_unsetenv("ARKILIAN_MANIFEST_HMAC_KEY");
   ark_unsetenv("ARKILIAN_OUTBOX_DURABLE");
-  ark_unsetenv("ARKILIAN_S3_ENDPOINT");
-  ark_unsetenv("ARKILIAN_S3_BUCKET");
-  ark_unsetenv("ARKILIAN_S3_REGION");
-  ark_unsetenv("ARKILIAN_S3_ACCESS_KEY");
-  ark_unsetenv("ARKILIAN_S3_SECRET_KEY");
-  ark_unsetenv("ARKILIAN_S3_PREFIX");
+  // Empty, not unset, so load_env(overwrite=0) cannot re-inject .env
+  ark_setenv("ARKILIAN_S3_ENDPOINT", "", 1);
+  ark_setenv("ARKILIAN_S3_BUCKET", "", 1);
+  ark_setenv("ARKILIAN_S3_REGION", "", 1);
+  ark_setenv("ARKILIAN_S3_ACCESS_KEY", "", 1);
+  ark_setenv("ARKILIAN_S3_SECRET_KEY", "", 1);
+  ark_setenv("ARKILIAN_S3_PREFIX", "", 1);
 }
 
 static void cleanup(const char *path) {
@@ -86,7 +87,7 @@ static void test_dead_letter_flag(void) {
   assert(db_init(&db, "hf_dlq.db") == 0);
   wait_flush_heartbeat(db);
   assert(db_exec(db, "INSERT INTO _dead_backup (payload, attempts, "
-                       "failed_reason) VALUES ('x', 3, 'test')") == SQLITE_OK);
+                     "failed_reason) VALUES ('x', 3, 'test')") == SQLITE_OK);
   assert(db_backup_dead_letter_count(db) == 1);
   unsigned f = db_backup_health_flags(db);
   assert(!(f & ARK_HF_NO_DEAD_LETTER));

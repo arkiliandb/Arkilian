@@ -85,74 +85,89 @@ static void cleanup_files(void) {
 int main(void) {
   printf("=== snapshot watermark invariant tests ===\n");
   stub_start();
-  set_s3_env();
-  // Disable the automatic hourly thread (we drive cycles manually) and
-  // make the flusher ship promptly.
-  setenv("ARKILIAN_BACKUP_INTERVAL", "999999", 1);
-  setenv("ARKILIAN_CHUNK_INTERVAL_SEC", "1", 1);
-
-  cleanup_files();
-  assert(db_init(&g_db, "wm_src.db") == 0);
-  assert(db_exec(g_db, "CREATE TABLE users (id INTEGER PRIMARY KEY, "
-                       "name TEXT)") == SQLITE_OK);
-  char sql[128];
-  for (int i = 1; i <= 20; i++) {
-    snprintf(sql, sizeof(sql),
-             "INSERT INTO users (id, name) VALUES (%d, 'user-%d')", i, i);
-    assert(db_exec(g_db, sql) == SQLITE_OK);
+  // Repeat knob for CI stress: ARKILIAN_SNAPSHOT_WATERMARK_REPEATS=N
+  // (default 1, CI sets 10). Each iteration drives a full adversarial cycle.
+  int repeats = 1;
+  const char *rep_env = getenv("ARKILIAN_SNAPSHOT_WATERMARK_REPEATS");
+  if (rep_env && rep_env[0]) {
+    char *end = NULL;
+    long v = strtol(rep_env, &end, 10);
+    if (end != rep_env && *end == '\0' && v > 0 && v < 1000) repeats = (int)v;
   }
+  for (int iter = 1; iter <= repeats; iter++) {
+    printf("  --- iteration %d/%d ---\n", iter, repeats);
+    set_s3_env();
+    // Disable the automatic hourly thread (we drive cycles manually) and
+    // make the flusher ship promptly. Manifest interval 1s for test speed
+    // (default 30s would make stub_manifest_contains timeout).
+    setenv("ARKILIAN_BACKUP_INTERVAL", "999999", 1);
+    setenv("ARKILIAN_CHUNK_INTERVAL_SEC", "1", 1);
+    setenv("ARKILIAN_MANIFEST_INTERVAL_SEC", "1", 1);
 
-  // Outbox ids: 1 = the CREATE TABLE DDL capture, 2..21 = the inserts.
-  // Wait until the flusher shipped through outbox id 21 and the manifest
-  // names it — the pre-copy registry state this test anchors on.
-  assert(stub_manifest_contains("\"lsn_end\":21}", 20));
-  for (int i = 0; i < 200; i++) {
-    if (db_backup_queue_depth(g_db) == 0) break;
-    usleep(50000);
+    cleanup_files();
+    assert(db_init(&g_db, "wm_src.db") == 0);
+    assert(db_exec(g_db, "CREATE TABLE users (id INTEGER PRIMARY KEY, "
+                         "name TEXT)") == SQLITE_OK);
+    char sql[128];
+    for (int i = 1; i <= 20; i++) {
+      snprintf(sql, sizeof(sql),
+               "INSERT INTO users (id, name) VALUES (%d, 'user-%d')", i, i);
+      assert(db_exec(g_db, sql) == SQLITE_OK);
+    }
+
+    // Outbox ids: 1 = the CREATE TABLE DDL capture, 2..21 = the inserts.
+    // Wait until the flusher shipped through outbox id 21 and the manifest
+    // names it — the pre-copy registry state this test anchors on.
+    assert(stub_manifest_contains("\"lsn_end\":21}", 45));
+    for (int i = 0; i < 200; i++) {
+      if (db_backup_queue_depth(g_db) == 0) break;
+      usleep(50000);
+    }
+    assert(db_backup_queue_depth(g_db) == 0);
+
+    // Run ONE real snapshot cycle with the mid-copy injection.
+    arkilian_snapshot_copy_hook = copy_hook;
+    int rc = arkilian_run_snapshot_cycle(g_db);
+    arkilian_snapshot_copy_hook = NULL;
+    if (rc != SQLITE_OK) fprintf(stderr, "DIAG cycle rc=%d\n", rc);
+    assert(rc == SQLITE_OK);
+
+    // ── Invariant 1: published baseline == PRE-copy watermark (21). The
+    // pre-fix code read the watermark after the copy → published 31.
+    char mkey[512];
+    snprintf(mkey, sizeof(mkey), "%s/manifest.json", PREFIX);
+    char *body = NULL;
+    size_t blen = 0;
+    assert(stub_get(mkey, &body, &blen));
+    assert(strstr(body, "\"baseline_lsn\":21") != NULL);
+    // ── Invariant 2: the mid-copy chunk record survived pruning — its rows
+    // are NOT in the snapshot, so hydration must still replay it.
+    assert(strstr(body, "lsn_0000000022_0000000031.sql") != NULL);
+    // ── Invariant 3: the pre-copy chunk record was pruned (covered by the
+    // snapshot — replaying it would be redundant).
+    assert(strstr(body, "\"lsn_end\":21}") == NULL);
+    free(body);
+
+    // ── Invariant 4: restore equivalence. Rows 1..20 come from the
+    // snapshot, rows 21..30 from the retained mid-copy chunk: exactly 30,
+    // none silently omitted.
+    remove("wm_dst.db");
+    int hrc = arkilian_hydrate_s3("wm_dst.db", g_endpoint, BUCKET, "us-east-1",
+                                  "test-access", "test-secret", PREFIX,
+                                  NULL, NULL);
+    if (hrc != HYDRATION_OK) fprintf(stderr, "DIAG hydrate rc=%d\n", hrc);
+    assert(hrc == HYDRATION_OK);
+    assert(count_rows("wm_dst.db", "users") == 30);
+
+    // Telemetry sanity: chunk_count is a real counter (1 real flush; the
+    // hook-injected record is bookkeeping, not a flush).
+    assert(db_backup_chunk_count(g_db) == 1);
+
+    db_close(g_db);
+    g_db = NULL;
+    cleanup_files();
+    printf("  iteration %d: watermark invariant + mid-copy retention + restore equivalence: OK\n", iter);
   }
-  assert(db_backup_queue_depth(g_db) == 0);
-
-  // Run ONE real snapshot cycle with the mid-copy injection.
-  arkilian_snapshot_copy_hook = copy_hook;
-  int rc = arkilian_run_snapshot_cycle(g_db);
-  arkilian_snapshot_copy_hook = NULL;
-  if (rc != SQLITE_OK) fprintf(stderr, "DIAG cycle rc=%d\n", rc);
-  assert(rc == SQLITE_OK);
-
-  // ── Invariant 1: published baseline == PRE-copy watermark (21). The
-  // pre-fix code read the watermark after the copy → published 31.
-  char mkey[512];
-  snprintf(mkey, sizeof(mkey), "%s/manifest.json", PREFIX);
-  char *body = NULL;
-  size_t blen = 0;
-  assert(stub_get(mkey, &body, &blen));
-  assert(strstr(body, "\"baseline_lsn\":21") != NULL);
-  // ── Invariant 2: the mid-copy chunk record survived pruning — its rows
-  // are NOT in the snapshot, so hydration must still replay it.
-  assert(strstr(body, "lsn_0000000022_0000000031.sql") != NULL);
-  // ── Invariant 3: the pre-copy chunk record was pruned (covered by the
-  // snapshot — replaying it would be redundant).
-  assert(strstr(body, "\"lsn_end\":21}") == NULL);
-  free(body);
-
-  // ── Invariant 4: restore equivalence. Rows 1..20 come from the
-  // snapshot, rows 21..30 from the retained mid-copy chunk: exactly 30,
-  // none silently omitted.
-  remove("wm_dst.db");
-  int hrc = arkilian_hydrate_s3("wm_dst.db", g_endpoint, BUCKET, "us-east-1",
-                                "test-access", "test-secret", PREFIX,
-                                NULL, NULL);
-  if (hrc != HYDRATION_OK) fprintf(stderr, "DIAG hydrate rc=%d\n", hrc);
-  assert(hrc == HYDRATION_OK);
-  assert(count_rows("wm_dst.db", "users") == 30);
-
-  // Telemetry sanity: chunk_count is a real counter (1 real flush; the
-  // hook-injected record is bookkeeping, not a flush).
-  assert(db_backup_chunk_count(g_db) == 1);
-
-  db_close(g_db);
-  cleanup_files();
-  printf("  watermark invariant + mid-copy retention + restore equivalence: OK\n");
-  printf("\nAll snapshot-watermark tests passed!\n");
+  printf("\nAll snapshot-watermark tests passed (%d iterations)!\n", repeats);
   return 0;
 }

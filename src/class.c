@@ -930,7 +930,7 @@ int sync_backup_triggers(sqlite3 *db, char **err_out) {
     "  payload TEXT NOT NULL,"
     "  attempts INTEGER NOT NULL,"
     "  failed_reason TEXT,"
-    "  created_at INTEGER NOT NULL,"
+    "  created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),"
     "  dead_lettered_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))"
     ");",
     "CREATE TABLE IF NOT EXISTS _arkilian_meta ("
@@ -3756,10 +3756,16 @@ static int manifest_registry_upload(arkilian *db, const char *snapshot_key,
   return rc;
 }
 
+#define MANIFEST_UPLOAD_MIN_INTERVAL_SEC 30
 // Manifest PUTs are batched: at most one per
 // MANIFEST_UPLOAD_MIN_INTERVAL_SEC, so the 1s chunk cadence doesn't double
-// the request count against the storage endpoint.
-#define MANIFEST_UPLOAD_MIN_INTERVAL_SEC 30
+// the request count against the storage endpoint. Overridable for tests
+// via ARKILIAN_MANIFEST_INTERVAL_SEC.
+static int manifest_interval_sec(void) {
+  int v = get_env_int_default("ARKILIAN_MANIFEST_INTERVAL_SEC",
+                              MANIFEST_UPLOAD_MIN_INTERVAL_SEC);
+  return v < 1 ? 1 : v;
+}
 static void manifest_registry_maybe_upload(arkilian *db) {
   manifest_registry_lock(db);
   int pending = db->manifest_pending;
@@ -3767,7 +3773,8 @@ static void manifest_registry_maybe_upload(arkilian *db) {
   manifest_registry_unlock(db);
   if (pending <= 0) return;
   time_t now = time(NULL);
-  if (last != 0 && now - last < MANIFEST_UPLOAD_MIN_INTERVAL_SEC) return;
+  int interval = manifest_interval_sec();
+  if (last != 0 && now - last < interval) return;
   manifest_registry_upload(db, NULL, NULL, 0);
 }
 

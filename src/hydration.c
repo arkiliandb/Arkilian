@@ -694,7 +694,7 @@ char *json_get_string(const char *json, const char *key) {
       case '"': val[out++] = '"';  p++; break;
       case 'u': {
         unsigned cp = hex4(p + 1);
-        if (cp == 0xFFFFFFFF) { val[out++] = '?'; p++; break; }
+        if (cp == 0xFFFFFFFF) { free(val); return NULL; }
         p += 5; // past \uXXXX
         // Combine surrogate pairs when present
         if (cp >= 0xD800 && cp <= 0xDBFF && p[0] == '\\' && p[1] == 'u') {
@@ -713,7 +713,7 @@ char *json_get_string(const char *json, const char *key) {
         out += utf8_encode(cp, &val[out]);
         break;
       }
-      default: if (*p) { val[out++] = *p++; } break; // unknown escape → literal
+      default: free(val); return NULL; // strict: unknown escape is protocol error
     }
   }
   val[out] = '\0';
@@ -1228,22 +1228,105 @@ static int64_t read_last_applied_lsn(sqlite3 *db) {
 
 // ── Step 3: Replay a single chunk ───────────────────────────────────
 
+// Hydration authorizer: the remote SQL is untrusted (it came from S3 via a
+// manifest that may have been forged). Even after SHA-256 content auth, the
+// SQL text itself must be restricted to the replication format's allowlist.
+// This prevents an attacker who somehow bypasses content auth (or a bug)
+// from executing arbitrary ATTACH, PRAGMA, virtual-table, or extension
+// operations on the hydration connection.
+static int hydration_authorizer(void *pUser, int action,
+                                const char *arg1, const char *arg2,
+                                const char *dbName, const char *inner) {
+  (void)pUser; (void)arg2; (void)dbName; (void)inner;
+  switch (action) {
+    case SQLITE_INSERT: // REPLACE is INSERT with conflict handling
+    case SQLITE_DELETE:
+    case SQLITE_UPDATE:
+    case SQLITE_CREATE_TABLE:
+    case SQLITE_DROP_TABLE:
+    case SQLITE_ALTER_TABLE:
+    case SQLITE_CREATE_INDEX:
+    case SQLITE_DROP_INDEX:
+    case SQLITE_CREATE_TRIGGER:
+    case SQLITE_DROP_TRIGGER:
+    case SQLITE_TRANSACTION:
+    case SQLITE_SAVEPOINT:
+    case SQLITE_READ:
+    case SQLITE_SELECT:
+      return SQLITE_OK;
+    // Explicitly denied: PRAGMA changes, virtual tables, ATTACH/DETACH,
+    // reindex, analyze, etc. Hydration's own PRAGMAs (journal_mode,
+    // etc.) are executed outside the authorizer-protected replay. The
+    // replication payload uses quote() for deterministic expansion, so
+    // allow it (and a few other safe scalar functions that may appear in
+    // DEFAULT values).
+    case SQLITE_PRAGMA:
+    case SQLITE_ATTACH:
+    case SQLITE_DETACH:
+    case SQLITE_CREATE_VTABLE:
+    case SQLITE_DROP_VTABLE:
+    case SQLITE_REINDEX:
+    case SQLITE_ANALYZE:
+      fprintf(stderr, "arkilian: hydration authorizer DENY action=%d arg1=%.80s\n",
+              action, arg1 ? arg1 : "(null)");
+      return SQLITE_DENY;
+    case SQLITE_FUNCTION:
+      // For SQLITE_FUNCTION, arg2 is the function name (arg1 is NULL per
+      // sqlite3.c:3824). Allow the safe scalar functions the replication
+      // payload may use (quote for deterministic expansion, plus a few
+      // others that appear in DEFAULT values and aggregate queries that
+      // may be part of the payload).
+      if (arg2 && (strcasecmp(arg2, "quote") == 0 ||
+                   strcasecmp(arg2, "hex") == 0 ||
+                   strcasecmp(arg2, "random") == 0 ||
+                   strcasecmp(arg2, "datetime") == 0 ||
+                   strcasecmp(arg2, "strftime") == 0 ||
+                   strcasecmp(arg2, "abs") == 0 ||
+                   strcasecmp(arg2, "replace") == 0 ||
+                   strcasecmp(arg2, "substr") == 0 ||
+                   strcasecmp(arg2, "count") == 0 ||
+                   strcasecmp(arg2, "sum") == 0 ||
+                   strcasecmp(arg2, "avg") == 0 ||
+                   strcasecmp(arg2, "min") == 0 ||
+                   strcasecmp(arg2, "max") == 0)) {
+        return SQLITE_OK;
+      }
+      fprintf(stderr, "arkilian: hydration authorizer DENY FUNCTION %.80s\n",
+              arg2 ? arg2 : "(null)");
+      return SQLITE_DENY;
+    default:
+      // arg1 often carries the SQL or object name – useful for forensics.
+      fprintf(stderr, "arkilian: hydration authorizer DENY action=%d arg1=%.80s\n",
+              action, arg1 ? arg1 : "(null)");
+      return SQLITE_DENY;
+  }
+}
+
 int hydrate_replay_chunk(sqlite3 *db, const char *raw_sql, int64_t chunk_lsn) {
   char *err_msg = NULL;
+
+  // Ensure the metadata table exists (defensive, in case the snapshot
+  // did not contain it and the caller did not create it).
+  sqlite3_exec(db, "CREATE TABLE IF NOT EXISTS _arkilian_meta (k TEXT PRIMARY KEY, v TEXT);", NULL, NULL, NULL);
+
+  // Install the authorizer before touching untrusted SQL. It stays
+  // installed for the whole replay transaction and is cleared on exit.
+  sqlite3_set_authorizer(db, hydration_authorizer, NULL);
 
   // 1. Begin explicit transaction for throughput
   int rc = sqlite3_exec(db, "BEGIN TRANSACTION;", NULL, NULL, &err_msg);
   if (rc != SQLITE_OK) {
-    if (err_msg) { fprintf(stderr, "Hydration BEGIN error: %s\n", err_msg); sqlite3_free(err_msg); }
+    if (err_msg) sqlite3_free(err_msg);
+    sqlite3_set_authorizer(db, NULL, NULL);
     return HYDRATION_ERR_SQL;
   }
 
   // 2. Replay the raw multi-statement SQL text
   rc = sqlite3_exec(db, raw_sql, NULL, NULL, &err_msg);
   if (rc != SQLITE_OK) {
-    fprintf(stderr, "Hydration replay error: %s\n", err_msg);
-    sqlite3_free(err_msg);
+    if (err_msg) sqlite3_free(err_msg);
     sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
+    sqlite3_set_authorizer(db, NULL, NULL);
     return HYDRATION_ERR_SQL;
   }
 
@@ -1255,10 +1338,12 @@ int hydrate_replay_chunk(sqlite3 *db, const char *raw_sql, int64_t chunk_lsn) {
   rc = sqlite3_exec(db, meta_sql, NULL, NULL, NULL);
   if (rc != SQLITE_OK) {
     sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
+    sqlite3_set_authorizer(db, NULL, NULL);
     return HYDRATION_ERR_SQL;
   }
 
   rc = sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
+  sqlite3_set_authorizer(db, NULL, NULL);
   if (rc != SQLITE_OK) {
     // Best effort: don't leave an open transaction behind.
     sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
@@ -1545,7 +1630,10 @@ int arkilian_hydrate_s3(const char *db_path,
     sqlite3 *db = NULL;
     int rc = sqlite3_open_v2(db_path, &db,
       SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX, NULL);
-    if (rc != SQLITE_OK) { hydrate_plan_free(&plan); hydrate_result = HYDRATION_ERR_SQL; goto hydrate_done; }
+    if (rc != SQLITE_OK) {
+      if (db) sqlite3_close(db);
+      hydrate_plan_free(&plan); hydrate_result = HYDRATION_ERR_SQL; goto hydrate_done;
+    }
 
     {
       char *perr = NULL;
@@ -1554,6 +1642,9 @@ int arkilian_hydrate_s3(const char *db_path,
       sqlite3_exec(db, "PRAGMA foreign_keys=OFF;", NULL, NULL, &perr);
       sqlite3_free(perr);
     }
+    // Ensure the hydration metadata table exists (snapshots created outside
+    // Arkilian, e.g. test fixtures, may not have it).
+    sqlite3_exec(db, "CREATE TABLE IF NOT EXISTS _arkilian_meta (k TEXT PRIMARY KEY, v TEXT);", NULL, NULL, NULL);
 
     int64_t local_lsn = read_last_applied_lsn(db);
     if (local_lsn == 0) local_lsn = plan.baseline_lsn;
@@ -1628,7 +1719,10 @@ int arkilian_hydrate_s3(const char *db_path,
 
       rc = hydrate_replay_chunk(db, sql_text, ch->lsn_end);
       free(sql_text);
-      if (rc != 0) { sqlite3_close(db); hydrate_plan_free(&plan); hydrate_result = rc; goto hydrate_done; }
+      if (rc != 0) {
+        fprintf(stderr, "arkilian: hydrate_replay_chunk failed rc=%d\n", rc);
+        sqlite3_close(db); hydrate_plan_free(&plan); hydrate_result = rc; goto hydrate_done;
+      }
 
       local_lsn = ch->lsn_end;
       chunk_total++;
