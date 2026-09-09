@@ -203,6 +203,7 @@ static void set_s3_env(void) {
   setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
   setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
   setenv("ARKILIAN_S3_PREFIX", PREFIX, 1);
+  setenv("ARKILIAN_MANIFEST_HMAC_KEY", "test-hmac-key-for-unit-tests-32b", 1);
   setenv("ARKILIAN_BACKUP_INTERVAL", "1", 1);
   setenv("ARKILIAN_CHUNK_INTERVAL_SEC", "1", 1);
 }

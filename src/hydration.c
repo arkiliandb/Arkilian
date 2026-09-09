@@ -895,23 +895,26 @@ int ark_manifest_fetch(const char *endpoint, const char *bucket,
   }
 
   // ── Manifest authenticity (HMAC over the exact manifest bytes) ──────
-  // The manifest is the ROOT OF TRUST for the restore protocol: its
-  // digest fields cannot authenticate it (circular), and the restore path
-  // EXECUTES the SQL the manifest points at. Object-level SHA-256 checks
-  // only prove "object matches what the manifest says" — an attacker who
-  // controls the bucket controls both. When ARKILIAN_MANIFEST_HMAC_KEY is
-  // configured, {prefix}/manifest.sig must carry a valid HMAC-SHA-256
-  // over the exact manifest bytes; a missing or mismatched signature is a
-  // hard refusal (fail closed). Without a key the manifest is accepted as
-  // before (legacy buckets keep working) — the downgrade is documented
-  // and visible. The key must live OUTSIDE the storage it protects.
+  // The manifest is the ROOT OF TRUST: digests cannot authenticate it
+  // (circular) and the restore path EXECUTES its SQL. Object SHA-256 only
+  // proves "object matches manifest" — bucket compromise controls both.
+  // ARKILIAN_MANIFEST_HMAC_KEY is REQUIRED (fail closed, no legacy). The
+  // key MUST live outside the storage it protects (env/secret manager,
+  // never bucket). Missing/invalid manifest.sig is HYDRATION_ERR_PROTO.
   {
     const char *hmac_key = getenv("ARKILIAN_MANIFEST_HMAC_KEY");
-    if (hmac_key && hmac_key[0]) {
-      char sig_key[512];
-      snprintf(sig_key, sizeof(sig_key), "%s/manifest.sig", prefix);
-      int verified = 0;
-      for (int attempt = 0; attempt < 3 && !verified; attempt++) {
+    if (!hmac_key || !hmac_key[0]) {
+      fprintf(stderr,
+              "arkilian: ARKILIAN_MANIFEST_HMAC_KEY not configured — "
+              "refusing unauthenticated manifest (no legacy)\n");
+      free(json);
+      free(manifest_url);
+      return HYDRATION_ERR_PROTO;
+    }
+    char sig_key[512];
+    snprintf(sig_key, sizeof(sig_key), "%s/manifest.sig", prefix);
+    int verified = 0;
+    for (int attempt = 0; attempt < 3 && !verified; attempt++) {
         if (attempt > 0) {
           // Publishing is manifest-PUT then sig-PUT: a signature mismatch
           // can be a torn read of that two-object commit. Re-fetch BOTH
@@ -978,7 +981,6 @@ int ark_manifest_fetch(const char *endpoint, const char *bucket,
         return HYDRATION_ERR_PROTO;
       }
     }
-  }
   free(manifest_url);
 
   memset(plan, 0, sizeof(*plan));

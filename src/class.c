@@ -256,14 +256,12 @@ struct arkilian {
   // but nothing is published — loudly logged by the seed path).
   volatile int manifest_seed_resolved;
 
-  // Optional manifest authenticity key (ARKILIAN_MANIFEST_HMAC_KEY). When
-  // set, every published manifest.json is accompanied by
-  // {prefix}/manifest.sig — an HMAC-SHA-256 over the exact manifest bytes.
+  // Manifest authenticity key (ARKILIAN_MANIFEST_HMAC_KEY) — REQUIRED,
+  // no legacy. Every published manifest.json is accompanied by
+  // {prefix}/manifest.sig — HMAC-SHA-256 over the exact manifest bytes.
   // Hydration (and the startup seed path, which shares ark_manifest_fetch)
-  // verify it before trusting ANY manifest content: the object store is no
-  // longer the root of trust for the restore protocol. The key must live
-  // OUTSIDE the storage it protects; hydration reads it from the process
-  // environment (set it as a real env var, not only .env).
+  // fail closed without a valid signature. The key must live OUTSIDE the
+  // storage it protects; set it as a real env var (never in bucket).
   char *manifest_hmac_key;
 
   // Cumulative count of WAL chunks that were durably uploaded AND recorded
@@ -3675,17 +3673,22 @@ static int manifest_registry_upload(arkilian *db, const char *snapshot_key,
   }
 
   // ── Manifest authenticity: sign the exact bytes we are about to PUT ──
-  // The manifest is the root of trust for the restore protocol (its
-  // digest fields cannot authenticate it — that would be circular). With
-  // ARKILIAN_MANIFEST_HMAC_KEY set, {prefix}/manifest.sig carries an
-  // HMAC-SHA-256 over the exact manifest bytes; hydration and the seed
-  // path (shared ark_manifest_fetch) fail closed on a missing/mismatched
-  // signature. If signing is configured but cannot be published, we
-  // refuse to publish an unsigned manifest at all: the registry keeps its
-  // records and the next cadence retries.
+  // The manifest is the ROOT OF TRUST: digests cannot authenticate it
+  // (circular) and the restore path EXECUTES its SQL. ARKILIAN_MANIFEST_HMAC_KEY
+  // is REQUIRED (no legacy). {prefix}/manifest.sig carries HMAC-SHA-256
+  // over the exact manifest bytes; missing/invalid sig is fail-closed.
+  // The key MUST live outside the bucket.
   char sig_path[1200];
   int have_sig = 0;
-  if (db->manifest_hmac_key && db->manifest_hmac_key[0]) {
+  if (!db->manifest_hmac_key || !db->manifest_hmac_key[0]) {
+    ark_log(db, ARK_LOG_ERROR,
+            "ARKILIAN_MANIFEST_HMAC_KEY not configured — refusing to publish "
+            "unauthenticated manifest (no legacy)");
+    free(json);
+    manifest_registry_unlock(db);
+    return -1;
+  }
+  {
     char sig_hex[65];
     ark_hmac_sha256_hex((const uint8_t *)db->manifest_hmac_key,
                         strlen(db->manifest_hmac_key),
@@ -3699,7 +3702,7 @@ static int manifest_registry_upload(arkilian *db, const char *snapshot_key,
       manifest_registry_unlock(db);
       ark_log(db, ARK_LOG_ERROR,
               "manifest.sig staging failed — refusing to publish an "
-              "unsigned manifest (HMAC key configured)");
+              "unsigned manifest");
       return -1;
     }
     fclose(sf);

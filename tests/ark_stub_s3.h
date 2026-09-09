@@ -200,6 +200,8 @@ static inline void set_s3_env(void) {
   setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
   setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
   setenv("ARKILIAN_S3_PREFIX", PREFIX, 1);
+  // HMAC is required (no legacy); use a deterministic test key for the stub.
+  setenv("ARKILIAN_MANIFEST_HMAC_KEY", "test-hmac-key-for-unit-tests-32b", 1);
 }
 
 static inline int stub_manifest_contains(const char *needle, int timeout_s) {

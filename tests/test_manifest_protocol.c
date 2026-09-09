@@ -144,13 +144,12 @@ int main(void) {
   printf("=== manifest protocol + authenticity tests ===\n");
   stub_start();
 
-  // ── 1. Unsigned manifest, no key configured → restores (legacy) ──
+  // ── 1. Unsigned manifest, no key configured → FAIL CLOSED (no legacy) ──
   ark_unsetenv("ARKILIAN_MANIFEST_HMAC_KEY");
   publish_valid_state();
-  assert(hydrate() == HYDRATION_OK);
-  assert(count_rows("users") == 25);
+  assert(hydrate() == HYDRATION_ERR_PROTO);
   cleanup_all();
-  printf("  unsigned manifest without key: OK\n");
+  printf("  unsigned manifest without key: correctly refused\n");
 
   // ── 2. Key configured + valid manifest.sig → restores ─────────────
   setenv("ARKILIAN_MANIFEST_HMAC_KEY", "operator-secret-key", 1);
