@@ -216,8 +216,20 @@ static void test_health(void) {
     usleep(100 * 1000);
   }
   assert(db_backup_thread_heartbeat_age_ms(db) >= 0);
-  // Small queue, no pressure → healthy.
-  assert(db_backup_is_healthy(db) == 1);
+  // Small queue, no pressure, threads alive. The destination here is
+  // deliberately unreachable (127.0.0.1:1), so the startup manifest read
+  // never resolves and NOTHING can ever publish remotely. The health
+  // boolean must NOT go green on heartbeats alone (the false-green this
+  // suite used to assert); the live conditions are asserted via flags.
+  assert(db_backup_is_healthy(db) == 0);
+  {
+    unsigned hf = db_backup_health_flags(db);
+    assert(hf & ARK_HF_BACKUP_ENABLED);
+    assert(hf & ARK_HF_DEST_CONFIGURED);
+    assert(hf & ARK_HF_FLUSH_ALIVE);
+    assert(hf & ARK_HF_QUEUE_BELOW_CAP);
+    assert(!(hf & ARK_HF_MANIFEST_RESOLVED));  // dead dest → publish-never
+  }
 
   // Queued rows beyond ARKILIAN_MAX_QUEUE_DEPTH → unhealthy AND capture is
   // soft-paused by the trigger's WHERE clause, so inserts beyond the cap
@@ -244,17 +256,28 @@ static void test_health(void) {
   db_backup_set_enabled(db, 0);
   assert(db_backup_is_healthy(db) == 0);
   db_backup_set_enabled(db, 1);
-  // Re-enabled with a live destination → healthy again (queue is far
-  // below the default ceiling and the flush thread beats continuously).
-  // Wait up to 3s for the flush thread to beat after re-enable (Windows
-  // scheduling is slower than Linux/macOS).
+  // Re-enabled: the queue is far below the ceiling and the flush thread
+  // beats. Two conditions keep health RED here, both now first-class
+  // flags instead of a silent green: (1) the sticky capture-paused
+  // signal set when this test forced the queue into the cap — it stays
+  // set until a successful SNAPSHOT re-baselines, which never happens
+  // against an unreachable destination; (2) the unresolved manifest
+  // registry (publish-never). The old suite asserted green on heartbeats
+  // alone; the gap must stay visible instead.
   {
-    int healthy = 0;
+    int drained = 0;
     for (int i = 0; i < 30; i++) {
-      if (db_backup_is_healthy(db) == 1) { healthy = 1; break; }
+      if (db_backup_queue_depth(db) < 10) { drained = 1; break; }
       usleep(100 * 1000);
     }
-    assert(healthy == 1);
+    assert(drained);
+    assert(db_backup_capture_paused(db) == 1);   // sticky gap, operator-visible
+    unsigned hf = db_backup_health_flags(db);
+    assert(hf & ARK_HF_FLUSH_ALIVE);
+    assert(hf & ARK_HF_QUEUE_BELOW_CAP);
+    assert(!(hf & ARK_HF_NO_CAPTURE_GAP));       // gap open until a snapshot
+    assert(!(hf & ARK_HF_MANIFEST_RESOLVED));    // dead dest
+    assert(db_backup_is_healthy(db) == 0);
   }
 
   db_close(db);

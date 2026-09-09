@@ -306,7 +306,8 @@ if(ARKILIAN_BUILD_TESTS)
         # (sys/socket.h, arpa/inet.h, posix_spawn); MinGW-w64 has no BSD
         # socket headers, so those stay on the POSIX CI legs.
         foreach(t test_basic test_interception test_regressions test_monitoring
-                 test_deterministic test_virtual_tables test_hardening)
+                 test_deterministic test_virtual_tables test_hardening
+                 test_health_flags)
             ark_add_test(${t} tests/${t}.c)
         endforeach()
 
@@ -332,6 +333,31 @@ if(ARKILIAN_BUILD_TESTS)
             target_compile_options(test_hydration PRIVATE -UNDEBUG)
             target_compile_definitions(test_hydration PRIVATE ${ARK_POSIX_DEFS})
             add_test(NAME test_hydration COMMAND test_hydration)
+
+            # ── Snapshot-baseline invariant (P0 regression) ──
+            # Drives the REAL snapshot cycle with a copy hook that ships a
+            # chunk mid-copy, then asserts manifest baseline/retention and
+            # full hydrate equivalence. Uses the shared stub (ark_stub_s3.h).
+            add_executable(test_snapshot_watermark tests/test_snapshot_watermark.c
+                           src/class.c src/hydration.c src/sha256.c src/deps/sqlite/sqlite3.c)
+            target_include_directories(test_snapshot_watermark PRIVATE src src/deps/sqlite)
+            target_link_libraries(test_snapshot_watermark PRIVATE ${CMAKE_THREAD_LIBS_INIT}
+                                  ${CURL_LIBRARIES} ${ARK_LIBM})
+            target_compile_options(test_snapshot_watermark PRIVATE -UNDEBUG)
+            target_compile_definitions(test_snapshot_watermark PRIVATE ${ARK_POSIX_DEFS})
+            add_test(NAME test_snapshot_watermark COMMAND test_snapshot_watermark)
+
+            # ── Manifest wire-protocol + authenticity (P0 regression) ──
+            # HMAC sign/verify (shipper + hydrator), digest-mandatory
+            # chunks, strict LSN sequence validation, version contract.
+            add_executable(test_manifest_protocol tests/test_manifest_protocol.c
+                           src/class.c src/hydration.c src/sha256.c src/deps/sqlite/sqlite3.c)
+            target_include_directories(test_manifest_protocol PRIVATE src src/deps/sqlite)
+            target_link_libraries(test_manifest_protocol PRIVATE ${CMAKE_THREAD_LIBS_INIT}
+                                  ${CURL_LIBRARIES} ${ARK_LIBM})
+            target_compile_options(test_manifest_protocol PRIVATE -UNDEBUG)
+            target_compile_definitions(test_manifest_protocol PRIVATE ${ARK_POSIX_DEFS})
+            add_test(NAME test_manifest_protocol COMMAND test_manifest_protocol)
         endif()
 
         # ── SHA-256 NIST vectors ──

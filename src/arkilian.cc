@@ -489,6 +489,12 @@ Napi::Value db_backup_is_healthy(const Napi::CallbackInfo& info) {
   return Napi::Boolean::New(env, dl ? db_backup_is_healthy(dl.db) != 0 : false);
 }
 
+Napi::Value db_backup_health_flags(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  DbLock dl = lockDb(info);
+  return Napi::Number::New(env, (double)(dl ? db_backup_health_flags(dl.db) : 0));
+}
+
 Napi::Value db_backup_triggers_dirty(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   DbLock dl = lockDb(info);
@@ -621,6 +627,20 @@ Napi::Value db_all_native(const Napi::CallbackInfo& info) {
 
 Napi::Value db_hydrate_s3(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
+  // Restore exclusivity (P0): hydration replaces the database file on
+  // disk. The addon already knows every live handle — refuse when any
+  // exist. (Cross-process exclusion is enforced by the C layer's
+  // <db_path>.arklock OS lock.)
+  {
+    std::lock_guard<std::mutex> regLock(g_registry_mutex);
+    if (!g_registry.empty()) {
+      Napi::Error::New(env, "hydration refused: " +
+          std::to_string(g_registry.size()) +
+          " Arkilian handle(s) still open in this process — close every " +
+          "database before hydrating").ThrowAsJavaScriptException();
+      return env.Null();
+    }
+  }
   if (info.Length() < 7 || !info[0].IsString() || !info[1].IsString() ||
       !info[2].IsString() || !info[3].IsString() || !info[4].IsString() ||
       !info[5].IsString() || !info[6].IsString()) {
@@ -687,6 +707,7 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
   exports.Set("db_backup_trigger_coverage", Napi::Function::New<db_backup_trigger_coverage>(env));
   exports.Set("db_backup_skipped_table_count", Napi::Function::New<db_backup_skipped_table_count>(env));
   exports.Set("db_backup_is_healthy", Napi::Function::New<db_backup_is_healthy>(env));
+  exports.Set("db_backup_health_flags", Napi::Function::New<db_backup_health_flags>(env));
   exports.Set("db_backup_triggers_dirty", Napi::Function::New<db_backup_triggers_dirty>(env));
   exports.Set("db_backup_capture_paused", Napi::Function::New<db_backup_capture_paused>(env));
   exports.Set("db_set_auto_resync_triggers", Napi::Function::New<db_set_auto_resync_triggers>(env));

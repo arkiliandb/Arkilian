@@ -78,6 +78,12 @@ typedef void (*hydration_progress_cb)(int phase, int current, int total,
 // ── Minimal JSON helpers (exposed for testing) ──────────────────────
 
 char   *json_get_string(const char *json, const char *key);
+// Strict integer parse (manifest wire protocol): the value must be a
+// complete, delimiter-terminated integer token — missing fields, quoted
+// numbers, and truncated tokens are REJECTED (the legacy json_get_int64
+// silently returned 0 for all of those, which the replay loop interpreted
+// as "already applied" and skipped). Returns 0 on success.
+int     json_get_int64_checked(const char *json, const char *key, int64_t *out);
 int64_t json_get_int64(const char *json, const char *key);
 int     json_array_count(const char *json, const char *key);
 char   *json_array_get(const char *json, const char *key, int index);
@@ -110,12 +116,22 @@ int ark_manifest_fetch(const char *endpoint, const char *bucket,
 //
 // Safety guards (all enforced before any file is touched):
 //   - HYDRATION_ERR_NEWER: local DB is further along than the snapshot
-//   - HYDRATION_ERR_BUSY:  another connection is actively writing
+//   - HYDRATION_ERR_BUSY:  another connection is actively writing, OR
+//                          another restore holds the <db_path>.arklock
+//                          exclusion (the lock is held for the ENTIRE
+//                          restore — the BEGIN IMMEDIATE probe is only a
+//                          point-in-time diagnostic for non-cooperating
+//                          writers)
+//   - manifest authenticity: when ARKILIAN_MANIFEST_HMAC_KEY is set, the
+//     manifest must verify against {prefix}/manifest.sig (HMAC-SHA-256
+//     over the exact manifest bytes) or the restore is refused — the
+//     bucket is not trusted as the root of the restore protocol
 //   - the downloaded snapshot is fsync'd and validated (opens as a
 //     clean SQLite database, PRAGMA quick_check) before install
 //   - SHA-256 digest is verified on every snapshot and chunk; a missing
 //     digest is a HARD refusal (no unauthenticated content is ever
-//     installed or replayed)
+//     installed or replayed — chunks are executed as SQL, which is
+//     exactly why their authentication cannot be optional)
 //
 // Returns HYDRATION_OK on success, or a negative error code.
 int arkilian_hydrate_s3(const char *db_path,

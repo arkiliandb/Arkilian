@@ -3,6 +3,8 @@
 
 #include "deps/sqlite/sqlite3.h"
 #include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -171,10 +173,63 @@ int db_backup_capture_paused(arkilian *db);
 // ARKILIAN_MAX_QUEUE_DEPTH (default 100000). 0 otherwise — including
 // when the kill-switch is on or capture was disabled at init: a green
 // light while nothing ships is a silent failure.
+// ── Health state machine ────────────────────────────────────────────
+// A durability product needs more than one boolean. Each flag isolates
+// one failure class so operators can alarm on the specific degraded
+// state; db_backup_is_healthy() is defined as "every core flag set".
+#define ARK_HF_BACKUP_ENABLED    (1u << 0)  // kill-switch off / not force-disabled
+#define ARK_HF_DEST_CONFIGURED   (1u << 1)  // S3 destination fully configured
+#define ARK_HF_FLUSH_ALIVE       (1u << 2)  // flush thread heartbeat fresh
+#define ARK_HF_SNAPSHOT_ALIVE    (1u << 3)  // snapshot thread heartbeat fresh
+#define ARK_HF_QUEUE_BELOW_CAP   (1u << 4)  // outbox depth below the cap
+#define ARK_HF_SCHEMA_IN_SYNC    (1u << 5)  // capture triggers not desynced by raw DDL
+#define ARK_HF_NO_DEAD_LETTER    (1u << 6)  // no CDC rows dead-lettered
+#define ARK_HF_MANIFEST_RESOLVED (1u << 7)  // startup manifest read resolved (not frozen)
+#define ARK_HF_NO_CAPTURE_GAP    (1u << 8)  // no cap-induced CDC gap awaiting a snapshot
+#define ARK_HF_DURABLE_CAPTURE   (1u << 9)  // capture outbox is synchronous=FULL (informational)
+#define ARK_HF_ALL_CORE (ARK_HF_BACKUP_ENABLED | ARK_HF_DEST_CONFIGURED | \
+                         ARK_HF_FLUSH_ALIVE | ARK_HF_SNAPSHOT_ALIVE | \
+                         ARK_HF_QUEUE_BELOW_CAP | ARK_HF_SCHEMA_IN_SYNC | \
+                         ARK_HF_NO_DEAD_LETTER | ARK_HF_MANIFEST_RESOLVED | \
+                         ARK_HF_NO_CAPTURE_GAP)
+// Bitmask of ARK_HF_* flags for this handle. 0 for a NULL handle.
+unsigned db_backup_health_flags(arkilian *db);
+
+// 1 when the backup subsystem is healthy: backup enabled, a push
+// destination configured, flush thread alive, and queue depth below
+// ARKILIAN_MAX_QUEUE_DEPTH (default 100000) — PLUS the durability
+// conditions the boolean previously ignored: capture triggers in sync
+// (no raw-DDL hole), an empty dead-letter queue, a resolved (not frozen)
+// manifest registry, and no unclosed capture gap. 0 otherwise — including
+// when the kill-switch is on or capture was disabled at init: a green
+// light while nothing ships is a silent failure.
+// ARK_HF_DURABLE_CAPTURE is informational (NORMAL capture is an operator
+// choice) and does not gate this boolean — read it from the flags.
 int db_backup_is_healthy(arkilian *db);
 
 int db_backup_chunk_count(arkilian *db);
 long long db_backup_last_chunk_flush_age_ms(arkilian *db);
+
+// ── Operational / test seams ────────────────────────────────────────
+// Record a chunk in the manifest registry (as the flush thread does after
+// a successful PUT). Exists for operational tooling and the
+// snapshot-cycle determinism tests; not part of the application API.
+int arkilian_registry_record(arkilian *db, const char *s3_key,
+                             const char *sha256, uint64_t lsn_start,
+                             uint64_t lsn_end);
+// Run one snapshot attempt synchronously on the calling thread (the
+// hourly thread runs this in a loop). Returns the backup_database status,
+// 0 if skipped via the kill-switch, -1 on a closed/NULL handle.
+int arkilian_run_snapshot_cycle(arkilian *db);
+// Test seam: when non-NULL, invoked instead of backup_database() inside
+// arkilian_run_snapshot_cycle(). Production code never sets it.
+extern int (*arkilian_snapshot_copy_hook)(sqlite3 *src, const char *dest_path,
+                                          volatile int *shutdown_flag);
+// Create a unique per-instance staging file <base>.arktmp.<pid>.<n>.<suffix>
+// with O_CREAT|O_EXCL, owner-only mode. Returns a writable FILE* (close
+// with fclose, remove by name) or NULL.
+FILE *arkilian_unique_tmp(const char *base, const char *suffix,
+                          char *out, size_t out_cap);
 
 char *db_s3_presign_get(arkilian *db, const char *key, long expires_sec);
 

@@ -43,9 +43,33 @@ run_hydration() {
 }
 
 # Dead-letter queue tool + its regression suite (launch Checklist #5).
-# The tool is standalone (SQLite only — no libcurl), so the build is cheap
-# and works on toolchain-less hosts. The test invokes the binary via
-# system() and asserts the recovery runbook's commands.
+# Snapshot-baseline invariant (P0): real cycle + mid-copy chunk injection
+# + hydrate equivalence. Shares the stub-server harness with test_hydration.
+run_snapshot_watermark() {
+  echo "── test_snapshot_watermark ──"
+  cc -O2 -Wall -Wextra tests/test_snapshot_watermark.c \
+     src/class.c src/hydration.c src/sha256.c src/deps/sqlite/sqlite3.c \
+     -Isrc -Isrc/deps/sqlite -lcurl -lpthread -lm \
+     -DSQLITE_ENABLE_PREUPDATE_HOOK -DSQLITE_ENABLE_FTS5 \
+     -o test_snapshot_watermark
+  ./test_snapshot_watermark
+  rm -f test_snapshot_watermark
+}
+
+# Manifest wire-protocol + authenticity (P0): HMAC sign/verify end-to-end,
+# digest-mandatory chunks, strict LSN sequence validation.
+run_manifest_protocol() {
+  echo "── test_manifest_protocol ──"
+  cc -O2 -Wall -Wextra tests/test_manifest_protocol.c \
+     src/class.c src/hydration.c src/sha256.c src/deps/sqlite/sqlite3.c \
+     -Isrc -Isrc/deps/sqlite -lcurl -lpthread -lm \
+     -DSQLITE_ENABLE_PREUPDATE_HOOK -DSQLITE_ENABLE_FTS5 \
+     -o test_manifest_protocol
+  ./test_manifest_protocol
+  rm -f test_manifest_protocol
+}
+
+# Dead-letter queue tool + its regression suite (launch Checklist #5).
 run_dlq() {
   echo "── arkilian-dlq (build) ──"
   cc -O2 -Wall -Wextra -Wpedantic -Werror tools/arkilian-dlq.c \
@@ -69,7 +93,10 @@ run      test_monitoring      tests/test_monitoring.c
 run      test_virtual_tables  tests/test_virtual_tables.c
 run      test_deterministic   tests/test_deterministic.c
 run      test_hardening       tests/test_hardening.c
+run      test_health_flags    tests/test_health_flags.c
 run_hydration
+run_snapshot_watermark
+run_manifest_protocol
 run_dlq
 
 # Benchmarks: built + run, but they assert correctness internally. Not

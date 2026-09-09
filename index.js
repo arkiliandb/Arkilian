@@ -116,6 +116,15 @@ class Arkilian {
     return native.db_backup_is_healthy(this.id);
   }
 
+  // Bitmask of ARK_HF_* durability flags (see src/class.h): one bit per
+  // failure class — schema-in-sync (raw-DDL hole), dead-letter queue,
+  // frozen manifest registry, unclosed capture gap, capture durability
+  // mode — so alarms can target the specific degraded state instead of a
+  // single boolean. backupHealthy is "every core flag set".
+  get backupHealthFlags() {
+    return native.db_backup_health_flags(this.id);
+  }
+
   // (Risk #1) Returns true when a raw-handle schema change (DDL via
   // db_get_handle()) has desynchronized the capture triggers. Alert when
   // true — triggers are stale and a db_resyncTriggers() is needed.

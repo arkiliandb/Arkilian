@@ -42,6 +42,7 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#include <share.h>
 #ifndef __MINGW32__
 #define strcasecmp _stricmp
 #define strncasecmp _strnicmp
@@ -55,6 +56,36 @@
 #include <pthread.h>
 #include <strings.h>
 #include <unistd.h>
+#include <sys/file.h>
+#endif
+#include <fcntl.h>
+#include <sys/stat.h>
+
+// ── Unique temp-file creation (O_EXCL, 0600) ────────────────────────
+// The chunk/manifest staging files used to be FIXED names derived from
+// backup_path ("backup.sqlite.chunk"). Two Arkilian instances sharing a
+// backup path (including two instances in the SAME process — the default
+// backup path is CWD-relative) would truncate each other's staging file,
+// and since the digest is computed from the same shared file, the
+// cross-contaminated bytes passed the integrity check and shipped under
+// the wrong prefix. Every staging file now gets a per-instance name
+// (pid + atomic counter) created with O_CREAT|O_EXCL and owner-only mode.
+// Windows spellings kept in lockstep with hydration.c's shims.
+#ifdef _WIN32
+#define ARK_OPEN_EXCL(path) _open((path), _O_CREAT | _O_EXCL | _O_WRONLY | _O_BINARY, _S_IREAD | _S_IWRITE)
+#define ARK_FDOPEN(fd, mode) _fdopen((fd), (mode))
+#define ARK_CLOSE_FD(fd) _close(fd)
+#define ARK_GETPID _getpid
+#else
+#define ARK_OPEN_EXCL(path) open((path), O_CREAT | O_EXCL | O_WRONLY, 0600)
+#define ARK_FDOPEN(fd, mode) fdopen((fd), (mode))
+#define ARK_CLOSE_FD(fd) close(fd)
+#define ARK_GETPID getpid
+#endif
+#ifdef __GNUC__
+#define ARK_ATOMIC_ADD(ptr, val) __atomic_add_fetch((ptr), (val), __ATOMIC_ACQ_REL)
+#elif defined(_WIN32)
+#define ARK_ATOMIC_ADD(ptr, val) (_InterlockedExchangeAdd((volatile long*)(ptr), (long)(val)) + (val))
 #endif
 
 // statfs-based network filesystem detection (NFS/SMB/AFP) for the
@@ -190,6 +221,7 @@ struct arkilian {
   char *s3_prefix;              // S3 key prefix (ARKILIAN_S3_PREFIX)
   volatile int s3_creds_loaded; // 1 when the S3 destination is fully configured
   int backup_interval;
+  int outbox_durable;          // 1 = capture outbox is synchronous=FULL (default)
   volatile int backup_enabled; // runtime kill-switch (written under wake_mutex)
 
   wal_chunk chunk;               // current chunk accumulator
@@ -223,6 +255,22 @@ struct arkilian {
   // none exists), -1 = resolved-unreadable (frozen: shipping continues
   // but nothing is published — loudly logged by the seed path).
   volatile int manifest_seed_resolved;
+
+  // Optional manifest authenticity key (ARKILIAN_MANIFEST_HMAC_KEY). When
+  // set, every published manifest.json is accompanied by
+  // {prefix}/manifest.sig — an HMAC-SHA-256 over the exact manifest bytes.
+  // Hydration (and the startup seed path, which shares ark_manifest_fetch)
+  // verify it before trusting ANY manifest content: the object store is no
+  // longer the root of trust for the restore protocol. The key must live
+  // OUTSIDE the storage it protects; hydration reads it from the process
+  // environment (set it as a real env var, not only .env).
+  char *manifest_hmac_key;
+
+  // Cumulative count of WAL chunks that were durably uploaded AND recorded
+  // in the manifest registry. Backs db_backup_chunk_count() — which
+  // previously returned a 1/0 "has ever flushed" value under a counter's
+  // name, so dashboards read a boolean as a total.
+  uint64_t chunks_flushed_total;
 
   // Background thread tracking & synchronization
   volatile int shutdown_requested;
@@ -370,6 +418,33 @@ static long outbox_cap(void) {
                                        ARKILIAN_DEFAULT_MAX_QUEUE_DEPTH);
   if (cap < 1) cap = 1;
   return cap;
+}
+
+// ── Unique staging files (O_EXCL, owner-only) ───────────────────────
+// Creates <base>.arktmp.<pid>.<counter>.<suffix> exclusively and returns a
+// writable FILE* (caller fcloses, then unlinks by name). Never collides
+// across instances sharing a backup path; never world-readable. Exported
+// (class.h) so the snapshot-cycle determinism tests can assert the
+// uniqueness contract directly.
+FILE *arkilian_unique_tmp(const char *base, const char *suffix,
+                          char *out, size_t out_cap) {
+  static volatile int g_tmp_counter = 0;
+  if (!base || !suffix || !out || out_cap == 0) return NULL;
+  for (int attempt = 0; attempt < 8; attempt++) {
+    long seq = ARK_ATOMIC_ADD(&g_tmp_counter, 1);
+    int n = snprintf(out, out_cap, "%s.arktmp.%ld.%ld.%s",
+                     base, (long)ARK_GETPID(), seq, suffix);
+    if (n <= 0 || (size_t)n >= out_cap) return NULL;
+    int fd = ARK_OPEN_EXCL(out);
+    if (fd < 0) {
+      if (errno == EEXIST) continue;  // astronomically unlikely; re-sequence
+      return NULL;
+    }
+    FILE *f = ARK_FDOPEN(fd, "wb");
+    if (!f) { ARK_CLOSE_FD(fd); unlink(out); return NULL; }
+    return f;
+  }
+  return NULL;
 }
 
 // ── Structured logging ──────────────────────────────────────────────
@@ -1389,21 +1464,30 @@ static int wal_chunk_flush_to_s3(arkilian *db, wal_chunk *c,
   if (strstr(db->s3_prefix, "..") || db->s3_prefix[0] == '/')
     return SHIP_RETRY;
 
-  // 1. Write the chunk body to a temp file (upload_to_s3 streams from
-  // disk). The body is plain SQL: one "stmt;\n" per captured row.
+  // 1. Write the chunk body to a unique per-instance staging file
+  // (upload_to_s3 streams from disk). The body is plain SQL: one "stmt;\n"
+  // per captured row. Fixed names ("%s.chunk") collided across Arkilian
+  // instances sharing a backup path — including two instances in the same
+  // process — and the digest was computed from the same shared file, so
+  // cross-contaminated bytes shipped with a valid self-referential digest.
   char tmp_path[1024];
-  snprintf(tmp_path, sizeof(tmp_path), "%s.chunk", db->backup_path);
-  FILE *f = fopen(tmp_path, "wb");
+  FILE *f = arkilian_unique_tmp(db->backup_path, "chunk",
+                                tmp_path, sizeof(tmp_path));
   if (!f) return SHIP_RETRY;
   if (fwrite(c->buffer, 1, c->len, f) != c->len) {
     fclose(f); unlink(tmp_path); return SHIP_RETRY;
   }
   fclose(f);
 
-  // 2. SHA-256 for content authentication on restore.
+  // 2. SHA-256 for content authentication on restore. A hashing failure
+  // must NOT publish a digest-less chunk: hydration hard-refuses chunks
+  // without a digest (matching the snapshot path and hydration.h's
+  // documented contract), so a digest-less object could never be restored
+  // anyway — the flush retries instead of shipping one.
   char sha256_hex[65] = {0};
   if (ark_sha256_hex_file(tmp_path, sha256_hex) != 0) {
-    sha256_hex[0] = '\0';
+    unlink(tmp_path);
+    return SHIP_RETRY;
   }
 
   // 3. Build the S3 key and presign the PUT URL locally (SigV4).
@@ -1424,8 +1508,41 @@ static int wal_chunk_flush_to_s3(arkilian *db, wal_chunk *c,
 
   if (rc != SHIP_OK) return rc;
 
-  // Durability ack: the chunk object is durable — delete the covered
-  // outbox rows and advance the flush watermark.
+  // 5. Record the chunk in the manifest registry BEFORE the durability ack
+  // (the outbox delete). If registry bookkeeping cannot record the shipped
+  // object, the covered rows MUST stay queued so a later cycle re-ships
+  // them under a fresh key. The previous order (delete, then best-effort
+  // append) silently orphaned the object on an append/strdup failure — a
+  // comment claimed "retried later" but nothing retried it, leaving rows
+  // unreachable by hydration until the next hourly snapshot. SHIP_RETRY
+  // feeds the normal failure logic (attempt counters → loud dead-lettering
+  // into _dead_backup, recoverable via arkilian-dlq) instead of a silent
+  // registry gap. The retried flush re-uploads the same rows to the same
+  // deterministic key — idempotent by REPLACE/DELETE replay semantics.
+  char *key_copy = strdup(s3_key);
+  char *sha_copy = strdup(sha256_hex);
+  if (!key_copy || !sha_copy) {
+    free(key_copy); free(sha_copy);   // ownership never handed off
+    ark_log(db, ARK_LOG_ERROR,
+            "chunk lsn %llu..%llu uploaded but registry record allocation "
+            "failed — rows stay queued for re-ship",
+            (unsigned long long)c->lsn_start, (unsigned long long)c->lsn_end);
+    return SHIP_RETRY;
+  }
+  // On failure manifest_registry_append consumes key_copy/sha_copy itself.
+  if (manifest_registry_append(db, key_copy, sha_copy,
+                               c->lsn_start, c->lsn_end) != 0) {
+    ark_log(db, ARK_LOG_ERROR,
+            "chunk lsn %llu..%llu uploaded but registry record failed — "
+            "rows stay queued for re-ship",
+            (unsigned long long)c->lsn_start, (unsigned long long)c->lsn_end);
+    return SHIP_RETRY;
+  }
+  manifest_registry_maybe_upload(db);
+  db->chunks_flushed_total++;
+
+  // 6. Durability ack: the chunk object is durable AND registered — delete
+  // the covered outbox rows and advance the flush watermark.
   if (delete_stmt) {
     sqlite3_reset(delete_stmt);
     sqlite3_clear_bindings(delete_stmt);
@@ -1434,32 +1551,14 @@ static int wal_chunk_flush_to_s3(arkilian *db, wal_chunk *c,
       ark_log(db, ARK_LOG_ERROR,
               "outbox delete after chunk flush failed: %s",
               sqlite3_errmsg(db->backup_db));
-      // The object IS durable; the stale rows are replay-safe duplicates
-      // (REPLACE/DELETE semantics) that the next flush cycle re-deletes.
+      // The object IS durable and registered; the stale rows are
+      // replay-safe duplicates (REPLACE/DELETE semantics) that the next
+      // flush cycle re-deletes.
     }
   }
   db->chunk_flushed_upto = c->lsn_end;
   c->last_s3_flush = time(NULL);
   ARK_STORE(&db->capture_paused, 0);
-
-  // 5. Record the chunk in the manifest registry, then re-upload the
-  // manifest — batched to at most one manifest PUT per
-  // MANIFEST_UPLOAD_MIN_INTERVAL_SEC so a 1s chunk cadence doesn't double
-  // the request count. A crash before the next manifest PUT loses at most
-  // that window of chunk *records* (the chunk objects themselves are
-  // durable); the next hourly snapshot re-baselines everything.
-  char *key_copy = strdup(s3_key);
-  char *sha_copy = sha256_hex[0] ? strdup(sha256_hex) : NULL;
-  if (!key_copy || (sha256_hex[0] && !sha_copy)) {
-    free(key_copy); free(sha_copy);
-    return SHIP_OK;  // object IS durable; registry bookkeeping retried later
-  }
-  if (manifest_registry_append(db, key_copy, sha_copy,
-                               c->lsn_start, c->lsn_end) == 0) {
-    manifest_registry_maybe_upload(db);
-  } else {
-    free(key_copy); free(sha_copy);
-  }
   return SHIP_OK;
 }
 
@@ -1847,6 +1946,17 @@ int db_init(arkilian **db_ptr, const char *filename) {
     if (db->s3_prefix)     strcpy(db->s3_prefix, pf);
   }
 
+  // Optional manifest authenticity key. NOT part of has_direct_s3(): a
+  // destination without a signing key still ships (legacy buckets keep
+  // working); with a key, publishes carry manifest.sig and hydrators with
+  // the same key refuse unverified manifests.
+  {
+    const char *hk = get_env_default("ARKILIAN_MANIFEST_HMAC_KEY", "");
+    db->manifest_hmac_key = malloc(strlen(hk) + 1);
+    if (db->manifest_hmac_key) strcpy(db->manifest_hmac_key, hk);
+  }
+  db->chunks_flushed_total = 0;
+
   db->backup_interval = get_env_int_default("ARKILIAN_BACKUP_INTERVAL", DEFAULT_BACKUP_INTERVAL);
   // A 0 or negative interval would make the hourly thread hot-loop
   // (backup + signed-URL request with no sleep in between). Clamp it.
@@ -2031,6 +2141,7 @@ int db_init(arkilian **db_ptr, const char *filename) {
     // unconditionally so the application's durability profile is right
     // even when capture was disabled by the network-FS guard.
     int outbox_durable = get_env_bool_default("ARKILIAN_OUTBOX_DURABLE", 1);
+    db->outbox_durable = outbox_durable ? 1 : 0;
     const char *sync_pragma = outbox_durable ? "PRAGMA synchronous=FULL;"
                                               : "PRAGMA synchronous=NORMAL;";
     const struct { const char *sql; const char *what; } pragmas[] = {
@@ -2268,6 +2379,7 @@ void db_close(arkilian *db) {
 
   if (db->db_path) free(db->db_path);
   if (db->backup_path) free(db->backup_path);
+  if (db->manifest_hmac_key) free(db->manifest_hmac_key);
   if (db->s3_endpoint) free(db->s3_endpoint);
   if (db->s3_bucket) free(db->s3_bucket);
   if (db->s3_region) free(db->s3_region);
@@ -2794,6 +2906,53 @@ int db_backup_trigger_coverage(arkilian *db) {
   return deficit < 0 ? 0 : deficit;
 }
 
+// ── Health state machine ────────────────────────────────────────────
+// A durability product needs more than one boolean. db_backup_health_flags()
+// isolates each failure class as a bit so operators can alarm on the
+// specific degraded state; db_backup_is_healthy() is now defined ON TOP of
+// the flags (single source of truth): healthy ⇔ every core flag set.
+unsigned db_backup_health_flags(arkilian *db) {
+  if (!db) return 0;
+  unsigned f = 0;
+  if (ARK_LOAD(&db->backup_enabled)) f |= ARK_HF_BACKUP_ENABLED;
+  if (has_direct_s3(db)) f |= ARK_HF_DEST_CONFIGURED;
+  // Flush thread liveness: a 30s threshold covers a 10s ship + margin.
+  long long hb_age = db_backup_thread_heartbeat_age_ms(db);
+  if (hb_age >= 0 && hb_age <= 30000) f |= ARK_HF_FLUSH_ALIVE;
+  // Snapshot thread liveness: the hourly thread beats once per backup
+  // interval (default 3600s); threshold is 2× interval + margin. A stale
+  // snapshot heartbeat means the thread died.
+  if (db->backup_interval > 0) {
+    long long snap_age = db_backup_snapshot_heartbeat_age_ms(db);
+    long long snap_threshold = (long long)db->backup_interval * 1000LL * 2 + 60000LL;
+    if (snap_age >= 0 && snap_age <= snap_threshold) f |= ARK_HF_SNAPSHOT_ALIVE;
+  } else {
+    f |= ARK_HF_SNAPSHOT_ALIVE;  // no snapshot schedule — vacuously alive
+  }
+  if (db_backup_queue_depth(db) < outbox_cap()) f |= ARK_HF_QUEUE_BELOW_CAP;
+  // (Risk #1) A raw-handle DDL gap means tables created/changed since it
+  // are NOT being captured — a real, silent CDC hole, not a cosmetic
+  // warning. The old health boolean ignored it.
+  if (!ARK_LOAD(&db->triggers_dirty)) f |= ARK_HF_SCHEMA_IN_SYNC;
+  // Dead-lettered rows are CDC rows that never shipped — a non-empty DLQ
+  // is missing remote protection, visible here and via
+  // db_backup_dead_letter_count().
+  if (db_backup_dead_letter_count(db) == 0) f |= ARK_HF_NO_DEAD_LETTER;
+  // A frozen startup manifest read means nothing is being PUBLISHED
+  // (manifest PUTs are gated on it): restores silently use the last good
+  // manifest while shipping continues. That is a restore gap, not a green
+  // light.
+  if (ARK_LOAD(&db->manifest_seed_resolved) == 1) f |= ARK_HF_MANIFEST_RESOLVED;
+  // Sticky "CDC rows were dropped at the cap" signal — set until a
+  // successful snapshot re-baselines. A gap occurred; healthy must wait
+  // for the snapshot that closes it.
+  if (!ARK_LOAD(&db->capture_paused)) f |= ARK_HF_NO_CAPTURE_GAP;
+  // Informational: capture outbox durability mode (FULL vs NORMAL). Does
+  // NOT gate the boolean — NORMAL is an operator choice, not a fault.
+  if (db->outbox_durable) f |= ARK_HF_DURABLE_CAPTURE;
+  return f;
+}
+
 // Default queue-depth ceiling for db_backup_is_healthy; override with
 // ARKILIAN_MAX_QUEUE_DEPTH. Kept in sync with the cap baked into the
 // capture triggers via outbox_cap().
@@ -2802,32 +2961,26 @@ int db_backup_is_healthy(arkilian *db) {
   // A disabled subsystem is NOT healthy — whether kill-switched, forced
   // off by an init failure (WAL/trigger setup), or configured without a
   // destination. A green light while nothing is shipping is exactly the
-  // silent failure monitoring exists to catch.
-  if (!ARK_LOAD(&db->backup_enabled)) return 0;
-  if (!has_direct_s3(db)) return 0;
-  // Flush thread liveness: a 30s threshold covers a 10s ship + margin.
-  long long hb_age = db_backup_thread_heartbeat_age_ms(db);
-  if (hb_age < 0 || hb_age > 30000) return 0;
-  // Snapshot thread liveness: the hourly thread beats once per backup
-  // interval (default 3600s). The threshold must be generous —
-  // backup_interval + margin for the snapshot+upload work. A stale
-  // snapshot heartbeat (e.g. 2× the interval) means the thread died.
-  if (db->backup_interval > 0) {
-    long long snap_age = db_backup_snapshot_heartbeat_age_ms(db);
-    long long snap_threshold = (long long)db->backup_interval * 1000LL * 2 + 60000LL;
-    if (snap_age < 0 || snap_age > snap_threshold) return 0;
-  }
-  if (db_backup_queue_depth(db) >= outbox_cap()) return 0;
-  return 1;
+  // silent failure monitoring exists to catch. Beyond the original five
+  // checks (enabled/dest/heartbeats/queue), the boolean now also requires:
+  // schema capture in sync, an empty dead-letter queue, a resolved (not
+  // frozen) manifest registry, and no unclosed capture gap — each is a
+  // state under which "backup enabled" silently stops meaning "every
+  // committed mutation is remotely protected".
+  return (db_backup_health_flags(db) & ARK_HF_ALL_CORE) == ARK_HF_ALL_CORE
+             ? 1 : 0;
 }
 
 // ── WAL Chunk Monitoring ─────────────────────────────────────────
 
 int db_backup_chunk_count(arkilian *db) {
   if (!db) return -1;
-  // Count is tracked via chunk.entry_count reset on each flush — return
-  // 1 if a flush has ever succeeded (non-zero last_s3_flush).
-  return (db->chunk.last_s3_flush > 0) ? 1 : 0;
+  // Cumulative count of WAL chunks durably uploaded AND recorded in the
+  // manifest registry. (This used to return a 1/0 "has ever flushed"
+  // value under a counter's name — telemetry built on it read a boolean
+  // as a total.)
+  return (db->chunks_flushed_total >= (uint64_t)INT_MAX)
+             ? INT_MAX : (int)db->chunks_flushed_total;
 }
 
 long long db_backup_last_chunk_flush_age_ms(arkilian *db) {
@@ -2924,6 +3077,16 @@ int backup_database(sqlite3 *pSource, const char *zFilename,
     if (pDest) sqlite3_close(pDest);
     return rc;
   }
+
+  // Hardened posture: the snapshot is a full plaintext copy of the
+  // customer database at a predictable path. Create it owner-only
+  // (best-effort — an existing file keeps its mode; document that the
+  // backup path should live in a protected directory).
+#ifndef _WIN32
+  (void)chmod(actualPath, 0600);
+#else
+  (void)_chmod(actualPath, _S_IREAD | _S_IWRITE);
+#endif
 
   sqlite3_backup *pBackup = sqlite3_backup_init(pDest, "main", pSource, "main");
   if (!pBackup) {
@@ -3492,9 +3655,11 @@ static int manifest_registry_upload(arkilian *db, const char *snapshot_key,
     return -1;
   }
 
-  char tmp_path[1024];
-  snprintf(tmp_path, sizeof(tmp_path), "%s.manifest", db->backup_path);
-  FILE *f = fopen(tmp_path, "wb");
+  // Stage the manifest body in a unique per-instance file (fixed
+  // "%s.manifest" names collided across instances sharing a backup path).
+  char tmp_path[1200];
+  FILE *f = arkilian_unique_tmp(db->backup_path, "manifest",
+                                tmp_path, sizeof(tmp_path));
   if (!f) {
     free(json);
     manifest_registry_unlock(db);
@@ -3509,6 +3674,38 @@ static int manifest_registry_upload(arkilian *db, const char *snapshot_key,
     return -1;
   }
 
+  // ── Manifest authenticity: sign the exact bytes we are about to PUT ──
+  // The manifest is the root of trust for the restore protocol (its
+  // digest fields cannot authenticate it — that would be circular). With
+  // ARKILIAN_MANIFEST_HMAC_KEY set, {prefix}/manifest.sig carries an
+  // HMAC-SHA-256 over the exact manifest bytes; hydration and the seed
+  // path (shared ark_manifest_fetch) fail closed on a missing/mismatched
+  // signature. If signing is configured but cannot be published, we
+  // refuse to publish an unsigned manifest at all: the registry keeps its
+  // records and the next cadence retries.
+  char sig_path[1200];
+  int have_sig = 0;
+  if (db->manifest_hmac_key && db->manifest_hmac_key[0]) {
+    char sig_hex[65];
+    ark_hmac_sha256_hex((const uint8_t *)db->manifest_hmac_key,
+                        strlen(db->manifest_hmac_key),
+                        json, jlen, sig_hex);
+    FILE *sf = arkilian_unique_tmp(db->backup_path, "manifestsig",
+                                   sig_path, sizeof(sig_path));
+    if (!sf || fwrite(sig_hex, 1, 64, sf) != 64) {
+      if (sf) fclose(sf);
+      unlink(sig_path);
+      free(json);
+      manifest_registry_unlock(db);
+      ark_log(db, ARK_LOG_ERROR,
+              "manifest.sig staging failed — refusing to publish an "
+              "unsigned manifest (HMAC key configured)");
+      return -1;
+    }
+    fclose(sf);
+    have_sig = 1;
+  }
+
   char manifest_key[512];
   snprintf(manifest_key, sizeof(manifest_key), "%s/manifest.json",
            db->s3_prefix);
@@ -3516,22 +3713,44 @@ static int manifest_registry_upload(arkilian *db, const char *snapshot_key,
   if (!put_url) {
     free(json);
     unlink(tmp_path);
+    if (have_sig) unlink(sig_path);
     manifest_registry_unlock(db);
     return -1;
   }
+  // Publish order: manifest.json first, then manifest.sig (hydrators
+  // re-fetch both once on a signature mismatch to absorb the torn
+  // two-object commit window).
   int rc = upload_to_s3(db, put_url, tmp_path);
   free(put_url);
   unlink(tmp_path);
+
+  if (rc == 0 && have_sig) {
+    char sig_key[512];
+    snprintf(sig_key, sizeof(sig_key), "%s/manifest.sig", db->s3_prefix);
+    char *sig_url = s3_presign_put(db, sig_key, 600L);
+    if (!sig_url || upload_to_s3(db, sig_url, sig_path) != 0) {
+      ark_log(db, ARK_LOG_ERROR,
+              "manifest.sig upload failed — HMAC-configured hydrators will "
+              "refuse manifest.json until the signature publish succeeds");
+      free(sig_url);
+      free(json);
+      unlink(sig_path);
+      manifest_registry_unlock(db);
+      return -1;
+    }
+    free(sig_url);
+  }
+  if (have_sig) unlink(sig_path);
   free(json);
 
   if (rc == 0) {
     db->manifest_pending = 0;
     db->manifest_last_upload = time(NULL);
-    // The manifest is durable: chunk records it names are now reachable by
-    // hydration. Outbox rows for those chunks were already deleted on
-    // flush ack (delete-on-flush-ack); any chunk PUT in the batching
-    // window but not yet named here is re-covered by the next hourly
-    // snapshot baseline, so nothing accumulates.
+    // The manifest (and its signature) are durable: chunk records it
+    // names are now reachable by hydration. Outbox rows for those chunks
+    // were already deleted on flush ack (delete-on-flush-ack); any chunk
+    // PUT in the batching window but not yet named here is re-covered by
+    // the next hourly snapshot baseline, so nothing accumulates.
   }
   manifest_registry_unlock(db);
   return rc;
@@ -3566,7 +3785,13 @@ static void manifest_registry_maybe_upload(arkilian *db) {
 //     on a bounded cadence, and NO manifest is published until then
 // Returns 1 once resolved (terminal), 0 while still pending.
 static int manifest_registry_seed(arkilian *db) {
-  if (!db || !has_direct_s3(db)) return 1;
+  if (!db || !has_direct_s3(db)) {
+    // No destination: there is no remote registry to adopt and nothing to
+    // gate — record the resolved state so db_backup_health_flags() reports
+    // the truth instead of a permanently "unresolved" read.
+    ARK_STORE(&db->manifest_seed_resolved, 1);
+    return 1;
+  }
   if (!db->s3_prefix || !db->s3_prefix[0]) return 1;
   HydratePlan plan;
   int rc = ark_manifest_fetch(db->s3_endpoint, db->s3_bucket, db->s3_region,
@@ -3609,6 +3834,123 @@ static int manifest_registry_seed(arkilian *db) {
   return 1;
 }
 
+// Overridable copy step for deterministic snapshot-cycle tests. NULL (the
+// production default) uses backup_database(). The hook lets a test run the
+// REAL cycle while injecting work into the copy window — the exact window
+// in which the flush thread ships chunks concurrently.
+int (*arkilian_snapshot_copy_hook)(sqlite3 *src, const char *dest_path,
+                                   volatile int *shutdown_flag) = NULL;
+
+// Record a chunk in the manifest registry. Production path is
+// wal_chunk_flush_to_s3 (which also batches manifest publishes); this
+// wrapper exists for operational tooling and the snapshot-cycle
+// determinism tests, which simulate "the flusher shipped a chunk while
+// the snapshot copy was running".
+int arkilian_registry_record(arkilian *db, const char *s3_key,
+                             const char *sha256, uint64_t lsn_start,
+                             uint64_t lsn_end) {
+  if (!db || !s3_key) return -1;
+  char *k = strdup(s3_key);
+  char *s = sha256 ? strdup(sha256) : NULL;
+  if (!k || (sha256 && !s)) { free(k); free(s); return -1; }
+  if (manifest_registry_append(db, k, s, lsn_start, lsn_end) != 0) return -1;
+  return 0;
+}
+
+// One snapshot attempt: heartbeat → capture pruning watermark → copy →
+// upload → prune + publish. Extracted from the hourly loop so the
+// watermark/copy ordering is directly testable.
+//
+// ── P0 correctness note (snapshot-baseline invariant) ────────────────
+// The baseline LSN published with a snapshot MUST be captured BEFORE the
+// copy starts. The previous code read it from the (mutable) manifest
+// registry AFTER backup_database() returned — while claiming in its own
+// comment that it was "the highest chunk LSN flushed before the copy
+// began". A chunk shipped during the copy (the normal case under
+// continuous writes) would be declared "contained in the snapshot",
+// pruned from the registry, and then skipped by hydration — a silent
+// restore gap. The copy's image is guaranteed to contain every change
+// committed BEFORE it started (sqlite3_backup_step restarts on source
+// modification, so the image is some state in [copy-start, copy-end]);
+// only a pre-copy watermark is sound.
+int arkilian_run_snapshot_cycle(arkilian *db) {
+  if (!db || !db->is_open || !db->handle) return -1;
+  // Kill-switch: skip the snapshot + upload entirely while disabled.
+  if (!ARK_LOAD(&db->backup_enabled)) return 0;
+
+  // Snapshot-thread heartbeat (spec §9): so a silent death of this
+  // thread is visible via db_backup_snapshot_heartbeat_age_ms().
+  ARK_STORE(&db->last_snapshot_heartbeat_sec, (int)(now_ms_mono() / 1000));
+
+  // ── Watermark FIRST (the fix): highest registered chunk LSN, floored by
+  // the previously published baseline so a later snapshot never
+  // REPUBLISHES a LOWER baseline over a durable higher one.
+  uint64_t snapshot_upto = 0;
+  manifest_registry_lock(db);
+  for (int i = 0; i < db->manifest_chunk_count; i++) {
+    if (db->manifest_chunks[i].lsn_end > snapshot_upto)
+      snapshot_upto = db->manifest_chunks[i].lsn_end;
+  }
+  if (db->manifest_baseline_lsn > snapshot_upto)
+    snapshot_upto = db->manifest_baseline_lsn;
+  manifest_registry_unlock(db);
+
+  // Snapshot from the SNAPSHOT connection (this thread's own, spec
+  // §3.1) — never the game connection: sqlite3_backup_step page I/O
+  // would otherwise hold the game connection's mutex for the whole
+  // copy, making game-thread writes wait on the backup thread (the
+  // exact §3.3 failure mode the spec forbids). Sharing the flush
+  // thread's connection would stall shipping during large snapshots.
+  int status = arkilian_snapshot_copy_hook
+      ? arkilian_snapshot_copy_hook(db->snapshot_db, db->backup_path,
+                                    &db->shutdown_requested)
+      : backup_database(db->snapshot_db, db->backup_path,
+                        &db->shutdown_requested);
+
+  // Upload path: the ONLY destination is S3-compatible object storage,
+  // signed locally with the configured credentials.
+  if (status == SQLITE_OK && has_direct_s3(db)) {
+    // Compute sha256 of the backup file — the manifest records it so
+    // hydration authenticates the object before installing it.
+    char snap_sha256[65] = {0};
+    (void)ark_sha256_hex_file(db->backup_path, snap_sha256);
+
+    char s3_key[512];
+    snprintf(s3_key, sizeof(s3_key), "%s/backup.sqlite", db->s3_prefix);
+
+    char *upload_url = s3_presign_put(db, s3_key, 3600L);
+    if (!upload_url) {
+      ark_log(db, ARK_LOG_ERROR,
+              "snapshot upload skipped: local SigV4 signing failed");
+    } else if (upload_to_s3(db, upload_url, db->backup_path) != 0) {
+      ark_log(db, ARK_LOG_ERROR, "scheduled backup upload failed");
+      free(upload_url);
+    } else {
+      free(upload_url);
+      ARK_STORE(&db->capture_paused, 0);
+      // Baseline + prune + publish: everything up to the PRE-COPY
+      // watermark is inside this snapshot, so its chunk records leave
+      // the registry. Chunks registered during the copy stay.
+      if (snap_sha256[0]) {
+        manifest_registry_prune_upto(db, snapshot_upto);
+        if (manifest_registry_upload(db, s3_key, snap_sha256,
+                                     snapshot_upto) != 0) {
+          // Loud, every occurrence: a failed publish means remote
+          // restores silently stay on the previous manifest while
+          // shipping continues. Not a reason to stop shipping — but
+          // never a quiet one.
+          ark_log(db, ARK_LOG_ERROR,
+                  "snapshot manifest publish failed (baseline %llu) — "
+                  "remote restores remain on the previous manifest until "
+                  "a publish succeeds",
+                  (unsigned long long)snapshot_upto);
+        }
+      }
+    }
+  }
+  return status;
+}
+
 #ifdef _WIN32
 DWORD WINAPI run_hourly_backup(LPVOID arg) {
 #else
@@ -3648,69 +3990,12 @@ void *run_hourly_backup(void *arg) {
     if (shutdown || !db->is_open || !db->handle) break;
     next_backup = time(NULL) + db->backup_interval;
 
-    // Kill-switch check: skip the snapshot + upload entirely while
-    // disabled. The interval still advances so re-enabling resumes on
-    // the normal schedule (the flush thread handles realtime resume).
-    if (!ARK_LOAD(&db->backup_enabled)) continue;
-
-    // Snapshot-thread heartbeat (spec §9): so a silent death of this
-    // thread (unhandled condition, thread cancellation) is visible via
-    // db_backup_snapshot_heartbeat_age_ms() instead of quietly stopping
-    // hourly uploads with no signal.
-    ARK_STORE(&db->last_snapshot_heartbeat_sec, (int)(now_ms_mono() / 1000));
-
-    // Snapshot from the SNAPSHOT connection (this thread's own, spec
-    // §3.1) — never the game connection: sqlite3_backup_step page I/O
-    // would otherwise hold the game connection's mutex for the whole
-    // copy, making game-thread writes wait on the backup thread (the
-    // exact §3.3 failure mode the spec forbids). Sharing the flush
-    // thread's connection would stall shipping during large snapshots.
-    int status = backup_database(db->snapshot_db, db->backup_path,
-                                 &db->shutdown_requested);
-
-    // Upload path: the ONLY destination is S3-compatible object storage,
-    // signed locally with the configured credentials. The baseline LSN is
-    // the highest chunk LSN flushed before the copy began — everything up
-    // to it is contained in this snapshot and prunable from the registry.
-    uint64_t snapshot_upto = 0;
-    manifest_registry_lock(db);
-    if (db->manifest_chunk_count > 0)
-      snapshot_upto = db->manifest_chunks[db->manifest_chunk_count - 1].lsn_end;
-    // Monotone baseline: the previously published baseline is the floor
-    // even after its chunk records were pruned, so a later snapshot never
-    // REPUBLISHES a LOWER baseline over a durable higher one (which would
-    // make hydration believe every row between the two was missing).
-    if (db->manifest_baseline_lsn > snapshot_upto)
-      snapshot_upto = db->manifest_baseline_lsn;
-    manifest_registry_unlock(db);
-
-    if (status == SQLITE_OK && has_direct_s3(db)) {
-      // Compute sha256 of the backup file — the manifest records it so
-      // hydration authenticates the object before installing it.
-      char snap_sha256[65] = {0};
-      (void)ark_sha256_hex_file(db->backup_path, snap_sha256);
-
-      char s3_key[512];
-      snprintf(s3_key, sizeof(s3_key), "%s/backup.sqlite", db->s3_prefix);
-
-      char *upload_url = s3_presign_put(db, s3_key, 3600L);
-      if (!upload_url) {
-        ark_log(db, ARK_LOG_ERROR,
-                "snapshot upload skipped: local SigV4 signing failed");
-      } else if (upload_to_s3(db, upload_url, db->backup_path) != 0) {
-        ark_log(db, ARK_LOG_ERROR, "scheduled backup upload failed");
-        free(upload_url);
-      } else {
-        free(upload_url);
-        ARK_STORE(&db->capture_paused, 0);
-        // Baseline + prune + publish: everything up to snapshot_upto is
-        // inside this snapshot, so its chunk records leave the registry.
-        if (snap_sha256[0]) {
-          manifest_registry_prune_upto(db, snapshot_upto);
-          manifest_registry_upload(db, s3_key, snap_sha256, snapshot_upto);
-        }
-      }
-    }
+    // One snapshot attempt. The kill-switch check, heartbeat, PRE-COPY
+    // watermark capture, copy, upload, and prune/publish live inside
+    // arkilian_run_snapshot_cycle() so the baseline invariant is directly
+    // testable (tests/test_snapshot_watermark.c drives the real cycle
+    // with a copy hook that ships a chunk mid-copy).
+    (void)arkilian_run_snapshot_cycle(db);
   }
 #ifdef _WIN32
   return 0;

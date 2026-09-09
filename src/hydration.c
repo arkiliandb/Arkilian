@@ -14,12 +14,19 @@
 // compiled standalone (N-API addon, test TUs) with CMake's strict
 // -std=c99 (extensions OFF), where glibc hides gmtime_r/strcasecmp/
 // O_DIRECTORY behind _DEFAULT_SOURCE/_POSIX_C_SOURCE unless they are
-// defined here. class.c does the same for the same reason.
+// defined here. class.c does the same for the same reason. macOS needs
+// _DARWIN_C_SOURCE for BSD symbols (flock in <sys/file.h>) that
+// _POSIX_C_SOURCE alone hides — same as class.c's statfs guard.
 #ifndef _POSIX_C_SOURCE
 #define _POSIX_C_SOURCE 200809L
 #endif
 #ifndef _DEFAULT_SOURCE
 #define _DEFAULT_SOURCE
+#endif
+#ifdef __APPLE__
+#ifndef _DARWIN_C_SOURCE
+#define _DARWIN_C_SOURCE
+#endif
 #endif
 
 #include "hydration.h"
@@ -45,6 +52,7 @@
 #ifdef _WIN32
   #include <windows.h>
   #include <io.h>
+  #include <sys/locking.h>
   #define strcasecmp _stricmp
   #define ARK_FILENO(f) _fileno(f)
   #define ARK_FSYNC(fd) _commit(fd)
@@ -57,10 +65,75 @@
 #else
   #include <pthread.h>
   #include <strings.h>
+  #include <sys/file.h>
   #include <unistd.h>
   #define ARK_FILENO(f) fileno(f)
   #define ARK_FSYNC(fd) fsync(fd)
 #endif
+
+// ── Restore-exclusion + staging-file shims ──────────────────────────
+// Hydration REPLACES the database file on disk. The BEGIN IMMEDIATE
+// probe is point-in-time only; the OS lock below is the actual exclusion
+// contract: an exclusive, non-blocking lock on <db_path>.arklock held for
+// the entire restore. Any other hydrator (process, runtime, or library
+// instance) that also takes the lock is refused immediately — the
+// process-global single-flight mutex only ever serialized hydrates within
+// one process. Application writers that do not take the lock are still
+// caught by the probe if actively writing; the operator contract
+// ("hydrate from a cold process") remains, now enforced as far as the
+// environment permits.
+#ifdef _WIN32
+  #define ARK_LOCKFILE_OPEN(path) \
+    _open((path), _O_CREAT | _O_RDWR, _S_IREAD | _S_IWRITE)
+  #define ARK_LOCKFILE_LOCK(fd)   (_locking((fd), _LK_NBLCK, 1) == 0)
+  #define ARK_LOCKFILE_UNLOCK(fd) ((void)_locking((fd), _LK_UNLCK, 1))
+  #define ARK_LOCKFILE_CLOSE(fd)  _close(fd)
+  #define ARK_OPEN_EXCL(path) \
+    _open((path), _O_CREAT | _O_EXCL | _O_WRONLY | _O_BINARY, _S_IREAD | _S_IWRITE)
+  #define ARK_FDOPEN(fd, mode) _fdopen((fd), (mode))
+  #define ARK_CLOSE_FD(fd)     _close(fd)
+  #define ARK_GETPID           _getpid
+#else
+  #define ARK_LOCKFILE_OPEN(path) open((path), O_CREAT | O_RDWR, 0600)
+  #define ARK_LOCKFILE_LOCK(fd)   (flock((fd), LOCK_EX | LOCK_NB) == 0)
+  #define ARK_LOCKFILE_UNLOCK(fd) ((void)flock((fd), LOCK_UN))
+  #define ARK_LOCKFILE_CLOSE(fd)  close(fd)
+  #define ARK_OPEN_EXCL(path)     open((path), O_CREAT | O_EXCL | O_WRONLY, 0600)
+  #define ARK_FDOPEN(fd, mode)    fdopen((fd), (mode))
+  #define ARK_CLOSE_FD(fd)        close(fd)
+  #define ARK_GETPID              getpid
+#endif
+
+// Unique per-instance staging file (same contract as class.c's
+// arkilian_unique_tmp — kept in lockstep; hydration.c links standalone in
+// the test_minio_hydrate target, so it cannot depend on class.c symbols).
+// The old fixed "<path>.arkdl" name was shared across processes hydrating
+// the same db path.
+static FILE *hydrate_unique_tmp(const char *base, const char *suffix,
+                                char *out, size_t out_cap) {
+  static volatile int g_tmp_counter = 0;
+  if (!base || !suffix || !out || out_cap == 0) return NULL;
+  for (int attempt = 0; attempt < 8; attempt++) {
+    int seq;
+#ifdef __GNUC__
+    seq = __atomic_add_fetch(&g_tmp_counter, 1, __ATOMIC_ACQ_REL);
+#else
+    seq = ++g_tmp_counter;
+#endif
+    int n = snprintf(out, out_cap, "%s.arktmp.%ld.%d.%s",
+                     base, (long)ARK_GETPID(), seq, suffix);
+    if (n <= 0 || (size_t)n >= out_cap) return NULL;
+    int fd = ARK_OPEN_EXCL(out);
+    if (fd < 0) {
+      if (errno == EEXIST) continue;
+      return NULL;
+    }
+    FILE *f = ARK_FDOPEN(fd, "wb");
+    if (!f) { ARK_CLOSE_FD(fd); remove(out); return NULL; }
+    return f;
+  }
+  return NULL;
+}
 
 // Pre-signed object-storage URLs carry their own authz in the query
 // string. The client never attaches any bearer token: storage auth is
@@ -360,14 +433,17 @@ static size_t file_write_cb(void *ptr, size_t sz, size_t nmemb, void *user) {
 }
 
 // Download a binary file from a URL and atomically install it at
-// local_path.  Streams to a temp file first; only on a complete 200
-// response + (optional) SHA-256 verification + SQLite quick_check are the
-// old database's stale -wal/-shm sidecars replaced and the snapshot
-// atomically installed.  A 404 maps to HYDRATION_ERR_NOTFOUND (cold
-// start); any other failure leaves the existing local database untouched.
-// `expected_sha256` is an optional lowercase hex digest (64 chars, no
-// dashes) authored by the uploader + recorded in the manifest; NULL/empty
-// skips content verification with a warning.
+// local_path.  Streams to a unique staging file first; only on a complete
+// 200 response + SHA-256 verification + SQLite quick_check are the old
+// database's stale -wal/-shm sidecars replaced and the snapshot atomically
+// installed.  A 404 maps to HYDRATION_ERR_NOTFOUND (cold start); any other
+// failure leaves the existing local database untouched.
+// `expected_sha256` is REQUIRED: a missing/empty digest is a hard refusal
+// (HYDRATION_ERR_PROTO) — silently installing unauthenticated content is
+// a downgrade-attack surface, not a back-compat feature. (An earlier
+// revision of this docblock claimed a NULL digest "skips verification
+// with a warning" — the code has refused for a long time; the docblock
+// now matches the behavior.)
 static int http_download_file(const char *url,
                                const char *local_path, const char *expected_sha256,
                                int *err_out) {
@@ -386,12 +462,10 @@ static int http_download_file(const char *url,
   if (http_init(&r, url) != 0) { *err_out = HYDRATION_ERR_NET; return -1; }
 
   char tmp_path[4096];
-  int n = snprintf(tmp_path, sizeof(tmp_path), "%s.arkdl", local_path);
-  if (n <= 0 || (size_t)n >= sizeof(tmp_path)) {
-    http_free(&r); *err_out = HYDRATION_ERR_DISK; return -1;
-  }
-
-  FILE *f = fopen(tmp_path, "wb");
+  // Unique per-instance staging file: the fixed "<path>.arkdl" name was
+  // shared across processes hydrating the same db path (two processes
+  // would truncate each other's download and race the install).
+  FILE *f = hydrate_unique_tmp(local_path, "arkdl", tmp_path, sizeof(tmp_path));
   if (!f) { http_free(&r); *err_out = HYDRATION_ERR_DISK; return -1; }
 
   curl_easy_setopt(r.handle, CURLOPT_WRITEFUNCTION, file_write_cb);
@@ -588,6 +662,13 @@ static unsigned hex4(const char *p) {
   return v;
 }
 
+// Presence check for the strict int parser: distinguishes "field absent
+// (legacy manifest, default applies)" from "field present but malformed
+// (protocol refusal)".
+static int json_has_key(const char *json, const char *key) {
+  return json_find_key(json, key) != NULL;
+}
+
 // Find a string value for a key in a flat JSON object: {"key":"value",...}
 // Handles all JSON string escapes.  Returns malloc'd string or NULL.
 char *json_get_string(const char *json, const char *key) {
@@ -640,9 +721,31 @@ char *json_get_string(const char *json, const char *key) {
 }
 
 int64_t json_get_int64(const char *json, const char *key) {
+  int64_t v = 0;
+  (void)json_get_int64_checked(json, key, &v);
+  return v;
+}
+
+// Strict integer field parse for the manifest wire protocol. The old
+// accessor was strtoll(..., NULL, 10) with no end-pointer validation, so
+// "lsn_end":"500" (string), "lsn_end":5ab, or a truncated number parsed
+// partially or as 0 instead of being rejected — and a missing field
+// silently became 0, which the replay loop then SKIPS as already-applied.
+// A manifest is a wire protocol, not trusted configuration: reject
+// anything that is not a complete, delimiter-terminated integer token.
+// Returns 0 and stores the value on success, -1 on absence/malformation.
+int json_get_int64_checked(const char *json, const char *key, int64_t *out) {
+  if (!json || !key || !out) return -1;
   const char *p = json_find_key(json, key);
-  if (!p) return 0;
-  return (int64_t)strtoll(p, NULL, 10);
+  if (!p) return -1;
+  errno = 0;
+  char *end = NULL;
+  long long v = strtoll(p, &end, 10);
+  if (end == p || errno == ERANGE) return -1;
+  while (*end == ' ' || *end == '\t' || *end == '\n' || *end == '\r') end++;
+  if (*end != '\0' && *end != ',' && *end != '}' && *end != ']') return -1;
+  *out = (int64_t)v;
+  return 0;
 }
 
 // Return the end of the array element starting at p: the first comma
@@ -762,8 +865,6 @@ int ark_manifest_fetch(const char *endpoint, const char *bucket,
 
   int err = 0;
   char *json = http_get_string(manifest_url, &err);
-  free(manifest_url);
-
   if (!json) {
     // Propagate the specific failure so callers can tell "no manifest yet"
     // (a genuine cold start) from a transient error that must be retried —
@@ -771,8 +872,114 @@ int ark_manifest_fetch(const char *endpoint, const char *bucket,
     // predecessor's chunks.
     if (err == HYDRATION_ERR_NOTFOUND) return HYDRATION_ERR_NOTFOUND;
     fprintf(stderr, "arkilian: manifest fetch failed (err=%d)\n", err);
+    free(manifest_url);
     return err ? err : HYDRATION_ERR_NET;
   }
+
+  // ── Version contract ────────────────────────────────────────────────
+  // The v3 manifest is the only layout this reader writes. A present
+  // version field that is not 3 is a protocol refusal, not a parse
+  // mystery; an ABSENT version means a legacy (v1/v2 flat-form) writer —
+  // accepted as before for back-compat.
+  {
+    int64_t version = 0;
+    if (json_get_int64_checked(json, "version", &version) == 0 &&
+        version != 3) {
+      fprintf(stderr,
+              "arkilian: unsupported manifest version %lld (expected 3)\n",
+              (long long)version);
+      free(json);
+      free(manifest_url);
+      return HYDRATION_ERR_PROTO;
+    }
+  }
+
+  // ── Manifest authenticity (HMAC over the exact manifest bytes) ──────
+  // The manifest is the ROOT OF TRUST for the restore protocol: its
+  // digest fields cannot authenticate it (circular), and the restore path
+  // EXECUTES the SQL the manifest points at. Object-level SHA-256 checks
+  // only prove "object matches what the manifest says" — an attacker who
+  // controls the bucket controls both. When ARKILIAN_MANIFEST_HMAC_KEY is
+  // configured, {prefix}/manifest.sig must carry a valid HMAC-SHA-256
+  // over the exact manifest bytes; a missing or mismatched signature is a
+  // hard refusal (fail closed). Without a key the manifest is accepted as
+  // before (legacy buckets keep working) — the downgrade is documented
+  // and visible. The key must live OUTSIDE the storage it protects.
+  {
+    const char *hmac_key = getenv("ARKILIAN_MANIFEST_HMAC_KEY");
+    if (hmac_key && hmac_key[0]) {
+      char sig_key[512];
+      snprintf(sig_key, sizeof(sig_key), "%s/manifest.sig", prefix);
+      int verified = 0;
+      for (int attempt = 0; attempt < 3 && !verified; attempt++) {
+        if (attempt > 0) {
+          // Publishing is manifest-PUT then sig-PUT: a signature mismatch
+          // can be a torn read of that two-object commit. Re-fetch BOTH
+          // before refusing so a normal publish race is not reported as
+          // tampering.
+          sqlite3_sleep(300);
+          free(json);
+          json = http_get_string(manifest_url, &err);
+          if (!json) {
+            fprintf(stderr,
+                    "arkilian: manifest re-fetch failed during signature "
+                    "verification (err=%d)\n", err);
+            free(manifest_url);
+            return err ? err : HYDRATION_ERR_NET;
+          }
+        }
+        char *sig_url = s3_presign_get(endpoint, bucket, region,
+                                       access_key, secret_key,
+                                       sig_key, 3600L);
+        if (!sig_url) {
+          free(json);
+          free(manifest_url);
+          return HYDRATION_ERR_MEM;
+        }
+        int sig_err = 0;
+        char *sig = http_get_string(sig_url, &sig_err);
+        free(sig_url);
+        if (!sig) {
+          if (sig_err == HYDRATION_ERR_NOTFOUND) {
+            fprintf(stderr,
+                    "arkilian: manifest.sig MISSING but "
+                    "ARKILIAN_MANIFEST_HMAC_KEY is configured — refusing to "
+                    "trust an unauthenticated manifest\n");
+          } else {
+            fprintf(stderr, "arkilian: manifest.sig fetch failed (err=%d)\n",
+                    sig_err);
+          }
+          free(json);
+          free(manifest_url);
+          return sig_err == HYDRATION_ERR_NOTFOUND ? HYDRATION_ERR_PROTO
+                 : (sig_err ? sig_err : HYDRATION_ERR_NET);
+        }
+        // Trim surrounding whitespace, then compare (64 hex chars).
+        char *b = sig;
+        char *e = sig + strlen(sig);
+        while (b < e && isspace((unsigned char)*b)) b++;
+        while (e > b && isspace((unsigned char)e[-1])) e--;
+        *e = '\0';
+        char expect[65];
+        ark_hmac_sha256_hex((const uint8_t *)hmac_key, strlen(hmac_key),
+                            json, strlen(json), expect);
+        verified = (strlen(b) == 64 && strcasecmp(b, expect) == 0);
+        free(sig);
+        if (!verified && attempt == 2) {
+          fprintf(stderr,
+                  "arkilian: manifest HMAC MISMATCH — refusing a manifest "
+                  "that does not verify under ARKILIAN_MANIFEST_HMAC_KEY "
+                  "(tampered storage, wrong key, or torn publish)\n");
+        }
+      }
+      if (!verified) {
+        free(json);
+        free(manifest_url);
+        return HYDRATION_ERR_PROTO;
+      }
+    }
+  }
+  free(manifest_url);
 
   memset(plan, 0, sizeof(*plan));
   plan->baseline_lsn = 0;
@@ -790,7 +997,23 @@ int ark_manifest_fetch(const char *endpoint, const char *bucket,
     char *s3_key = json_get_string(snap, "s3_key");
     char *sha    = json_get_string(snap, "sha256");
     if (!sha)    sha = json_get_string(snap, "snapshot_sha256"); // legacy
-    plan->baseline_lsn = json_get_int64(snap, "baseline_lsn");
+    // Strict baseline parse: malformed (quoted/truncated) is a protocol
+    // refusal; ABSENT is tolerated as 0 (legacy manifests predate it).
+    {
+      int64_t bl = 0;
+      if (json_get_int64_checked(snap, "baseline_lsn", &bl) != 0) {
+        if (json_has_key(snap, "baseline_lsn")) {
+          fprintf(stderr,
+                  "arkilian: manifest snapshot.baseline_lsn is malformed — "
+                  "refusing manifest\n");
+          free(s3_key); free(sha); free(snap); free(json);
+          hydrate_plan_free(plan);
+          return HYDRATION_ERR_PROTO;
+        }
+        bl = 0;
+      }
+      plan->baseline_lsn = bl;
+    }
     if (s3_key && s3_key[0]) {
       plan->snapshot_s3_key = s3_key;
       // The snapshot is fetched over a locally presigned GET: the manifest
@@ -834,9 +1057,25 @@ int ark_manifest_fetch(const char *endpoint, const char *bucket,
         }
         plan->chunks[i].sha256 = json_get_string(elem, "sha256");
         // LSN values are JSON numbers in the v3 manifest (see
-        // manifest_registry_upload) — parse them as integers.
-        plan->chunks[i].lsn_start = json_get_int64(elem, "lsn_start");
-        plan->chunks[i].lsn_end   = json_get_int64(elem, "lsn_end");
+        // manifest_registry_upload) — parse them STRICTLY: a missing or
+        // malformed field used to silently parse as 0, which the replay
+        // loop then skipped as "already applied" (silent data omission).
+        // It is now a protocol refusal.
+        {
+          int64_t ls = 0, le = 0;
+          if (json_get_int64_checked(elem, "lsn_start", &ls) != 0 ||
+              json_get_int64_checked(elem, "lsn_end", &le) != 0) {
+            fprintf(stderr,
+                    "arkilian: chunk %d has missing/malformed LSN fields — "
+                    "refusing manifest\n", i);
+            free(elem);
+            hydrate_plan_free(plan);
+            free(json);
+            return HYDRATION_ERR_PROTO;
+          }
+          plan->chunks[i].lsn_start = ls;
+          plan->chunks[i].lsn_end   = le;
+        }
         free(elem);
       }
     }
@@ -877,6 +1116,40 @@ void hydrate_plan_free(HydratePlan *plan) {
   }
   free(plan->chunks);
   memset(plan, 0, sizeof(*plan));
+}
+
+// ── Wire-protocol validation of a parsed plan ───────────────────────
+// The manifest decides what database content gets restored, so it is
+// validated like a wire protocol, not like trusted configuration:
+// required fields, sane ranges, strict ordering (no overlaps, no
+// duplicates, no unsorted entries — the previous gap-only check accepted
+// overlapping ranges), digest shape, and baseline sanity. Any violation
+// is HYDRATION_ERR_PROTO before a byte is downloaded.
+static int hydrate_validate_plan(const HydratePlan *plan) {
+  if (!plan) return HYDRATION_ERR_PROTO;
+  if (plan->baseline_lsn < 0) return HYDRATION_ERR_PROTO;
+  // A recorded snapshot must always carry a digest (the installer hard-
+  // refuses without one — make the refusal happen before any download).
+  if (plan->snapshot_s3_key && plan->snapshot_s3_key[0] &&
+      !(plan->snapshot_sha256 && plan->snapshot_sha256[0]))
+    return HYDRATION_ERR_PROTO;
+  int64_t prev_end = plan->baseline_lsn;
+  for (int i = 0; i < plan->chunk_count; i++) {
+    const HydrateChunk *ch = &plan->chunks[i];
+    if (!ch->s3_key || !ch->s3_key[0]) return HYDRATION_ERR_PROTO;
+    if (!ch->url) return HYDRATION_ERR_PROTO;
+    if (ch->lsn_start < 1 || ch->lsn_end < ch->lsn_start)
+      return HYDRATION_ERR_PROTO;
+    // Strict sequence: each chunk starts strictly after the previous one
+    // ends — no overlaps, no duplicates, no unsorted entries.
+    if (i > 0 && ch->lsn_start <= prev_end) return HYDRATION_ERR_PROTO;
+    if (!ch->sha256 || strlen(ch->sha256) != 64)
+      return HYDRATION_ERR_PROTO;
+    for (const char *h = ch->sha256; *h; h++)
+      if (!isxdigit((unsigned char)*h)) return HYDRATION_ERR_PROTO;
+    prev_end = ch->lsn_end;
+  }
+  return 0;
 }
 
 // ── Step 1: Download & decompress snapshot ──────────────────────────
@@ -1126,6 +1399,46 @@ int arkilian_hydrate_s3(const char *db_path,
   HYDRATE_LOCK();
   int hydrate_result = 0;
 
+  // ── Restore exclusivity (OS lock, P0) ──────────────────────────────
+  // Hydration replaces the database file and removes its sidecars; the
+  // BEGIN IMMEDIATE probe below is a point-in-time diagnostic, not an
+  // exclusion. An exclusive non-blocking lock on <db_path>.arklock held
+  // for the whole restore is the actual contract: any other hydrator —
+  // other process, runtime, or library instance — that also takes the
+  // lock is refused immediately (the process-global mutex below only ever
+  // serialized hydrates within ONE process). Application writers that do
+  // not take the lock are still caught by the probe while actively
+  // writing; the cold-process operator contract remains, now enforced as
+  // far as the environment permits.
+  char lock_path[4352];
+  int lock_fd = -1;
+  {
+    int n = snprintf(lock_path, sizeof(lock_path), "%s.arklock", db_path);
+    if (n <= 0 || (size_t)n >= sizeof(lock_path)) {
+      HYDRATE_UNLOCK();
+      return HYDRATION_ERR_PROTO;
+    }
+    lock_fd = ARK_LOCKFILE_OPEN(lock_path);
+    if (lock_fd < 0) {
+      // A durability product does not restore on a maybe: failure to
+      // create the exclusion artifact is a refusal, not a downgrade.
+      fprintf(stderr,
+              "arkilian: hydration refused — cannot create restore lock "
+              "file %s\n", lock_path);
+      HYDRATE_UNLOCK();
+      return HYDRATION_ERR_DISK;
+    }
+    if (!ARK_LOCKFILE_LOCK(lock_fd)) {
+      fprintf(stderr,
+              "arkilian: hydration refused — another restore owns %s "
+              "(HYDRATION_ERR_BUSY)\n", lock_path);
+      ARK_LOCKFILE_CLOSE(lock_fd);
+      lock_fd = -1;
+      HYDRATE_UNLOCK();
+      return HYDRATION_ERR_BUSY;
+    }
+  }
+
   HydratePlan plan = {0};
   int plan_ok = 0;
 
@@ -1141,6 +1454,19 @@ int arkilian_hydrate_s3(const char *db_path,
   if (!plan_ok) {
     hydrate_result = HYDRATION_ERR_PROTO;
     goto hydrate_done;
+  }
+
+  // ── Wire-protocol validation BEFORE any download/replay ─────────────
+  {
+    int vr = hydrate_validate_plan(&plan);
+    if (vr != 0) {
+      fprintf(stderr,
+              "arkilian: manifest failed wire-protocol validation "
+              "(refusing restore)\n");
+      hydrate_plan_free(&plan);
+      hydrate_result = vr;
+      goto hydrate_done;
+    }
   }
 
   // ── Reuse the existing arkilian_hydrate core logic (Phase 0.5 through Phase 2) ──
@@ -1271,7 +1597,23 @@ int arkilian_hydrate_s3(const char *db_path,
       char *sql_text = http_get_string(ch->url, &err);
       if (!sql_text) { sqlite3_close(db); hydrate_plan_free(&plan); hydrate_result = err; goto hydrate_done; }
 
-      if (ch->sha256 && ch->sha256[0]) {
+      // Content authentication — the missing-digest case is a HARD
+      // refusal, matching the snapshot path and hydration.h's documented
+      // contract. Chunks are replayed as SQL: unauthenticated SQL in the
+      // restore path is the exact attack the digest exists to stop. The
+      // shipper never publishes digest-less chunks (a hashing failure
+      // fails the flush), so this can only be a foreign/tampered manifest.
+      if (!ch->sha256 || !ch->sha256[0]) {
+        fprintf(stderr,
+                "arkilian: chunk %d has NO SHA-256 digest in the manifest — "
+                "refusing to replay unauthenticated SQL\n", i);
+        free(sql_text);
+        sqlite3_close(db);
+        hydrate_plan_free(&plan);
+        hydrate_result = HYDRATION_ERR_PROTO;
+        goto hydrate_done;
+      }
+      {
         char digest[65];
         ark_sha256_hex(sql_text, strlen(sql_text), digest);
         if (strcasecmp(digest, ch->sha256) != 0) {
@@ -1301,6 +1643,10 @@ int arkilian_hydrate_s3(const char *db_path,
   hydrate_plan_free(&plan);
 
 hydrate_done:
+  if (lock_fd >= 0) {
+    ARK_LOCKFILE_UNLOCK(lock_fd);
+    ARK_LOCKFILE_CLOSE(lock_fd);
+  }
   HYDRATE_UNLOCK();
   return hydrate_result;
 }
