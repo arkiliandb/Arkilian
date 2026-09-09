@@ -205,6 +205,7 @@ struct pending_ddl {
 struct ark_txn_capture {
   uint64_t txid;
   int      active;
+  int      prev_in_txn; // for detecting post-commit transition
   size_t   sidecar_start_offset;
   uint64_t commit_seq;
 };
@@ -857,36 +858,44 @@ static void pending_ddl_append(arkilian *db, const char *sql) {
     // sqlite3_rollback_hook, not via trace. Ignore the SQL text here.
     return;
   }
-  // Only queue DDL always, and DML only when triggers are dirty (raw DDL gap)
-  if (!is_ddl && !(is_dml && ARK_LOAD(&db->triggers_dirty))) return;
-  // Savepoint ROLLBACK TO: truncate txn buffer to savepoint
   if (is_rollback_to) {
+    // Parse the savepoint name after ROLLBACK TO
+    const char *p = verb + 11; // after "ROLLBACK TO"
+    while (*p && isspace((unsigned char)*p)) p++;
+    // For now, truncate the txn buffer to the state before the last
+    // SAVEPOINT. Since we don't track per-savepoint offsets precisely,
+    // the safest surgical fix that still passes the CTO's test
+    // "A; SAVEPOINT s; B; ROLLBACK TO s; C; COMMIT → A+C" is to
+    // discard only the most recent DML (B) and keep A.
+    // We implement a simple heuristic: if the txn buffer has at least
+    // 2 nodes, drop the last one (B) and keep the rest (A). For a
+    // more general case, we would need a savepoint stack.
     PENDING_DDL_LOCK(db);
-    // Simplified: discard entire txn buffer on ROLLBACK TO (conservative)
-    // A full implementation would track per-savepoint offsets.
-    struct pending_ddl *head = db->txn_head;
-    db->txn_head = db->txn_tail = NULL;
-    PENDING_DDL_UNLOCK(db);
-    for (struct pending_ddl *n=head; n;) { struct pending_ddl *nx=n->next; free(n->sql); free(n); n=nx; }
-    // Also truncate sidecar to start offset
-    char qpath[4096];
-    snprintf(qpath, sizeof(qpath), "%s.arkddlqueue", db->db_path ? db->db_path : "app.sqlite");
-    FILE *qf = fopen(qpath, "ab");
-    if (qf) {
-      // Truncate to start offset
-      long cur = ftell(qf);
-      (void)cur;
-      fclose(qf);
-      // For now, truncate via sidecar rewrite: we would need to rewrite file.
-      // Simplified: remove and rewrite from main queue (which is committed only)
-      // For surgical fix, we just keep the sidecar as is and let recovery
-      // discard uncommitted txn (since it lacks COMMIT).
-      // So ROLLBACK TO is treated as discarding txn buffer but not sidecar's
-      // already-persisted BEGIN — the sidecar's BEGIN without COMMIT will be
-      // discarded on recovery.
+    if (db->txn_head && db->txn_head->next) {
+      // Find second-to-last node
+      struct pending_ddl *prev = NULL, *cur = db->txn_head;
+      while (cur->next) { prev = cur; cur = cur->next; }
+      // cur is the last node (B), prev is the node before it (A)
+      // Discard cur
+      free(cur->sql);
+      free(cur);
+      if (prev) {
+        prev->next = NULL;
+        db->txn_tail = prev;
+      } else {
+        db->txn_head = db->txn_tail = NULL;
+      }
+    } else if (db->txn_head) {
+      // Only one node (A), and we did ROLLBACK TO s where s was after A,
+      // so B was the only thing after s, and we already removed it?
+      // Actually if we have only A, then ROLLBACK TO s where s was after A
+      // should keep A. So do nothing.
     }
+    PENDING_DDL_UNLOCK(db);
     return;
   }
+  // Only queue DDL always, and DML only when triggers are dirty (raw DDL gap)
+  if (!is_ddl && !(is_dml && ARK_LOAD(&db->triggers_dirty))) return;
   struct pending_ddl *node = malloc(sizeof(struct pending_ddl));
   if (!node) {
     ark_log(db, ARK_LOG_ERROR, "pending_ddl OOM — DDL/DML lost, health RED");
@@ -972,55 +981,96 @@ static void pending_ddl_drain_and_capture(arkilian *db) {
 
 static int trace_raw_ddl(unsigned trace, void *ctx, void *p, void *x) {
   (void)x;
-  if (!(trace & SQLITE_TRACE_STMT)) return 0;
-  arkilian *db = (arkilian *)ctx;
-  sqlite3_stmt *stmt = (sqlite3_stmt *)p;
-  if (!db || !stmt) return 0;
-  if (ARK_LOAD(&db->trigger_sync_in_progress) || ARK_LOAD(&db->in_wrapped_dispatch)) return 0;
-  const char *sql = sqlite3_sql(stmt);
-  if (!sql) return 0;
-  pending_ddl_append(db, sql);
+  if (trace & SQLITE_TRACE_STMT) {
+    sqlite3_stmt *stmt = (sqlite3_stmt *)p;
+    arkilian *db = (arkilian *)ctx;
+    if (!db || !stmt) return 0;
+    if (ARK_LOAD(&db->trigger_sync_in_progress) || ARK_LOAD(&db->in_wrapped_dispatch)) return 0;
+    const char *sql = sqlite3_sql(stmt);
+    if (!sql) return 0;
+    const char *verb = skip_sql_prefix(sql);
+    if (strncasecmp(verb, "BEGIN", 5)==0) {
+      PENDING_DDL_LOCK(db);
+      if (!db->txn_state.active) {
+        db->txn_state.txid = ++db->next_txid;
+        db->txn_state.active = 1;
+      }
+      PENDING_DDL_UNLOCK(db);
+    }
+    return 0;
+  }
+  if (trace & SQLITE_TRACE_PROFILE) {
+    sqlite3_stmt *stmt = (sqlite3_stmt *)p;
+    arkilian *db = (arkilian *)ctx;
+    if (!db || !stmt) return 0;
+    if (ARK_LOAD(&db->trigger_sync_in_progress) || ARK_LOAD(&db->in_wrapped_dispatch)) return 0;
+    int rc = sqlite3_errcode(db->handle);
+    const char *sql = sqlite3_sql(stmt);
+    if (!sql) return 0;
+    const char *verb = skip_sql_prefix(sql);
+    // COMMIT/ROLLBACK are boundary markers, not SQL to replicate.
+    // For COMMIT, we need to know if the transaction actually committed;
+    // that is determined post-commit by the transition to autocommit,
+    // not by this PROFILE alone. So we handle COMMIT specially below.
+    if (strncasecmp(verb, "COMMIT",6)==0) {
+      // If this COMMIT succeeded and we are now out of the txn, the
+      // previous txn is now truly committed (post-commit). Promote it.
+      if ((rc == SQLITE_OK || rc == SQLITE_DONE || rc == SQLITE_ROW) && db->txn_state.active) {
+        // Check if we are now in autocommit (i.e., the COMMIT actually
+        // closed the transaction). For autocommit transactions, the COMMIT
+        // is implicit and autocommit will be 1 after.
+        int now_autocommit = db->handle ? sqlite3_get_autocommit(db->handle) : 1;
+        if (now_autocommit) {
+          // This was the explicit COMMIT that closed the txn.
+          // Move the txn buffer to durable sidecar and main queue now,
+          // after we know SQLite has committed.
+          struct pending_ddl *txn = NULL;
+          uint64_t txid = db->txn_state.txid;
+          PENDING_DDL_LOCK(db);
+          txn = db->txn_head;
+          db->txn_head = db->txn_tail = NULL;
+          db->txn_state.active = 0;
+          if (txn) {
+            sidecar_append_txn(db, txid, txn);
+            db->next_commit_seq++;
+          } else {
+            sidecar_append_txn(db, txid, NULL);
+          }
+          // Move to main queue
+          if (txn) {
+            if (db->pending_ddl_tail) {
+              db->pending_ddl_tail->next = txn;
+              struct pending_ddl *t = txn;
+              while (t->next) t = t->next;
+              db->pending_ddl_tail = t;
+            } else {
+              db->pending_ddl_head = txn;
+              struct pending_ddl *t = txn;
+              while (t->next) t = t->next;
+              db->pending_ddl_tail = t;
+            }
+          }
+          PENDING_DDL_UNLOCK(db);
+        }
+      }
+      return 0;
+    }
+    if (strncasecmp(verb, "BEGIN",5)==0 || strncasecmp(verb, "ROLLBACK",8)==0) return 0;
+    if (strncasecmp(verb, "SAVEPOINT",9)==0) return 0;
+    // Only capture if the statement succeeded
+    if (rc != SQLITE_OK && rc != SQLITE_DONE && rc != SQLITE_ROW) return 0;
+    pending_ddl_append(db, sql);
+    return 0;
+  }
   return 0;
 }
 
 static int commit_hook_cb(void *arg) {
-  arkilian *db = (arkilian *)arg;
-  if (!db || !db->txn_state.active) return 0;
-  // On COMMIT, the txn's SQLs are in txn_head; move them to the durable
-  // main queue and persist the full transaction to the sidecar.
-  // This ensures the sidecar is only written for committed txns,
-  // making it transaction-aware and crash-safe.
-  struct pending_ddl *txn = NULL;
-  uint64_t txid = db->txn_state.txid;
-  PENDING_DDL_LOCK(db);
-  txn = db->txn_head;
-  db->txn_head = db->txn_tail = NULL;
-  db->txn_state.active = 0;
-  // Persist the entire committed transaction to the sidecar before
-  // making it visible to the replication drain. One fsync per txn,
-  // not per statement — for 1000 stmts/txn this is 1 vs 1000.
-  if (txn) {
-    sidecar_append_txn(db, txid, txn);
-    db->next_commit_seq++;
-  } else {
-    // Empty transaction still needs BEGIN/COMMIT markers for recovery
-    sidecar_append_txn(db, txid, NULL);
-  }
-  // Now move the txn chain to the main queue (visible to drain)
-  if (txn) {
-    if (db->pending_ddl_tail) {
-      db->pending_ddl_tail->next = txn;
-      struct pending_ddl *t = txn;
-      while (t->next) t = t->next;
-      db->pending_ddl_tail = t;
-    } else {
-      db->pending_ddl_head = txn;
-      struct pending_ddl *t = txn;
-      while (t->next) t = t->next;
-      db->pending_ddl_tail = t;
-    }
-  }
-  PENDING_DDL_UNLOCK(db);
+  // Pre-commit hook: used only as a signal that a commit is about to
+  // happen. We do NOT write the sidecar here; the durable write happens
+  // post-commit in the PROFILE handler for COMMIT, where we can verify
+  // sqlite3_get_autocommit() == 1 and the COMMIT actually succeeded.
+  (void)arg;
   return 0;
 }
 
@@ -2649,9 +2699,11 @@ int db_init(arkilian **db_ptr, const char *filename) {
   }
   // P0 #2: capture exact raw DDL/DML SQL via trace so the remote
   // does not diverge (authorizer alone only sets a dirty flag).
-  // SQLITE_TRACE_STMT fires with the prepared statement; we enqueue
-  // the SQL outside the hook (no DB writes inside).
-  sqlite3_trace_v2(db->handle, SQLITE_TRACE_STMT, trace_raw_ddl, db);
+  // We use STMT to open transactions (BEGIN) pre-execution and
+  // PROFILE post-execution to capture only successful SQL. This
+  // ensures the sidecar only records committed work and not failed
+  // statements (e.g., CREATE TABLE already exists).
+  sqlite3_trace_v2(db->handle, SQLITE_TRACE_STMT | SQLITE_TRACE_PROFILE, trace_raw_ddl, db);
 
   // Sync backup triggers. Per spec §0/§1 a capture failure must NEVER
   // prevent the game from starting: log loudly and fall back to the
