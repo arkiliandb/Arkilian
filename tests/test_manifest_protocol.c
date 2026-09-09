@@ -220,6 +220,7 @@ int main(void) {
   // ── 6. Shipper publishes a verifiable signature (end-to-end) ───────
   {
     set_s3_env();
+    setenv("ARKILIAN_MANIFEST_HMAC_KEY", "operator-secret-key", 1);
     remove("mp_src.db");
     arkilian *db = NULL;
     assert(db_init(&db, "mp_src.db") == 0);
