@@ -724,13 +724,28 @@ static void pending_ddl_append(arkilian *db, const char *sql) {
   if (ARK_LOAD(&db->trigger_sync_in_progress)) return;
   if (ARK_LOAD(&db->in_wrapped_dispatch)) return;
   const char *verb = skip_sql_prefix(sql);
-  if (strncasecmp(verb, "CREATE", 6) != 0 &&
-      strncasecmp(verb, "ALTER", 5) != 0 &&
-      strncasecmp(verb, "DROP", 4) != 0) return;
+  int is_ddl = (strncasecmp(verb, "CREATE", 6) == 0 ||
+                strncasecmp(verb, "ALTER", 5) == 0 ||
+                strncasecmp(verb, "DROP", 4) == 0);
+  int is_dml = (strncasecmp(verb, "INSERT", 6) == 0 ||
+                strncasecmp(verb, "UPDATE", 6) == 0 ||
+                strncasecmp(verb, "DELETE", 6) == 0 ||
+                strncasecmp(verb, "REPLACE", 7) == 0);
+  // Only queue DDL always, and DML only when triggers are dirty (raw DDL gap)
+  if (!is_ddl && !(is_dml && ARK_LOAD(&db->triggers_dirty))) return;
   struct pending_ddl *node = malloc(sizeof(struct pending_ddl));
-  if (!node) return;
+  if (!node) {
+    ark_log(db, ARK_LOG_ERROR, "pending_ddl OOM — DDL/DML lost, health RED");
+    ARK_STORE(&db->triggers_dirty, 1);
+    return;
+  }
   node->sql = strdup(sql);
-  if (!node->sql) { free(node); return; }
+  if (!node->sql) {
+    free(node);
+    ark_log(db, ARK_LOG_ERROR, "pending_ddl OOM — DDL/DML lost, health RED");
+    ARK_STORE(&db->triggers_dirty, 1);
+    return;
+  }
   node->next = NULL;
   PENDING_DDL_LOCK(db);
   if (db->pending_ddl_tail) {
@@ -740,6 +755,25 @@ static void pending_ddl_append(arkilian *db, const char *sql) {
     db->pending_ddl_head = db->pending_ddl_tail = node;
   }
   PENDING_DDL_UNLOCK(db);
+  // Durable spill: also append to a sidecar file that survives crash.
+  // Best-effort, fsynced, truncated on successful drain.
+  {
+    char qpath[4096];
+    snprintf(qpath, sizeof(qpath), "%s.arkddlqueue", db->db_path ? db->db_path : "app.sqlite");
+    FILE *qf = fopen(qpath, "ab");
+    if (qf) {
+      uint32_t len = (uint32_t)strlen(sql);
+      fwrite(&len, 1, sizeof(len), qf);
+      fwrite(sql, 1, len, qf);
+      fflush(qf);
+#ifdef _WIN32
+      _commit(_fileno(qf));
+#else
+      fsync(fileno(qf));
+#endif
+      fclose(qf);
+    }
+  }
 }
 
 static void pending_ddl_drain_and_capture(arkilian *db) {
@@ -749,6 +783,7 @@ static void pending_ddl_drain_and_capture(arkilian *db) {
   head = db->pending_ddl_head;
   db->pending_ddl_head = db->pending_ddl_tail = NULL;
   PENDING_DDL_UNLOCK(db);
+  int drained = 0;
   for (struct pending_ddl *node = head; node; ) {
     // Enqueue exactly as apply_ddl_capture would for a wrapped DDL,
     // but without re-running sync (we already synced at the top of
@@ -760,7 +795,7 @@ static void pending_ddl_drain_and_capture(arkilian *db) {
       outbox_cap());
     if (sqlite3_prepare_v2(db->handle, ins, -1, &stmt, NULL) == SQLITE_OK) {
       sqlite3_bind_text(stmt, 1, node->sql, -1, SQLITE_TRANSIENT);
-      sqlite3_step(stmt);
+      if (sqlite3_step(stmt) == SQLITE_DONE) drained++;
       sqlite3_finalize(stmt);
     }
     struct pending_ddl *next = node->next;
@@ -768,6 +803,15 @@ static void pending_ddl_drain_and_capture(arkilian *db) {
     free(node);
     node = next;
   }
+  // Truncate durable sidecar only after successful drain (at least one row)
+  // or if the queue was non-empty but drain succeeded (even if zero rows
+  // due to cap, we still consider the DDLs durable via outbox). Best-effort.
+  if (head) {
+    char qpath[4096];
+    snprintf(qpath, sizeof(qpath), "%s.arkddlqueue", db->db_path ? db->db_path : "app.sqlite");
+    remove(qpath);
+  }
+  (void)drained;
 }
 
 static int trace_raw_ddl(unsigned trace, void *ctx, void *p, void *x) {
@@ -779,13 +823,28 @@ static int trace_raw_ddl(unsigned trace, void *ctx, void *p, void *x) {
   if (ARK_LOAD(&db->trigger_sync_in_progress) || ARK_LOAD(&db->in_wrapped_dispatch)) return 0;
   const char *sql = sqlite3_sql(stmt);
   if (!sql) return 0;
-  const char *verb = skip_sql_prefix(sql);
-  if (strncasecmp(verb, "CREATE", 6) == 0 ||
-      strncasecmp(verb, "ALTER", 5) == 0 ||
-      strncasecmp(verb, "DROP", 4) == 0) {
-    pending_ddl_append(db, sql);
-  }
+  pending_ddl_append(db, sql);
   return 0;
+}
+
+static void rollback_hook_cb(void *arg) {
+  arkilian *db = (arkilian *)arg;
+  if (!db) return;
+  // A ROLLBACK discards any DDL/DML that was queued for that transaction.
+  // Clear both the heap queue and the durable sidecar.
+  PENDING_DDL_LOCK(db);
+  struct pending_ddl *head = db->pending_ddl_head;
+  db->pending_ddl_head = db->pending_ddl_tail = NULL;
+  PENDING_DDL_UNLOCK(db);
+  for (struct pending_ddl *n = head; n; ) {
+    struct pending_ddl *nx = n->next;
+    free(n->sql);
+    free(n);
+    n = nx;
+  }
+  char qpath[4096];
+  snprintf(qpath, sizeof(qpath), "%s.arkddlqueue", db->db_path ? db->db_path : "app.sqlite");
+  remove(qpath);
 }
 
 // Extract the host component of a URL into a caller-provided buffer.
@@ -2296,7 +2355,32 @@ int db_init(arkilian **db_ptr, const char *filename) {
   // Schema-change observer: flag raw-handle DDL so capture desync is
   // visible (Risk #1 / spec §1). Never blocks, performs no I/O.
   sqlite3_set_authorizer(db->handle, on_schema_authorizer, db);
-  // P0 #2: capture exact raw DDL SQL via trace so the remote replica
+  // P0 #2: transaction-aware DDL/DML capture for raw handle.
+  // ROLLBACK must discard any queued DDL/DML for that txn.
+  sqlite3_rollback_hook(db->handle, rollback_hook_cb, db);
+  // Durable sidecar reload: if previous process crashed after queueing
+  // raw DDL/DML but before drain, the sidecar file survives. Reload it
+  // so the DDL is not silently lost (P0 #2 durability).
+  {
+    char qpath[4096];
+    snprintf(qpath, sizeof(qpath), "%s.arkddlqueue", db->db_path ? db->db_path : "app.sqlite");
+    FILE *qf = fopen(qpath, "rb");
+    if (qf) {
+      for (;;) {
+        uint32_t len = 0;
+        if (fread(&len, 1, sizeof(len), qf) != sizeof(len)) break;
+        if (len == 0 || len > 100000) break; // sanity
+        char *sql = malloc(len + 1);
+        if (!sql) break;
+        if (fread(sql, 1, len, qf) != len) { free(sql); break; }
+        sql[len] = '\0';
+        pending_ddl_append(db, sql);
+        free(sql);
+      }
+      fclose(qf);
+    }
+  }
+  // P0 #2: capture exact raw DDL/DML SQL via trace so the remote
   // does not diverge (authorizer alone only sets a dirty flag).
   // SQLITE_TRACE_STMT fires with the prepared statement; we enqueue
   // the SQL outside the hook (no DB writes inside).

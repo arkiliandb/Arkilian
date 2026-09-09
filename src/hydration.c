@@ -1704,12 +1704,14 @@ int arkilian_hydrate_s3(const char *db_path,
 #ifdef SQLITE_DBCONFIG_ENABLE_TRIGGER
     sqlite3_db_config(db, SQLITE_DBCONFIG_ENABLE_TRIGGER, 0, &hydrate_old_trigger);
 #else
-    // Fallback: best-effort drop of Arkilian capture triggers; customer
-    // triggers cannot be safely disabled without the config flag.
-    sqlite3_exec(db, "DROP TRIGGER IF EXISTS \"trg__pending_backup_ai\";", NULL, NULL, NULL);
-    // The full sync path will recreate them after replay; dropping here is
-    // just to reduce contamination on old SQLite builds.
-    fprintf(stderr, "arkilian: warning — SQLITE_DBCONFIG_ENABLE_TRIGGER not available, trigger isolation is incomplete\n");
+    // No trigger disable support: fail closed — we cannot guarantee
+    // replay equivalence without it. The vendored 3.51 always has the
+    // flag, so this path is for arbitrary system SQLite builds.
+    fprintf(stderr, "arkilian: hydration requires SQLITE_DBCONFIG_ENABLE_TRIGGER — restore refused\n");
+    sqlite3_close(db);
+    hydrate_plan_free(&plan);
+    hydrate_result = HYDRATION_ERR_SQL;
+    goto hydrate_done;
 #endif
     // Snapshot is a whole-file copy and therefore contains the source's
     // internal outbox state (_pending_backup, _dead_backup) that is NOT part
