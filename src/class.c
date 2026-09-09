@@ -193,6 +193,8 @@ typedef struct {
   time_t    last_s3_flush;  // last successful S3 PUT (0 = never)
 } wal_chunk;
 
+struct pending_ddl; // forward decl for queue pointer in arkilian
+
 struct arkilian {
   sqlite3 *handle;            // Primary connection (game / application thread)
   sqlite3 *backup_db;         // Dedicated connection (flush/shipping thread)
@@ -326,9 +328,27 @@ struct arkilian {
                                        // already auto-re-syncs (see on_schema_authorizer)
   volatile int auto_resync_triggers;   // opt-in: resync on next wrapped dispatch
                                        // when triggers_dirty is set (raw-handle DDL users)
-volatile int capture_paused;         // sticky: set when outbox hits cap (CDC rows
-                                        // are being dropped); cleared on successful
-                                        // snapshot upload (the gap is recovered)
+ volatile int capture_paused;         // sticky: set when outbox hits cap (CDC rows
+                                         // are being dropped); cleared on successful
+                                         // snapshot upload (the gap is recovered)
+  // P0 #2: pending raw DDL queue — DDL executed on the raw handle
+  // (db_get_handle) bypasses apply_ddl_capture. The trace callback
+  // appends the exact SQL here (no DB work inside the hook), and
+  // db_resync_triggers drains it into _pending_backup so the remote
+  // does not diverge. Guarded by pending_ddl_mutex.
+  struct pending_ddl *pending_ddl_head;
+  struct pending_ddl *pending_ddl_tail;
+#ifdef _WIN32
+  CRITICAL_SECTION pending_ddl_mutex;
+#else
+  pthread_mutex_t pending_ddl_mutex;
+#endif
+};
+
+// Pending raw DDL queue node (P0 #2)
+struct pending_ddl {
+  char *sql;
+  struct pending_ddl *next;
 };
 
 // ── Helper Prototypes ───────────────────────────────────────────────
@@ -684,6 +704,88 @@ static const char *skip_sql_prefix(const char *sql) {
     }
     return sql;
   }
+}
+
+// ── P0 #2: Pending raw DDL queue (raw handle → replay stream) ──────
+// DDL via db_get_handle() bypasses db_exec's apply_ddl_capture. We
+// capture the exact SQL via SQLITE_TRACE_STMT (no DB writes inside the
+// hook) and drain it in db_resync_triggers() so the remote replica
+// does not diverge. Guarded by pending_ddl_mutex.
+#ifdef _WIN32
+#define PENDING_DDL_LOCK(db)   EnterCriticalSection(&(db)->pending_ddl_mutex)
+#define PENDING_DDL_UNLOCK(db) LeaveCriticalSection(&(db)->pending_ddl_mutex)
+#else
+#define PENDING_DDL_LOCK(db)   pthread_mutex_lock(&(db)->pending_ddl_mutex)
+#define PENDING_DDL_UNLOCK(db) pthread_mutex_unlock(&(db)->pending_ddl_mutex)
+#endif
+
+static void pending_ddl_append(arkilian *db, const char *sql) {
+  if (!db || !sql) return;
+  if (ARK_LOAD(&db->trigger_sync_in_progress)) return;
+  if (ARK_LOAD(&db->in_wrapped_dispatch)) return;
+  const char *verb = skip_sql_prefix(sql);
+  if (strncasecmp(verb, "CREATE", 6) != 0 &&
+      strncasecmp(verb, "ALTER", 5) != 0 &&
+      strncasecmp(verb, "DROP", 4) != 0) return;
+  struct pending_ddl *node = malloc(sizeof(struct pending_ddl));
+  if (!node) return;
+  node->sql = strdup(sql);
+  if (!node->sql) { free(node); return; }
+  node->next = NULL;
+  PENDING_DDL_LOCK(db);
+  if (db->pending_ddl_tail) {
+    db->pending_ddl_tail->next = node;
+    db->pending_ddl_tail = node;
+  } else {
+    db->pending_ddl_head = db->pending_ddl_tail = node;
+  }
+  PENDING_DDL_UNLOCK(db);
+}
+
+static void pending_ddl_drain_and_capture(arkilian *db) {
+  if (!db || !db->handle) return;
+  struct pending_ddl *head = NULL;
+  PENDING_DDL_LOCK(db);
+  head = db->pending_ddl_head;
+  db->pending_ddl_head = db->pending_ddl_tail = NULL;
+  PENDING_DDL_UNLOCK(db);
+  for (struct pending_ddl *node = head; node; ) {
+    // Enqueue exactly as apply_ddl_capture would for a wrapped DDL,
+    // but without re-running sync (we already synced at the top of
+    // db_resync_triggers). Preserves order.
+    sqlite3_stmt *stmt = NULL;
+    char ins[220];
+    snprintf(ins, sizeof(ins),
+      "INSERT INTO _pending_backup (payload) SELECT ? WHERE (SELECT COUNT(*) FROM _pending_backup) < %ld",
+      outbox_cap());
+    if (sqlite3_prepare_v2(db->handle, ins, -1, &stmt, NULL) == SQLITE_OK) {
+      sqlite3_bind_text(stmt, 1, node->sql, -1, SQLITE_TRANSIENT);
+      sqlite3_step(stmt);
+      sqlite3_finalize(stmt);
+    }
+    struct pending_ddl *next = node->next;
+    free(node->sql);
+    free(node);
+    node = next;
+  }
+}
+
+static int trace_raw_ddl(unsigned trace, void *ctx, void *p, void *x) {
+  (void)x;
+  if (!(trace & SQLITE_TRACE_STMT)) return 0;
+  arkilian *db = (arkilian *)ctx;
+  sqlite3_stmt *stmt = (sqlite3_stmt *)p;
+  if (!db || !stmt) return 0;
+  if (ARK_LOAD(&db->trigger_sync_in_progress) || ARK_LOAD(&db->in_wrapped_dispatch)) return 0;
+  const char *sql = sqlite3_sql(stmt);
+  if (!sql) return 0;
+  const char *verb = skip_sql_prefix(sql);
+  if (strncasecmp(verb, "CREATE", 6) == 0 ||
+      strncasecmp(verb, "ALTER", 5) == 0 ||
+      strncasecmp(verb, "DROP", 4) == 0) {
+    pending_ddl_append(db, sql);
+  }
+  return 0;
 }
 
 // Extract the host component of a URL into a caller-provided buffer.
@@ -1901,13 +2003,15 @@ int db_init(arkilian **db_ptr, const char *filename) {
                 (pthread_cond_init(&db->wake_cond, NULL) == 0) &&
                 (pthread_mutex_init(&db->payload_mutex, NULL) == 0) &&
                 (pthread_mutex_init(&db->manifest_mutex, NULL) == 0) &&
-                (pthread_mutex_init(&db->log_mutex, NULL) == 0);
+                (pthread_mutex_init(&db->log_mutex, NULL) == 0) &&
+                (pthread_mutex_init(&db->pending_ddl_mutex, NULL) == 0);
 #else
   InitializeCriticalSection(&db->wake_mutex);
   InitializeConditionVariable(&db->wake_cond);
   InitializeCriticalSection(&db->payload_mutex);
   InitializeCriticalSection(&db->manifest_mutex);
   InitializeCriticalSection(&db->log_mutex);
+  InitializeCriticalSection(&db->pending_ddl_mutex);
   int init_ok = 1;
 #endif
   if (!init_ok) {
@@ -2192,6 +2296,11 @@ int db_init(arkilian **db_ptr, const char *filename) {
   // Schema-change observer: flag raw-handle DDL so capture desync is
   // visible (Risk #1 / spec §1). Never blocks, performs no I/O.
   sqlite3_set_authorizer(db->handle, on_schema_authorizer, db);
+  // P0 #2: capture exact raw DDL SQL via trace so the remote replica
+  // does not diverge (authorizer alone only sets a dirty flag).
+  // SQLITE_TRACE_STMT fires with the prepared statement; we enqueue
+  // the SQL outside the hook (no DB writes inside).
+  sqlite3_trace_v2(db->handle, SQLITE_TRACE_STMT, trace_raw_ddl, db);
 
   // Sync backup triggers. Per spec §0/§1 a capture failure must NEVER
   // prevent the game from starting: log loudly and fall back to the
@@ -2363,6 +2472,28 @@ void db_close(arkilian *db) {
     db->handle = NULL;
   }
 
+  // Drain and free any pending raw DDL queue (P0 #2)
+  {
+    struct pending_ddl *head = NULL;
+#ifdef _WIN32
+    if (db->sync_initialized) EnterCriticalSection(&db->pending_ddl_mutex);
+    head = db->pending_ddl_head;
+    db->pending_ddl_head = db->pending_ddl_tail = NULL;
+    if (db->sync_initialized) LeaveCriticalSection(&db->pending_ddl_mutex);
+#else
+    if (db->sync_initialized) pthread_mutex_lock(&db->pending_ddl_mutex);
+    head = db->pending_ddl_head;
+    db->pending_ddl_head = db->pending_ddl_tail = NULL;
+    if (db->sync_initialized) pthread_mutex_unlock(&db->pending_ddl_mutex);
+#endif
+    for (struct pending_ddl *n = head; n; ) {
+      struct pending_ddl *nx = n->next;
+      free(n->sql);
+      free(n);
+      n = nx;
+    }
+  }
+
   // Destroy the sync primitives only now: threads are joined and the
   // update hook is deregistered, so nothing can acquire them again. The
   // caller must not race db_close with in-flight DB statements on the
@@ -2374,6 +2505,7 @@ void db_close(arkilian *db) {
     pthread_mutex_destroy(&db->payload_mutex);
     pthread_mutex_destroy(&db->manifest_mutex);
     pthread_mutex_destroy(&db->log_mutex);
+    pthread_mutex_destroy(&db->pending_ddl_mutex);
   }
 #else
   if (db->sync_initialized) {
@@ -2381,6 +2513,7 @@ void db_close(arkilian *db) {
     DeleteCriticalSection(&db->payload_mutex);
     DeleteCriticalSection(&db->manifest_mutex);
     DeleteCriticalSection(&db->log_mutex);
+    DeleteCriticalSection(&db->pending_ddl_mutex);
   }
 #endif
 
@@ -2470,15 +2603,93 @@ int db_exec(arkilian *db, const char *sql) {
     db_resync_triggers(db);
   }
 
-  char *errmsg = NULL;
-  // Mark this as a wrapped dispatch so the schema authorizer knows the
-  // DDL (if any) will be auto-re-synced by apply_ddl_capture below — it
-  // stays silent and lets the wrapper handle it, instead of warning about
-  // a bypass that did not happen.
+  // ── P0 #3: multi-statement DDL/data hole ──────────────────────────
+  // The old path used a single sqlite3_exec() for the whole input and
+  // only AFTER it returned inspected the first verb and called
+  // apply_ddl_capture(). For "CREATE TABLE t; INSERT INTO t..." the
+  // INSERTs executed BEFORE capture triggers existed and were silently
+  // lost, and "ALTER + UPDATE" in one string was recorded in the wrong
+  // order (UPDATE captured with old schema, DDL after). We now split
+  // the input into individual SQLite statements via prepare tail
+  // iteration, execute each via sqlite3_step, and interleave
+  // trigger-sync + DDL capture per-statement so the capture is
+  // atomic with the correct schema for every subsequent statement.
   ARK_STORE(&db->in_wrapped_dispatch, 1);
-  int rc = sqlite3_exec(db->handle, sql, NULL, NULL, &errmsg);
+  const char *p = sql;
+  char *errmsg = NULL;
+  int final_rc = SQLITE_OK;
+
+  while (p && *p) {
+    // sqlite3_prepare_v2 skips leading whitespace/comments itself, but
+    // we also skip stray semicolons that would otherwise produce a
+    // no-op NULL statement and stall the loop.
+    while (*p && (isspace((unsigned char)*p) || *p == ';')) p++;
+    if (!*p) break;
+
+    sqlite3_stmt *stmt = NULL;
+    const char *tail = NULL;
+    int rc = sqlite3_prepare_v2(db->handle, p, -1, &stmt, &tail);
+    if (rc != SQLITE_OK) {
+      if (errmsg) sqlite3_free(errmsg);
+      errmsg = sqlite3_mprintf("%s", sqlite3_errmsg(db->handle));
+      if (stmt) sqlite3_finalize(stmt);
+      final_rc = rc;
+      break;
+    }
+    if (!stmt) {
+      // sqlite_prepare returned OK but no statement (e.g. comment only)
+      p = tail;
+      continue;
+    }
+
+    // Copy the per-statement SQL for DDL capture before stepping, as
+    // sqlite3_sql() remains valid until finalize and is the exact text
+    // SQLite parsed for this statement (better than slicing `p`).
+    const char *stmt_sql_raw = sqlite3_sql(stmt);
+    char *stmt_sql_copy = NULL;
+    if (stmt_sql_raw) stmt_sql_copy = strdup(stmt_sql_raw);
+
+    // Execute: step until DONE (or ROW for SELECTs which we discard, as
+    // sqlite3_exec would). sqlite3_exec uses a callback and discards rows;
+    // db_exec historically discards them as well, so we just drain ROWs.
+    int step_rc = SQLITE_OK;
+    do {
+      step_rc = sqlite3_step(stmt);
+      if (step_rc == SQLITE_ROW) {
+        // Discard row, keep stepping
+        continue;
+      }
+      break;
+    } while (step_rc == SQLITE_ROW);
+
+    sqlite3_finalize(stmt);
+
+    if (step_rc != SQLITE_DONE && step_rc != SQLITE_OK && step_rc != SQLITE_ROW) {
+      if (errmsg) sqlite3_free(errmsg);
+      errmsg = sqlite3_mprintf("%s", sqlite3_errmsg(db->handle));
+      final_rc = step_rc;
+      free(stmt_sql_copy);
+      break;
+    }
+
+    // Per-statement DDL capture: the trigger sync must happen BEFORE the
+    // next statement, so "CREATE TABLE t; INSERT INTO t" captures the
+    // INSERT, and "ALTER; UPDATE" records in the correct order.
+    if (stmt_sql_copy) {
+      const char *verb = skip_sql_prefix(stmt_sql_copy);
+      if (strncasecmp(verb, "CREATE", 6) == 0 ||
+          strncasecmp(verb, "ALTER", 5) == 0 ||
+          strncasecmp(verb, "DROP", 4) == 0) {
+        apply_ddl_capture(db, stmt_sql_copy);
+      }
+      free(stmt_sql_copy);
+    }
+
+    p = tail;
+  }
+
   ARK_STORE(&db->in_wrapped_dispatch, 0);
-  if (rc != SQLITE_OK) {
+  if (final_rc != SQLITE_OK) {
     if (errmsg) {
       strncpy(db->last_error_msg, errmsg, sizeof(db->last_error_msg) - 1);
       db->last_error_msg[sizeof(db->last_error_msg) - 1] = '\0';
@@ -2486,19 +2697,10 @@ int db_exec(arkilian *db, const char *sql) {
     } else {
       snprintf(db->last_error_msg, sizeof(db->last_error_msg), "%s", sqlite3_errmsg(db->handle));
     }
-    return rc;
+    return final_rc;
   }
 
-  const char *sql_verb = skip_sql_prefix(sql);
-  if (strncasecmp(sql_verb, "CREATE", 6) == 0 ||
-      strncasecmp(sql_verb, "ALTER", 5) == 0 ||
-      strncasecmp(sql_verb, "DROP", 4) == 0) {
-    apply_ddl_capture(db, sql);
-  }
-
-  // Public contract: SQLITE_OK (0) on success. sqlite3_exec returns
-  // SQLITE_OK; surfacing SQLITE_DONE here would break every C caller
-  // that compares against the conventional success code.
+  // Public contract: SQLITE_OK (0) on success.
   return SQLITE_OK;
 }
 
@@ -3030,8 +3232,16 @@ int db_resync_triggers(arkilian *db) {
             err ? err : "unknown error");
     // resync failed — the schema may still be stale; leave the dirty flag
     // as-is so monitoring keeps surfacing the gap.
+    // Do NOT drain the pending DDL queue — the DDLs are still needed for
+    // the remote, and a failed resync means the local capture is still
+    // stale, so we keep the queue for the next retry.
   } else {
     ARK_STORE(&db->triggers_dirty, 0);
+    // P0 #2: remote would still diverge if we only repaired local
+    // triggers. Drain any raw DDL that was executed on the raw handle
+    // and captured via the trace hook, enqueuing each as a separate
+    // outbox row in order so the replay stream contains the DDL.
+    pending_ddl_drain_and_capture(db);
   }
   if (err) sqlite3_free(err);
   return rc;

@@ -1322,6 +1322,16 @@ static int hydration_authorizer(void *pUser, int action,
 int hydrate_replay_chunk(sqlite3 *db, const char *raw_sql, int64_t chunk_lsn) {
   char *err_msg = NULL;
 
+  // ── Trigger isolation (defense in depth) ──────────────────────────
+  // Even if the outer hydration loop already disabled triggers via
+  // SQLITE_DBCONFIG_ENABLE_TRIGGER, a standalone call to this helper
+  // (tests, tooling) must also not fire customer or capture triggers.
+  // Disabling here is idempotent and restores the prior state on exit.
+  int replay_old_trigger = 1;
+#ifdef SQLITE_DBCONFIG_ENABLE_TRIGGER
+  sqlite3_db_config(db, SQLITE_DBCONFIG_ENABLE_TRIGGER, 0, &replay_old_trigger);
+#endif
+
   // Ensure the metadata table exists (defensive, in case the snapshot
   // did not contain it and the caller did not create it).
   sqlite3_exec(db, "CREATE TABLE IF NOT EXISTS _arkilian_meta (k TEXT PRIMARY KEY, v TEXT);", NULL, NULL, NULL);
@@ -1335,6 +1345,9 @@ int hydrate_replay_chunk(sqlite3 *db, const char *raw_sql, int64_t chunk_lsn) {
   if (rc != SQLITE_OK) {
     if (err_msg) sqlite3_free(err_msg);
     sqlite3_set_authorizer(db, NULL, NULL);
+#ifdef SQLITE_DBCONFIG_ENABLE_TRIGGER
+    sqlite3_db_config(db, SQLITE_DBCONFIG_ENABLE_TRIGGER, replay_old_trigger, NULL);
+#endif
     return HYDRATION_ERR_SQL;
   }
 
@@ -1344,6 +1357,9 @@ int hydrate_replay_chunk(sqlite3 *db, const char *raw_sql, int64_t chunk_lsn) {
     if (err_msg) sqlite3_free(err_msg);
     sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
     sqlite3_set_authorizer(db, NULL, NULL);
+#ifdef SQLITE_DBCONFIG_ENABLE_TRIGGER
+    sqlite3_db_config(db, SQLITE_DBCONFIG_ENABLE_TRIGGER, replay_old_trigger, NULL);
+#endif
     return HYDRATION_ERR_SQL;
   }
 
@@ -1356,11 +1372,17 @@ int hydrate_replay_chunk(sqlite3 *db, const char *raw_sql, int64_t chunk_lsn) {
   if (rc != SQLITE_OK) {
     sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
     sqlite3_set_authorizer(db, NULL, NULL);
+#ifdef SQLITE_DBCONFIG_ENABLE_TRIGGER
+    sqlite3_db_config(db, SQLITE_DBCONFIG_ENABLE_TRIGGER, replay_old_trigger, NULL);
+#endif
     return HYDRATION_ERR_SQL;
   }
 
   rc = sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
   sqlite3_set_authorizer(db, NULL, NULL);
+#ifdef SQLITE_DBCONFIG_ENABLE_TRIGGER
+  sqlite3_db_config(db, SQLITE_DBCONFIG_ENABLE_TRIGGER, replay_old_trigger, NULL);
+#endif
   if (rc != SQLITE_OK) {
     // Best effort: don't leave an open transaction behind.
     sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
@@ -1663,6 +1685,40 @@ int arkilian_hydrate_s3(const char *db_path,
     // Arkilian, e.g. test fixtures, may not have it).
     sqlite3_exec(db, "CREATE TABLE IF NOT EXISTS _arkilian_meta (k TEXT PRIMARY KEY, v TEXT);", NULL, NULL, NULL);
 
+    // ── P0 #1 & P1: trigger isolation + internal state sanitization ──
+    // Hydration replays SQL against a snapshot that already contains both
+    // customer triggers and Arkilian's own capture triggers. Replaying DML
+    // with those triggers active would duplicate side effects (customer
+    // trigger fires + captured audit row replayed) and contaminate the
+    // restored DB's _pending_backup with new rows generated solely because
+    // we restored it. We therefore enter a strict replay mode where NO
+    // triggers fire: the authoritative state is snapshot + the ordered
+    // captured stream, not the stream re-triggered.
+    //
+    // SQLITE_DBCONFIG_ENABLE_TRIGGER is the supported way to disable trigger
+    // firing on a connection (creation still works). If the SQLite version
+    // lacks it (pre-3.13), fall back to dropping Arkilian triggers and
+    // warn — customer triggers would still be a risk there, but the vendored
+    // 3.51 always has the config.
+    int hydrate_old_trigger = 1;
+#ifdef SQLITE_DBCONFIG_ENABLE_TRIGGER
+    sqlite3_db_config(db, SQLITE_DBCONFIG_ENABLE_TRIGGER, 0, &hydrate_old_trigger);
+#else
+    // Fallback: best-effort drop of Arkilian capture triggers; customer
+    // triggers cannot be safely disabled without the config flag.
+    sqlite3_exec(db, "DROP TRIGGER IF EXISTS \"trg__pending_backup_ai\";", NULL, NULL, NULL);
+    // The full sync path will recreate them after replay; dropping here is
+    // just to reduce contamination on old SQLite builds.
+    fprintf(stderr, "arkilian: warning — SQLITE_DBCONFIG_ENABLE_TRIGGER not available, trigger isolation is incomplete\n");
+#endif
+    // Snapshot is a whole-file copy and therefore contains the source's
+    // internal outbox state (_pending_backup, _dead_backup) that is NOT part
+    // of the logical data. A restored DB must start clean: any rows in those
+    // tables are either already shipped (baseline) or would be duplicate
+    // outbox work after restore. Clean them while triggers are disabled so
+    // the DELETEs themselves do not generate new capture rows.
+    sqlite3_exec(db, "DELETE FROM _pending_backup; DELETE FROM _dead_backup; DELETE FROM sqlite_sequence WHERE name IN ('_pending_backup','_dead_backup');", NULL, NULL, NULL);
+
     int64_t local_lsn = read_last_applied_lsn(db);
     if (local_lsn == 0) local_lsn = plan.baseline_lsn;
     else if (local_lsn < plan.baseline_lsn) {
@@ -1745,6 +1801,19 @@ int arkilian_hydrate_s3(const char *db_path,
       chunk_total++;
       if (progress) progress(2, chunk_total, plan.chunk_count, user_data);
     }
+
+    // Leave replay mode: re-enable trigger firing so the restored DB is
+    // immediately usable by a normal Arkilian runtime. The next db_init()
+    // will call sync_backup_triggers() to create any capture triggers that
+    // are missing for tables created by replayed DDL while triggers were
+    // off (those DDLs created the tables but not their capture triggers).
+    // That post-hydration repair is required because CREATE TABLE replayed
+    // with triggers disabled does not magically get a capture trigger.
+#ifdef SQLITE_DBCONFIG_ENABLE_TRIGGER
+    sqlite3_db_config(db, SQLITE_DBCONFIG_ENABLE_TRIGGER, hydrate_old_trigger, NULL);
+#else
+    // Fallback path already warned above.
+#endif
 
     sqlite3_exec(db, "PRAGMA synchronous=NORMAL;", NULL, NULL, NULL);
     sqlite3_exec(db, "PRAGMA foreign_keys=ON;", NULL, NULL, NULL);
