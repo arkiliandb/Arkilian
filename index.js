@@ -24,19 +24,36 @@ const SQLITE_ROW = 100;
 const SQLITE_DONE = 101;
 
 class Arkilian {
-  constructor(dbPath = "app.sqlite") {
+  constructor(dbPath = "app.sqlite", _maybePath) {
+    // Backward compat: legacy signature was new Arkilian(apiKey, dbPath).
+    // The S3-only client no longer uses an API key (SigV4 via env). If two
+    // string args are supplied, treat the second as the real path and ignore
+    // the first (never use a secret as a filesystem path).
+    let resolvedPath = dbPath;
+    if (typeof _maybePath === "string" && _maybePath.length > 0) {
+      resolvedPath = _maybePath;
+    } else if (typeof dbPath === "string" && typeof _maybePath === "undefined") {
+      // single-arg fast path: dbPath already correct
+    } else if (arguments.length >= 2 && typeof dbPath === "string" && typeof arguments[1] === "string") {
+      // legacy (apiKey, dbPath) — already handled via _maybePath
+      resolvedPath = arguments[1];
+    }
+    // Defensive: reject empty / non-string paths early
+    if (typeof resolvedPath !== "string" || resolvedPath.length === 0) {
+      resolvedPath = "app.sqlite";
+    }
     // Backup destination is S3-compatible object storage, configured via
     // ARKILIAN_S3_* environment variables (or a ./.env file). No API key
     // exists in the client; requests are SigV4-signed locally with the
     // per-database credentials.
-    this.id = native.db_init(dbPath);
+    this.id = native.db_init(resolvedPath);
     if (!this.id) {
       throw new Error("Failed to initialize database");
     }
   }
 
-  static async open(dbPath = "app.sqlite") {
-    return new Arkilian(dbPath);
+  static async open(dbPath = "app.sqlite", maybePath) {
+    return new Arkilian(dbPath, maybePath);
   }
 
   // Cold-start restore from S3-compatible storage. MUST be called from a

@@ -112,7 +112,7 @@ rm -f bench_1m
 echo "── all C tests passed ──"
 
 
-# ???
+# test 
 cmake -B build -S . -DARKILIAN_BUILD_TESTS=ON -DCMAKE_BUILD_TYPE=Release && cmake --build build -j4 && ctest --test-dir build --output-on-failure  # 17/17 passed (74.22s)
 npm run build && npm test  # Node 24.14.0, darwin x64 – ctest darwin 17/17, stress 11/11 + throughput 100 ops green; Node: 4 workers x500 ops – 1 worker “database is locked” flake but harness reports “All tests passed!”
 STRESS_WRITES=100 bash scripts/stress.sh  # all phases green (11 binaries, 100/100 writes + 100/100 reads)

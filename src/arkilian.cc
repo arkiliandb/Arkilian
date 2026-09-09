@@ -34,7 +34,19 @@ static std::unordered_set<arkilian*> g_registry;
 // the call. Entries are erased in db_close (after the C struct is freed
 // and the per-handle mutex is unlocked) so the map does not grow
 // unboundedly across handle churn.
-static std::unordered_map<arkilian*, std::mutex> g_stmt_mutexes;
+//
+// std::mutex is non-copyable/non-movable, so it cannot be stored by value
+// in an unordered_map on strict stdlibs. Store via unique_ptr instead.
+static std::unordered_map<arkilian*, std::unique_ptr<std::mutex>> g_stmt_mutexes;
+
+// Ensure a per-handle mutex exists (caller must hold g_registry_mutex).
+static std::mutex& ensurePerHandleMutex(arkilian* db) {
+  auto it = g_stmt_mutexes.find(db);
+  if (it == g_stmt_mutexes.end()) {
+    it = g_stmt_mutexes.emplace(db, std::make_unique<std::mutex>()).first;
+  }
+  return *it->second;
+}
 
 // RAII helper: acquires g_registry_mutex, validates the handle, acquires
 // the per-handle mutex, releases g_registry_mutex, and returns both the
@@ -57,19 +69,13 @@ static DbLock lockDb(const Napi::CallbackInfo& info) {
   // Acquire the per-handle mutex while holding g_registry_mutex so
   // db_close (which also needs g_registry_mutex to unregister) cannot
   // free the struct between our lookup and our lock.
-  std::unique_lock<std::mutex> lock(g_stmt_mutexes[db]);
+  std::mutex& m = ensurePerHandleMutex(db);
+  std::unique_lock<std::mutex> lock(m);
   return {db, std::move(lock)};
 }
 
-// Overload for functions that receive the id as a raw int64_t (db_close).
-static DbLock lockDbById(int64_t id) {
-  arkilian* db = reinterpret_cast<arkilian*>(id);
-  std::lock_guard<std::mutex> regLock(g_registry_mutex);
-  if (!g_registry.count(db))
-    return {nullptr, std::unique_lock<std::mutex>()};
-  std::unique_lock<std::mutex> lock(g_stmt_mutexes[db]);
-  return {db, std::move(lock)};
-}
+// (Removed lockDbById — db_close now extracts the per-handle mutex directly
+// without holding g_registry_mutex across the join.)
 
 // ── Log callback bridge ─────────────────────────────────────────────
 // ark_log can fire from the backup threads, so the JS callback is
@@ -104,6 +110,9 @@ static void releaseLogTsfn(arkilian* db) {
 static void registerDb(arkilian* db) {
   std::lock_guard<std::mutex> lock(g_registry_mutex);
   g_registry.insert(db);
+  // Pre-create per-handle mutex so first lockDb doesn't need to emplace
+  // under contention.
+  g_stmt_mutexes.emplace(db, std::make_unique<std::mutex>());
 }
 
 // Returns true (and removes the handle) only if it was live.
@@ -143,28 +152,26 @@ Napi::Value db_close(const Napi::CallbackInfo& info) {
   arkilian* db = reinterpret_cast<arkilian*>(id);
   if (!unregisterDb(db)) return env.Null();
 
-  // Acquire the per-handle mutex and wait for in-flight calls to finish.
-  // Use a unique_lock so we can release it before erasing the mutex from
-  // the map (erasing a locked mutex is UB).
-  DbLock dl = lockDbById(id);
-  // dl.db is null here because we already unregistered, but the mutex
-  // entry still exists — lockDbById found it in g_stmt_mutexes. However,
-  // lockDbById checks g_registry which we just removed from. So we need
-  // to acquire the mutex directly.
+  // Extract the per-handle mutex without holding the global lock during
+  // the close/join. Holding g_registry_mutex across db_close() (which
+  // joins backup threads) would block all other handles for seconds.
+  std::unique_ptr<std::mutex> heldMutex;
   {
     std::lock_guard<std::mutex> regLock(g_registry_mutex);
     auto it = g_stmt_mutexes.find(db);
     if (it != g_stmt_mutexes.end()) {
-      it->second.lock();
-      db_close(db); // joins backup threads — no more logs can fire
-      releaseLogTsfn(db);
-      it->second.unlock();
+      heldMutex = std::move(it->second);
       g_stmt_mutexes.erase(it);
-    } else {
-      // No mutex entry — no calls were ever made; just close.
-      db_close(db);
-      releaseLogTsfn(db);
     }
+  }
+  if (heldMutex) {
+    // Wait for in-flight cursor ops to finish, then close without global lock.
+    std::lock_guard<std::mutex> lk(*heldMutex);
+    db_close(db); // joins backup threads — no more logs can fire
+    releaseLogTsfn(db);
+  } else {
+    db_close(db);
+    releaseLogTsfn(db);
   }
   return env.Null();
 }

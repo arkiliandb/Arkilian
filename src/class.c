@@ -763,23 +763,32 @@ static size_t url_host(const char *url, char *out, size_t out_cap) {
 // destination. Operators with a self-hosted MinIO or other custom storage
 // add its host via ARKILIAN_STORAGE_HOSTS="host1,host2" (comma-separated,
 // suffix-matched).
+static int host_has_suffix(const char *host, const char *suffix) {
+  if (!host || !suffix) return 0;
+  size_t hlen = strlen(host);
+  size_t slen = strlen(suffix);
+  if (hlen < slen) return 0;
+  return strcmp(host + hlen - slen, suffix) == 0;
+}
 static int host_is_known_storage(const char *host) {
   if (!host || !*host) return 0;
-  // AWS S3 (and s3-website, s3-accelerate, dualstack)
-  if (strstr(host, ".amazonaws.com")) return 1;
+  // AWS S3 (and s3-website, s3-accelerate, dualstack) — suffix-matched so
+  // evil.amazonaws.com.evil.com is NOT accepted (strstr would have).
+  if (host_has_suffix(host, ".amazonaws.com")) return 1;
+  if (strcmp(host, "amazonaws.com") == 0) return 1;
   // Google Cloud Storage
   if (strcmp(host, "storage.googleapis.com") == 0) return 1;
-  if (strstr(host, ".storage.googleapis.com")) return 1;
+  if (host_has_suffix(host, ".storage.googleapis.com")) return 1;
   // Azure Blob
-  if (strstr(host, ".blob.core.windows.net")) return 1;
+  if (host_has_suffix(host, ".blob.core.windows.net")) return 1;
   // Backblaze B2
-  if (strstr(host, ".backblazeb2.com")) return 1;
+  if (host_has_suffix(host, ".backblazeb2.com")) return 1;
   // Cloudflare R2
-  if (strstr(host, ".r2.cloudflarestorage.com")) return 1;
+  if (host_has_suffix(host, ".r2.cloudflarestorage.com")) return 1;
   // Wasabi
-  if (strstr(host, ".wasabisys.com")) return 1;
+  if (host_has_suffix(host, ".wasabisys.com")) return 1;
   // DigitalOcean Spaces
-  if (strstr(host, ".digitaloceanspaces.com")) return 1;
+  if (host_has_suffix(host, ".digitaloceanspaces.com")) return 1;
   return 0;
 }
 
@@ -3131,9 +3140,15 @@ static int upload_to_s3(arkilian *db, const char *signed_url,
   // Defense-in-depth SSRF guard: never upload the database to a host that
   // is not an allowed storage destination.
   if (!url_is_allowed_storage(signed_url)) {
+    // Truncate at '?' so the presigned query (which holds the SigV4
+    // signature) is never written to logs. Signatures in logs are
+    // replayable bearer tokens.
+    const char *q = strchr(signed_url, '?');
+    size_t host_len = q ? (size_t)(q - signed_url) : strlen(signed_url);
+    if (host_len > 200) host_len = 200;
     ark_log(db, ARK_LOG_ERROR,
-            "upload_to_s3 refused: signed_url host is not an allowed "
-            "storage destination (SSRF guard): %.200s", signed_url);
+            "upload_to_s3 refused: host is not an allowed "
+            "storage destination (SSRF guard): %.*s", (int)host_len, signed_url);
     return 1;
   }
   CURL *curl = curl_easy_init();
@@ -3144,27 +3159,51 @@ static int upload_to_s3(arkilian *db, const char *signed_url,
     return 1;
   }
 
-  if (fseek(fd, 0L, SEEK_END) != 0) {
+  // Use 64-bit file positioning (fseeko/ftello or _fseeki64/_ftelli64) to
+  // handle snapshots >2 GiB on 32-bit builds. ftell returns long (32-bit
+  // on ILP32) and truncates large sizes, producing a wrong Content-Length.
+#if defined(_WIN32)
+  if (_fseeki64(fd, 0, SEEK_END) != 0) {
     fclose(fd);
     curl_easy_cleanup(curl);
     return 1;
   }
-  long file_size = ftell(fd);
-  if (file_size < 0) {
+  __int64 file_size_64 = _ftelli64(fd);
+  if (file_size_64 < 0) {
     fclose(fd);
     curl_easy_cleanup(curl);
     return 1;
   }
+  curl_off_t file_size = (curl_off_t)file_size_64;
+  if (_fseeki64(fd, 0, SEEK_SET) != 0) {
+    fclose(fd);
+    curl_easy_cleanup(curl);
+    return 1;
+  }
+#else
+  if (fseeko(fd, 0, SEEK_END) != 0) {
+    fclose(fd);
+    curl_easy_cleanup(curl);
+    return 1;
+  }
+  off_t file_size_off = ftello(fd);
+  if (file_size_off < 0) {
+    fclose(fd);
+    curl_easy_cleanup(curl);
+    return 1;
+  }
+  curl_off_t file_size = (curl_off_t)file_size_off;
   // rewind() discards errno — a failed seek would silently upload from
-  // the wrong position, producing a torn snapshot. Use fseek() and treat
+  // the wrong position, producing a torn snapshot. Use fseeko() and treat
   // any failure as an upload failure (consistent with the SEEK_END probe
   // above) so the snapshot re-attempts on the next hourly cycle rather
   // than shipping a corrupted backup.
-  if (fseek(fd, 0L, SEEK_SET) != 0) {
+  if (fseeko(fd, 0, SEEK_SET) != 0) {
     fclose(fd);
     curl_easy_cleanup(curl);
     return 1;
   }
+#endif
 
   // Every curl_easy_setopt / curl_slist_append return code is checked —
   // a misconfigured upload must be reported, not silently swallowed.

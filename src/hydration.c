@@ -157,26 +157,29 @@ static size_t url_host(const char *url, char *out, size_t out_cap) {
 }
 
 // Storage-safe host: excludes link-local (169.254.0.0/16 and IPv6
-// fe80::) because that range hosts the cloud instance-metadata service
-// (IMDS at 169.254.169.254 on AWS/GCP/Azure). A tampered manifest
-// returning a snapshot/chunk URL pointing at IMDS would otherwise have
-// the client download from the metadata service.
+// fe80::) AND ULA fc00::/7 (fd00::/8) because that range hosts the cloud
+// instance-metadata service (IMDS at 169.254.169.254 on AWS/GCP/Azure and
+// fd00:ec2::254 for AWS IMDSv2). A tampered manifest returning a
+// snapshot/chunk URL pointing at IMDS would otherwise have the client
+// download from the metadata service. Kept in lockstep with class.c's
+// host_is_storage_safe.
 static int host_is_storage_safe(const char *host) {
   if (!host || !*host) return 0;
   if (host[0] == '[') {
     if (strncmp(host, "[::1]", 5) == 0) return 1;
-    if (strncmp(host, "[fc", 3) == 0 || strncmp(host, "[fd", 3) == 0) return 1;
-    // NO [fe80 — link-local / IMDS excluded
+    // NO [fc / [fd ULA — AWS IMDSv2 is reachable at fd00:ec2::254 and
+    // must never be treated as a safe storage destination. ULA prefixes
+    // are NOT metadata-endpoint boundaries.
     return 0;
   }
   if (strcmp(host, "localhost") == 0) return 1;
   if (strncmp(host, "127.", 4) == 0) return 1;
   if (strncmp(host, "10.", 3) == 0) return 1;
   if (strncmp(host, "192.168.", 8) == 0) return 1;
-  // NO 169.254. — IMDS excluded
+  // NO 169.254. — IMDS (IPv4) excluded
   // NO fe80 — IPv6 link-local excluded
-  if (strncmp(host, "::1", 3) == 0) return 1;
-  if (strncmp(host, "fc", 2) == 0 || strncmp(host, "fd", 2) == 0) return 1;
+  // NO fc / fd ULA — AWS IMDSv2 (fd00:ec2::254) excluded
+  if (strcmp(host, "::1") == 0) return 1;
   if (strncmp(host, "172.", 4) == 0) {
     unsigned second = 0;
     if (sscanf(host, "172.%u.", &second) == 1 && second >= 16 && second <= 31)
@@ -185,16 +188,25 @@ static int host_is_storage_safe(const char *host) {
   return 0;
 }
 
+static int host_has_suffix(const char *host, const char *suffix) {
+  if (!host || !suffix) return 0;
+  size_t hlen = strlen(host);
+  size_t slen = strlen(suffix);
+  if (hlen < slen) return 0;
+  return strcmp(host + hlen - slen, suffix) == 0;
+}
 static int host_is_known_storage(const char *host) {
   if (!host || !*host) return 0;
-  if (strstr(host, ".amazonaws.com")) return 1;
+  // Suffix-matched (not substring) so evil.amazonaws.com.evil.com is NOT accepted.
+  if (host_has_suffix(host, ".amazonaws.com")) return 1;
+  if (strcmp(host, "amazonaws.com") == 0) return 1;
   if (strcmp(host, "storage.googleapis.com") == 0) return 1;
-  if (strstr(host, ".storage.googleapis.com")) return 1;
-  if (strstr(host, ".blob.core.windows.net")) return 1;
-  if (strstr(host, ".backblazeb2.com")) return 1;
-  if (strstr(host, ".r2.cloudflarestorage.com")) return 1;
-  if (strstr(host, ".wasabisys.com")) return 1;
-  if (strstr(host, ".digitaloceanspaces.com")) return 1;
+  if (host_has_suffix(host, ".storage.googleapis.com")) return 1;
+  if (host_has_suffix(host, ".blob.core.windows.net")) return 1;
+  if (host_has_suffix(host, ".backblazeb2.com")) return 1;
+  if (host_has_suffix(host, ".r2.cloudflarestorage.com")) return 1;
+  if (host_has_suffix(host, ".wasabisys.com")) return 1;
+  if (host_has_suffix(host, ".digitaloceanspaces.com")) return 1;
   return 0;
 }
 
@@ -452,9 +464,12 @@ static int http_download_file(const char *url,
   // metadata-service URL has no path to the local DB even before content
   // auth runs.
   if (!url_is_allowed_storage(url)) {
+    const char *q = strchr(url, '?');
+    size_t host_len = q ? (size_t)(q - url) : strlen(url);
+    if (host_len > 200) host_len = 200;
     fprintf(stderr,
             "arkilian: snapshot download refused — host is not an allowed "
-            "storage destination (SSRF guard): %.200s\n", url);
+            "storage destination (SSRF guard): %.*s\n", (int)host_len, url);
     *err_out = HYDRATION_ERR_PROTO;
     return -1;
   }
