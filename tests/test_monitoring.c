@@ -280,6 +280,12 @@ static void test_health(void) {
   // single-threaded, so 10 is the upper bound.
   assert(depth >= 1 && depth <= 10);
   assert(db_backup_is_healthy(db) == 0);
+
+  // Wait for the flush thread to observe the cap and set the sticky gap while cap is 10.
+  for (int i = 0; i < 50; i++) {
+    if (db_backup_capture_paused(db) == 1) break;
+    usleep(100 * 1000);
+  }
   ark_unsetenv("ARKILIAN_MAX_QUEUE_DEPTH");
 
   // Kill-switch → unhealthy: a green light while nothing ships is a
@@ -296,25 +302,7 @@ static void test_health(void) {
   // registry (publish-never). The old suite asserted green on heartbeats
   // alone; the gap must stay visible instead.
   {
-    // Wait for the flush thread to observe the cap and set the sticky gap.
-    // Poll up to 30s (flush thread polls every ~2s, a bit slower on CI).
-    int paused = 0;
-    for (int i = 0; i < 300; i++) {
-      if (db_backup_capture_paused(db) == 1) { paused = 1; break; }
-      usleep(100 * 1000);
-    }
-    if (!paused) {
-      fprintf(stderr, "WARN: capture_paused not set within 30s (depth=%d flags=0x%x paused=%d)\n",
-              db_backup_queue_depth(db), db_backup_health_flags(db), db_backup_capture_paused(db));
-    }
-    // Don't assert on paused – it's best-effort and the health flags below
-    // still verify the degraded state (queue at cap, manifest unresolved).
     assert(db_backup_queue_depth(db) <= 10);
-    // Sticky gap is best-effort; if not yet set, just warn and check the
-    // health flags that are always visible (queue at cap, manifest unresolved).
-    if (db_backup_capture_paused(db) != 1) {
-      fprintf(stderr, "WARN: capture_paused still 0 (depth=%d)\n", db_backup_queue_depth(db));
-    }
     unsigned hf = db_backup_health_flags(db);
     assert(hf & ARK_HF_FLUSH_ALIVE);
     assert(hf & ARK_HF_QUEUE_BELOW_CAP);
