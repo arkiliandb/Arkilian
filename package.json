@@ -11,7 +11,8 @@
     "clean": "node-gyp clean",
     "pretest": "node-gyp configure && node-gyp build",
     "test": "node test.js",
-    "prebuildify": "prebuildify --napi --strip"
+    "prebuildify": "prebuildify --napi --strip",
+    "release:packages": "bash scripts/build-release-packages.sh"
   },
   "keywords": [
     "sqlite",

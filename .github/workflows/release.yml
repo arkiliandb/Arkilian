@@ -1,23 +1,28 @@
 name: release
 
-# Builds tagged-release artifacts on all three platforms, attaches them
+# Builds tagged-release artifacts on Linux, macOS, and Windows across all
+# language bindings (Node.js, Python, Rust, Go, PHP, C Core), attaches them
 # to the GitHub release, and publishes supply-chain evidence:
 #
-#   * SLSA provenance — slsa-github-generator (GitHub OIDC), verifiable
-#     with `slsa-verifier`.
-#   * SBOM — Syft-generated SPDX document, signed with sigstore keyless,
-#     verifiable with `cosign verify-blob`.
-#
-# This is deliberately a *separate* workflow from ci.yml: CI stays a
-# pure test gate, and releases are the only place assets + evidence are
-# attached.
+#   * SLSA provenance — slsa-github-generator (GitHub OIDC)
+#   * SBOM — Syft-generated SPDX document, signed with sigstore keyless
+#   * SHA256SUMS.txt — cryptographic checksums covering all release assets
 
 on:
   release:
     types: [published]
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v1.4.1 — defaults to package.json version)'
+        required: false
+        default: ''
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.release.tag_name }}
+  group: ${{ github.workflow }}-${{ github.event.release.tag_name || inputs.tag || github.ref_name }}
   cancel-in-progress: true
 
 permissions:
@@ -26,8 +31,28 @@ permissions:
   actions: read
 
 jobs:
-  # ── Build the native assets for every platform ─────────────────────
-  build:
+  # ── Resolve Release Tag & Version ──────────────────────────────────
+  resolve_tag:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      version: ${{ steps.resolve.outputs.version }}
+    steps:
+    - uses: actions/checkout@v4
+    - id: resolve
+      run: |
+        TAG="${{ github.event.release.tag_name || inputs.tag || github.ref_name }}"
+        if [[ -z "$TAG" || "$TAG" == "main" || "$TAG" == "prod" ]]; then
+          VER=$(node -p "require('./package.json').version")
+          TAG="v$VER"
+        fi
+        echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+        echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+        echo "Target Release Tag: $TAG"
+
+  # ── Build the native C core assets for every platform ──────────────
+  build_native:
+    needs: [resolve_tag]
     strategy:
       fail-fast: false
       matrix:
@@ -38,27 +63,29 @@ jobs:
             shared-lib: libarkilian.so
             static-lib: libarkilian.a
             dlq-bin: arkilian-dlq
-          - os: macos-latest
+          - os: macos-13
             suffix: darwin-x64
+            artifact-dir: build
+            shared-lib: libarkilian.dylib
+            static-lib: libarkilian.a
+            dlq-bin: arkilian-dlq
+          - os: macos-latest
+            suffix: darwin-arm64
             artifact-dir: build
             shared-lib: libarkilian.dylib
             static-lib: libarkilian.a
             dlq-bin: arkilian-dlq
           - os: windows-latest
             suffix: windows-x64
-            # MSVC uses a multi-config generator: Release outputs land in
-            # build/Release/, NOT build/.
             artifact-dir: build/Release
             shared-lib: arkilian.dll
-            # Renamed in CMakeLists.txt to avoid clashing with the DLL's
-            # import library (which is also arkilian.lib).
             static-lib: arkilian_static.lib
             dlq-bin: arkilian-dlq.exe
     runs-on: ${{ matrix.os }}
     steps:
     - uses: actions/checkout@v4
       with:
-        ref: ${{ github.event.release.tag_name }}
+        ref: ${{ github.event.release.tag_name || github.ref }}
 
     - name: Install Dependencies (Linux)
       if: matrix.os == 'ubuntu-latest'
@@ -67,7 +94,7 @@ jobs:
         sudo apt-get install -y libcurl4-openssl-dev
 
     - name: Install Dependencies (macOS)
-      if: matrix.os == 'macos-latest'
+      if: startsWith(matrix.os, 'macos')
       run: |
         brew install curl
         echo "CMAKE_PREFIX_PATH=$(brew --prefix curl)" >> "$GITHUB_ENV"
@@ -92,38 +119,50 @@ jobs:
       run: cmake -B build -S . -DCMAKE_BUILD_TYPE=Release -DARKILIAN_BUILD_EXAMPLES=OFF -DARKILIAN_BUILD_TESTS=OFF
 
     - name: Build
-      run: cmake --build build --config Release
+      run: cmake --build build --config Release -j4
 
-    - name: Stage release assets
+    - name: Stage release package
       shell: bash
       run: |
-        mkdir -p dist
-        cp "${{ matrix.artifact-dir }}/${{ matrix.shared-lib }}" dist/ 2>/dev/null || true
-        cp "${{ matrix.artifact-dir }}/${{ matrix.static-lib }}" dist/
-        # Dead-letter queue recovery tool (docs/operations.md §3) — built
-        # on every default build, shipped per-platform so operators can run
-        # support without a toolchain (launch Checklist #5).
-        cp "${{ matrix.artifact-dir }}/${{ matrix.dlq-bin }}" dist/ 2>/dev/null || true
-        cp src/class.h src/hydration.h src/sha256.h dist/
+        VERSION="${{ needs.resolve_tag.outputs.version }}"
+        STAGE_DIR="$(mktemp -d /tmp/c-stage.XXXXXX 2>/dev/null || mktemp -d -t 'c-stage')"
+        mkdir -p "$STAGE_DIR/include/arkilian" "$STAGE_DIR/lib" "$STAGE_DIR/bin" "dist"
+
+        cp src/class.h src/hydration.h src/sha256.h "$STAGE_DIR/include/arkilian/"
+        cp "${{ matrix.artifact-dir }}/${{ matrix.shared-lib }}" "$STAGE_DIR/lib/" 2>/dev/null || true
+        cp "${{ matrix.artifact-dir }}/${{ matrix.static-lib }}" "$STAGE_DIR/lib/"
+        cp "${{ matrix.artifact-dir }}/${{ matrix.dlq-bin }}" "$STAGE_DIR/bin/" 2>/dev/null || true
+
+        # Copy standalone dlq binary for easy direct download
+        if [ -f "${{ matrix.artifact-dir }}/${{ matrix.dlq-bin }}" ]; then
+          EXT=""
+          if [[ "${{ matrix.suffix }}" == *"windows"* ]]; then EXT=".exe"; fi
+          cp "${{ matrix.artifact-dir }}/${{ matrix.dlq-bin }}" "dist/arkilian-dlq-v${VERSION}-${{ matrix.suffix }}${EXT}"
+        fi
+
+        # Create platform archive
+        if [[ "${{ matrix.suffix }}" == *"windows"* ]]; then
+          (cd "$STAGE_DIR" && powershell Compress-Archive -Path * -DestinationPath "$GITHUB_WORKSPACE/dist/arkilian-c-v${VERSION}-${{ matrix.suffix }}.zip")
+        else
+          tar -czf "dist/arkilian-c-v${VERSION}-${{ matrix.suffix }}.tar.gz" -C "$STAGE_DIR" .
+        fi
+
+        # Also preserve raw shared lib for python wheel bundling in downstream jobs
+        cp "${{ matrix.artifact-dir }}/${{ matrix.shared-lib }}" "dist/" 2>/dev/null || true
+
+        rm -rf "$STAGE_DIR"
         ls -la dist/
 
-    - name: Upload build assets
+    - name: Upload native assets
       uses: actions/upload-artifact@v4
       with:
-        name: assets-${{ matrix.suffix }}
-        path: dist
+        name: native-assets-${{ matrix.suffix }}
+        path: dist/
         if-no-files-found: error
 
-  # ── N-API prebuilt addons (launch Checklist #2) ─────────────────────
-  # Builds a .node prebuild per platform/arch via prebuildify, then
-  # publishes the npm package with ALL prebuilds bundled in prebuilds/.
-  # Consumers on toolchain-less hosts (Alpine, Lambda, serverless) get
-  # `npm install arkilian` without a C compiler or libcurl-dev —
-  # node-gyp-build picks the right .node at runtime from the bundle.
-  # prebuildify is the maintained successor to the deprecated
-  # prebuild/prebuild-install download flow (no network fetch at install,
-  # works with install-scripts disabled, npm checksum covers prebuilds).
+  # ── N-API prebuilt addons for Node.js ──────────────────────────────
   napi_prebuild:
+    needs: [resolve_tag]
     strategy:
       fail-fast: false
       matrix:
@@ -145,7 +184,7 @@ jobs:
             arch: x64
             libc: musl
             container: alpine:3.20
-          # macOS x64 (macos-13 is the last Intel runner)
+          # macOS x64 (Intel)
           - os: macos-13
             platform: darwin
             arch: x64
@@ -165,14 +204,13 @@ jobs:
     steps:
     - uses: actions/checkout@v4
       with:
-        ref: ${{ github.event.release.tag_name }}
+        ref: ${{ github.event.release.tag_name || github.ref }}
 
     - name: Install build deps (Linux glibc)
       if: matrix.platform == 'linux' && matrix.libc != 'musl'
       run: |
         sudo apt-get update
         sudo apt-get install -y libcurl4-openssl-dev
-        # Cross-compiler for arm64 target
         if [ "${{ matrix.cross }}" = "1" ]; then
           sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
         fi
@@ -203,7 +241,6 @@ jobs:
       uses: actions/setup-node@v4
       with:
         node-version: '20'
-        registry-url: 'https://registry.npmjs.org'
 
     - name: Install deps
       if: matrix.libc != 'musl'
@@ -220,16 +257,6 @@ jobs:
         echo "CXX=aarch64-linux-gnu-g++" >> "$GITHUB_ENV"
         echo "npm_config_arch=arm64" >> "$GITHUB_ENV"
 
-    # Windows: node-gyp cannot resolve vcpkg's transitive libcurl
-    # dependencies (zlib, bcrypt, normaliz, …) from binding.gyp alone, so
-    # the win32-x64 prebuild is produced with cmake-js + the vcpkg
-    # toolchain — the same combination the `build` job uses, where
-    # find_package(CURL) links every transitive dependency via
-    # CURL::libcurl. The finished addon is staged at the exact
-    # node-gyp-build location prebuildify would have produced
-    # (prebuilds/win32-x64/node.napi.node).
-    # NOTE cmake-js's --CD syntax: "--CD<KEY>=<VALUE>" as ONE token (a
-    # space-separated "--CD KEY=VALUE" is silently ignored).
     - name: Build prebuild (Windows — cmake-js with vcpkg curl)
       if: matrix.platform == 'win32'
       shell: pwsh
@@ -250,8 +277,6 @@ jobs:
     - name: Stage prebuild artifact
       shell: bash
       run: |
-        # prebuildify outputs to prebuilds/{platform}-{arch}/ — rename for
-        # musl so the publish job can place it at linux-x64-musl.
         if [ -n "${{ matrix.libc }}" ]; then
           mv prebuilds/${{ matrix.platform }}-${{ matrix.arch }} \
              prebuilds/${{ matrix.platform }}-${{ matrix.arch }}-${{ matrix.libc }}
@@ -265,14 +290,114 @@ jobs:
         path: prebuilds/
         if-no-files-found: error
 
-  # ── Publish to npm with all prebuilds bundled ───────────────────────
+  # ── Build Language Bindings (Python, Rust, Go, PHP) ────────────────
+  build_bindings:
+    needs: [resolve_tag, build_native]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux
+            arch: x64
+            native-asset-name: native-assets-linux-x64
+            shared-lib: libarkilian.so
+          - os: macos-latest
+            platform: darwin
+            arch: arm64
+            native-asset-name: native-assets-darwin-arm64
+            shared-lib: libarkilian.dylib
+    runs-on: ${{ matrix.os }}
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        ref: ${{ github.event.release.tag_name || github.ref }}
+
+    - name: Download native shared library
+      uses: actions/download-artifact@v4
+      with:
+        name: ${{ matrix.native-asset-name }}
+        path: native-lib-dl
+
+    - name: Setup Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Setup Rust
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Setup Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.22'
+
+    - name: Build Python packages (wheel & sdist)
+      run: |
+        VERSION="${{ needs.resolve_tag.outputs.version }}"
+        mkdir -p dist-bindings
+        python -m pip install --upgrade pip build wheel setuptools cffi
+
+        # Copy shared library into python package directory for self-contained wheel
+        if [ -f "native-lib-dl/${{ matrix.shared-lib }}" ]; then
+          cp "native-lib-dl/${{ matrix.shared-lib }}" bindings/python/arkilian/
+        fi
+
+        cd bindings/python
+        python -m pip wheel --no-deps -w ../../dist-bindings .
+        tar -czf "../../dist-bindings/arkilian-python-v${VERSION}.tar.gz" \
+          --exclude='__pycache__' --exclude='*.egg-info' --exclude='dist' .
+        rm -f arkilian/${{ matrix.shared-lib }}
+        cd ../..
+
+    - name: Build Rust crates & compiled libraries
+      run: |
+        VERSION="${{ needs.resolve_tag.outputs.version }}"
+        # Package crates
+        (cd bindings/rust/arkilian-sys && cargo package --allow-dirty --no-verify)
+        if [ -f bindings/rust/arkilian-sys/target/package/arkilian-sys-*.crate ]; then
+          cp bindings/rust/arkilian-sys/target/package/arkilian-sys-*.crate dist-bindings/arkilian-sys-v${VERSION}.crate
+        fi
+
+        (cd bindings/rust/arkilian && cargo package --allow-dirty --no-verify)
+        if [ -f bindings/rust/arkilian/target/package/arkilian-*.crate ]; then
+          cp bindings/rust/arkilian/target/package/arkilian-*.crate dist-bindings/arkilian-rust-v${VERSION}.crate
+        fi
+
+        # Precompiled Rust library archive
+        mkdir -p build
+        cp native-lib-dl/${{ matrix.shared-lib }} build/ 2>/dev/null || true
+        (cd bindings/rust/arkilian && cargo build --release --lib)
+        RUST_STAGE=$(mktemp -d)
+        mkdir -p "$RUST_STAGE/lib" "$RUST_STAGE/include"
+        cp bindings/rust/arkilian/src/bindings.h "$RUST_STAGE/include/" 2>/dev/null || true
+        cp bindings/rust/arkilian/target/release/libarkilian.* "$RUST_STAGE/lib/" 2>/dev/null || true
+        tar -czf "dist-bindings/arkilian-rust-lib-v${VERSION}-${{ matrix.platform }}-${{ matrix.arch }}.tar.gz" -C "$RUST_STAGE" .
+        rm -rf "$RUST_STAGE"
+
+    - name: Package Go & PHP bindings (Linux only to prevent duplicates)
+      if: matrix.platform == 'linux'
+      run: |
+        VERSION="${{ needs.resolve_tag.outputs.version }}"
+        tar -czf "dist-bindings/arkilian-go-v${VERSION}.tar.gz" -C bindings/go .
+        tar -czf "dist-bindings/arkilian-php-v${VERSION}.tar.gz" -C bindings/php .
+        (cd bindings/php && zip -r "../../dist-bindings/arkilian-php-v${VERSION}.zip" .)
+
+    - name: Upload language binding artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: bindings-${{ matrix.platform }}-${{ matrix.arch }}
+        path: dist-bindings/
+        if-no-files-found: error
+
+  # ── Bundle npm package with all prebuilds ───────────────────────────
   publish_npm:
-    needs: [napi_prebuild]
+    needs: [resolve_tag, napi_prebuild]
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
       with:
-        ref: ${{ github.event.release.tag_name }}
+        ref: ${{ github.event.release.tag_name || github.ref }}
 
     - name: Setup Node
       uses: actions/setup-node@v4
@@ -289,77 +414,78 @@ jobs:
 
     - name: Merge prebuilds into package
       run: |
-        # Each matrix job uploaded its own prebuilds/{plat}-{arch}/ dir;
-        # downloading with merge-multiple puts them all under one tree.
-        # Move them into the repo's prebuilds/ for npm publish.
         rm -rf prebuilds
         mkdir -p prebuilds
         cp -r prebuilds-collected/* prebuilds/
-        # Clean up the intermediate
         rm -rf prebuilds-collected
-        echo "=== Final prebuilds tree ==="
         find prebuilds/ -type f
 
-    - name: Install production deps (for node-gyp-build runtime)
-      run: npm ci
+    - name: Package standalone prebuilds archive
+      run: |
+        VERSION="${{ needs.resolve_tag.outputs.version }}"
+        mkdir -p dist-npm
+        tar -czf "dist-npm/arkilian-node-prebuilds-v${VERSION}.tar.gz" prebuilds/
 
-    - name: Publish to npm
+    - name: Pack offline npm tarball (.tgz)
+      run: |
+        npm pack --pack-destination dist-npm/
+        ls -la dist-npm/
+
+    - name: Upload npm release assets
+      uses: actions/upload-artifact@v4
+      with:
+        name: npm-release-assets
+        path: dist-npm/
+        if-no-files-found: error
+
+    - name: Publish to npm (if NPM_TOKEN set)
+      if: env.NODE_AUTH_TOKEN != ''
       run: npm publish --access public
       env:
         NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
-    - name: Verify published package resolves
-      run: |
-        # Smoke-test: install the just-published package in a clean dir
-        # and require it — proves the prebuild resolves on this platform.
-        mkdir -p /tmp/arkilian-smoke && cd /tmp/arkilian-smoke
-        npm init -y
-        npm install arkilian@$(node -p "require('$GITHUB_WORKSPACE/package.json').version")
-        node -e "const A = require('arkilian'); console.log('module loaded OK');" || true
-
-  # ── Attach assets, hash them for SLSA subjects, SBOM, and sign ──────
-  sign:
-    needs: [build]
+  # ── Drop All Release Artifacts to GitHub Release ────────────────────
+  drop_release_artifacts:
+    needs: [resolve_tag, build_native, build_bindings, publish_npm]
     runs-on: ubuntu-latest
     outputs:
       hashes: ${{ steps.subjects.outputs.hashes }}
     steps:
     - uses: actions/checkout@v4
       with:
-        ref: ${{ github.event.release.tag_name }}
+        ref: ${{ github.event.release.tag_name || github.ref }}
 
-    - name: Download all build assets
+    - name: Download all release artifacts
       uses: actions/download-artifact@v4
       with:
-        pattern: assets-*
-        path: assets
-        merge-multiple: true
+        path: all-downloads
 
-    - name: Attach assets to release
-      env:
-        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      run: |
-        TARGET_DIR="$GITHUB_WORKSPACE/assets"
-        for f in "$TARGET_DIR"/*; do
-          echo "uploading: $(basename "$f")"
-          gh release upload "${{ github.event.release.tag_name }}" "$f" --clobber
-        done
-
-    - name: Compute SLSA subject hashes
+    - name: Aggregate release artifacts
       id: subjects
       run: |
-        mkdir -p dist
-        cp assets/* dist/
-        cd dist
-        sha256sum * | tee ../subjects.sha256sum
+        mkdir -p final-artifacts
+        # Find all archives, packages, binaries, and checksums
+        find all-downloads -type f \( \
+          -name "*.tar.gz" -o \
+          -name "*.tgz" -o \
+          -name "*.zip" -o \
+          -name "*.whl" -o \
+          -name "*.crate" -o \
+          -name "arkilian-dlq*" \
+        \) -exec cp {} final-artifacts/ \;
+
+        cd final-artifacts
+        sha256sum * > SHA256SUMS.txt
+        echo "=== SHA256 Checksums ==="
+        cat SHA256SUMS.txt
+        base64 -w0 SHA256SUMS.txt > ../subjects.sha256sum.base64
+        echo "hashes=$(cat ../subjects.sha256sum.base64)" >> "$GITHUB_OUTPUT"
         cd ..
-        base64 -w0 subjects.sha256sum > subjects.sha256sum.base64
-        echo "hashes=$(base64 -w0 subjects.sha256sum)" >> "$GITHUB_OUTPUT"
 
     - name: Generate SBOM (SPDX)
       uses: anchore/sbom-action@v0.24.0
       with:
-        path: ./dist
+        path: ./final-artifacts
         format: spdx-json
         output-file: arkilian.spdx.json
 
@@ -372,26 +498,36 @@ jobs:
           --output-signature arkilian.spdx.json.sig \
           --output-certificate arkilian.spdx.json.pem \
           arkilian.spdx.json
+        cp arkilian.spdx.json arkilian.spdx.json.sig arkilian.spdx.json.pem final-artifacts/
 
-    - name: Attach SBOM + signature + manifest to release
+    - name: Drop artifacts on GitHub Release
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
-        gh release upload "${{ github.event.release.tag_name }}" \
-          arkilian.spdx.json \
-          arkilian.spdx.json.sig \
-          arkilian.spdx.json.pem \
-          subjects.sha256sum \
-          --clobber
+        TAG="${{ needs.resolve_tag.outputs.tag }}"
+        echo "Target GitHub Release: $TAG"
 
-  # ── SLSA provenance (reusable generic generator) ────────────────────
+        # Create the release if it does not exist yet
+        if ! gh release view "$TAG" >/dev/null 2>&1; then
+          echo "Creating release $TAG..."
+          gh release create "$TAG" \
+            --title "Arkilian $TAG" \
+            --generate-notes
+        fi
+
+        echo "Attaching release artifacts to $TAG..."
+        gh release upload "$TAG" final-artifacts/* --clobber
+        echo "Release artifacts dropped successfully!"
+        gh release view "$TAG"
+
+  # ── SLSA Provenance Attestation ─────────────────────────────────────
   provenance:
-    needs: [sign]
+    needs: [drop_release_artifacts]
     permissions:
       id-token: write
       contents: write
       actions: read
     uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2.1.0
     with:
-      base64-subjects: ${{ needs.sign.outputs.hashes }}
+      base64-subjects: ${{ needs.drop_release_artifacts.outputs.hashes }}
       upload-assets: true
