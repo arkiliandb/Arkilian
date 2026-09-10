@@ -1,11 +1,19 @@
 fn main() {
+    println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=src/bindings.h");
 
+    let manifest_dir = std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".into()));
     if let Ok(dir) = std::env::var("ARKILIAN_LIB_DIR") {
         println!("cargo:rustc-link-search=native={}", dir);
     }
-    println!("cargo:rustc-link-search=native=../../../build");
-    println!("cargo:rustc-link-search=native=../../../build/Release");
+    if let Ok(p) = manifest_dir.join("../../../build").canonicalize() {
+        println!("cargo:rustc-link-search=native={}", p.display());
+        println!("cargo:rustc-link-arg=-Wl,-rpath,{}", p.display());
+    }
+    if let Ok(p) = manifest_dir.join("../../../build/Release").canonicalize() {
+        println!("cargo:rustc-link-search=native={}", p.display());
+        println!("cargo:rustc-link-arg=-Wl,-rpath,{}", p.display());
+    }
     println!("cargo:rustc-link-search=native=/usr/local/lib");
     println!("cargo:rustc-link-search=native=/opt/homebrew/lib");
     println!("cargo:rustc-link-lib=arkilian");

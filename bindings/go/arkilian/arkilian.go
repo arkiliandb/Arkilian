@@ -16,7 +16,7 @@
 package arkilian
 
 /*
-#cgo CFLAGS: -I${SRCDIR}/../../../src -I${SRCDIR}/../../../src/deps/sqlite
+#cgo CFLAGS: -I${SRCDIR} -I${SRCDIR}/../../../src -I${SRCDIR}/../../../src/deps/sqlite
 #cgo darwin CFLAGS: -D_DARWIN_C_SOURCE
 #cgo LDFLAGS: -lcurl -lpthread
 #cgo darwin LDFLAGS: -framework CoreFoundation -framework Security

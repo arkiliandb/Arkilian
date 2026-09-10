@@ -49,6 +49,9 @@ func TestSimulation(t *testing.T) {
 	serverBin := filepath.Join(os.TempDir(), "arkilian-sim-server")
 	_, thisFile, _, _ := runtime.Caller(0)
 	serverDir := filepath.Join(filepath.Dir(thisFile), "..", "..", "..", "server")
+	if _, err := os.Stat(serverDir); os.IsNotExist(err) {
+		t.Skip("legacy server directory not present — skipping simulation test")
+	}
 	buildCmd := exec.Command("go", "build", "-C", serverDir, "-o", serverBin, ".")
 	if out, err := buildCmd.CombinedOutput(); err != nil {
 		t.Fatalf("build server: %v\n%s", err, out)

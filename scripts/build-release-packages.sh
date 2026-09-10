@@ -89,9 +89,27 @@ echo "==============================================================="
 echo ""
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 1. Build C Core Libraries & DLQ Recovery Tool
+# 1. Node.js N-API Prebuilds
 # ─────────────────────────────────────────────────────────────────────────────
-echo "==> [1/6] Building native C core libraries and CLI tools..."
+echo "==> [1/6] Building Node.js N-API addons..."
+# Build prebuild for current platform (runs node-gyp into build/)
+if command -v npx >/dev/null 2>&1; then
+  npx prebuildify --napi --strip || true
+fi
+
+if [ -d "prebuilds" ]; then
+  tar -czf "$DIST_DIR/arkilian-node-prebuilds-v${VERSION}-${PLATFORM_SUFFIX}.tar.gz" prebuilds/
+  echo "  -> Created: arkilian-node-prebuilds-v${VERSION}-${PLATFORM_SUFFIX}.tar.gz"
+fi
+
+# Create packed npm tarball containing code + available prebuilds
+npm pack --pack-destination "$DIST_DIR"
+echo "  -> Created: $(ls "$DIST_DIR"/arkilian-*.tgz | head -n 1)"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2. C Shared/Static Libraries & Tools (CMake)
+# ─────────────────────────────────────────────────────────────────────────────
+echo "==> [2/6] Compiling C core libraries & tools (CMake)..."
 cmake -B build -S . \
   -DCMAKE_BUILD_TYPE=Release \
   -DARKILIAN_BUILD_EXAMPLES=OFF \
@@ -130,24 +148,6 @@ fi
 tar -czf "$DIST_DIR/arkilian-c-v${VERSION}-${PLATFORM_SUFFIX}.tar.gz" -C "$C_STAGE_DIR" .
 rm -rf "$C_STAGE_DIR"
 echo "  -> Created: arkilian-c-v${VERSION}-${PLATFORM_SUFFIX}.tar.gz"
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 2. Node.js (npm package & prebuilds)
-# ─────────────────────────────────────────────────────────────────────────────
-echo "==> [2/6] Packaging Node.js N-API addons and npm bundle..."
-# Build prebuild for current platform
-if command -v npx >/dev/null 2>&1; then
-  npx prebuildify --napi --strip || true
-fi
-
-if [ -d "prebuilds" ]; then
-  tar -czf "$DIST_DIR/arkilian-node-prebuilds-v${VERSION}-${PLATFORM_SUFFIX}.tar.gz" prebuilds/
-  echo "  -> Created: arkilian-node-prebuilds-v${VERSION}-${PLATFORM_SUFFIX}.tar.gz"
-fi
-
-# Create packed npm tarball containing code + available prebuilds
-npm pack --pack-destination "$DIST_DIR"
-echo "  -> Created: $(ls "$DIST_DIR"/arkilian-*.tgz | head -n 1)"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 3. Python (Wheel & Source Distribution)
@@ -227,14 +227,27 @@ fi
 # ─────────────────────────────────────────────────────────────────────────────
 echo "==> [5/6] Packaging Go & PHP bindings..."
 if [ -d "bindings/go" ]; then
-  tar -czf "$DIST_DIR/arkilian-go-v${VERSION}.tar.gz" \
-    -C bindings/go .
+  GO_STAGE="$(mktemp -d /tmp/arkilian-go-stage.XXXXXX)"
+  cp -RL bindings/go/* "$GO_STAGE/"
+  mkdir -p "$GO_STAGE/arkilian"
+  cp -f src/*.h "$GO_STAGE/arkilian/" 2>/dev/null || true
+  cp -f src/deps/sqlite/*.h "$GO_STAGE/arkilian/" 2>/dev/null || true
+  tar -czf "$DIST_DIR/arkilian-go-v${VERSION}.tar.gz" -C "$GO_STAGE" .
+  rm -rf "$GO_STAGE"
   echo "  -> Created: arkilian-go-v${VERSION}.tar.gz"
 fi
 
 if [ -d "bindings/php" ]; then
-  tar -czf "$DIST_DIR/arkilian-php-v${VERSION}.tar.gz" \
-    -C bindings/php .
+  PHP_STAGE="$(mktemp -d /tmp/arkilian-php-stage.XXXXXX)"
+  cp -RL bindings/php/* "$PHP_STAGE/"
+  if [ -f "build/libarkilian.dylib" ]; then
+    cp "build/libarkilian.dylib" "$PHP_STAGE/"
+  elif [ -f "build/libarkilian.so" ]; then
+    cp "build/libarkilian.so" "$PHP_STAGE/"
+  fi
+  cp -f src/class.h "$PHP_STAGE/" 2>/dev/null || true
+  tar -czf "$DIST_DIR/arkilian-php-v${VERSION}.tar.gz" -C "$PHP_STAGE" .
+  rm -rf "$PHP_STAGE"
   echo "  -> Created: arkilian-php-v${VERSION}.tar.gz"
 fi
 

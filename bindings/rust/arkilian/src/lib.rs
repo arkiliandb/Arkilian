@@ -14,6 +14,7 @@ mod bindings {
         _private: [u8; 0],
     }
     
+    #[link(name = "arkilian")]
     extern "C" {
         pub fn db_init(db: *mut *mut Arkilian, path: *const c_char) -> i32;
         pub fn db_close(db: *mut Arkilian);

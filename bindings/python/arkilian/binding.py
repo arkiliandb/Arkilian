@@ -52,6 +52,8 @@ for name in lib_names:
 repo_build_dirs = [
     os.path.join(this_dir, "..", "..", "..", "build"),
     os.path.join(this_dir, "..", "..", "..", "build", "Release"),
+    os.path.join(this_dir, "..", "..", "..", "build-c"),
+    os.path.join(this_dir, "..", "..", "..", "cmake-build-release"),
     os.path.join(this_dir, "..", "..", "build"),
     os.path.join(this_dir, "..", "build"),
 ]
