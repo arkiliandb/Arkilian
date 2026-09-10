@@ -95,3 +95,4 @@ cmake-napi-build/
 **.db.**
 **.sqlite.**
 bindings/rust/arkilian-sys/target/*
+all-tests.log
