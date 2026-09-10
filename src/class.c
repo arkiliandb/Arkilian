@@ -767,6 +767,16 @@ static int sidecar_fault_check(const char *op) {
   return 0;
 }
 
+static int sidecar_fault_check_tx(const char *op, uint64_t txid) {
+  const char *val = getenv("ARKILIAN_FAULT_SIDECAR");
+  if (!val) return 0;
+  if (strcmp(val, op) == 0) return 1;
+  char buf[64];
+  snprintf(buf, sizeof(buf), "%s_%llu", op, (unsigned long long)txid);
+  if (strcmp(val, buf) == 0) return 1;
+  return 0;
+}
+
 static uint32_t txn_checksum(uint64_t txid, uint8_t type, const char *sql) {
   // Simple FNV-1a over txid+type+sql for sidecar integrity
   uint32_t h = 2166136261u;
@@ -969,16 +979,20 @@ static uint64_t get_sidecar_promoted_watermark(sqlite3 *h) {
   return wm;
 }
 
-static void set_sidecar_promoted_watermark(sqlite3 *h, uint64_t wm) {
-  if (!h) return;
+static int set_sidecar_promoted_watermark(sqlite3 *h, uint64_t wm) {
+  if (!h) return -1;
   sqlite3_stmt *st = NULL;
   char buf[32];
   snprintf(buf, sizeof(buf), "%llu", (unsigned long long)wm);
+  int rc = -1;
   if (sqlite3_prepare_v2(h, "INSERT OR REPLACE INTO _arkilian_meta (k, v) VALUES ('sidecar_promoted_txid', ?)", -1, &st, NULL) == SQLITE_OK) {
     sqlite3_bind_text(st, 1, buf, -1, SQLITE_TRANSIENT);
-    sqlite3_step(st);
+    if (sqlite3_step(st) == SQLITE_DONE) {
+      rc = 0;
+    }
     sqlite3_finalize(st);
   }
+  return rc;
 }
 
 static void pending_ddl_append(arkilian *db, const char *sql) {
@@ -1128,6 +1142,17 @@ static void pending_ddl_drain_and_capture(arkilian *db) {
       }
     }
 
+    // Atomic watermark update: part of the same SQLite transaction as outbox rows
+    if (insert_ok && txid > 0) {
+      if (sidecar_fault_check_tx("watermark", txid)) {
+        insert_ok = 0;
+      } else {
+        if (set_sidecar_promoted_watermark(db->handle, txid) != 0) {
+          insert_ok = 0;
+        }
+      }
+    }
+
     if (insert_ok) {
       sqlite3_exec(db->handle, "RELEASE ark_promote_tx;", NULL, NULL, NULL);
       if (txid > 0) {
@@ -1167,14 +1192,7 @@ static void pending_ddl_drain_and_capture(arkilian *db) {
     }
     PENDING_DDL_UNLOCK(db);
   }
-
-  // Update durable promotion watermark only for fully promoted transactions
-  if (last_promoted_txid > 0) {
-    uint64_t prev_wm = get_sidecar_promoted_watermark(db->handle);
-    if (last_promoted_txid > prev_wm) {
-      set_sidecar_promoted_watermark(db->handle, last_promoted_txid);
-    }
-  }
+  (void)last_promoted_txid;
 
   // Sidecar truncation/removal:
   // Only remove if ALL pending records were promoted, no sidecar I/O error, and no unpersisted records

@@ -781,6 +781,176 @@ static void test_case_l_partial_drain_ordering_preserved(void) {
   ark_unsetenv("ARKILIAN_MAX_QUEUE_DEPTH");
 }
 
+// Case M: Crash/fault after outbox row insertion before watermark commit
+// Tests both:
+// 1. Single transaction (TX 500): fault before watermark -> savepoint rolls back rows;
+//    on restart, recovered and promoted once (no duplicates in outbox or target).
+// 2. Multi-transaction (TX 500 committed, TX 501 faults): TX 500 committed with watermark 500,
+//    TX 501 rolls back. On restart, TX 500 is NOT re-promoted, TX 501 is promoted,
+//    both exist exactly once in strict order.
+static void test_case_m_crash_after_outbox_before_watermark(void) {
+  // ── Part 1: Single transaction (TX 500) ──
+  {
+    const char *src_path = "recov_case_m1_src.db";
+    const char *tgt_path = "recov_case_m1_tgt.db";
+    char qpath[512];
+    snprintf(qpath, sizeof(qpath), "%s.arkddlqueue", src_path);
+    cleanup(src_path); cleanup(tgt_path);
+
+    arkilian *base = open_hermetic(src_path);
+    db_close(base);
+
+    // Write TX 500 to sidecar: 1 CREATE TABLE + 99 INSERTs = 100 statements
+    FILE *f = fopen(qpath, "wb");
+    assert(f != NULL);
+    uint64_t txid = 500;
+    write_sidecar_record(f, txid, 1, "BEGIN");
+    write_sidecar_record(f, txid, 4, "CREATE TABLE tbl_m1 (id INT PRIMARY KEY, v TEXT);");
+    for (int i = 1; i <= 99; i++) {
+      char sql[128];
+      snprintf(sql, sizeof(sql), "INSERT INTO tbl_m1 VALUES (%d, 'v_%d');", i, i);
+      write_sidecar_record(f, txid, 4, sql);
+    }
+    write_sidecar_record(f, txid, 2, "COMMIT");
+    fclose(f);
+
+    // Apply to source SQLite db
+    sqlite3 *raw_pre = NULL;
+    assert(sqlite3_open(src_path, &raw_pre) == SQLITE_OK);
+    assert(sqlite3_exec(raw_pre, "CREATE TABLE tbl_m1 (id INT PRIMARY KEY, v TEXT);", NULL, NULL, NULL) == SQLITE_OK);
+    for (int i = 1; i <= 99; i++) {
+      char sql[128];
+      snprintf(sql, sizeof(sql), "INSERT INTO tbl_m1 VALUES (%d, 'v_%d');", i, i);
+      assert(sqlite3_exec(raw_pre, sql, NULL, NULL, NULL) == SQLITE_OK);
+    }
+    sqlite3_close(raw_pre);
+
+    // Inject failpoint BEFORE watermark update
+    ark_setenv("ARKILIAN_FAULT_SIDECAR", "watermark", 1);
+
+    arkilian *src = NULL;
+    assert(db_init(&src, src_path) == 0 && src != NULL);
+    // Drain attempt: inserts run into savepoint, but failpoint fires before watermark update.
+    // The entire savepoint is rolled back!
+    db_backup_drain_pending(src);
+
+    // Assert: atomicity held! Neither rows nor watermark committed
+    assert(db_backup_queue_depth(src) == 0);
+    assert(db_backup_sidecar_watermark(src) < 500);
+
+    // Simulate crash / restart: close handle, unset fault
+    db_close(src);
+    ark_unsetenv("ARKILIAN_FAULT_SIDECAR");
+
+    // Restart: sidecar recovery recovers TX 500, drain promotes both rows and watermark atomically
+    src = NULL;
+    assert(db_init(&src, src_path) == 0 && src != NULL);
+    db_backup_drain_pending(src);
+
+    // Assert: TX 500 exists exactly once in _pending_backup
+    assert(db_backup_queue_depth(src) == 100);
+    assert(db_backup_sidecar_watermark(src) == 500);
+
+    // Replay to target: remote receives exactly one logical TX 500
+    sqlite3 *tgt = NULL;
+    assert(sqlite3_open(tgt_path, &tgt) == SQLITE_OK);
+    replay_outbox_to_target(src, tgt, NULL);
+
+    assert(tables_match(db_get_handle(src), tgt, "tbl_m1") == 1);
+    sqlite3_stmt *st = NULL;
+    assert(sqlite3_prepare_v2(tgt, "SELECT COUNT(*) FROM tbl_m1", -1, &st, NULL) == SQLITE_OK);
+    assert(sqlite3_step(st) == SQLITE_ROW);
+    assert(sqlite3_column_int(st, 0) == 99);
+    sqlite3_finalize(st);
+
+    sqlite3_close(tgt);
+    db_close(src);
+    cleanup(src_path); cleanup(tgt_path);
+  }
+
+  // ── Part 2: Two transactions (TX 500 committed, TX 501 faults) ──
+  {
+    const char *src_path = "recov_case_m2_src.db";
+    const char *tgt_path = "recov_case_m2_tgt.db";
+    char qpath[512];
+    snprintf(qpath, sizeof(qpath), "%s.arkddlqueue", src_path);
+    cleanup(src_path); cleanup(tgt_path);
+
+    arkilian *base = open_hermetic(src_path);
+    db_close(base);
+
+    FILE *f = fopen(qpath, "wb");
+    assert(f != NULL);
+    // TX 500 (100 records)
+    write_sidecar_record(f, 500, 1, "BEGIN");
+    write_sidecar_record(f, 500, 4, "CREATE TABLE tbl_m2_a (id INT PRIMARY KEY, v TEXT);");
+    for (int i = 1; i <= 99; i++) {
+      char sql[128];
+      snprintf(sql, sizeof(sql), "INSERT INTO tbl_m2_a VALUES (%d, 'va_%d');", i, i);
+      write_sidecar_record(f, 500, 4, sql);
+    }
+    write_sidecar_record(f, 500, 2, "COMMIT");
+
+    // TX 501 (3 records)
+    write_sidecar_record(f, 501, 1, "BEGIN");
+    write_sidecar_record(f, 501, 4, "CREATE TABLE tbl_m2_b (id INT PRIMARY KEY, v TEXT);");
+    write_sidecar_record(f, 501, 4, "INSERT INTO tbl_m2_b VALUES (1, 'vb_1');");
+    write_sidecar_record(f, 501, 4, "INSERT INTO tbl_m2_b VALUES (2, 'vb_2');");
+    write_sidecar_record(f, 501, 2, "COMMIT");
+    fclose(f);
+
+    sqlite3 *raw_pre = NULL;
+    assert(sqlite3_open(src_path, &raw_pre) == SQLITE_OK);
+    assert(sqlite3_exec(raw_pre, "CREATE TABLE tbl_m2_a (id INT PRIMARY KEY, v TEXT);", NULL, NULL, NULL) == SQLITE_OK);
+    for (int i = 1; i <= 99; i++) {
+      char sql[128];
+      snprintf(sql, sizeof(sql), "INSERT INTO tbl_m2_a VALUES (%d, 'va_%d');", i, i);
+      assert(sqlite3_exec(raw_pre, sql, NULL, NULL, NULL) == SQLITE_OK);
+    }
+    assert(sqlite3_exec(raw_pre, "CREATE TABLE tbl_m2_b (id INT PRIMARY KEY, v TEXT);", NULL, NULL, NULL) == SQLITE_OK);
+    assert(sqlite3_exec(raw_pre, "INSERT INTO tbl_m2_b VALUES (1, 'vb_1');", NULL, NULL, NULL) == SQLITE_OK);
+    assert(sqlite3_exec(raw_pre, "INSERT INTO tbl_m2_b VALUES (2, 'vb_2');", NULL, NULL, NULL) == SQLITE_OK);
+    sqlite3_close(raw_pre);
+
+    // Failpoint targeting TX 501 specifically
+    ark_setenv("ARKILIAN_FAULT_SIDECAR", "watermark_501", 1);
+
+    arkilian *src = NULL;
+    assert(db_init(&src, src_path) == 0 && src != NULL);
+    // TX 500 succeeds (watermark = 500, outbox depth = 100).
+    // TX 501 fails at watermark failpoint and rolls back.
+    db_backup_drain_pending(src);
+
+    assert(db_backup_queue_depth(src) == 100);
+    assert(db_backup_sidecar_watermark(src) == 500);
+
+    // Simulate crash / restart
+    db_close(src);
+    ark_unsetenv("ARKILIAN_FAULT_SIDECAR");
+
+    src = NULL;
+    assert(db_init(&src, src_path) == 0 && src != NULL);
+    // Sidecar recovery skips TX 500 (since 500 <= watermark 500).
+    // Only TX 501 is recovered and promoted!
+    db_backup_drain_pending(src);
+
+    // Outbox has 100 (TX 500) + 3 (TX 501) = 103 rows. No duplicates!
+    assert(db_backup_queue_depth(src) == 103);
+    assert(db_backup_sidecar_watermark(src) == 501);
+
+    sqlite3 *tgt = NULL;
+    assert(sqlite3_open(tgt_path, &tgt) == SQLITE_OK);
+    replay_outbox_to_target(src, tgt, NULL);
+
+    assert(tables_match(db_get_handle(src), tgt, "tbl_m2_a") == 1);
+    assert(tables_match(db_get_handle(src), tgt, "tbl_m2_b") == 1);
+
+    sqlite3_close(tgt);
+    db_close(src);
+    cleanup(src_path); cleanup(tgt_path);
+  }
+}
+
 int main(void) {
   printf("=== Arkilian Raw Transaction Recovery Adversarial Suite ===\n\n");
 
@@ -801,6 +971,7 @@ int main(void) {
   RUN_TEST(test_case_j_truncated_sidecar_tail);
   RUN_TEST(test_case_k_partial_drain_transaction_intact);
   RUN_TEST(test_case_l_partial_drain_ordering_preserved);
+  RUN_TEST(test_case_m_crash_after_outbox_before_watermark);
 
   printf("\n=== Results: %d/%d passed ===\n", tests_passed, tests_run);
   return (tests_passed == tests_run) ? 0 : 1;
