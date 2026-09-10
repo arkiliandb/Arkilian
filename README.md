@@ -17,11 +17,13 @@
 
 Arkilian is a managed embedded database that wraps SQLite and is written in C, designed to extend SQLite with automated cloud backup functionality and horizontal scaling (in the coming updates).
 
+> **Recent Improvements:** Full 1:1 API parity across Node.js, Python, Go, Rust, and PHP bindings with deep health monitoring, cold S3 hydration, and a 1:1 REST-compliant S3 mock engine for reliable, zero-noise testing.
+
 ### Key Features
 * **Simplified SQLite Binding:** Exposes fundamental SQLite session management alongside fully permissive raw handle extraction.
 * **Background Data Protection:** Features two integrated background threads — a flush thread that continuously ships row-level changes to a push endpoint, and a snapshot thread that uploads full hourly backups to S3 via presigned URLs.
 * **Cross-platform:** Compiles natively on macOS, Linux, and Windows (MSVC and MinGW) without a POSIX compatibility layer.
-* **Multi-language Support:** Build as a shared library for FFI or static library for embedded C/C++ applications. A prebuilt N-API addon is published to npm for Node.js/Bun.
+* **Multi-language Support:** Complete 1:1 feature parity across Node.js, Python, Go, Rust, and PHP (FFI, N-API, cgo, bindgen) with typed bindings, cold S3 hydration, and deep health diagnostics.
 * **Environment-based Configuration:** All settings configurable via `ARKILIAN_` prefixed environment variables.
 
 ## Getting Started
