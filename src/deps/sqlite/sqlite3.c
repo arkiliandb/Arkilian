@@ -93272,10 +93272,6 @@ static int sqlite3Step(Vdbe *p){
     db->errCode = SQLITE_ROW;
     return SQLITE_ROW;
   }else{
-#ifndef SQLITE_OMIT_TRACE
-    /* If the statement completed successfully, invoke the profile callback */
-    checkProfileCallback(db, p);
-#endif
     p->pResultRow = 0;
     if( rc==SQLITE_DONE && db->autoCommit ){
       assert( p->rc==SQLITE_OK );
@@ -93290,9 +93286,12 @@ static int sqlite3Step(Vdbe *p){
       */
       rc = sqlite3VdbeTransferError(p);
     }
+    db->errCode = rc;
+#ifndef SQLITE_OMIT_TRACE
+    /* If the statement completed successfully, invoke the profile callback */
+    checkProfileCallback(db, p);
+#endif
   }
-
-  db->errCode = rc;
   if( SQLITE_NOMEM==sqlite3ApiExit(p->db, p->rc) ){
     p->rc = SQLITE_NOMEM_BKPT;
     if( (p->prepFlags & SQLITE_PREPARE_SAVESQL)!=0 ) rc = p->rc;

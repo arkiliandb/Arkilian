@@ -201,6 +201,13 @@ struct pending_ddl {
   struct pending_ddl *next;
 };
 
+// Savepoint stack node (P0: real savepoint stack)
+struct ark_savepoint {
+  char *name;
+  struct pending_ddl *txn_tail_at_savepoint;
+  struct ark_savepoint *prev;
+};
+
 // Transaction-aware capture state (CTO blueprint)
 struct ark_txn_capture {
   uint64_t txid;
@@ -209,6 +216,16 @@ struct ark_txn_capture {
   size_t   sidecar_start_offset;
   uint64_t commit_seq;
 };
+
+// Statement execution tracking state (P1: explicit execution status)
+typedef enum {
+  ARK_STMT_IDLE = 0,
+  ARK_STMT_STARTED,
+  ARK_STMT_FINISHED_SUCCESS,
+  ARK_STMT_FINISHED_ERROR,
+  ARK_STMT_ROLLED_BACK,
+  ARK_STMT_COMMITTED
+} ark_stmt_state_t;
 
 struct arkilian {
   sqlite3 *handle;            // Primary connection (game / application thread)
@@ -362,8 +379,10 @@ struct arkilian {
   struct pending_ddl *txn_head;
   struct pending_ddl *txn_tail;
   struct ark_txn_capture txn_state;
+  struct ark_savepoint *savepoint_stack;
   uint64_t next_txid;
   uint64_t next_commit_seq;
+  ark_stmt_state_t last_stmt_state;
 #ifdef _WIN32
   CRITICAL_SECTION pending_ddl_mutex;
 #else
@@ -821,6 +840,71 @@ static void sidecar_append_txn(arkilian *db, uint64_t txid, struct pending_ddl *
   fclose(qf);
 }
 
+static char *extract_savepoint_name(const char *sql, const char *after_keyword) {
+  if (!sql || !after_keyword) return NULL;
+  const char *p = strcasestr(sql, after_keyword);
+  if (!p) return NULL;
+  p += strlen(after_keyword);
+  while (*p && isspace((unsigned char)*p)) p++;
+  if (strncasecmp(p, "TRANSACTION", 11) == 0 && isspace((unsigned char)p[11])) {
+    p += 11;
+    while (*p && isspace((unsigned char)*p)) p++;
+  }
+  if (strncasecmp(p, "TO", 2) == 0 && isspace((unsigned char)p[2])) {
+    p += 2;
+    while (*p && isspace((unsigned char)*p)) p++;
+  }
+  if (strncasecmp(p, "SAVEPOINT", 9) == 0 && (isspace((unsigned char)p[9]) || p[9] == '"' || p[9] == '`' || p[9] == '[')) {
+    p += 9;
+    while (*p && isspace((unsigned char)*p)) p++;
+  }
+  if (!*p) return NULL;
+  char quote = 0;
+  if (*p == '"' || *p == '\'' || *p == '`') {
+    quote = *p++;
+  } else if (*p == '[') {
+    quote = ']';
+    p++;
+  }
+  const char *start = p;
+  while (*p && ((quote && *p != quote) || (!quote && !isspace((unsigned char)*p) && *p != ';'))) {
+    p++;
+  }
+  size_t len = (size_t)(p - start);
+  if (len == 0) return NULL;
+  char *name = malloc(len + 1);
+  if (!name) return NULL;
+  memcpy(name, start, len);
+  name[len] = '\0';
+  return name;
+}
+
+static uint64_t get_sidecar_promoted_watermark(sqlite3 *h) {
+  if (!h) return 0;
+  sqlite3_stmt *st = NULL;
+  uint64_t wm = 0;
+  if (sqlite3_prepare_v2(h, "SELECT v FROM _arkilian_meta WHERE k = 'sidecar_promoted_txid'", -1, &st, NULL) == SQLITE_OK) {
+    if (sqlite3_step(st) == SQLITE_ROW) {
+      const char *v = (const char *)sqlite3_column_text(st, 0);
+      if (v) wm = (uint64_t)strtoull(v, NULL, 10);
+    }
+    sqlite3_finalize(st);
+  }
+  return wm;
+}
+
+static void set_sidecar_promoted_watermark(sqlite3 *h, uint64_t wm) {
+  if (!h) return;
+  sqlite3_stmt *st = NULL;
+  char buf[32];
+  snprintf(buf, sizeof(buf), "%llu", (unsigned long long)wm);
+  if (sqlite3_prepare_v2(h, "INSERT OR REPLACE INTO _arkilian_meta (k, v) VALUES ('sidecar_promoted_txid', ?)", -1, &st, NULL) == SQLITE_OK) {
+    sqlite3_bind_text(st, 1, buf, -1, SQLITE_TRANSIENT);
+    sqlite3_step(st);
+    sqlite3_finalize(st);
+  }
+}
+
 static void pending_ddl_append(arkilian *db, const char *sql) {
   if (!db || !sql) return;
   if (ARK_LOAD(&db->trigger_sync_in_progress)) return;
@@ -832,66 +916,14 @@ static void pending_ddl_append(arkilian *db, const char *sql) {
   int is_begin = (strncasecmp(verb, "BEGIN", 5) == 0);
   int is_commit = (strncasecmp(verb, "COMMIT", 6) == 0);
   int is_rollback = (strncasecmp(verb, "ROLLBACK", 8) == 0);
-  int is_rollback_to = (strncasecmp(verb, "ROLLBACK TO", 11) == 0 ||
-                        (strncasecmp(verb, "ROLLBACK", 8)==0 && strstr(verb, "TO")));
+  int is_savepoint = (strncasecmp(verb, "SAVEPOINT", 9) == 0);
+  int is_release = (strncasecmp(verb, "RELEASE", 7) == 0);
   int is_dml = (strncasecmp(verb, "INSERT", 6) == 0 ||
                 strncasecmp(verb, "UPDATE", 6) == 0 ||
                 strncasecmp(verb, "DELETE", 6) == 0 ||
                 strncasecmp(verb, "REPLACE", 7) == 0);
-  // Track BEGIN/COMMIT/ROLLBACK as transaction boundaries.
-  // We do NOT write BEGIN/COMMIT to sidecar immediately; the sidecar
-  // is only appended on COMMIT (commit hook) to ensure the entire txn
-  // is durable and transaction-aware. This prevents replicating
-  // uncommitted work and ensures ROLLBACK discards the txn.
-  if (is_begin) {
-    PENDING_DDL_LOCK(db);
-    if (!db->txn_state.active) {
-      db->txn_state.txid = ++db->next_txid;
-      db->txn_state.active = 1;
-      db->txn_state.sidecar_start_offset = 0;
-    }
-    PENDING_DDL_UNLOCK(db);
-    return;
-  }
-  if (is_commit || is_rollback) {
-    // COMMIT/ROLLBACK are authoritative via sqlite3_commit_hook/
-    // sqlite3_rollback_hook, not via trace. Ignore the SQL text here.
-    return;
-  }
-  if (is_rollback_to) {
-    // Parse the savepoint name after ROLLBACK TO
-    const char *p = verb + 11; // after "ROLLBACK TO"
-    while (*p && isspace((unsigned char)*p)) p++;
-    // For now, truncate the txn buffer to the state before the last
-    // SAVEPOINT. Since we don't track per-savepoint offsets precisely,
-    // the safest surgical fix that still passes the CTO's test
-    // "A; SAVEPOINT s; B; ROLLBACK TO s; C; COMMIT → A+C" is to
-    // discard only the most recent DML (B) and keep A.
-    // We implement a simple heuristic: if the txn buffer has at least
-    // 2 nodes, drop the last one (B) and keep the rest (A). For a
-    // more general case, we would need a savepoint stack.
-    PENDING_DDL_LOCK(db);
-    if (db->txn_head && db->txn_head->next) {
-      // Find second-to-last node
-      struct pending_ddl *prev = NULL, *cur = db->txn_head;
-      while (cur->next) { prev = cur; cur = cur->next; }
-      // cur is the last node (B), prev is the node before it (A)
-      // Discard cur
-      free(cur->sql);
-      free(cur);
-      if (prev) {
-        prev->next = NULL;
-        db->txn_tail = prev;
-      } else {
-        db->txn_head = db->txn_tail = NULL;
-      }
-    } else if (db->txn_head) {
-      // Only one node (A), and we did ROLLBACK TO s where s was after A,
-      // so B was the only thing after s, and we already removed it?
-      // Actually if we have only A, then ROLLBACK TO s where s was after A
-      // should keep A. So do nothing.
-    }
-    PENDING_DDL_UNLOCK(db);
+  // Transaction & savepoint boundaries are managed in trace_raw_ddl
+  if (is_begin || is_commit || is_rollback || is_savepoint || is_release) {
     return;
   }
   // Only queue DDL always, and DML only when triggers are dirty (raw DDL gap)
@@ -945,12 +977,11 @@ static void pending_ddl_drain_and_capture(arkilian *db) {
   head = db->pending_ddl_head;
   db->pending_ddl_head = db->pending_ddl_tail = NULL;
   PENDING_DDL_UNLOCK(db);
+  if (!head) return;
   int total = 0, drained = 0;
+  uint64_t max_drained_txid = 0;
   for (struct pending_ddl *n = head; n; n = n->next) total++;
   for (struct pending_ddl *node = head; node; ) {
-    // Enqueue exactly as apply_ddl_capture would for a wrapped DDL,
-    // but without re-running sync (we already synced at the top of
-    // db_resync_triggers). Preserves order.
     sqlite3_stmt *stmt = NULL;
     char ins[220];
     snprintf(ins, sizeof(ins),
@@ -958,7 +989,10 @@ static void pending_ddl_drain_and_capture(arkilian *db) {
       outbox_cap());
     if (sqlite3_prepare_v2(db->handle, ins, -1, &stmt, NULL) == SQLITE_OK) {
       sqlite3_bind_text(stmt, 1, node->sql, -1, SQLITE_TRANSIENT);
-      if (sqlite3_step(stmt) == SQLITE_DONE) drained++;
+      if (sqlite3_step(stmt) == SQLITE_DONE) {
+        drained++;
+        if (node->txid > max_drained_txid) max_drained_txid = node->txid;
+      }
       sqlite3_finalize(stmt);
     }
     struct pending_ddl *next = node->next;
@@ -966,14 +1000,17 @@ static void pending_ddl_drain_and_capture(arkilian *db) {
     free(node);
     node = next;
   }
+  // Persist durable promotion watermark so restart recovery never re-enqueues
+  if (drained > 0 && max_drained_txid > 0) {
+    set_sidecar_promoted_watermark(db->handle, max_drained_txid);
+  }
   // Only truncate durable sidecar if ALL enqueues succeeded; otherwise
-  // keep it for retry (prevents P0 #2 partial-drain loss where
-  // enqueue B fails after A succeeded and sidecar is deleted).
-  if (head && drained == total) {
+  // keep it for retry.
+  if (drained == total) {
     char qpath[4096];
     snprintf(qpath, sizeof(qpath), "%s.arkddlqueue", db->db_path ? db->db_path : "app.sqlite");
     remove(qpath);
-  } else if (head && drained != total) {
+  } else {
     ark_log(db, ARK_LOG_ERROR, "pending_ddl drain partial (%d/%d) — sidecar retained for retry", drained, total);
   }
   (void)drained;
@@ -985,11 +1022,12 @@ static int trace_raw_ddl(unsigned trace, void *ctx, void *p, void *x) {
     sqlite3_stmt *stmt = (sqlite3_stmt *)p;
     arkilian *db = (arkilian *)ctx;
     if (!db || !stmt) return 0;
+    db->last_stmt_state = ARK_STMT_STARTED;
     if (ARK_LOAD(&db->trigger_sync_in_progress) || ARK_LOAD(&db->in_wrapped_dispatch)) return 0;
     const char *sql = sqlite3_sql(stmt);
     if (!sql) return 0;
     const char *verb = skip_sql_prefix(sql);
-    if (strncasecmp(verb, "BEGIN", 5)==0) {
+    if (strncasecmp(verb, "BEGIN", 5) == 0 || strncasecmp(verb, "SAVEPOINT", 9) == 0) {
       PENDING_DDL_LOCK(db);
       if (!db->txn_state.active) {
         db->txn_state.txid = ++db->next_txid;
@@ -1004,84 +1042,185 @@ static int trace_raw_ddl(unsigned trace, void *ctx, void *p, void *x) {
     arkilian *db = (arkilian *)ctx;
     if (!db || !stmt) return 0;
     if (ARK_LOAD(&db->trigger_sync_in_progress) || ARK_LOAD(&db->in_wrapped_dispatch)) return 0;
-    int rc = sqlite3_errcode(db->handle);
-    const char *sql = sqlite3_sql(stmt);
-    if (!sql) return 0;
-    const char *verb = skip_sql_prefix(sql);
-    // COMMIT/ROLLBACK are boundary markers, not SQL to replicate.
-    // For COMMIT, we need to know if the transaction actually committed;
-    // that is determined post-commit by the transition to autocommit,
-    // not by this PROFILE alone. So we handle COMMIT specially below.
-    if (strncasecmp(verb, "COMMIT",6)==0) {
-      // If this COMMIT succeeded and we are now out of the txn, the
-      // previous txn is now truly committed (post-commit). Promote it.
-      if ((rc == SQLITE_OK || rc == SQLITE_DONE || rc == SQLITE_ROW) && db->txn_state.active) {
-        // Check if we are now in autocommit (i.e., the COMMIT actually
-        // closed the transaction). For autocommit transactions, the COMMIT
-        // is implicit and autocommit will be 1 after.
-        int now_autocommit = db->handle ? sqlite3_get_autocommit(db->handle) : 1;
-        if (now_autocommit) {
-          // This was the explicit COMMIT that closed the txn.
-          // Move the txn buffer to durable sidecar and main queue now,
-          // after we know SQLite has committed.
-          struct pending_ddl *txn = NULL;
-          uint64_t txid = db->txn_state.txid;
+    sqlite3 *handle = sqlite3_db_handle(stmt);
+    int rc = handle ? sqlite3_errcode(handle) : SQLITE_ERROR;
+    db->last_stmt_state = (rc == SQLITE_OK || rc == SQLITE_DONE || rc == SQLITE_ROW)
+                            ? ARK_STMT_FINISHED_SUCCESS
+                            : ARK_STMT_FINISHED_ERROR;
+    const char *orig_sql = sqlite3_sql(stmt);
+    if (!orig_sql) return 0;
+    const char *verb = skip_sql_prefix(orig_sql);
+
+    // Only successful statements can advance transaction state or be captured
+    if (rc != SQLITE_OK && rc != SQLITE_DONE && rc != SQLITE_ROW) return 0;
+
+    // SAVEPOINT <name>
+    if (strncasecmp(verb, "SAVEPOINT", 9) == 0) {
+      char *sp_name = extract_savepoint_name(orig_sql, "SAVEPOINT");
+      if (sp_name) {
+        struct ark_savepoint *sp = malloc(sizeof(struct ark_savepoint));
+        if (sp) {
+          sp->name = sp_name;
           PENDING_DDL_LOCK(db);
-          txn = db->txn_head;
-          db->txn_head = db->txn_tail = NULL;
-          db->txn_state.active = 0;
-          if (txn) {
-            sidecar_append_txn(db, txid, txn);
-            db->next_commit_seq++;
-          } else {
-            sidecar_append_txn(db, txid, NULL);
-          }
-          // Move to main queue
-          if (txn) {
-            if (db->pending_ddl_tail) {
-              db->pending_ddl_tail->next = txn;
-              struct pending_ddl *t = txn;
-              while (t->next) t = t->next;
-              db->pending_ddl_tail = t;
-            } else {
-              db->pending_ddl_head = txn;
-              struct pending_ddl *t = txn;
-              while (t->next) t = t->next;
-              db->pending_ddl_tail = t;
-            }
-          }
+          sp->txn_tail_at_savepoint = db->txn_tail;
+          sp->prev = db->savepoint_stack;
+          db->savepoint_stack = sp;
           PENDING_DDL_UNLOCK(db);
+        } else {
+          free(sp_name);
         }
       }
       return 0;
     }
-    if (strncasecmp(verb, "BEGIN",5)==0 || strncasecmp(verb, "ROLLBACK",8)==0) return 0;
-    if (strncasecmp(verb, "SAVEPOINT",9)==0) return 0;
-    // Only capture if the statement succeeded
-    if (rc != SQLITE_OK && rc != SQLITE_DONE && rc != SQLITE_ROW) return 0;
-    pending_ddl_append(db, sql);
+
+    // ROLLBACK TO [SAVEPOINT] <name>
+    int is_rollback_to = (strncasecmp(verb, "ROLLBACK TO", 11) == 0 ||
+                          (strncasecmp(verb, "ROLLBACK", 8) == 0 && strstr(verb, "TO")));
+    if (is_rollback_to) {
+      char *sp_name = extract_savepoint_name(orig_sql, "TO");
+      if (sp_name) {
+        PENDING_DDL_LOCK(db);
+        struct ark_savepoint *target = NULL;
+        for (struct ark_savepoint *s = db->savepoint_stack; s; s = s->prev) {
+          if (strcasecmp(s->name, sp_name) == 0) {
+            target = s;
+            break;
+          }
+        }
+        if (target) {
+          // Pop any savepoints nested deeper than target
+          while (db->savepoint_stack && db->savepoint_stack != target) {
+            struct ark_savepoint *cur = db->savepoint_stack;
+            db->savepoint_stack = cur->prev;
+            free(cur->name);
+            free(cur);
+          }
+          // Rewind txn list to target->txn_tail_at_savepoint
+          struct pending_ddl *to_free = NULL;
+          if (target->txn_tail_at_savepoint) {
+            to_free = target->txn_tail_at_savepoint->next;
+            target->txn_tail_at_savepoint->next = NULL;
+            db->txn_tail = target->txn_tail_at_savepoint;
+          } else {
+            to_free = db->txn_head;
+            db->txn_head = db->txn_tail = NULL;
+          }
+          while (to_free) {
+            struct pending_ddl *nx = to_free->next;
+            free(to_free->sql);
+            free(to_free);
+            to_free = nx;
+          }
+        }
+        PENDING_DDL_UNLOCK(db);
+        free(sp_name);
+      }
+      return 0;
+    }
+
+    // COMMIT or RELEASE
+    if (strncasecmp(verb, "COMMIT", 6) == 0 || strncasecmp(verb, "RELEASE", 7) == 0) {
+      if (strncasecmp(verb, "RELEASE", 7) == 0) {
+        char *sp_name = extract_savepoint_name(orig_sql, "RELEASE");
+        if (sp_name) {
+          PENDING_DDL_LOCK(db);
+          // Pop savepoints down to and including target
+          while (db->savepoint_stack) {
+            struct ark_savepoint *cur = db->savepoint_stack;
+            db->savepoint_stack = cur->prev;
+            int match = (strcasecmp(cur->name, sp_name) == 0);
+            free(cur->name);
+            free(cur);
+            if (match) break;
+          }
+          PENDING_DDL_UNLOCK(db);
+          free(sp_name);
+        }
+      }
+
+      int now_autocommit = db->handle ? sqlite3_get_autocommit(db->handle) : 1;
+      if (now_autocommit && db->txn_state.active) {
+        struct pending_ddl *txn = NULL;
+        uint64_t txid = db->txn_state.txid;
+        PENDING_DDL_LOCK(db);
+        while (db->savepoint_stack) {
+          struct ark_savepoint *cur = db->savepoint_stack;
+          db->savepoint_stack = cur->prev;
+          free(cur->name);
+          free(cur);
+        }
+        txn = db->txn_head;
+        db->txn_head = db->txn_tail = NULL;
+        db->txn_state.active = 0;
+        if (txn) {
+          sidecar_append_txn(db, txid, txn);
+          db->next_commit_seq++;
+        } else {
+          sidecar_append_txn(db, txid, NULL);
+        }
+        if (txn) {
+          if (db->pending_ddl_tail) {
+            db->pending_ddl_tail->next = txn;
+            struct pending_ddl *t = txn;
+            while (t->next) t = t->next;
+            db->pending_ddl_tail = t;
+          } else {
+            db->pending_ddl_head = txn;
+            struct pending_ddl *t = txn;
+            while (t->next) t = t->next;
+            db->pending_ddl_tail = t;
+          }
+        }
+        PENDING_DDL_UNLOCK(db);
+      }
+      return 0;
+    }
+
+    if (strncasecmp(verb, "BEGIN", 5) == 0 || strncasecmp(verb, "ROLLBACK", 8) == 0) return 0;
+
+    int is_ddl = (strncasecmp(verb, "CREATE", 6) == 0 ||
+                  strncasecmp(verb, "ALTER", 5) == 0 ||
+                  strncasecmp(verb, "DROP", 4) == 0);
+    int is_dml = (strncasecmp(verb, "INSERT", 6) == 0 ||
+                  strncasecmp(verb, "UPDATE", 6) == 0 ||
+                  strncasecmp(verb, "DELETE", 6) == 0 ||
+                  strncasecmp(verb, "REPLACE", 7) == 0);
+
+    if (!is_ddl && !(is_dml && ARK_LOAD(&db->triggers_dirty))) return 0;
+
+    // Expand bound parameters using sqlite3_expanded_sql so that prepared
+    // DML statements contain actual bound values (strings, blobs, ints, floats)
+    // instead of unexpanded '?' placeholders.
+    char *expanded = sqlite3_expanded_sql(stmt);
+    const char *sql_to_capture = expanded ? expanded : orig_sql;
+    pending_ddl_append(db, sql_to_capture);
+    if (expanded) sqlite3_free(expanded);
     return 0;
   }
   return 0;
 }
 
 static int commit_hook_cb(void *arg) {
-  // Pre-commit hook: used only as a signal that a commit is about to
-  // happen. We do NOT write the sidecar here; the durable write happens
-  // post-commit in the PROFILE handler for COMMIT, where we can verify
-  // sqlite3_get_autocommit() == 1 and the COMMIT actually succeeded.
-  (void)arg;
+  arkilian *db = (arkilian *)arg;
+  if (db) db->last_stmt_state = ARK_STMT_COMMITTED;
   return 0;
 }
 
 static void rollback_hook_cb(void *arg) {
   arkilian *db = (arkilian *)arg;
+  if (db) db->last_stmt_state = ARK_STMT_ROLLED_BACK;
   if (!db || !db->txn_state.active) return;
   uint64_t txid = db->txn_state.txid;
   PENDING_DDL_LOCK(db);
   struct pending_ddl *head = db->txn_head;
   db->txn_head = db->txn_tail = NULL;
   db->txn_state.active = 0;
+  while (db->savepoint_stack) {
+    struct ark_savepoint *cur = db->savepoint_stack;
+    db->savepoint_stack = cur->prev;
+    free(cur->name);
+    free(cur);
+  }
   PENDING_DDL_UNLOCK(db);
   for (struct pending_ddl *n = head; n; ) {
     struct pending_ddl *nx = n->next;
@@ -1089,15 +1228,7 @@ static void rollback_hook_cb(void *arg) {
     free(n);
     n = nx;
   }
-  // Persist ROLLBACK marker so recovery knows to discard this txid's
-  // already-persisted BEGIN/SQLs (if any were written before the txn
-  // was known to be explicit). For our current scheme we only write
-  // sidecar on COMMIT, so ROLLBACK needs no sidecar write — the txn's
-  // SQLs were never persisted, so they are naturally discarded.
-  // We still write a ROLLBACK marker for debugging and for the case
-  // where we had written BEGIN to sidecar earlier.
   sidecar_append_record(db, txid, 3, "ROLLBACK");
-  // Do NOT clear the main queue — only the txn buffer is discarded.
 }
 
 // Extract the host component of a URL into a caller-provided buffer.
@@ -2307,6 +2438,138 @@ void *run_wal_flush(void *arg) {
 #endif
 }
 
+// Dedicated crash recovery for durable sidecar — strictly read-only on the sidecar.
+// Reconstructs committed transaction groupings without invoking pending_ddl_append,
+// sidecar_append_txn, or re-journaling recovered records.
+static void recover_committed_tx_into_pending(arkilian *db) {
+  if (!db || !db->handle) return;
+  char qpath[4096];
+  snprintf(qpath, sizeof(qpath), "%s.arkddlqueue", db->db_path ? db->db_path : "app.sqlite");
+  FILE *qf = fopen(qpath, "rb");
+  if (!qf) return;
+
+  uint64_t watermark = get_sidecar_promoted_watermark(db->handle);
+
+  fseek(qf, 0, SEEK_END);
+  long fsize = ftell(qf);
+  fseek(qf, 0, SEEK_SET);
+  if (fsize <= 0) {
+    fclose(qf);
+    remove(qpath);
+    return;
+  }
+
+  struct sidecar_rec {
+    uint64_t txid;
+    uint8_t  type;
+    char    *sql;
+  } *recs = NULL;
+  size_t rec_cap = 0, rec_cnt = 0;
+  int is_new_format = 1;
+
+  for (;;) {
+    uint64_t txid;
+    uint8_t type;
+    uint32_t sql_len;
+    uint32_t csum, expect;
+    if (fread(&txid, 1, sizeof(txid), qf) != sizeof(txid)) break;
+    if (fread(&type, 1, sizeof(type), qf) != sizeof(type)) break;
+    if (fread(&sql_len, 1, sizeof(sql_len), qf) != sizeof(sql_len)) break;
+    if (sql_len > 1000000) { is_new_format = 0; break; }
+    char *sql = NULL;
+    if (sql_len) {
+      sql = malloc(sql_len + 1);
+      if (!sql) break;
+      if (fread(sql, 1, sql_len, qf) != sql_len) { free(sql); break; }
+      sql[sql_len] = '\0';
+    }
+    if (fread(&csum, 1, sizeof(csum), qf) != sizeof(csum)) { free(sql); break; }
+    expect = txn_checksum(txid, type, sql);
+    if (csum != expect) { free(sql); is_new_format = 0; break; }
+    if (rec_cnt == rec_cap) {
+      size_t ncap = rec_cap ? rec_cap * 2 : 32;
+      void *np = realloc(recs, ncap * sizeof(*recs));
+      if (!np) { free(sql); break; }
+      recs = np;
+      rec_cap = ncap;
+    }
+    recs[rec_cnt].txid = txid;
+    recs[rec_cnt].type = type;
+    recs[rec_cnt].sql = sql;
+    rec_cnt++;
+    if (ftell(qf) >= fsize) break;
+  }
+  fclose(qf);
+
+  if (is_new_format && rec_cnt > 0) {
+    // Only recover transactions that have a COMMIT marker (type 2) AND txid > watermark
+    for (size_t i = 0; i < rec_cnt; i++) {
+      if (recs[i].type == 2 /* COMMIT */) {
+        uint64_t txid = recs[i].txid;
+        if (txid <= watermark) continue; // Already promoted in prior run
+
+        for (size_t j = 0; j < rec_cnt; j++) {
+          if (recs[j].txid == txid && recs[j].type == 4 /* SQL */ && recs[j].sql) {
+            struct pending_ddl *node = malloc(sizeof(struct pending_ddl));
+            if (node) {
+              node->sql = strdup(recs[j].sql);
+              node->txid = txid;
+              node->type = 4;
+              node->next = NULL;
+              PENDING_DDL_LOCK(db);
+              if (db->pending_ddl_tail) {
+                db->pending_ddl_tail->next = node;
+                db->pending_ddl_tail = node;
+              } else {
+                db->pending_ddl_head = db->pending_ddl_tail = node;
+              }
+              PENDING_DDL_UNLOCK(db);
+            }
+          }
+        }
+        if (txid >= db->next_txid) db->next_txid = txid;
+      }
+    }
+    for (size_t i = 0; i < rec_cnt; i++) free(recs[i].sql);
+    free(recs);
+  } else {
+    for (size_t i = 0; i < rec_cnt; i++) free(recs[i].sql);
+    free(recs);
+
+    // Fall back to old len+sql format
+    qf = fopen(qpath, "rb");
+    if (qf) {
+      for (;;) {
+        uint32_t len = 0;
+        if (fread(&len, 1, sizeof(len), qf) != sizeof(len)) break;
+        if (len == 0 || len > 1000000) break;
+        char *sql = malloc(len + 1);
+        if (!sql) break;
+        if (fread(sql, 1, len, qf) != len) { free(sql); break; }
+        sql[len] = '\0';
+        struct pending_ddl *node = malloc(sizeof(struct pending_ddl));
+        if (node) {
+          node->sql = sql;
+          node->txid = ++db->next_txid;
+          node->type = 4;
+          node->next = NULL;
+          PENDING_DDL_LOCK(db);
+          if (db->pending_ddl_tail) {
+            db->pending_ddl_tail->next = node;
+            db->pending_ddl_tail = node;
+          } else {
+            db->pending_ddl_head = db->pending_ddl_tail = node;
+          }
+          PENDING_DDL_UNLOCK(db);
+        } else {
+          free(sql);
+        }
+      }
+      fclose(qf);
+    }
+  }
+}
+
 // ── Database Lifecycle: db_init / db_close ──────────────────────────
 
 int db_init(arkilian **db_ptr, const char *filename) {
@@ -2621,96 +2884,14 @@ int db_init(arkilian **db_ptr, const char *filename) {
   // discards it. This makes the sidecar transactionally correct.
   sqlite3_commit_hook(db->handle, commit_hook_cb, db);
   sqlite3_rollback_hook(db->handle, rollback_hook_cb, db);
-  // Durable sidecar reload: transaction-aware recovery.
-  // The sidecar is now TX-framed (BEGIN/SQL/COMMIT/ROLLBACK with txid
-  // and checksum). On crash, an uncommitted txn (BEGIN without COMMIT)
-  // must be discarded, and a committed txn must be recovered.
-  // We scan the file, validate checksums, group by txid, and only
-  // recover transactions that have a COMMIT marker. For backward compat
-  // with the old len+sql format (pre-transaction-aware), we try the new
-  // format first and fall back to the old one if the first record fails
-  // checksum but the file looks like old format.
-  {
-    char qpath[4096];
-    snprintf(qpath, sizeof(qpath), "%s.arkddlqueue", db->db_path ? db->db_path : "app.sqlite");
-    FILE *qf = fopen(qpath, "rb");
-    if (qf) {
-      long fsize = 0;
-      fseek(qf, 0, SEEK_END);
-      fsize = ftell(qf);
-      fseek(qf, 0, SEEK_SET);
-      // Try new TX-framed format
-      struct { uint64_t txid; uint8_t type; char *sql; } *recs = NULL;
-      size_t rec_cap = 0, rec_cnt = 0;
-      int is_new_format = 1;
-      for (;;) {
-        uint64_t txid; uint8_t type; uint32_t sql_len; uint32_t csum, expect;
-        if (fread(&txid, 1, sizeof(txid), qf) != sizeof(txid)) break;
-        if (fread(&type, 1, sizeof(type), qf) != sizeof(type)) break;
-        if (fread(&sql_len, 1, sizeof(sql_len), qf) != sizeof(sql_len)) break;
-        if (sql_len > 100000) { is_new_format = 0; break; }
-        char *sql = NULL;
-        if (sql_len) {
-          sql = malloc(sql_len + 1);
-          if (!sql) break;
-          if (fread(sql, 1, sql_len, qf) != sql_len) { free(sql); break; }
-          sql[sql_len] = '\0';
-        }
-        if (fread(&csum, 1, sizeof(csum), qf) != sizeof(csum)) { free(sql); break; }
-        expect = txn_checksum(txid, type, sql);
-        if (csum != expect) { free(sql); is_new_format = 0; break; }
-        if (rec_cnt == rec_cap) {
-          size_t ncap = rec_cap ? rec_cap*2 : 16;
-          void *np = realloc(recs, ncap * sizeof(*recs));
-          if (!np) { free(sql); break; }
-          recs = np; rec_cap = ncap;
-        }
-        recs[rec_cnt].txid = txid;
-        recs[rec_cnt].type = type;
-        recs[rec_cnt].sql = sql;
-        rec_cnt++;
-        // If we have read at least one full record and the next bytes
-        // don't look like a new record, stop.
-        if (ftell(qf) >= fsize) break;
-      }
-      if (is_new_format && rec_cnt > 0) {
-        // New format: only recover committed txids
-        for (size_t i=0;i<rec_cnt;i++) if (recs[i].type==2) {
-          uint64_t txid = recs[i].txid;
-          for (size_t j=0;j<rec_cnt;j++) if (recs[j].txid==txid && recs[j].type==4 && recs[j].sql) {
-            pending_ddl_append(db, recs[j].sql);
-          }
-        }
-        for (size_t i=0;i<rec_cnt;i++) free(recs[i].sql);
-        free(recs);
-        fclose(qf);
-      } else {
-        // Fall back to old len+sql format (or empty file)
-        for (size_t i=0;i<rec_cnt;i++) free(recs[i].sql);
-        free(recs);
-        fseek(qf, 0, SEEK_SET);
-        // Old format: just len+sql, treat each as a committed autocommit txn
-        for (;;) {
-          uint32_t len = 0;
-          if (fread(&len, 1, sizeof(len), qf) != sizeof(len)) break;
-          if (len == 0 || len > 100000) break;
-          char *sql = malloc(len + 1);
-          if (!sql) break;
-          if (fread(sql, 1, len, qf) != len) { free(sql); break; }
-          sql[len] = '\0';
-          pending_ddl_append(db, sql);
-          free(sql);
-        }
-        fclose(qf);
-      }
-    }
-  }
+  // Durable sidecar reload: strictly read-only crash recovery.
+  // Reconstructs committed transactions into pending_ddl without re-journaling.
+  recover_committed_tx_into_pending(db);
+
   // P0 #2: capture exact raw DDL/DML SQL via trace so the remote
   // does not diverge (authorizer alone only sets a dirty flag).
-  // We use STMT to open transactions (BEGIN) pre-execution and
-  // PROFILE post-execution to capture only successful SQL. This
-  // ensures the sidecar only records committed work and not failed
-  // statements (e.g., CREATE TABLE already exists).
+  // We use STMT to open transactions (BEGIN/SAVEPOINT) pre-execution and
+  // PROFILE post-execution to capture only successful SQL with bound parameters expanded.
   sqlite3_trace_v2(db->handle, SQLITE_TRACE_STMT | SQLITE_TRACE_PROFILE, trace_raw_ddl, db);
 
   // Sync backup triggers. Per spec §0/§1 a capture failure must NEVER
@@ -2733,6 +2914,8 @@ int db_init(arkilian **db_ptr, const char *filename) {
     // Init sync establishes full coverage: clear any transient dirty flag
     // the authorizer may have raised before the guard took effect.
     ARK_STORE(&db->triggers_dirty, 0);
+    // Promote any recovered sidecar transactions into _pending_backup
+    pending_ddl_drain_and_capture(db);
   }
 
   // Internal-schema version check: an outbox written by a NEWER release
@@ -2879,6 +3062,7 @@ void db_close(arkilian *db) {
   }
 
   if (db->handle) {
+    if (db->pending_ddl_head) pending_ddl_drain_and_capture(db);
     sqlite3_close(db->handle); // deregisters the update hook
     db->handle = NULL;
   }
@@ -2913,10 +3097,14 @@ void db_close(arkilian *db) {
       free(n);
       n = nx;
     }
-    // Sidecar file is per-db_path; remove it on clean close (if it
-    // still exists, it will be reloaded on next open, but a clean close
-    // with no pending queue should not leave it).
-    if (db->db_path) {
+    while (db->savepoint_stack) {
+      struct ark_savepoint *cur = db->savepoint_stack;
+      db->savepoint_stack = cur->prev;
+      free(cur->name);
+      free(cur);
+    }
+    // Sidecar file is removed only when all records were successfully drained
+    if (db->db_path && db->pending_ddl_head == NULL) {
       char qpath[4096];
       snprintf(qpath, sizeof(qpath), "%s.arkddlqueue", db->db_path);
       remove(qpath);
