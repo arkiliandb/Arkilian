@@ -96,3 +96,4 @@ cmake-napi-build/
 **.sqlite.**
 bindings/rust/arkilian-sys/target/*
 all-tests.log
+arkilian-dlq
