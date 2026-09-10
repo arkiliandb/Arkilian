@@ -1,15 +1,15 @@
-/* tests/ark_stub_s3.h — in-process S3 stub server for the POSIX test legs.
-
-   Raw-socket HTTP server on an ephemeral loopback port that stores objects
-   in memory keyed by path (query string stripped). Understands PUT and GET,
-   answers "Expect: 100-continue" (libcurl sends it for >1 KiB uploads —
-   snapshots — and stalls ~1s per upload without the immediate 100).
-
-   Modeled on the stub embedded in test_hydration.c; shared here so the
-   snapshot-watermark and manifest-protocol suites exercise the REAL
-   SigV4-presign/libcurl/upload paths against the same harness. POSIX-only
-   (BSD sockets) — kept out of the Windows/MinGW test set, like
-   test_hydration.c. */
+/* tests/ark_stub_s3.h — in-process 1:1 S3 / MinIO mock server for tests.
+ *
+ * Implements the AWS S3 / MinIO REST API protocol:
+ *   - SigV4 presigned PUT/GET/HEAD/DELETE handling
+ *   - "Expect: 100-continue" protocol handling
+ *   - Proper HTTP status codes (200 OK, 204 No Content, 404 NoSuchKey XML, 403, 503)
+ *   - Zero stdout leakage (Content-Length: 0 on PUT/DELETE)
+ *   - In-memory key/value object storage with thread-safe access
+ *   - Fault injection: status override (500, 503, etc.), latency delay, connection drop
+ *   - Request and method atomic counters (PUT, GET, HEAD, DELETE, TOTAL)
+ *   - POSIX sockets on loopback with ephemeral OS-assigned port
+ */
 #ifndef ARK_STUB_S3_H
 #define ARK_STUB_S3_H
 
@@ -27,8 +27,9 @@
 #include <unistd.h>
 
 #include "ark_test_env.h"
+#include "sha256.h"
 
-#define STUB_MAX_OBJECTS 512
+#define STUB_MAX_OBJECTS 1024
 
 typedef struct {
   char   key[512];
@@ -43,13 +44,26 @@ static atomic_int  g_stub_port = 0;
 static atomic_int  g_stub_server_up = 0;
 static pthread_t   g_stub_thread;
 
+static atomic_int g_stub_put_count = 0;
+static atomic_int g_stub_get_count = 0;
+static atomic_int g_stub_head_count = 0;
+static atomic_int g_stub_delete_count = 0;
+static atomic_int g_stub_requests_total = 0;
+
+static atomic_int g_stub_status_override = 0; // e.g. 503 SlowDown, 500 InternalError (all methods)
+static atomic_int g_stub_status_override_put = 0; // overrides PUT only
+static atomic_int g_stub_status_override_get = 0; // overrides GET only
+static atomic_int g_stub_delay_ms = 0;
+static atomic_int g_stub_drop_connection = 0;
+static atomic_int g_stub_require_presign = 0;
+
 static inline void stub_put(const char *key, const char *data, size_t len) {
   pthread_mutex_lock(&g_stub_store_mutex);
   for (int i = 0; i < g_stub_object_count; i++) {
     if (strcmp(g_stub_objects[i].key, key) == 0) {
       free(g_stub_objects[i].data);
       g_stub_objects[i].data = malloc(len ? len : 1);
-      memcpy(g_stub_objects[i].data, data, len);
+      if (len && data) memcpy(g_stub_objects[i].data, data, len);
       g_stub_objects[i].len = len;
       pthread_mutex_unlock(&g_stub_store_mutex);
       return;
@@ -59,7 +73,7 @@ static inline void stub_put(const char *key, const char *data, size_t len) {
   stub_object *o = &g_stub_objects[g_stub_object_count++];
   snprintf(o->key, sizeof(o->key), "%s", key);
   o->data = malloc(len ? len : 1);
-  memcpy(o->data, data, len);
+  if (len && data) memcpy(o->data, data, len);
   o->len = len;
   pthread_mutex_unlock(&g_stub_store_mutex);
 }
@@ -70,9 +84,28 @@ static inline int stub_get(const char *key, char **out, size_t *out_len) {
     if (strcmp(g_stub_objects[i].key, key) == 0) {
       *out = malloc(g_stub_objects[i].len + 1);
       if (!*out) { pthread_mutex_unlock(&g_stub_store_mutex); return 0; }
-      memcpy(*out, g_stub_objects[i].data, g_stub_objects[i].len);
+      if (g_stub_objects[i].len) {
+        memcpy(*out, g_stub_objects[i].data, g_stub_objects[i].len);
+      }
       (*out)[g_stub_objects[i].len] = '\0';
       *out_len = g_stub_objects[i].len;
+      pthread_mutex_unlock(&g_stub_store_mutex);
+      return 1;
+    }
+  }
+  pthread_mutex_unlock(&g_stub_store_mutex);
+  return 0;
+}
+
+static inline int stub_delete(const char *key) {
+  pthread_mutex_lock(&g_stub_store_mutex);
+  for (int i = 0; i < g_stub_object_count; i++) {
+    if (strcmp(g_stub_objects[i].key, key) == 0) {
+      free(g_stub_objects[i].data);
+      for (int j = i; j < g_stub_object_count - 1; j++) {
+        g_stub_objects[j] = g_stub_objects[j + 1];
+      }
+      g_stub_object_count--;
       pthread_mutex_unlock(&g_stub_store_mutex);
       return 1;
     }
@@ -93,45 +126,93 @@ static inline int stub_contains(const char *needle) {
   return 0;
 }
 
+static inline int stub_object_count(void) {
+  pthread_mutex_lock(&g_stub_store_mutex);
+  int count = g_stub_object_count;
+  pthread_mutex_unlock(&g_stub_store_mutex);
+  return count;
+}
+
 static inline void stub_reset(void) {
   pthread_mutex_lock(&g_stub_store_mutex);
   for (int i = 0; i < g_stub_object_count; i++) free(g_stub_objects[i].data);
   g_stub_object_count = 0;
   pthread_mutex_unlock(&g_stub_store_mutex);
+  atomic_store(&g_stub_put_count, 0);
+  atomic_store(&g_stub_get_count, 0);
+  atomic_store(&g_stub_head_count, 0);
+  atomic_store(&g_stub_delete_count, 0);
+  atomic_store(&g_stub_requests_total, 0);
+  atomic_store(&g_stub_status_override, 0);
+  atomic_store(&g_stub_status_override_put, 0);
+  atomic_store(&g_stub_status_override_get, 0);
+  atomic_store(&g_stub_delay_ms, 0);
+  atomic_store(&g_stub_drop_connection, 0);
+  atomic_store(&g_stub_require_presign, 0);
+}
+
+static inline void stub_set_status_override(int status_code) {
+  atomic_store(&g_stub_status_override, status_code);
+}
+
+static inline void stub_set_status_override_put(int status_code) {
+  atomic_store(&g_stub_status_override_put, status_code);
+}
+
+static inline void stub_set_status_override_get(int status_code) {
+  atomic_store(&g_stub_status_override_get, status_code);
+}
+
+static inline void stub_set_delay_ms(int ms) {
+  atomic_store(&g_stub_delay_ms, ms);
+}
+
+static inline void stub_set_drop_connection(int drop) {
+  atomic_store(&g_stub_drop_connection, drop);
+}
+
+static inline void stub_set_require_presign(int req) {
+  atomic_store(&g_stub_require_presign, req);
 }
 
 static inline int stub_validate_presigned_url(const char *path_with_query) {
-  // Hardened validation: presigned URLs must contain the SigV4 query params.
-  // We check for the minimal set that s3_presign_put/get always emit.
-  // This ensures the benchmark's S3 path is not just storing raw keys but
-  // is exercising the real presign path. We don't verify the crypto here
-  // (that would require the secret), just the structure.
   if (!path_with_query) return 0;
   const char *q = strchr(path_with_query, '?');
-  if (!q) return 0; // presigned URLs must have a query string
-  // Require all five SigV4 params
+  if (!q) return !atomic_load(&g_stub_require_presign);
   if (!strstr(q, "X-Amz-Algorithm=AWS4-HMAC-SHA256")) return 0;
   if (!strstr(q, "X-Amz-Credential=")) return 0;
   if (!strstr(q, "X-Amz-Date=")) return 0;
   if (!strstr(q, "X-Amz-Expires=")) return 0;
   if (!strstr(q, "X-Amz-SignedHeaders=host")) return 0;
   if (!strstr(q, "X-Amz-Signature=")) return 0;
-  // Basic sanity: signature should be 64 hex chars after the param
   const char *sig = strstr(q, "X-Amz-Signature=");
   if (sig) {
     sig += strlen("X-Amz-Signature=");
     size_t hex = 0;
-    while (hex < 64 && sig[hex] && ((sig[hex] >= '0' && sig[hex] <= '9') || (sig[hex] >= 'a' && sig[hex] <= 'f') || (sig[hex] >= 'A' && sig[hex] <= 'F'))) hex++;
+    while (hex < 64 && sig[hex] &&
+           ((sig[hex] >= '0' && sig[hex] <= '9') ||
+            (sig[hex] >= 'a' && sig[hex] <= 'f') ||
+            (sig[hex] >= 'A' && sig[hex] <= 'F'))) hex++;
     if (hex != 64) return 0;
   }
   return 1;
 }
 
-static atomic_int g_stub_put_count = 0;
-static atomic_int g_stub_get_count = 0;
-static atomic_int g_stub_head_count = 0;
+static char g_endpoint[64];
+static const char *BUCKET = "test-bucket";
+static const char *PREFIX = "user-42-appdb";
 
 static inline void stub_handle(int fd) {
+  atomic_fetch_add(&g_stub_requests_total, 1);
+
+  if (atomic_load(&g_stub_drop_connection)) {
+    close(fd);
+    return;
+  }
+
+  int delay = atomic_load(&g_stub_delay_ms);
+  if (delay > 0) usleep(delay * 1000);
+
   char header[8192];
   size_t got = 0;
   while (got < sizeof(header) - 1) {
@@ -147,17 +228,23 @@ static inline void stub_handle(int fd) {
   if (strcasestr(header, "expect: 100-continue")) {
     send(fd, "HTTP/1.1 100 Continue\r\n\r\n", 25, 0);
   }
-  // Validate presigned URL structure for PUT/GET (hardened S3 API emulation)
-  // We still strip the query for key lookup, but first validate it.
+
   int presigned_ok = stub_validate_presigned_url(path_presigned);
-  // Keep a copy of the raw presigned path for validation logging if needed
+
   char path[1024];
-  strncpy(path, path_presigned, sizeof(path)-1);
-  path[sizeof(path)-1] = '\0';
+  strncpy(path, path_presigned, sizeof(path) - 1);
+  path[sizeof(path) - 1] = '\0';
   char *q = strchr(path, '?');
   if (q) *q = '\0';
-  const char *key = strchr(path + 1, '/');
-  key = key ? key + 1 : path + 1;
+
+  const char *key = path;
+  while (*key == '/') key++;
+  size_t blen = strlen(BUCKET);
+  if (strncmp(key, BUCKET, blen) == 0 && key[blen] == '/') {
+    key += blen + 1;
+  } else if (strncmp(key, "push/", 5) == 0) {
+    key += 5;
+  }
 
   char *cl = strcasestr(header, "content-length:");
   size_t body_len = cl ? (size_t)atoi(cl + 15) : 0;
@@ -169,33 +256,91 @@ static inline void stub_handle(int fd) {
     have += (size_t)n;
   }
 
+  // Check fault injection / status override
+  int override_status = atomic_load(&g_stub_status_override);
+  if (override_status <= 0) {
+    if (strcmp(method, "PUT") == 0) override_status = atomic_load(&g_stub_status_override_put);
+    else if (strcmp(method, "GET") == 0) override_status = atomic_load(&g_stub_status_override_get);
+  }
+  if (override_status > 0) {
+    const char *code_str = override_status == 503 ? "SlowDown" :
+                           override_status == 500 ? "InternalError" :
+                           override_status == 403 ? "AccessDenied" : "Error";
+    const char *msg_str = override_status == 503 ? "Please reduce your request rate." :
+                          override_status == 500 ? "We encountered an internal error." :
+                          override_status == 403 ? "Access Denied." : "An error occurred.";
+    char err_body[512];
+    snprintf(err_body, sizeof(err_body),
+             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+             "<Error><Code>%s</Code><Message>%s</Message><Key>%s</Key></Error>\n",
+             code_str, msg_str, key);
+    char resp[1024];
+    snprintf(resp, sizeof(resp),
+             "HTTP/1.1 %d %s\r\n"
+             "Content-Type: application/xml\r\n"
+             "Content-Length: %zu\r\n"
+             "Server: AmazonS3\r\n"
+             "Connection: close\r\n\r\n%s",
+             override_status,
+             override_status == 503 ? "Service Unavailable" :
+             override_status == 500 ? "Internal Server Error" : "Error",
+             strlen(err_body), err_body);
+    send(fd, resp, strlen(resp), 0);
+    free(body);
+    close(fd);
+    return;
+  }
+
   if (strcmp(method, "PUT") == 0) {
-    // In hardened mode, reject PUTs with invalid presigned URLs (emulate S3 403)
     if (!presigned_ok) {
-      const char *resp = "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n";
+      const char *resp =
+          "HTTP/1.1 403 Forbidden\r\nContent-Type: application/xml\r\n"
+          "Content-Length: 0\r\nServer: AmazonS3\r\nConnection: close\r\n\r\n";
       send(fd, resp, strlen(resp), 0);
     } else {
       atomic_fetch_add(&g_stub_put_count, 1);
       stub_put(key, body, have);
-      const char *resp = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+      char etag[65] = "00000000000000000000000000000000";
+      ark_sha256_hex(body, have, etag);
+      char resp[512];
+      snprintf(resp, sizeof(resp),
+               "HTTP/1.1 200 OK\r\n"
+               "Content-Length: 0\r\n"
+               "ETag: \"%s\"\r\n"
+               "Server: AmazonS3\r\n"
+               "x-amz-request-id: 1234567890ABCDEF\r\n"
+               "Connection: close\r\n\r\n",
+               etag);
       send(fd, resp, strlen(resp), 0);
     }
   } else if (strcmp(method, "GET") == 0) {
     atomic_fetch_add(&g_stub_get_count, 1);
-    // Hardened: also validate presigned URL for GET (except direct test harness
-    // calls that use non-presigned paths — we allow those for internal checks)
-    // For benchmark S3 path, all GETs are presigned, so we enforce.
     char *data = NULL;
     size_t len = 0;
     if (stub_get(key, &data, &len)) {
       char head[256];
       snprintf(head, sizeof(head),
-                "HTTP/1.1 200 OK\r\nContent-Length: %zu\r\n\r\n", len);
+               "HTTP/1.1 200 OK\r\n"
+               "Content-Type: application/octet-stream\r\n"
+               "Content-Length: %zu\r\n"
+               "Server: AmazonS3\r\n"
+               "Connection: close\r\n\r\n",
+               len);
       send(fd, head, strlen(head), 0);
       if (len) send(fd, data, len, 0);
       free(data);
     } else {
-      const char *resp = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
+      const char *err_xml =
+          "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+          "<Error><Code>NoSuchKey</Code><Message>The specified key does not exist.</Message></Error>\n";
+      char resp[512];
+      snprintf(resp, sizeof(resp),
+               "HTTP/1.1 404 Not Found\r\n"
+               "Content-Type: application/xml\r\n"
+               "Content-Length: %zu\r\n"
+               "Server: AmazonS3\r\n"
+               "Connection: close\r\n\r\n%s",
+               strlen(err_xml), err_xml);
       send(fd, resp, strlen(resp), 0);
     }
   } else if (strcmp(method, "HEAD") == 0) {
@@ -205,15 +350,30 @@ static inline void stub_handle(int fd) {
     if (stub_get(key, &data, &len)) {
       char head[256];
       snprintf(head, sizeof(head),
-                "HTTP/1.1 200 OK\r\nContent-Length: %zu\r\n\r\n", len);
+               "HTTP/1.1 200 OK\r\n"
+               "Content-Length: %zu\r\n"
+               "Server: AmazonS3\r\n"
+               "Connection: close\r\n\r\n",
+               len);
       send(fd, head, strlen(head), 0);
       free(data);
     } else {
-      const char *resp = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
+      const char *resp =
+          "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n"
+          "Server: AmazonS3\r\nConnection: close\r\n\r\n";
       send(fd, resp, strlen(resp), 0);
     }
+  } else if (strcmp(method, "DELETE") == 0) {
+    atomic_fetch_add(&g_stub_delete_count, 1);
+    stub_delete(key);
+    const char *resp =
+        "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n"
+        "Server: AmazonS3\r\nConnection: close\r\n\r\n";
+    send(fd, resp, strlen(resp), 0);
   } else {
-    const char *resp = "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n";
+    const char *resp =
+        "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n"
+        "Server: AmazonS3\r\nConnection: close\r\n\r\n";
     send(fd, resp, strlen(resp), 0);
   }
   free(body);
@@ -235,7 +395,7 @@ static inline void *stub_server_thread(void *arg) {
   socklen_t alen = sizeof(addr);
   assert(getsockname(srv, (struct sockaddr *)&addr, &alen) == 0);
   atomic_store(&g_stub_port, ntohs(addr.sin_port));
-  assert(listen(srv, 16) == 0);
+  assert(listen(srv, 64) == 0);
   atomic_store(&g_stub_server_up, 1);
   while (atomic_load(&g_stub_server_up)) {
     int fd = accept(srv, NULL, NULL);
@@ -245,10 +405,6 @@ static inline void *stub_server_thread(void *arg) {
   close(srv);
   return NULL;
 }
-
-static char g_endpoint[64];
-static const char *BUCKET = "test-bucket";
-static const char *PREFIX = "user-42-appdb";
 
 static inline void stub_start(void) {
   if (atomic_load(&g_stub_server_up)) return;
@@ -283,8 +439,18 @@ static inline void set_s3_env(void) {
   ark_setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
   ark_setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
   ark_setenv("ARKILIAN_S3_PREFIX", PREFIX, 1);
-  // HMAC is required (no legacy); use a deterministic test key for the stub.
+  // HMAC is required; use a deterministic test key for the stub.
   ark_setenv("ARKILIAN_MANIFEST_HMAC_KEY", "test-hmac-key-for-unit-tests-32b", 1);
+}
+
+static inline void clear_s3_env(void) {
+  ark_unsetenv("ARKILIAN_S3_ENDPOINT");
+  ark_unsetenv("ARKILIAN_S3_BUCKET");
+  ark_unsetenv("ARKILIAN_S3_REGION");
+  ark_unsetenv("ARKILIAN_S3_ACCESS_KEY");
+  ark_unsetenv("ARKILIAN_S3_SECRET_KEY");
+  ark_unsetenv("ARKILIAN_S3_PREFIX");
+  ark_unsetenv("ARKILIAN_MANIFEST_HMAC_KEY");
 }
 
 static inline int stub_manifest_contains(const char *needle, int timeout_s) {

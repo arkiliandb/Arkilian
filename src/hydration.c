@@ -886,7 +886,6 @@ int ark_manifest_fetch(const char *endpoint, const char *bucket,
     // publishing a registry over an unreadable manifest would orphan the
     // predecessor's chunks.
     if (err == HYDRATION_ERR_NOTFOUND) return HYDRATION_ERR_NOTFOUND;
-    fprintf(stderr, "arkilian: manifest fetch failed (err=%d)\n", err);
     free(manifest_url);
     return err ? err : HYDRATION_ERR_NET;
   }

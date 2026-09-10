@@ -1,4 +1,6 @@
 import os
+os.environ["ARKILIAN_S3_ENDPOINT"] = ""
+os.environ["ARKILIAN_ENABLE_BACKUP"] = "0"
 import unittest
 import arkilian
 from arkilian import Arkilian, ARK_HF_ALL_CORE, HYDRATION_OK

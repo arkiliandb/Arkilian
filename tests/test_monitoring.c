@@ -122,17 +122,19 @@ static void get_captured_log(char *out, size_t out_cap, int *out_count) {
   unlock_log();
 }
 
+static void silent_log(ark_log_level_t level, const char *msg, void *ctx) {
+  (void)level;
+  (void)msg;
+  (void)ctx;
+}
+
 // ── Tests ───────────────────────────────────────────────────────────
 
 static void test_queue_depth_and_oldest_age(void) {
   cleanup("test_mon_depth.db");
   hermetic_env();
-  ark_setenv("ARKILIAN_S3_ACCESS_KEY", "test-key", 1);
-  ark_setenv("ARKILIAN_S3_ENDPOINT", "http://127.0.0.1:1", 1);
-  ark_setenv("ARKILIAN_S3_BUCKET", "test-bucket", 1);
-  ark_setenv("ARKILIAN_S3_REGION", "us-east-1", 1);
-  ark_setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
-  ark_setenv("ARKILIAN_S3_PREFIX", "test-prefix", 1);
+  ark_setenv("ARKILIAN_ENABLE_BACKUP", "0", 1);
+  ark_setenv("ARKILIAN_S3_ENDPOINT", "", 1);
   arkilian *db = NULL;
   assert(db_init(&db, "test_mon_depth.db") == 0);
   assert(db_exec(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)") == SQLITE_OK);
@@ -155,15 +157,7 @@ static void test_queue_depth_and_oldest_age(void) {
 static void test_dead_letter_count(void) {
   cleanup("test_mon_dl.db");
   hermetic_env();
-  ark_setenv("ARKILIAN_S3_ENDPOINT", "http://127.0.0.1:1", 1);
-  ark_setenv("ARKILIAN_S3_BUCKET", "test-bucket", 1);
-  ark_setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
-  ark_setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
-  ark_setenv("ARKILIAN_S3_PREFIX", "test-prefix", 1);
-  ark_setenv("ARKILIAN_S3_BUCKET", "test-bucket", 1);
-  ark_setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
-  ark_setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
-  ark_setenv("ARKILIAN_S3_PREFIX", "test-prefix", 1);
+  ark_setenv("ARKILIAN_S3_ENDPOINT", "", 1);
   arkilian *db = NULL;
   assert(db_init(&db, "test_mon_dl.db") == 0);
   assert(db_backup_dead_letter_count(db) == 0);
@@ -185,15 +179,7 @@ static void test_dead_letter_count(void) {
 static void test_thread_heartbeat(void) {
   cleanup("test_mon_hb.db");
   hermetic_env();
-  ark_setenv("ARKILIAN_S3_ENDPOINT", "http://127.0.0.1:1", 1);
-  ark_setenv("ARKILIAN_S3_BUCKET", "test-bucket", 1);
-  ark_setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
-  ark_setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
-  ark_setenv("ARKILIAN_S3_PREFIX", "test-prefix", 1);
-  ark_setenv("ARKILIAN_S3_BUCKET", "test-bucket", 1);
-  ark_setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
-  ark_setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
-  ark_setenv("ARKILIAN_S3_PREFIX", "test-prefix", 1);
+  ark_setenv("ARKILIAN_S3_ENDPOINT", "", 1);
   arkilian *db = NULL;
   assert(db_init(&db, "test_mon_hb.db") == 0);
 
@@ -217,15 +203,7 @@ static void test_thread_heartbeat(void) {
 static void test_trigger_coverage_and_resync(void) {
   cleanup("test_mon_trg.db");
   hermetic_env();
-  ark_setenv("ARKILIAN_S3_ENDPOINT", "http://127.0.0.1:1", 1);
-  ark_setenv("ARKILIAN_S3_BUCKET", "test-bucket", 1);
-  ark_setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
-  ark_setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
-  ark_setenv("ARKILIAN_S3_PREFIX", "test-prefix", 1);
-  ark_setenv("ARKILIAN_S3_BUCKET", "test-bucket", 1);
-  ark_setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
-  ark_setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
-  ark_setenv("ARKILIAN_S3_PREFIX", "test-prefix", 1);
+  ark_setenv("ARKILIAN_S3_ENDPOINT", "", 1);
   arkilian *db = NULL;
   assert(db_init(&db, "test_mon_trg.db") == 0);
   assert(db_exec(db, "CREATE TABLE a (id INTEGER PRIMARY KEY)") == SQLITE_OK);
@@ -254,11 +232,8 @@ static void test_trigger_coverage_and_resync(void) {
 static void test_health(void) {
   cleanup("test_mon_health.db");
   hermetic_env();
+  db_set_default_log_callback(silent_log, NULL);
   ark_setenv("ARKILIAN_S3_ENDPOINT", "http://127.0.0.1:1", 1);
-  ark_setenv("ARKILIAN_S3_BUCKET", "test-bucket", 1);
-  ark_setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
-  ark_setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
-  ark_setenv("ARKILIAN_S3_PREFIX", "test-prefix", 1);
   ark_setenv("ARKILIAN_S3_BUCKET", "test-bucket", 1);
   ark_setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
   ark_setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
@@ -350,6 +325,7 @@ static void test_health(void) {
   }
 
   db_close(db);
+  db_set_default_log_callback(NULL, NULL);
   cleanup("test_mon_health.db");
 }
 

@@ -1748,6 +1748,14 @@ static int curl_abort_cb(void *clientp, curl_off_t dltotal, curl_off_t dlnow,
   return (shutdown_flag && ARK_LOAD(shutdown_flag)) ? 1 : 0;
 }
 
+// Write callback to silently discard HTTP response bodies during S3 uploads
+// (prevents libcurl from leaking server bodies like "OK" or XML errors to stdout).
+static size_t curl_discard_cb(void *ptr, size_t size, size_t nmemb, void *user) {
+  (void)ptr;
+  (void)user;
+  return size * nmemb;
+}
+
 typedef enum { SHIP_OK = 0, SHIP_RETRY = 1 } ship_result_t;
 
 // Exponential backoff: seconds to wait before retrying a row that has
@@ -3860,6 +3868,7 @@ static int upload_to_s3(arkilian *db, const char *signed_url,
   if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
   if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, curl_abort_cb);
   if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_XFERINFODATA, (void *)&db->shutdown_requested);
+  if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_discard_cb);
 
   struct curl_slist *headers = NULL;
   if (rc == CURLE_OK) {
@@ -4474,8 +4483,13 @@ static int manifest_registry_seed(arkilian *db) {
     // No destination: there is no remote registry to adopt and nothing to
     // gate — record the resolved state so db_backup_health_flags() reports
     // the truth instead of a permanently "unresolved" read.
-    ARK_STORE(&db->manifest_seed_resolved, 1);
+    if (db) ARK_STORE(&db->manifest_seed_resolved, 1);
     return 1;
+  }
+  if (!ARK_LOAD(&db->backup_enabled)) {
+    // Destination configured but backup kill-switch is active: do not make
+    // network calls while disabled; leave seed pending until enabled.
+    return 0;
   }
   if (!db->s3_prefix || !db->s3_prefix[0]) return 1;
   HydratePlan plan;

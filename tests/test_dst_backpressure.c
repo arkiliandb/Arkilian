@@ -99,6 +99,17 @@ static void *mock_503_run(void *arg) {
     if (s->stop) { close(fd); break; }
     if (n > 0) {
       buf[n] = '\0';
+      if (strcasestr(buf, "expect: 100-continue")) {
+        send(fd, "HTTP/1.1 100 Continue\r\n\r\n", 25, 0);
+      }
+      char method[8] = {0}, path[1024] = {0};
+      sscanf(buf, "%7s %1023s", method, path);
+      if (strcasecmp(method, "GET") == 0 && strstr(path, "manifest.json")) {
+        const char *resp = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        send(fd, resp, strlen(resp), 0);
+        close(fd);
+        continue;
+      }
       // Drain the full request body (Content-Length)
       long body_len = 0;
       char *cl = strstr(buf, "Content-Length:");
@@ -120,9 +131,9 @@ static void *mock_503_run(void *arg) {
                "\r\n";
       } else {
         resp = "HTTP/1.1 200 OK\r\n"
-               "Content-Length: 2\r\n"
+               "Content-Length: 0\r\n"
                "Connection: close\r\n"
-               "\r\nOK";
+               "\r\n";
         s->accepted++;
       }
       send(fd, resp, strlen(resp), 0);
@@ -196,6 +207,7 @@ static void test_writes_survive_503_backpressure(void) {
   setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
   setenv("ARKILIAN_S3_PREFIX", "test-prefix", 1);
   ark_setenv("ARKILIAN_BACKUP_INTERVAL", "3600", 1);
+  ark_setenv("ARKILIAN_MANIFEST_HMAC_KEY", "test-hmac-key-for-unit-tests-32b", 1);
 
   arkilian *db = NULL;
   assert(db_init(&db, db_path) == 0);
@@ -266,6 +278,7 @@ static void test_outbox_cap_respected_under_503(void) {
   setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
   setenv("ARKILIAN_S3_PREFIX", "test-prefix", 1);
   ark_setenv("ARKILIAN_BACKUP_INTERVAL", "3600", 1);
+  ark_setenv("ARKILIAN_MANIFEST_HMAC_KEY", "test-hmac-key-for-unit-tests-32b", 1);
   ark_setenv("ARKILIAN_MAX_QUEUE_DEPTH", "10", 1); // tight cap
 
   arkilian *db = NULL;
@@ -322,6 +335,7 @@ static void test_backlog_drains_on_recovery(void) {
   setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
   setenv("ARKILIAN_S3_PREFIX", "test-prefix", 1);
   ark_setenv("ARKILIAN_BACKUP_INTERVAL", "3600", 1);
+  ark_setenv("ARKILIAN_MANIFEST_HMAC_KEY", "test-hmac-key-for-unit-tests-32b", 1);
 
   arkilian *db = NULL;
   assert(db_init(&db, db_path) == 0);

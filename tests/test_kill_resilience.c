@@ -159,7 +159,7 @@ static void *rec_server_run(void *arg) {
       }
       atomic_fetch_add(&s->requests, 1);
       if (s->delay_ms > 0) usleep((useconds_t)s->delay_ms * 1000);
-      const char *resp = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK";
+      const char *resp = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
       send(fd, resp, strlen(resp), 0);
     }
     close(fd);
@@ -333,6 +333,7 @@ static int child_entrypoint(int argc, char **argv) {
   setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
   setenv("ARKILIAN_S3_PREFIX", "test-prefix", 1);
   setenv("ARKILIAN_BACKUP_INTERVAL", "3600", 1);
+  setenv("ARKILIAN_MANIFEST_HMAC_KEY", "test-hmac-key-for-unit-tests-32b", 1);
 
   arkilian *db = NULL;
   if (db_init(&db, db_path) != 0) return 2;
@@ -452,6 +453,7 @@ static void run_kill_scenario(int kill_mode) {
   setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
   setenv("ARKILIAN_S3_PREFIX", "test-prefix", 1);
   setenv("ARKILIAN_BACKUP_INTERVAL", "3600", 1);
+  setenv("ARKILIAN_MANIFEST_HMAC_KEY", "test-hmac-key-for-unit-tests-32b", 1);
   arkilian *db = NULL;
   assert(db_init(&db, db_path) == 0);
   // Mid-ship drains through the 250ms-per-row destination: allow longer.
@@ -494,6 +496,7 @@ static void test_kill_mid_ship(void)     { run_kill_scenario(2); }
 int main(int argc, char **argv) {
   signal(SIGPIPE, SIG_IGN);
   setenv("ARKILIAN_S3_ACCESS_KEY", "test-key", 1);
+  setenv("ARKILIAN_MANIFEST_HMAC_KEY", "test-hmac-key-for-unit-tests-32b", 1);
 
   if (argc >= 2 && strcmp(argv[1], "--child") == 0) {
     return child_entrypoint(argc, argv);

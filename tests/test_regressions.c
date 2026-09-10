@@ -16,6 +16,7 @@
 
 #include "class.h"
 #include "ark_test_env.h"
+#include "ark_stub_s3.h"
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -54,11 +55,7 @@ static void cleanup(const char *path) {
 static arkilian *open_db(const char *path) {
   cleanup(path); // idempotent across re-runs
   ark_setenv("ARKILIAN_ENABLE_BACKUP", "0", 1);
-  ark_setenv("ARKILIAN_S3_ENDPOINT", "http://127.0.0.1:1", 1);
-  ark_setenv("ARKILIAN_S3_BUCKET", "test-bucket", 1);
-  ark_setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
-  ark_setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
-  ark_setenv("ARKILIAN_S3_PREFIX", "test-prefix", 1);
+  ark_setenv("ARKILIAN_S3_ENDPOINT", "", 1);
   arkilian *db = NULL;
   int rc = db_init(&db, path);
   assert(rc == 0 && "db_init failed");
@@ -231,6 +228,7 @@ static void test_prepare_empty_sql_rejected(void) {
 
 static void test_close_does_not_block_on_backup_interval(void) {
   ark_setenv("ARKILIAN_ENABLE_BACKUP", "1", 1);
+  ark_setenv("ARKILIAN_S3_ENDPOINT", "", 1);
   ark_setenv("ARKILIAN_BACKUP_INTERVAL", "3600", 1); // 1 hour
   ark_setenv("ARKILIAN_BACKUP_PATH", "test_reg_close_backup.sqlite", 1);
   arkilian *db = NULL;
@@ -371,12 +369,7 @@ static void test_no_destination_rows_survive(void) {
 
 static void test_text_pk_replay_fidelity(void) {
   cleanup("test_reg_fid.db");
-  ark_setenv("ARKILIAN_ENABLE_BACKUP", "1", 1);
-  ark_setenv("ARKILIAN_S3_ENDPOINT", "http://127.0.0.1:1", 1);
-  ark_setenv("ARKILIAN_S3_BUCKET", "test-bucket", 1);
-  ark_setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
-  ark_setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
-  ark_setenv("ARKILIAN_S3_PREFIX", "test-prefix", 1); // keep rows in outbox
+  ark_setenv("ARKILIAN_ENABLE_BACKUP", "0", 1);
   ark_setenv("ARKILIAN_BACKUP_INTERVAL", "3600", 1);
   arkilian *db = NULL;
   assert(db_init(&db, "test_reg_fid.db") == 0);
@@ -429,12 +422,7 @@ static void test_text_pk_replay_fidelity(void) {
 
 static void test_keyless_table_skipped(void) {
   cleanup("test_reg_keyless.db");
-  ark_setenv("ARKILIAN_ENABLE_BACKUP", "1", 1);
-  ark_setenv("ARKILIAN_S3_ENDPOINT", "http://127.0.0.1:1", 1);
-  ark_setenv("ARKILIAN_S3_BUCKET", "test-bucket", 1);
-  ark_setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
-  ark_setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
-  ark_setenv("ARKILIAN_S3_PREFIX", "test-prefix", 1);
+  ark_setenv("ARKILIAN_ENABLE_BACKUP", "0", 1);
   ark_setenv("ARKILIAN_BACKUP_INTERVAL", "3600", 1);
   arkilian *db = NULL;
   assert(db_init(&db, "test_reg_keyless.db") == 0);
@@ -469,16 +457,14 @@ static void test_keyless_table_skipped(void) {
 
 static void test_dead_letter_zombie_cleared(void) {
   cleanup("test_reg_zombie.db");
+  stub_start();
+  stub_reset();
+  set_s3_env();
+  stub_set_status_override_put(500); // 1:1 S3 mock returns 500 Internal Error on PUT
   ark_setenv("ARKILIAN_ENABLE_BACKUP", "1", 1);
-  ark_setenv("ARKILIAN_S3_ENDPOINT", "http://127.0.0.1:1", 1);
-  ark_setenv("ARKILIAN_S3_BUCKET", "test-bucket", 1);
-  ark_setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
-  ark_setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
-  ark_setenv("ARKILIAN_S3_PREFIX", "test-prefix", 1);
   ark_setenv("ARKILIAN_BACKUP_INTERVAL", "3600", 1);
   // Tight attempt budget so the crafted zombie (10 attempts) is at the
-  // limit on the FIRST pass — dead-lettering then runs immediately. The
-  // flush thread must actually attempt-and-fail (127.0.0.1:1 refuses).
+  // limit on the FIRST pass — dead-lettering then runs immediately.
   ark_setenv("ARKILIAN_MAX_ATTEMPTS", "10", 1);
   arkilian *db = NULL;
   assert(db_init(&db, "test_reg_zombie.db") == 0);
@@ -527,7 +513,10 @@ static void test_dead_letter_zombie_cleared(void) {
   assert(db_column_int(db, 0) == 1);
   db_finalize(db);
 
+  // Clean up.
   db_close(db);
+  stub_stop();
+  clear_s3_env();
   cleanup("test_reg_zombie.db");
 }
 

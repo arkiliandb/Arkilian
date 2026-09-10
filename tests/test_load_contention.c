@@ -96,6 +96,14 @@ static void *slow_server_run(void *arg) {
       if (strcasestr(buf, "expect: 100-continue")) {
         send(fd, "HTTP/1.1 100 Continue\r\n\r\n", 25, 0);
       }
+      char method[8] = {0}, path[1024] = {0};
+      sscanf(buf, "%7s %1023s", method, path);
+      if (strcasecmp(method, "GET") == 0 && strstr(path, "manifest.json")) {
+        const char *resp = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        send(fd, resp, strlen(resp), 0);
+        close(fd);
+        continue;
+      }
       long body_len = 0;
       char *cl = strcasestr(buf, "content-length:");
       if (cl) body_len = atol(cl + 15);
@@ -111,7 +119,7 @@ static void *slow_server_run(void *arg) {
       }
       atomic_fetch_add(&s->requests, 1);
       if (s->delay_ms > 0) usleep((useconds_t)s->delay_ms * 1000);
-      const char *resp = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK";
+      const char *resp = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
       send(fd, resp, strlen(resp), 0);
     }
     close(fd);
@@ -226,6 +234,7 @@ static void test_load_contention(void) {
   setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
   setenv("ARKILIAN_S3_PREFIX", "test-prefix", 1);
   setenv("ARKILIAN_BACKUP_INTERVAL", "3600", 1); // hermetic: no .env dependence
+  setenv("ARKILIAN_MANIFEST_HMAC_KEY", "test-hmac-key-for-unit-tests-32b", 1);
 
   arkilian *db = NULL;
   assert(db_init(&db, "test_load.db") == 0);

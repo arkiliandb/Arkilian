@@ -915,14 +915,7 @@ int main(int argc, char **argv) {
     printf("\n  Hardened S3 verification: OK (full API emulated)\n");
     return 0;
   }
-  setenv("ARKILIAN_S3_ACCESS_KEY", "test-key", 1);
-  setenv("ARKILIAN_S3_ENDPOINT", "http://localhost:8080", 1);
-  setenv("ARKILIAN_S3_BUCKET", "test-bucket", 1);
-  setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
-  setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
-  setenv("ARKILIAN_S3_PREFIX", "test-prefix", 1);
-  setenv("ARKILIAN_S3_ACCESS_KEY",
-         "ak_db_d25e9ea4cb93_7c3872fc11e9f12feb644a68533529445124668a0f7ab1c1c5b1157c6ae64bc8", 1);
+  clear_s3_env();
   setenv("ARKILIAN_ENABLE_BACKUP", "0", 1);
   remove("bench_1m.db");
 

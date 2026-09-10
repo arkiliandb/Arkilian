@@ -1,4 +1,6 @@
 <?php
+putenv('ARKILIAN_S3_ENDPOINT=');
+putenv('ARKILIAN_ENABLE_BACKUP=0');
 require_once __DIR__ . '/Arkilian.php';
 
 $testDbPath = sys_get_temp_dir() . '/test_arkilian_' . uniqid() . '.sqlite';
