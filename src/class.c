@@ -383,6 +383,9 @@ struct arkilian {
   uint64_t next_txid;
   uint64_t next_commit_seq;
   ark_stmt_state_t last_stmt_state;
+  struct pending_ddl *unpersisted_head;
+  struct pending_ddl *unpersisted_tail;
+  volatile int sidecar_io_error;
 #ifdef _WIN32
   CRITICAL_SECTION pending_ddl_mutex;
 #else
@@ -758,6 +761,12 @@ static const char *skip_sql_prefix(const char *sql) {
 #define PENDING_DDL_UNLOCK(db) pthread_mutex_unlock(&(db)->pending_ddl_mutex)
 #endif
 
+static int sidecar_fault_check(const char *op) {
+  const char *val = getenv("ARKILIAN_FAULT_SIDECAR");
+  if (val && strcmp(val, op) == 0) return 1;
+  return 0;
+}
+
 static uint32_t txn_checksum(uint64_t txid, uint8_t type, const char *sql) {
   // Simple FNV-1a over txid+type+sql for sidecar integrity
   uint32_t h = 2166136261u;
@@ -767,77 +776,144 @@ static uint32_t txn_checksum(uint64_t txid, uint8_t type, const char *sql) {
   return h;
 }
 
-static void sidecar_append_record(arkilian *db, uint64_t txid, uint8_t type, const char *sql) {
+static int sidecar_append_record(arkilian *db, uint64_t txid, uint8_t type, const char *sql) {
+  if (!db) return -1;
+  if (sidecar_fault_check("open")) return -1;
   char qpath[4096];
   snprintf(qpath, sizeof(qpath), "%s.arkddlqueue", db->db_path ? db->db_path : "app.sqlite");
   FILE *qf = fopen(qpath, "ab");
-  if (!qf) return;
+  if (!qf) {
+    ark_log(db, ARK_LOG_ERROR, "sidecar: open failed for %s: %s", qpath, strerror(errno));
+    return -1;
+  }
   uint32_t sql_len = sql ? (uint32_t)strlen(sql) : 0;
   uint32_t csum = txn_checksum(txid, type, sql);
-  fwrite(&txid, 1, sizeof(txid), qf);
-  fwrite(&type, 1, sizeof(type), qf);
-  fwrite(&sql_len, 1, sizeof(sql_len), qf);
-  if (sql_len) fwrite(sql, 1, sql_len, qf);
-  fwrite(&csum, 1, sizeof(csum), qf);
-  fflush(qf);
+
+  if (sidecar_fault_check("write") ||
+      fwrite(&txid, 1, sizeof(txid), qf) != sizeof(txid) ||
+      fwrite(&type, 1, sizeof(type), qf) != sizeof(type) ||
+      fwrite(&sql_len, 1, sizeof(sql_len), qf) != sizeof(sql_len) ||
+      (sql_len && fwrite(sql, 1, sql_len, qf) != sql_len) ||
+      fwrite(&csum, 1, sizeof(csum), qf) != sizeof(csum)) {
+    ark_log(db, ARK_LOG_ERROR, "sidecar: write failed for %s", qpath);
+    fclose(qf);
+    return -1;
+  }
+
+  if (sidecar_fault_check("fflush") || fflush(qf) != 0) {
+    ark_log(db, ARK_LOG_ERROR, "sidecar: fflush failed for %s: %s", qpath, strerror(errno));
+    fclose(qf);
+    return -1;
+  }
+
 #ifdef _WIN32
-  _commit(_fileno(qf));
+  if (sidecar_fault_check("fsync") || _commit(_fileno(qf)) != 0) {
 #else
-  fsync(fileno(qf));
+  if (sidecar_fault_check("fsync") || fsync(fileno(qf)) != 0) {
 #endif
-  fclose(qf);
+    ark_log(db, ARK_LOG_ERROR, "sidecar: fsync failed for %s: %s", qpath, strerror(errno));
+    fclose(qf);
+    return -1;
+  }
+
+  if (sidecar_fault_check("fclose") || fclose(qf) != 0) {
+    ark_log(db, ARK_LOG_ERROR, "sidecar: fclose failed for %s: %s", qpath, strerror(errno));
+    return -1;
+  }
+  return 0;
 }
 
 // Perf: one fsync per committed transaction, not per statement.
 // For a txn with 1000 DMLs, this is 1 fsync vs 1000.
-static void sidecar_append_txn(arkilian *db, uint64_t txid, struct pending_ddl *head) {
+static int sidecar_append_txn(arkilian *db, uint64_t txid, struct pending_ddl *head) {
+  if (!db) return -1;
   if (!head) {
-    sidecar_append_record(db, txid, 1, "BEGIN");
-    sidecar_append_record(db, txid, 2, "COMMIT");
-    return;
+    if (sidecar_append_record(db, txid, 1, "BEGIN") != 0) return -1;
+    if (sidecar_append_record(db, txid, 2, "COMMIT") != 0) return -1;
+    return 0;
   }
+  if (sidecar_fault_check("open")) return -1;
   char qpath[4096];
   snprintf(qpath, sizeof(qpath), "%s.arkddlqueue", db->db_path ? db->db_path : "app.sqlite");
   FILE *qf = fopen(qpath, "ab");
-  if (!qf) return;
+  if (!qf) {
+    ark_log(db, ARK_LOG_ERROR, "sidecar: open failed for %s: %s", qpath, strerror(errno));
+    return -1;
+  }
+
+  if (sidecar_fault_check("write")) {
+    fclose(qf);
+    return -1;
+  }
+
   uint32_t csum;
   uint32_t sql_len;
+  uint8_t t;
   // BEGIN
   csum = txn_checksum(txid, 1, "BEGIN");
-  fwrite(&txid, 1, sizeof(txid), qf);
-  uint8_t t = 1;
-  fwrite(&t, 1, sizeof(t), qf);
+  t = 1;
   sql_len = 5;
-  fwrite(&sql_len, 1, sizeof(sql_len), qf);
-  fwrite("BEGIN", 1, 5, qf);
-  fwrite(&csum, 1, sizeof(csum), qf);
+  if (fwrite(&txid, 1, sizeof(txid), qf) != sizeof(txid) ||
+      fwrite(&t, 1, sizeof(t), qf) != sizeof(t) ||
+      fwrite(&sql_len, 1, sizeof(sql_len), qf) != sizeof(sql_len) ||
+      fwrite("BEGIN", 1, 5, qf) != 5 ||
+      fwrite(&csum, 1, sizeof(csum), qf) != sizeof(csum)) {
+    ark_log(db, ARK_LOG_ERROR, "sidecar: write failed on BEGIN for %s", qpath);
+    fclose(qf);
+    return -1;
+  }
+
   // SQLs
   for (struct pending_ddl *n = head; n; n = n->next) {
     uint32_t len = (uint32_t)strlen(n->sql);
     csum = txn_checksum(txid, 4, n->sql);
-    fwrite(&txid, 1, sizeof(txid), qf);
     t = 4;
-    fwrite(&t, 1, sizeof(t), qf);
-    fwrite(&len, 1, sizeof(len), qf);
-    fwrite(n->sql, 1, len, qf);
-    fwrite(&csum, 1, sizeof(csum), qf);
+    if (fwrite(&txid, 1, sizeof(txid), qf) != sizeof(txid) ||
+        fwrite(&t, 1, sizeof(t), qf) != sizeof(t) ||
+        fwrite(&len, 1, sizeof(len), qf) != sizeof(len) ||
+        fwrite(n->sql, 1, len, qf) != len ||
+        fwrite(&csum, 1, sizeof(csum), qf) != sizeof(csum)) {
+      ark_log(db, ARK_LOG_ERROR, "sidecar: write failed on SQL record for %s", qpath);
+      fclose(qf);
+      return -1;
+    }
   }
+
   // COMMIT
   csum = txn_checksum(txid, 2, "COMMIT");
-  fwrite(&txid, 1, sizeof(txid), qf);
   t = 2;
-  fwrite(&t, 1, sizeof(t), qf);
   sql_len = 6;
-  fwrite(&sql_len, 1, sizeof(sql_len), qf);
-  fwrite("COMMIT", 1, 6, qf);
-  fwrite(&csum, 1, sizeof(csum), qf);
-  fflush(qf);
+  if (fwrite(&txid, 1, sizeof(txid), qf) != sizeof(txid) ||
+      fwrite(&t, 1, sizeof(t), qf) != sizeof(t) ||
+      fwrite(&sql_len, 1, sizeof(sql_len), qf) != sizeof(sql_len) ||
+      fwrite("COMMIT", 1, 6, qf) != 6 ||
+      fwrite(&csum, 1, sizeof(csum), qf) != sizeof(csum)) {
+    ark_log(db, ARK_LOG_ERROR, "sidecar: write failed on COMMIT for %s", qpath);
+    fclose(qf);
+    return -1;
+  }
+
+  if (sidecar_fault_check("fflush") || fflush(qf) != 0) {
+    ark_log(db, ARK_LOG_ERROR, "sidecar: fflush failed for %s: %s", qpath, strerror(errno));
+    fclose(qf);
+    return -1;
+  }
+
 #ifdef _WIN32
-  _commit(_fileno(qf));
+  if (sidecar_fault_check("fsync") || _commit(_fileno(qf)) != 0) {
 #else
-  fsync(fileno(qf));
+  if (sidecar_fault_check("fsync") || fsync(fileno(qf)) != 0) {
 #endif
-  fclose(qf);
+    ark_log(db, ARK_LOG_ERROR, "sidecar: fsync failed for %s: %s", qpath, strerror(errno));
+    fclose(qf);
+    return -1;
+  }
+
+  if (sidecar_fault_check("fclose") || fclose(qf) != 0) {
+    ark_log(db, ARK_LOG_ERROR, "sidecar: fclose failed for %s: %s", qpath, strerror(errno));
+    return -1;
+  }
+  return 0;
 }
 
 static char *extract_savepoint_name(const char *sql, const char *after_keyword) {
@@ -958,15 +1034,31 @@ static void pending_ddl_append(arkilian *db, const char *sql) {
     // Autocommit: single-statement transaction — one fsync, not three.
     uint64_t txid = ++db->next_txid;
     node->txid = txid;
-    sidecar_append_txn(db, txid, node);
-    PENDING_DDL_LOCK(db);
-    if (db->pending_ddl_tail) {
-      db->pending_ddl_tail->next = node;
-      db->pending_ddl_tail = node;
+    int s_rc = sidecar_append_txn(db, txid, node);
+    if (s_rc == 0) {
+      PENDING_DDL_LOCK(db);
+      if (db->pending_ddl_tail) {
+        db->pending_ddl_tail->next = node;
+        db->pending_ddl_tail = node;
+      } else {
+        db->pending_ddl_head = db->pending_ddl_tail = node;
+      }
+      PENDING_DDL_UNLOCK(db);
     } else {
-      db->pending_ddl_head = db->pending_ddl_tail = node;
+      ARK_STORE(&db->sidecar_io_error, 1);
+      ARK_STORE(&db->capture_paused, 1);
+      ark_log(db, ARK_LOG_ERROR,
+              "sidecar: failed to durably persist autocommit txid %llu — capture degraded to memory-only, health RED",
+              (unsigned long long)txid);
+      PENDING_DDL_LOCK(db);
+      if (db->unpersisted_tail) {
+        db->unpersisted_tail->next = node;
+        db->unpersisted_tail = node;
+      } else {
+        db->unpersisted_head = db->unpersisted_tail = node;
+      }
+      PENDING_DDL_UNLOCK(db);
     }
-    PENDING_DDL_UNLOCK(db);
   }
 }
 
@@ -1004,9 +1096,9 @@ static void pending_ddl_drain_and_capture(arkilian *db) {
   if (drained > 0 && max_drained_txid > 0) {
     set_sidecar_promoted_watermark(db->handle, max_drained_txid);
   }
-  // Only truncate durable sidecar if ALL enqueues succeeded; otherwise
-  // keep it for retry.
-  if (drained == total) {
+  // Only truncate durable sidecar if ALL enqueues succeeded AND no sidecar
+  // I/O failure occurred; otherwise keep it for retry.
+  if (drained == total && !ARK_LOAD(&db->sidecar_io_error) && !db->unpersisted_head) {
     char qpath[4096];
     snprintf(qpath, sizeof(qpath), "%s.arkddlqueue", db->db_path ? db->db_path : "app.sqlite");
     remove(qpath);
@@ -1153,22 +1245,40 @@ static int trace_raw_ddl(unsigned trace, void *ctx, void *p, void *x) {
         db->txn_head = db->txn_tail = NULL;
         db->txn_state.active = 0;
         if (txn) {
-          sidecar_append_txn(db, txid, txn);
-          db->next_commit_seq++;
-        } else {
-          sidecar_append_txn(db, txid, NULL);
-        }
-        if (txn) {
-          if (db->pending_ddl_tail) {
-            db->pending_ddl_tail->next = txn;
-            struct pending_ddl *t = txn;
-            while (t->next) t = t->next;
-            db->pending_ddl_tail = t;
+          int s_rc = sidecar_append_txn(db, txid, txn);
+          if (s_rc == 0) {
+            db->next_commit_seq++;
+            if (db->pending_ddl_tail) {
+              db->pending_ddl_tail->next = txn;
+              struct pending_ddl *t = txn;
+              while (t->next) t = t->next;
+              db->pending_ddl_tail = t;
+            } else {
+              db->pending_ddl_head = txn;
+              struct pending_ddl *t = txn;
+              while (t->next) t = t->next;
+              db->pending_ddl_tail = t;
+            }
           } else {
-            db->pending_ddl_head = txn;
-            struct pending_ddl *t = txn;
-            while (t->next) t = t->next;
-            db->pending_ddl_tail = t;
+            ARK_STORE(&db->sidecar_io_error, 1);
+            ARK_STORE(&db->capture_paused, 1);
+            ark_log(db, ARK_LOG_ERROR,
+                    "sidecar write FAILED for txid %llu — capture degraded to memory-only, health RED",
+                    (unsigned long long)txid);
+            if (db->unpersisted_tail) {
+              db->unpersisted_tail->next = txn;
+              struct pending_ddl *t = txn;
+              while (t->next) t = t->next;
+              db->unpersisted_tail = t;
+            } else {
+              db->unpersisted_head = db->unpersisted_tail = txn;
+            }
+          }
+        } else {
+          int s_rc = sidecar_append_txn(db, txid, NULL);
+          if (s_rc != 0) {
+            ARK_STORE(&db->sidecar_io_error, 1);
+            ARK_STORE(&db->capture_paused, 1);
           }
         }
         PENDING_DDL_UNLOCK(db);
@@ -3096,15 +3206,21 @@ void db_close(arkilian *db) {
       free(n->sql);
       free(n);
       n = nx;
+    for (struct pending_ddl *n = db->unpersisted_head; n; ) {
+      struct pending_ddl *nx = n->next;
+      free(n->sql);
+      free(n);
+      n = nx;
     }
+    db->unpersisted_head = db->unpersisted_tail = NULL;
     while (db->savepoint_stack) {
       struct ark_savepoint *cur = db->savepoint_stack;
       db->savepoint_stack = cur->prev;
       free(cur->name);
       free(cur);
     }
-    // Sidecar file is removed only when all records were successfully drained
-    if (db->db_path && db->pending_ddl_head == NULL) {
+    // Sidecar file is removed only when all records were successfully drained AND no sidecar I/O error occurred
+    if (db->db_path && db->pending_ddl_head == NULL && !ARK_LOAD(&db->sidecar_io_error) && !db->unpersisted_head) {
       char qpath[4096];
       snprintf(qpath, sizeof(qpath), "%s.arkddlqueue", db->db_path);
       remove(qpath);
@@ -3774,10 +3890,9 @@ unsigned db_backup_health_flags(arkilian *db) {
   // manifest while shipping continues. That is a restore gap, not a green
   // light.
   if (ARK_LOAD(&db->manifest_seed_resolved) == 1) f |= ARK_HF_MANIFEST_RESOLVED;
-  // Sticky "CDC rows were dropped at the cap" signal — set until a
-  // successful snapshot re-baselines. A gap occurred; healthy must wait
-  // for the snapshot that closes it.
-  if (!ARK_LOAD(&db->capture_paused)) f |= ARK_HF_NO_CAPTURE_GAP;
+  // Sticky "CDC rows were dropped at the cap" or sidecar I/O failure signal —
+  // a gap occurred; healthy must wait for the snapshot that closes it.
+  if (!ARK_LOAD(&db->capture_paused) && !ARK_LOAD(&db->sidecar_io_error)) f |= ARK_HF_NO_CAPTURE_GAP;
   // Informational: capture outbox durability mode (FULL vs NORMAL). Does
   // NOT gate the boolean — NORMAL is an operator choice, not a fault.
   if (db->outbox_durable) f |= ARK_HF_DURABLE_CAPTURE;
