@@ -1338,7 +1338,14 @@ static void rollback_hook_cb(void *arg) {
     free(n);
     n = nx;
   }
-  sidecar_append_record(db, txid, 3, "ROLLBACK");
+  int rb_rc = sidecar_append_record(db, txid, 3, "ROLLBACK");
+  if (rb_rc != 0) {
+    ARK_STORE(&db->sidecar_io_error, 1);
+    ark_log(db, ARK_LOG_WARN,
+            "sidecar: ROLLBACK record write failed for txid %llu — "
+            "sidecar may contain a partial transaction on crash recovery",
+            (unsigned long long)txid);
+  }
 }
 
 // Extract the host component of a URL into a caller-provided buffer.
@@ -2585,7 +2592,10 @@ static void recover_committed_tx_into_pending(arkilian *db) {
     if (fread(&txid, 1, sizeof(txid), qf) != sizeof(txid)) break;
     if (fread(&type, 1, sizeof(type), qf) != sizeof(type)) break;
     if (fread(&sql_len, 1, sizeof(sql_len), qf) != sizeof(sql_len)) break;
-    if (sql_len > 1000000) { is_new_format = 0; break; }
+    if (sql_len > 1000000) {
+      if (rec_cnt == 0) is_new_format = 0;
+      break;
+    }
     char *sql = NULL;
     if (sql_len) {
       sql = malloc(sql_len + 1);
@@ -2595,7 +2605,11 @@ static void recover_committed_tx_into_pending(arkilian *db) {
     }
     if (fread(&csum, 1, sizeof(csum), qf) != sizeof(csum)) { free(sql); break; }
     expect = txn_checksum(txid, type, sql);
-    if (csum != expect) { free(sql); is_new_format = 0; break; }
+    if (csum != expect) {
+      free(sql);
+      if (rec_cnt == 0) is_new_format = 0;
+      break;
+    }
     if (rec_cnt == rec_cap) {
       size_t ncap = rec_cap ? rec_cap * 2 : 32;
       void *np = realloc(recs, ncap * sizeof(*recs));
@@ -4018,6 +4032,19 @@ int db_get_auto_resync_triggers(arkilian *db) {
 // are being dropped" signal.
 int db_backup_capture_paused(arkilian *db) {
   return (db && ARK_LOAD(&db->capture_paused)) ? 1 : 0;
+}
+
+int db_backup_unpersisted_count(arkilian *db) {
+  if (!db) return 0;
+  int count = 0;
+  PENDING_DDL_LOCK(db);
+  for (struct pending_ddl *n = db->unpersisted_head; n; n = n->next) count++;
+  PENDING_DDL_UNLOCK(db);
+  return count;
+}
+
+int db_backup_sidecar_io_error(arkilian *db) {
+  return (db && ARK_LOAD(&db->sidecar_io_error)) ? 1 : 0;
 }
 
 // ── Hourly Backup Implementation ────────────────────────────────────

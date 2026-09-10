@@ -169,6 +169,10 @@ int db_get_auto_resync_triggers(arkilian *db);
 // == 0: that fires for many reasons (disabled, no dest, thread dead, cap);
 // this is the specific "CDC rows dropped, snapshot is the fallback" signal.
 int db_backup_capture_paused(arkilian *db);
+// Number of raw transactions currently held in memory due to sidecar I/O error
+int db_backup_unpersisted_count(arkilian *db);
+// 1 if a sidecar journal I/O failure has occurred on this handle, 0 otherwise
+int db_backup_sidecar_io_error(arkilian *db);
 // 1 when the backup subsystem is healthy: backup enabled, a push
 // destination configured, flush thread alive, and queue depth below
 // ARKILIAN_MAX_QUEUE_DEPTH (default 100000). 0 otherwise — including

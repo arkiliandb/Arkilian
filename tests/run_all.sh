@@ -94,6 +94,8 @@ run      test_virtual_tables  tests/test_virtual_tables.c
 run      test_deterministic   tests/test_deterministic.c
 run      test_hardening       tests/test_hardening.c
 run      test_p0_hardening    tests/test_p0_hardening.c
+run      test_sidecar_faults  tests/test_sidecar_faults.c
+run      test_raw_transaction_recovery tests/test_raw_transaction_recovery.c
 run      test_health_flags    tests/test_health_flags.c
 run      test_sha256          tests/test_sha256.c
 run_hydration
