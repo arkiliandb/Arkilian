@@ -3206,6 +3206,7 @@ void db_close(arkilian *db) {
       free(n->sql);
       free(n);
       n = nx;
+    }
     for (struct pending_ddl *n = db->unpersisted_head; n; ) {
       struct pending_ddl *nx = n->next;
       free(n->sql);
