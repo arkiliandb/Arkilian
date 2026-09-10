@@ -595,6 +595,192 @@ static void test_case_j_truncated_sidecar_tail(void) {
   cleanup(src_path); cleanup(tgt_path);
 }
 
+// Case K: TX 500 has 100 captured SQL records, outbox capacity is 10.
+// Assert: 0 records of TX 500 are lost, watermark < 500, sidecar still contains TX 500,
+// and after restart with sufficient capacity, all 100 records eventually reach target.
+static void test_case_k_partial_drain_transaction_intact(void) {
+  const char *src_path = "recov_case_k_src.db";
+  const char *tgt_path = "recov_case_k_tgt.db";
+  char qpath[512];
+  snprintf(qpath, sizeof(qpath), "%s.arkddlqueue", src_path);
+  cleanup(src_path); cleanup(tgt_path);
+
+  // Initialize DB so internal metadata table exists
+  arkilian *base = open_hermetic(src_path);
+  db_close(base);
+
+  // Synthesize sidecar with TX 500 having 100 SQL records (1 CREATE + 99 INSERTs)
+  FILE *f = fopen(qpath, "wb");
+  assert(f != NULL);
+  uint64_t txid = 500;
+  write_sidecar_record(f, txid, 1, "BEGIN");
+  write_sidecar_record(f, txid, 4, "CREATE TABLE tbl_500 (id INT PRIMARY KEY, v TEXT);");
+  for (int i = 1; i <= 99; i++) {
+    char sql[128];
+    snprintf(sql, sizeof(sql), "INSERT INTO tbl_500 VALUES (%d, 'val_%d');", i, i);
+    write_sidecar_record(f, txid, 4, sql);
+  }
+  write_sidecar_record(f, txid, 2, "COMMIT");
+  fclose(f);
+
+  // Also apply to raw sqlite DB to match committed state
+  sqlite3 *raw_pre = NULL;
+  assert(sqlite3_open(src_path, &raw_pre) == SQLITE_OK);
+  assert(sqlite3_exec(raw_pre, "CREATE TABLE tbl_500 (id INT PRIMARY KEY, v TEXT);", NULL, NULL, NULL) == SQLITE_OK);
+  for (int i = 1; i <= 99; i++) {
+    char sql[128];
+    snprintf(sql, sizeof(sql), "INSERT INTO tbl_500 VALUES (%d, 'val_%d');", i, i);
+    assert(sqlite3_exec(raw_pre, sql, NULL, NULL, NULL) == SQLITE_OK);
+  }
+  sqlite3_close(raw_pre);
+
+  // Set outbox capacity to 10
+  ark_setenv("ARKILIAN_MAX_QUEUE_DEPTH", "10", 1);
+
+  // Start source: db_init recovers TX 500 from sidecar into pending_ddl,
+  // then calls pending_ddl_drain_and_capture.
+  arkilian *src = NULL;
+  assert(db_init(&src, src_path) == 0 && src != NULL);
+
+  // Drain assert:
+  // 1. TX 500 was NOT partially promoted (outbox depth is 0, 0 records lost)
+  assert(db_backup_queue_depth(src) == 0);
+  // 2. Watermark remains < 500 (remains 0)
+  assert(db_backup_sidecar_watermark(src) < 500);
+  // 3. Sidecar still contains TX 500
+  FILE *check_f = fopen(qpath, "rb");
+  assert(check_f != NULL);
+  fseek(check_f, 0, SEEK_END);
+  assert(ftell(check_f) > 0);
+  fclose(check_f);
+
+  // Close source: sidecar must NOT be deleted because pending_ddl was not empty
+  db_close(src);
+
+  check_f = fopen(qpath, "rb");
+  assert(check_f != NULL);
+  fclose(check_f);
+
+  // Restart with ample capacity: 1000
+  ark_setenv("ARKILIAN_MAX_QUEUE_DEPTH", "1000", 1);
+  src = NULL;
+  assert(db_init(&src, src_path) == 0 && src != NULL);
+  db_resync_triggers(src);
+
+  // Assert: all 100 records are now promoted in _pending_backup
+  assert(db_backup_queue_depth(src) == 100);
+  // Assert: watermark is now 500
+  assert(db_backup_sidecar_watermark(src) == 500);
+
+  // Replay outbox to target
+  sqlite3 *tgt = NULL;
+  assert(sqlite3_open(tgt_path, &tgt) == SQLITE_OK);
+  replay_outbox_to_target(src, tgt, NULL);
+
+  // Assert: all 100 records eventually reach target
+  assert(tables_match(db_get_handle(src), tgt, "tbl_500") == 1);
+  sqlite3_stmt *st = NULL;
+  assert(sqlite3_prepare_v2(tgt, "SELECT COUNT(*) FROM tbl_500", -1, &st, NULL) == SQLITE_OK);
+  assert(sqlite3_step(st) == SQLITE_ROW);
+  assert(sqlite3_column_int(st, 0) == 99);
+  sqlite3_finalize(st);
+
+  sqlite3_close(tgt);
+  db_close(src);
+  cleanup(src_path); cleanup(tgt_path);
+  ark_unsetenv("ARKILIAN_MAX_QUEUE_DEPTH");
+}
+
+// Case L: TX 500 = 100 records, TX 501 = 3 records, capacity = 50.
+// Assert: TX 500 remains intact, TX 501 does NOT bypass TX 500, ordering preserved.
+static void test_case_l_partial_drain_ordering_preserved(void) {
+  const char *src_path = "recov_case_l_src.db";
+  const char *tgt_path = "recov_case_l_tgt.db";
+  char qpath[512];
+  snprintf(qpath, sizeof(qpath), "%s.arkddlqueue", src_path);
+  cleanup(src_path); cleanup(tgt_path);
+
+  arkilian *base = open_hermetic(src_path);
+  db_close(base);
+
+  // Write TX 500 (100 records) and TX 501 (3 records) to sidecar
+  FILE *f = fopen(qpath, "wb");
+  assert(f != NULL);
+
+  // TX 500: 1 CREATE + 99 INSERTs = 100 records
+  write_sidecar_record(f, 500, 1, "BEGIN");
+  write_sidecar_record(f, 500, 4, "CREATE TABLE tbl_ord_500 (id INT PRIMARY KEY, v TEXT);");
+  for (int i = 1; i <= 99; i++) {
+    char sql[128];
+    snprintf(sql, sizeof(sql), "INSERT INTO tbl_ord_500 VALUES (%d, 'v500_%d');", i, i);
+    write_sidecar_record(f, 500, 4, sql);
+  }
+  write_sidecar_record(f, 500, 2, "COMMIT");
+
+  // TX 501: 1 CREATE + 2 INSERTs = 3 records
+  write_sidecar_record(f, 501, 1, "BEGIN");
+  write_sidecar_record(f, 501, 4, "CREATE TABLE tbl_ord_501 (id INT PRIMARY KEY, v TEXT);");
+  write_sidecar_record(f, 501, 4, "INSERT INTO tbl_ord_501 VALUES (1, 'v501_1');");
+  write_sidecar_record(f, 501, 4, "INSERT INTO tbl_ord_501 VALUES (2, 'v501_2');");
+  write_sidecar_record(f, 501, 2, "COMMIT");
+  fclose(f);
+
+  // Apply both to SQLite db
+  sqlite3 *raw_pre = NULL;
+  assert(sqlite3_open(src_path, &raw_pre) == SQLITE_OK);
+  assert(sqlite3_exec(raw_pre, "CREATE TABLE tbl_ord_500 (id INT PRIMARY KEY, v TEXT);", NULL, NULL, NULL) == SQLITE_OK);
+  for (int i = 1; i <= 99; i++) {
+    char sql[128];
+    snprintf(sql, sizeof(sql), "INSERT INTO tbl_ord_500 VALUES (%d, 'v500_%d');", i, i);
+    assert(sqlite3_exec(raw_pre, sql, NULL, NULL, NULL) == SQLITE_OK);
+  }
+  assert(sqlite3_exec(raw_pre, "CREATE TABLE tbl_ord_501 (id INT PRIMARY KEY, v TEXT);", NULL, NULL, NULL) == SQLITE_OK);
+  assert(sqlite3_exec(raw_pre, "INSERT INTO tbl_ord_501 VALUES (1, 'v501_1');", NULL, NULL, NULL) == SQLITE_OK);
+  assert(sqlite3_exec(raw_pre, "INSERT INTO tbl_ord_501 VALUES (2, 'v501_2');", NULL, NULL, NULL) == SQLITE_OK);
+  sqlite3_close(raw_pre);
+
+  // Set outbox capacity to 50
+  ark_setenv("ARKILIAN_MAX_QUEUE_DEPTH", "50", 1);
+
+  arkilian *src = NULL;
+  assert(db_init(&src, src_path) == 0 && src != NULL);
+
+  // Assert: TX 500 (100) could not fit in 50, and TX 501 (3) did NOT bypass TX 500.
+  // Neither transaction was promoted to _pending_backup!
+  assert(db_backup_queue_depth(src) == 0);
+  assert(db_backup_sidecar_watermark(src) < 500);
+
+  // Close source: sidecar must be retained on disk
+  db_close(src);
+
+  FILE *check_f = fopen(qpath, "rb");
+  assert(check_f != NULL);
+  fclose(check_f);
+
+  // Restart with capacity = 500
+  ark_setenv("ARKILIAN_MAX_QUEUE_DEPTH", "500", 1);
+  src = NULL;
+  assert(db_init(&src, src_path) == 0 && src != NULL);
+  db_resync_triggers(src);
+
+  // Both transactions promoted in order: 100 + 3 = 103 records
+  assert(db_backup_queue_depth(src) == 103);
+  assert(db_backup_sidecar_watermark(src) == 501);
+
+  // Replay to target: ordering preserved (TX 500 table created & filled first, then TX 501)
+  sqlite3 *tgt = NULL;
+  assert(sqlite3_open(tgt_path, &tgt) == SQLITE_OK);
+  replay_outbox_to_target(src, tgt, NULL);
+
+  assert(tables_match(db_get_handle(src), tgt, "tbl_ord_500") == 1);
+  assert(tables_match(db_get_handle(src), tgt, "tbl_ord_501") == 1);
+
+  sqlite3_close(tgt);
+  db_close(src);
+  cleanup(src_path); cleanup(tgt_path);
+  ark_unsetenv("ARKILIAN_MAX_QUEUE_DEPTH");
+}
+
 int main(void) {
   printf("=== Arkilian Raw Transaction Recovery Adversarial Suite ===\n\n");
 
@@ -613,6 +799,8 @@ int main(void) {
   RUN_TEST(test_case_h_crash_before_outbox_promotion);
   RUN_TEST(test_case_i_partial_promotion_watermark);
   RUN_TEST(test_case_j_truncated_sidecar_tail);
+  RUN_TEST(test_case_k_partial_drain_transaction_intact);
+  RUN_TEST(test_case_l_partial_drain_ordering_preserved);
 
   printf("\n=== Results: %d/%d passed ===\n", tests_passed, tests_run);
   return (tests_passed == tests_run) ? 0 : 1;

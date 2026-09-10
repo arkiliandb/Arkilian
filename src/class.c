@@ -1070,42 +1070,125 @@ static void pending_ddl_drain_and_capture(arkilian *db) {
   db->pending_ddl_head = db->pending_ddl_tail = NULL;
   PENDING_DDL_UNLOCK(db);
   if (!head) return;
-  int total = 0, drained = 0;
-  uint64_t max_drained_txid = 0;
-  for (struct pending_ddl *n = head; n; n = n->next) total++;
-  for (struct pending_ddl *node = head; node; ) {
-    sqlite3_stmt *stmt = NULL;
-    char ins[220];
-    snprintf(ins, sizeof(ins),
-      "INSERT INTO _pending_backup (payload) SELECT ? WHERE (SELECT COUNT(*) FROM _pending_backup) < %ld",
-      outbox_cap());
-    if (sqlite3_prepare_v2(db->handle, ins, -1, &stmt, NULL) == SQLITE_OK) {
-      sqlite3_bind_text(stmt, 1, node->sql, -1, SQLITE_TRANSIENT);
-      if (sqlite3_step(stmt) == SQLITE_DONE) {
-        drained++;
-        if (node->txid > max_drained_txid) max_drained_txid = node->txid;
-      }
-      sqlite3_finalize(stmt);
+
+  sqlite3_stmt *stmt = NULL;
+  const char *ins = "INSERT INTO _pending_backup (payload) VALUES (?)";
+  if (sqlite3_prepare_v2(db->handle, ins, -1, &stmt, NULL) != SQLITE_OK) {
+    PENDING_DDL_LOCK(db);
+    if (db->pending_ddl_head) {
+      struct pending_ddl *t = head;
+      while (t->next) t = t->next;
+      t->next = db->pending_ddl_head;
+      db->pending_ddl_head = head;
+    } else {
+      db->pending_ddl_head = head;
+      struct pending_ddl *t = head;
+      while (t->next) t = t->next;
+      db->pending_ddl_tail = t;
     }
-    struct pending_ddl *next = node->next;
-    free(node->sql);
-    free(node);
-    node = next;
+    PENDING_DDL_UNLOCK(db);
+    return;
   }
-  // Persist durable promotion watermark so restart recovery never re-enqueues
-  if (drained > 0 && max_drained_txid > 0) {
-    set_sidecar_promoted_watermark(db->handle, max_drained_txid);
+
+  uint64_t last_promoted_txid = 0;
+  struct pending_ddl *curr = head;
+  long cap = outbox_cap();
+
+  while (curr) {
+    uint64_t txid = curr->txid;
+    int tx_count = 0;
+    struct pending_ddl *tx_end = curr;
+    if (txid == 0) {
+      tx_count = 1;
+      tx_end = curr->next;
+    } else {
+      while (tx_end && tx_end->txid == txid) {
+        tx_count++;
+        tx_end = tx_end->next;
+      }
+    }
+
+    int current_depth = db_backup_queue_depth(db);
+    if (current_depth + tx_count > cap) {
+      // Entire transaction cannot fit in outbox without exceeding capacity.
+      // Halt drain immediately to preserve strict transaction atomicity and FIFO ordering.
+      break;
+    }
+
+    sqlite3_exec(db->handle, "SAVEPOINT ark_promote_tx;", NULL, NULL, NULL);
+    int insert_ok = 1;
+
+    for (struct pending_ddl *node = curr; node != tx_end; node = node->next) {
+      sqlite3_reset(stmt);
+      sqlite3_clear_bindings(stmt);
+      sqlite3_bind_text(stmt, 1, node->sql, -1, SQLITE_TRANSIENT);
+      if (sqlite3_step(stmt) != SQLITE_DONE) {
+        insert_ok = 0;
+        break;
+      }
+    }
+
+    if (insert_ok) {
+      sqlite3_exec(db->handle, "RELEASE ark_promote_tx;", NULL, NULL, NULL);
+      if (txid > 0) {
+        last_promoted_txid = txid;
+      }
+
+      // Free promoted nodes
+      struct pending_ddl *p = curr;
+      while (p != tx_end) {
+        struct pending_ddl *nx = p->next;
+        free(p->sql);
+        free(p);
+        p = nx;
+      }
+      curr = tx_end;
+    } else {
+      sqlite3_exec(db->handle, "ROLLBACK TO ark_promote_tx;", NULL, NULL, NULL);
+      sqlite3_exec(db->handle, "RELEASE ark_promote_tx;", NULL, NULL, NULL);
+      break;
+    }
   }
-  // Only truncate durable sidecar if ALL enqueues succeeded AND no sidecar
-  // I/O failure occurred; otherwise keep it for retry.
-  if (drained == total && !ARK_LOAD(&db->sidecar_io_error) && !db->unpersisted_head) {
+
+  sqlite3_finalize(stmt);
+
+  // If unpromoted records remain, prepend them back to pending_ddl in FIFO order
+  if (curr) {
+    PENDING_DDL_LOCK(db);
+    struct pending_ddl *rem_tail = curr;
+    while (rem_tail->next) rem_tail = rem_tail->next;
+
+    if (db->pending_ddl_head) {
+      rem_tail->next = db->pending_ddl_head;
+      db->pending_ddl_head = curr;
+    } else {
+      db->pending_ddl_head = curr;
+      db->pending_ddl_tail = rem_tail;
+    }
+    PENDING_DDL_UNLOCK(db);
+  }
+
+  // Update durable promotion watermark only for fully promoted transactions
+  if (last_promoted_txid > 0) {
+    uint64_t prev_wm = get_sidecar_promoted_watermark(db->handle);
+    if (last_promoted_txid > prev_wm) {
+      set_sidecar_promoted_watermark(db->handle, last_promoted_txid);
+    }
+  }
+
+  // Sidecar truncation/removal:
+  // Only remove if ALL pending records were promoted, no sidecar I/O error, and no unpersisted records
+  PENDING_DDL_LOCK(db);
+  int has_pending = (db->pending_ddl_head != NULL);
+  PENDING_DDL_UNLOCK(db);
+
+  if (!has_pending && !ARK_LOAD(&db->sidecar_io_error) && !db->unpersisted_head) {
     char qpath[4096];
     snprintf(qpath, sizeof(qpath), "%s.arkddlqueue", db->db_path ? db->db_path : "app.sqlite");
     remove(qpath);
   } else {
-    ark_log(db, ARK_LOG_ERROR, "pending_ddl drain partial (%d/%d) — sidecar retained for retry", drained, total);
+    ark_log(db, ARK_LOG_WARN, "pending_ddl drain partial — sidecar retained for retry");
   }
-  (void)drained;
 }
 
 static int trace_raw_ddl(unsigned trace, void *ctx, void *p, void *x) {
@@ -3297,7 +3380,7 @@ void db_close(arkilian *db) {
       free(cur);
     }
     // Sidecar file is removed only when all records were successfully drained AND no sidecar I/O error occurred
-    if (db->db_path && db->pending_ddl_head == NULL && !ARK_LOAD(&db->sidecar_io_error) && !db->unpersisted_head) {
+    if (db->db_path && head == NULL && txn == NULL && !ARK_LOAD(&db->sidecar_io_error) && !db->unpersisted_head) {
       char qpath[4096];
       snprintf(qpath, sizeof(qpath), "%s.arkddlqueue", db->db_path);
       remove(qpath);
@@ -4107,6 +4190,14 @@ int db_backup_unpersisted_count(arkilian *db) {
 
 int db_backup_sidecar_io_error(arkilian *db) {
   return (db && ARK_LOAD(&db->sidecar_io_error)) ? 1 : 0;
+}
+
+uint64_t db_backup_sidecar_watermark(arkilian *db) {
+  return (db && db->handle) ? get_sidecar_promoted_watermark(db->handle) : 0;
+}
+
+void db_backup_drain_pending(arkilian *db) {
+  if (db) pending_ddl_drain_and_capture(db);
 }
 
 // ── Hourly Backup Implementation ────────────────────────────────────
