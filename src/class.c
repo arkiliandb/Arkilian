@@ -2555,6 +2555,14 @@ void *run_wal_flush(void *arg) {
 #endif
 }
 
+static int compare_txids(const void *a, const void *b) {
+  uint64_t ua = *(const uint64_t *)a;
+  uint64_t ub = *(const uint64_t *)b;
+  if (ua < ub) return -1;
+  if (ua > ub) return 1;
+  return 0;
+}
+
 // Dedicated crash recovery for durable sidecar — strictly read-only on the sidecar.
 // Reconstructs committed transaction groupings without invoking pending_ddl_append,
 // sidecar_append_txn, or re-journaling recovered records.
@@ -2626,35 +2634,89 @@ static void recover_committed_tx_into_pending(arkilian *db) {
   fclose(qf);
 
   if (is_new_format && rec_cnt > 0) {
-    // Only recover transactions that have a COMMIT marker (type 2) AND txid > watermark
+    // Collect all unique committed txids where txid > watermark
+    size_t commit_cap = 16;
+    size_t commit_cnt = 0;
+    uint64_t *committed_txids = malloc(commit_cap * sizeof(uint64_t));
+    uint64_t max_committed_txid = 0;
+
     for (size_t i = 0; i < rec_cnt; i++) {
       if (recs[i].type == 2 /* COMMIT */) {
         uint64_t txid = recs[i].txid;
-        if (txid <= watermark) continue; // Already promoted in prior run
+        if (txid > watermark) {
+          if (commit_cnt == commit_cap) {
+            size_t ncap = commit_cap * 2;
+            void *np = realloc(committed_txids, ncap * sizeof(uint64_t));
+            if (np) {
+              committed_txids = np;
+              commit_cap = ncap;
+            }
+          }
+          if (commit_cnt < commit_cap && committed_txids) {
+            committed_txids[commit_cnt++] = txid;
+          }
+          if (txid > max_committed_txid) {
+            max_committed_txid = txid;
+          }
+        }
+      }
+    }
 
-        for (size_t j = 0; j < rec_cnt; j++) {
-          if (recs[j].txid == txid && recs[j].type == 4 /* SQL */ && recs[j].sql) {
+    if (committed_txids && commit_cnt > 0) {
+      qsort(committed_txids, commit_cnt, sizeof(uint64_t), compare_txids);
+      size_t uniq = 0;
+      for (size_t i = 0; i < commit_cnt; i++) {
+        if (i == 0 || committed_txids[i] != committed_txids[uniq - 1]) {
+          committed_txids[uniq++] = committed_txids[i];
+        }
+      }
+      commit_cnt = uniq;
+
+      // Linear pass over recs: match type==4 records against committed_txids via bsearch
+      struct pending_ddl *promoted_head = NULL, *promoted_tail = NULL;
+      for (size_t i = 0; i < rec_cnt; i++) {
+        if (recs[i].type == 4 /* SQL */ && recs[i].sql && recs[i].txid > watermark) {
+          uint64_t txid = recs[i].txid;
+          if (bsearch(&txid, committed_txids, commit_cnt, sizeof(uint64_t), compare_txids)) {
             struct pending_ddl *node = malloc(sizeof(struct pending_ddl));
             if (node) {
-              node->sql = strdup(recs[j].sql);
+              node->sql = recs[i].sql;
+              recs[i].sql = NULL; // ownership transferred to node
               node->txid = txid;
               node->type = 4;
               node->next = NULL;
-              PENDING_DDL_LOCK(db);
-              if (db->pending_ddl_tail) {
-                db->pending_ddl_tail->next = node;
-                db->pending_ddl_tail = node;
+              if (promoted_tail) {
+                promoted_tail->next = node;
+                promoted_tail = node;
               } else {
-                db->pending_ddl_head = db->pending_ddl_tail = node;
+                promoted_head = promoted_tail = node;
               }
-              PENDING_DDL_UNLOCK(db);
             }
           }
         }
-        if (txid >= db->next_txid) db->next_txid = txid;
+      }
+
+      if (promoted_head) {
+        PENDING_DDL_LOCK(db);
+        if (db->pending_ddl_tail) {
+          db->pending_ddl_tail->next = promoted_head;
+          db->pending_ddl_tail = promoted_tail;
+        } else {
+          db->pending_ddl_head = promoted_head;
+          db->pending_ddl_tail = promoted_tail;
+        }
+        PENDING_DDL_UNLOCK(db);
+      }
+
+      if (max_committed_txid >= db->next_txid) {
+        db->next_txid = max_committed_txid;
       }
     }
-    for (size_t i = 0; i < rec_cnt; i++) free(recs[i].sql);
+    free(committed_txids);
+
+    for (size_t i = 0; i < rec_cnt; i++) {
+      if (recs[i].sql) free(recs[i].sql);
+    }
     free(recs);
   } else {
     for (size_t i = 0; i < rec_cnt; i++) free(recs[i].sql);

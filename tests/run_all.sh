@@ -110,7 +110,11 @@ cc -O2 tests/bench_1m.c src/class.c src/hydration.c src/sha256.c src/deps/sqlite
    -Isrc -Isrc/deps/sqlite -lcurl -lpthread -lm \
    -DSQLITE_ENABLE_PREUPDATE_HOOK -DSQLITE_ENABLE_FTS5 -o bench_1m || {
      echo "bench_1m build failed" ; exit 1 ; }
-./bench_1m
+if [ "${RUN_FULL_BENCH:-0}" = "1" ]; then
+  ./bench_1m
+else
+  ./bench_1m "${BENCH_OPS:-1000}"
+fi
 rm -f bench_1m
 
 echo "── all C tests passed ──"

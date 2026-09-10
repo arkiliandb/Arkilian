@@ -876,8 +876,10 @@ static int run_s3_hardened_verification(int ops) {
   char s[512];
   snprintf(s, sizeof(s), "%s-wal", src); remove(s);
   snprintf(s, sizeof(s), "%s-shm", src); remove(s);
+  snprintf(s, sizeof(s), "%s.arkddlqueue", src); remove(s);
   snprintf(s, sizeof(s), "%s-wal", dst); remove(s);
   snprintf(s, sizeof(s), "%s-shm", dst); remove(s);
+  snprintf(s, sizeof(s), "%s.arkddlqueue", dst); remove(s);
   remove("bench_1m_s3.db"); remove("bench_1m_s3_hydra.db");
   // Reset env to not affect later benchmarks
   setenv("ARKILIAN_ENABLE_BACKUP", "0", 1);
@@ -918,6 +920,9 @@ int main(int argc, char **argv) {
   clear_s3_env();
   setenv("ARKILIAN_ENABLE_BACKUP", "0", 1);
   remove("bench_1m.db");
+  remove("bench_1m.db-wal");
+  remove("bench_1m.db-shm");
+  remove("bench_1m.db.arkddlqueue");
 
   long mem_before = get_resident_mem_kb();
 
@@ -949,6 +954,7 @@ int main(int argc, char **argv) {
   assert(rc == 0);
   sqlite3 *raw = db_get_handle(db);
   sqlite3_exec(raw, TBL, NULL, NULL, NULL);
+  db_resync_triggers(db);
 
   // Pre-populate 50K rows for UPDATE/SELECT benchmarks
   printf("  Seeding 50,000 rows for UPDATE/SELECT benchmarks ...\n");
@@ -1284,6 +1290,9 @@ int main(int argc, char **argv) {
       fprintf(stderr, "\n  Hardened S3 verification FAILED (rc=%d)\n", s3_rc);
       db_close(db);
       remove("bench_1m.db");
+      remove("bench_1m.db-wal");
+      remove("bench_1m.db-shm");
+      remove("bench_1m.db.arkddlqueue");
       return s3_rc;
     }
     printf("\n  Hardened S3 verification: OK (full API emulated)\n");
@@ -1292,5 +1301,8 @@ int main(int argc, char **argv) {
   // ── Cleanup ────────────────────────────────────────────────────────
   db_close(db);
   remove("bench_1m.db");
+  remove("bench_1m.db-wal");
+  remove("bench_1m.db-shm");
+  remove("bench_1m.db.arkddlqueue");
   return 0;
 }
