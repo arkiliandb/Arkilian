@@ -219,18 +219,35 @@ static int wait_for_key(const char *needle, int timeout_s) {
 
 // Poll until the published manifest's baseline LSN reaches `lsn` — i.e.
 // the snapshot thread has re-baselined every row written so far (or a
-// chunk covering it was flushed and the manifest refreshed).
+// chunk covering it was flushed and the manifest refreshed), and the
+// corresponding manifest.sig has been published and verifies against it.
 static int wait_for_baseline(uint64_t lsn, int timeout_s) {
   char mkey[512];
   snprintf(mkey, sizeof(mkey), "%s/manifest.json", PREFIX);
+  char skey[512];
+  snprintf(skey, sizeof(skey), "%s/manifest.sig", PREFIX);
   char needle[64];
   snprintf(needle, sizeof(needle), "\"baseline_lsn\":%llu",
            (unsigned long long)lsn);
+  const char *hmac_key = getenv("ARKILIAN_MANIFEST_HMAC_KEY");
   for (int i = 0; i < timeout_s * 20; i++) {
     char *body = NULL;
     size_t len = 0;
     if (stub_get(mkey, &body, &len)) {
       int ok = strstr(body, needle) != NULL;
+      if (ok && hmac_key && *hmac_key) {
+        char *sig = NULL;
+        size_t slen = 0;
+        if (stub_get(skey, &sig, &slen)) {
+          char expect[65];
+          ark_hmac_sha256_hex((const uint8_t *)hmac_key, strlen(hmac_key),
+                              body, len, expect);
+          ok = (slen >= 64 && strncasecmp(sig, expect, 64) == 0);
+          free(sig);
+        } else {
+          ok = 0;
+        }
+      }
       free(body);
       if (ok) return 1;
     }
