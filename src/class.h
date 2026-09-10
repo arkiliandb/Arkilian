@@ -74,6 +74,7 @@ int db_bind_int(arkilian *db, int idx, int val);
 int db_bind_int64(arkilian *db, int idx, sqlite3_int64 val);
 int db_bind_double(arkilian *db, int idx, double val);
 int db_bind_null(arkilian *db, int idx);
+int db_bind_blob(arkilian *db, int idx, const void *val, int n);
 
 int db_column_type(arkilian *db, int col);
 sqlite3_int64 db_column_int64(arkilian *db, int col);

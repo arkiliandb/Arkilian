@@ -6,26 +6,88 @@ ffi = cffi.FFI()
 
 ffi.cdef("""
 typedef struct arkilian arkilian;
+typedef int64_t sqlite3_int64;
 
 int db_init(arkilian **db, const char *connection_url);
 void db_close(arkilian *db);
 const char* db_errmsg(arkilian *db);
 
 int db_exec(arkilian *db, const char *sql);
+int db_begin(arkilian *db);
+int db_commit(arkilian *db);
+int db_rollback(arkilian *db);
+int db_changes(arkilian *db);
+sqlite3_int64 db_last_insert_rowid(arkilian *db);
+
+int db_wal_pending(arkilian *db);
+void db_wal_flush(arkilian *db);
+const char* db_wal_last_sql(arkilian *db);
+
+void db_backup_set_enabled(arkilian *db, int enabled);
+int db_backup_is_enabled(arkilian *db);
+int db_resync_triggers(arkilian *db);
+void db_set_auto_resync_triggers(arkilian *db, int enabled);
+int db_get_auto_resync_triggers(arkilian *db);
+int db_backup_triggers_dirty(arkilian *db);
+int db_backup_capture_paused(arkilian *db);
+
+int db_backup_queue_depth(arkilian *db);
+long long db_backup_oldest_pending_age_sec(arkilian *db);
+int db_backup_dead_letter_count(arkilian *db);
+long long db_backup_thread_heartbeat_age_ms(arkilian *db);
+long long db_backup_snapshot_heartbeat_age_ms(arkilian *db);
+int db_backup_trigger_coverage(arkilian *db);
+int db_backup_skipped_table_count(arkilian *db);
+int db_backup_chunk_count(arkilian *db);
+long long db_backup_last_chunk_flush_age_ms(arkilian *db);
+unsigned db_backup_health_flags(arkilian *db);
+int db_backup_is_healthy(arkilian *db);
+
 int db_prepare(arkilian *db, const char *sql);
 int db_use_stmt(arkilian *db, int index);
 int db_stmt_count(arkilian *db);
 int db_step(arkilian *db);
 int db_finalize(arkilian *db);
 int db_reset(arkilian *db);
+
 int db_column_count(arkilian *db);
 const char* db_column_name(arkilian *db, int col);
+int db_column_type(arkilian *db, int col);
 const char* db_column_text(arkilian *db, int col);
 int db_column_int(arkilian *db, int col);
+sqlite3_int64 db_column_int64(arkilian *db, int col);
 double db_column_double(arkilian *db, int col);
+const void* db_column_blob(arkilian *db, int col);
+int db_column_bytes(arkilian *db, int col);
+
 int db_bind_text(arkilian *db, int idx, const char *val);
 int db_bind_int(arkilian *db, int idx, int val);
+int db_bind_int64(arkilian *db, int idx, sqlite3_int64 val);
 int db_bind_double(arkilian *db, int idx, double val);
+int db_bind_null(arkilian *db, int idx);
+int db_bind_blob(arkilian *db, int idx, const void *val, int n);
+
+typedef void (*hydration_progress_cb)(int phase, int current, int total, void *user_data);
+
+int arkilian_hydrate_s3(const char *db_path,
+                         const char *s3_endpoint,
+                         const char *s3_bucket,
+                         const char *s3_region,
+                         const char *s3_access_key,
+                         const char *s3_secret_key,
+                         const char *s3_prefix,
+                         hydration_progress_cb progress,
+                         void *user_data);
+
+typedef enum {
+  ARK_LOG_ERROR = 0,
+  ARK_LOG_WARN  = 1,
+  ARK_LOG_INFO  = 2,
+  ARK_LOG_DEBUG = 3
+} ark_log_level_t;
+
+typedef void (*ark_log_fn_t)(ark_log_level_t level, const char *msg, void *ctx);
+void db_set_log_callback(arkilian *db, ark_log_fn_t fn, void *ctx);
 """)
 
 this_dir = os.path.dirname(os.path.abspath(__file__))

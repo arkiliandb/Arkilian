@@ -550,6 +550,39 @@ Napi::Value db_last_insert_rowid(const Napi::CallbackInfo& info) {
   return Napi::Number::New(env, dl ? db_last_insert_rowid(dl.db) : 0);
 }
 
+Napi::Value db_wal_pending(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  DbLock dl = lockDb(info);
+  return Napi::Number::New(env, dl ? db_wal_pending(dl.db) : 0);
+}
+
+Napi::Value db_wal_flush(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  DbLock dl = lockDb(info);
+  if (dl) db_wal_flush(dl.db);
+  return env.Undefined();
+}
+
+Napi::Value db_wal_last_sql(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  DbLock dl = lockDb(info);
+  if (!dl) return env.Null();
+  const char *sql = db_wal_last_sql(dl.db);
+  return sql ? Napi::String::New(env, sql) : env.Null();
+}
+
+Napi::Value db_backup_chunk_count(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  DbLock dl = lockDb(info);
+  return Napi::Number::New(env, dl ? db_backup_chunk_count(dl.db) : 0);
+}
+
+Napi::Value db_backup_last_chunk_flush_age_ms(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  DbLock dl = lockDb(info);
+  return Napi::Number::New(env, dl ? (double)db_backup_last_chunk_flush_age_ms(dl.db) : -1.0);
+}
+
 // ── Native Fast Path: Single N-API turn query execution ─────────────
 
 Napi::Value db_all_native(const Napi::CallbackInfo& info) {
@@ -723,13 +756,36 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
   exports.Set("db_hydrate_s3", Napi::Function::New<db_hydrate_s3>(env));
   exports.Set("db_changes", Napi::Function::New<db_changes>(env));
   exports.Set("db_last_insert_rowid", Napi::Function::New<db_last_insert_rowid>(env));
+  exports.Set("db_wal_pending", Napi::Function::New<db_wal_pending>(env));
+  exports.Set("db_wal_flush", Napi::Function::New<db_wal_flush>(env));
+  exports.Set("db_wal_last_sql", Napi::Function::New<db_wal_last_sql>(env));
+  exports.Set("db_backup_chunk_count", Napi::Function::New<db_backup_chunk_count>(env));
+  exports.Set("db_backup_last_chunk_flush_age_ms", Napi::Function::New<db_backup_last_chunk_flush_age_ms>(env));
   exports.Set("db_all_native", Napi::Function::New<db_all_native>(env));
-  
 
   exports.Set("SQLITE_OK", Napi::Number::New(env, 0));
   exports.Set("SQLITE_ROW", Napi::Number::New(env, 100));
   exports.Set("SQLITE_DONE", Napi::Number::New(env, 101));
   exports.Set("SQLITE_ERROR", Napi::Number::New(env, 1));
+
+  // Health state machine flags
+  exports.Set("ARK_HF_BACKUP_ENABLED", Napi::Number::New(env, ARK_HF_BACKUP_ENABLED));
+  exports.Set("ARK_HF_DEST_CONFIGURED", Napi::Number::New(env, ARK_HF_DEST_CONFIGURED));
+  exports.Set("ARK_HF_FLUSH_ALIVE", Napi::Number::New(env, ARK_HF_FLUSH_ALIVE));
+  exports.Set("ARK_HF_SNAPSHOT_ALIVE", Napi::Number::New(env, ARK_HF_SNAPSHOT_ALIVE));
+  exports.Set("ARK_HF_QUEUE_BELOW_CAP", Napi::Number::New(env, ARK_HF_QUEUE_BELOW_CAP));
+  exports.Set("ARK_HF_SCHEMA_IN_SYNC", Napi::Number::New(env, ARK_HF_SCHEMA_IN_SYNC));
+  exports.Set("ARK_HF_NO_DEAD_LETTER", Napi::Number::New(env, ARK_HF_NO_DEAD_LETTER));
+  exports.Set("ARK_HF_MANIFEST_RESOLVED", Napi::Number::New(env, ARK_HF_MANIFEST_RESOLVED));
+  exports.Set("ARK_HF_NO_CAPTURE_GAP", Napi::Number::New(env, ARK_HF_NO_CAPTURE_GAP));
+  exports.Set("ARK_HF_DURABLE_CAPTURE", Napi::Number::New(env, ARK_HF_DURABLE_CAPTURE));
+  exports.Set("ARK_HF_ALL_CORE", Napi::Number::New(env, ARK_HF_ALL_CORE));
+
+  // Log levels
+  exports.Set("ARK_LOG_ERROR", Napi::Number::New(env, ARK_LOG_ERROR));
+  exports.Set("ARK_LOG_WARN", Napi::Number::New(env, ARK_LOG_WARN));
+  exports.Set("ARK_LOG_INFO", Napi::Number::New(env, ARK_LOG_INFO));
+  exports.Set("ARK_LOG_DEBUG", Napi::Number::New(env, ARK_LOG_DEBUG));
 
   // Hydration error codes
   exports.Set("HYDRATION_OK", Napi::Number::New(env, HYDRATION_OK));
@@ -738,6 +794,7 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
   exports.Set("HYDRATION_ERR_MEM", Napi::Number::New(env, HYDRATION_ERR_MEM));
   exports.Set("HYDRATION_ERR_PROTO", Napi::Number::New(env, HYDRATION_ERR_PROTO));
   exports.Set("HYDRATION_ERR_SQL", Napi::Number::New(env, HYDRATION_ERR_SQL));
+  exports.Set("HYDRATION_ERR_DECOMP", Napi::Number::New(env, HYDRATION_ERR_DECOMP));
   exports.Set("HYDRATION_ERR_EXPIRED", Napi::Number::New(env, HYDRATION_ERR_EXPIRED));
   exports.Set("HYDRATION_ERR_NOTFOUND", Napi::Number::New(env, HYDRATION_ERR_NOTFOUND));
   exports.Set("HYDRATION_ERR_NEWER", Napi::Number::New(env, HYDRATION_ERR_NEWER));

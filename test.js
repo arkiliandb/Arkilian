@@ -160,6 +160,15 @@ console.log("   4 workers x 500 concurrent ops: all rows intact (2000)");
 await db.exec("DROP TABLE thrash");
 console.log("   OK");
 
+console.log("\n11. WAL buffer, chunk metrics, and HealthFlags constants...");
+if (typeof db.walPending !== "number") throw new Error("walPending should be number");
+db.walFlush();
+if (typeof db.backupChunkCount !== "number") throw new Error("backupChunkCount should be number");
+if (typeof db.backupHealthFlags !== "number") throw new Error("backupHealthFlags should be number");
+if (typeof Arkilian.HealthFlags.ALL_CORE !== "number") throw new Error("HealthFlags.ALL_CORE should be number");
+if (Arkilian.HydrationErrors.OK !== 0) throw new Error("HydrationErrors.OK should be 0");
+console.log("   OK");
+
 await db.close();
 cleanupDb(dbPath);
 console.log("\nAll tests passed!");

@@ -107,42 +107,52 @@ npm pack --pack-destination "$DIST_DIR"
 echo "  -> Created: $(ls "$DIST_DIR"/arkilian-*.tgz | head -n 1)"
 
 # ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 # 2. C Shared/Static Libraries & Tools (CMake)
 # ─────────────────────────────────────────────────────────────────────────────
 echo "==> [2/6] Compiling C core libraries & tools (CMake)..."
-cmake -B build -S . \
+cmake -B build-c -S . \
   -DCMAKE_BUILD_TYPE=Release \
   -DARKILIAN_BUILD_EXAMPLES=OFF \
   -DARKILIAN_BUILD_TESTS=OFF
-cmake --build build --config Release -j4
+cmake --build build-c --config Release -j4
 
 C_STAGE_DIR="$(mktemp -d /tmp/arkilian-c-stage.XXXXXX)"
 mkdir -p "$C_STAGE_DIR/include/arkilian" "$C_STAGE_DIR/lib" "$C_STAGE_DIR/bin"
 
 cp src/class.h src/hydration.h src/sha256.h "$C_STAGE_DIR/include/arkilian/"
 
-if [ -f "build/libarkilian.dylib" ]; then
-  cp build/libarkilian.dylib "$C_STAGE_DIR/lib/"
-elif [ -f "build/Release/libarkilian.dylib" ]; then
-  cp build/Release/libarkilian.dylib "$C_STAGE_DIR/lib/"
+# Sync to build/ as well for local bindings
+mkdir -p build
+
+if [ -f "build-c/libarkilian.dylib" ]; then
+  cp -a build-c/libarkilian.* "$C_STAGE_DIR/lib/" 2>/dev/null || cp build-c/libarkilian.dylib "$C_STAGE_DIR/lib/"
+  cp -a build-c/libarkilian.* build/ 2>/dev/null || true
+elif [ -f "build-c/Release/libarkilian.dylib" ]; then
+  cp -a build-c/Release/libarkilian.* "$C_STAGE_DIR/lib/" 2>/dev/null || cp build-c/Release/libarkilian.dylib "$C_STAGE_DIR/lib/"
+  cp -a build-c/Release/libarkilian.* build/ 2>/dev/null || true
 fi
 
-if [ -f "build/libarkilian.so" ]; then
-  cp build/libarkilian.so "$C_STAGE_DIR/lib/"
-elif [ -f "build/Release/libarkilian.so" ]; then
-  cp build/Release/libarkilian.so "$C_STAGE_DIR/lib/"
+if [ -f "build-c/libarkilian.so" ]; then
+  cp -a build-c/libarkilian.* "$C_STAGE_DIR/lib/" 2>/dev/null || cp build-c/libarkilian.so "$C_STAGE_DIR/lib/"
+  cp -a build-c/libarkilian.* build/ 2>/dev/null || true
+elif [ -f "build-c/Release/libarkilian.so" ]; then
+  cp -a build-c/Release/libarkilian.* "$C_STAGE_DIR/lib/" 2>/dev/null || cp build-c/Release/libarkilian.so "$C_STAGE_DIR/lib/"
+  cp -a build-c/Release/libarkilian.* build/ 2>/dev/null || true
 fi
 
-if [ -f "build/libarkilian.a" ]; then
-  cp build/libarkilian.a "$C_STAGE_DIR/lib/"
-elif [ -f "build/Release/libarkilian.a" ]; then
-  cp build/Release/libarkilian.a "$C_STAGE_DIR/lib/"
+if [ -f "build-c/libarkilian.a" ]; then
+  cp build-c/libarkilian.a "$C_STAGE_DIR/lib/" 2>/dev/null || true
+  cp build-c/libarkilian.a build/ 2>/dev/null || true
+elif [ -f "build-c/Release/libarkilian.a" ]; then
+  cp build-c/Release/libarkilian.a "$C_STAGE_DIR/lib/" 2>/dev/null || true
+  cp build-c/Release/libarkilian.a build/ 2>/dev/null || true
 fi
 
-if [ -f "build/arkilian-dlq" ]; then
-  cp build/arkilian-dlq "$C_STAGE_DIR/bin/"
-elif [ -f "build/Release/arkilian-dlq" ]; then
-  cp build/Release/arkilian-dlq "$C_STAGE_DIR/bin/"
+if [ -f "build-c/arkilian-dlq" ]; then
+  cp build-c/arkilian-dlq "$C_STAGE_DIR/bin/"
+elif [ -f "build-c/Release/arkilian-dlq" ]; then
+  cp build-c/Release/arkilian-dlq "$C_STAGE_DIR/bin/"
 fi
 
 tar -czf "$DIST_DIR/arkilian-c-v${VERSION}-${PLATFORM_SUFFIX}.tar.gz" -C "$C_STAGE_DIR" .
@@ -157,7 +167,11 @@ PY_PKG_DIR="$REPO_ROOT/bindings/python"
 if [ -d "$PY_PKG_DIR" ]; then
   # Temporarily bundle native shared library into python package directory for self-contained wheel
   SHARED_LIB=""
-  if [ -f "build/libarkilian.dylib" ]; then
+  if [ -f "build-c/libarkilian.dylib" ]; then
+    SHARED_LIB="build-c/libarkilian.dylib"
+  elif [ -f "build-c/libarkilian.so" ]; then
+    SHARED_LIB="build-c/libarkilian.so"
+  elif [ -f "build/libarkilian.dylib" ]; then
     SHARED_LIB="build/libarkilian.dylib"
   elif [ -f "build/libarkilian.so" ]; then
     SHARED_LIB="build/libarkilian.so"

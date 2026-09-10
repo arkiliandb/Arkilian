@@ -63,6 +63,67 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // ── Test New Core 1:1 Parity Features ─────────────────────────────────
+
+    // 1. Transactions & Changes
+    db.begin()?;
+    db.exec("INSERT INTO users (name, age) VALUES ('RollbackMe', 99)")?;
+    assert_eq!(db.changes(), 1);
+    let rollback_id = db.last_insert_rowid();
+    assert!(rollback_id > 0);
+    db.rollback()?;
+    println!("✓ Transactions (begin/rollback/changes/last_insert_rowid) working");
+
+    // 2. Prepared Statement typed blobs & int64
+    db.exec("CREATE TABLE blobs (id INTEGER PRIMARY KEY, bin BLOB, big INT)")?;
+    db.prepare("INSERT INTO blobs (bin, big) VALUES (?, ?)")?;
+    let payload = vec![0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01];
+    db.bind_blob(1, &payload)?;
+    db.bind_int64(2, 888888888888888)?;
+    assert_eq!(db.step(), arkilian::SQLITE_DONE);
+    db.finalize()?;
+
+    db.prepare("SELECT bin, big FROM blobs WHERE id = 1")?;
+    assert_eq!(db.step(), arkilian::SQLITE_ROW);
+    assert_eq!(db.column_type(0), arkilian::SQLITE_BLOB);
+    assert_eq!(db.column_blob(0), payload);
+    assert_eq!(db.column_int64(1), 888888888888888);
+    db.finalize()?;
+    println!("✓ Typed BLOB and int64 column/binding working");
+
+    // 3. WAL & Shipping
+    let pending = db.wal_pending();
+    println!("✓ WAL pending count: {}", pending);
+    let _ = db.wal_flush();
+    if let Some(sql) = db.wal_last_sql() {
+        println!("✓ WAL last SQL: {}", sql);
+    }
+
+    // 4. Backup & Trigger Controls
+    db.backup_set_enabled(true);
+    assert!(db.backup_is_enabled());
+    db.set_auto_resync_triggers(true);
+    assert!(db.auto_resync_triggers());
+    db.resync_triggers()?;
+    let _ = db.backup_triggers_dirty();
+    let _ = db.backup_capture_paused();
+    println!("✓ Backup & trigger controls working");
+
+    // 5. Monitoring & Health Flags
+    let _ = db.backup_queue_depth();
+    let _ = db.backup_oldest_pending_age_sec();
+    let _ = db.backup_dead_letter_count();
+    let _ = db.backup_thread_heartbeat_age_ms();
+    let _ = db.backup_snapshot_heartbeat_age_ms();
+    let _ = db.backup_trigger_coverage();
+    let _ = db.backup_skipped_table_count();
+    let _ = db.backup_chunk_count();
+    let _ = db.backup_last_chunk_flush_age_ms();
+    let flags = db.backup_health_flags();
+    let _ = db.backup_is_healthy();
+    println!("✓ Backup health flags: 0x{:04X}", flags);
+    assert_eq!(arkilian::ARK_HF_ALL_CORE, 0x3FF);
+
     // db auto-closes on drop
     drop(db);
     println!("✓ Database closed");

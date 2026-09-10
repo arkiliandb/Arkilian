@@ -288,7 +288,7 @@ func TestOpenClose(t *testing.T) {
 	if err != nil {
 		t.Fatalf("query: %v", err)
 	}
-	if len(rows) != 1 || rows[0]["x"] != "1" {
+	if len(rows) != 1 || fmt.Sprint(rows[0]["x"]) != "1" {
 		t.Fatalf("unexpected result: %v", rows)
 	}
 
@@ -313,7 +313,7 @@ func TestBatchRollback(t *testing.T) {
 	db.Rollback()
 
 	rows, _ := db.Query("SELECT COUNT(*) as cnt FROM t")
-	if rows[0]["cnt"] != "0" {
+	if fmt.Sprint(rows[0]["cnt"]) != "0" {
 		t.Fatalf("expected 0 after rollback, got %v", rows[0]["cnt"])
 	}
 }
@@ -342,4 +342,116 @@ func TestWALPending(t *testing.T) {
 	if pending < 3 {
 		t.Fatalf("expected at least 3 WAL entries, got %d", pending)
 	}
+
+	lastSQL := db.WALLastSQL()
+	if !strings.Contains(lastSQL, "43") {
+		t.Fatalf("expected last sql to contain 43, got: %s", lastSQL)
+	}
 }
+
+func TestCoreParityAndHealth(t *testing.T) {
+	dbPath := "/tmp/arkilian_go_test_parity.sqlite"
+	os.Remove(dbPath)
+	defer os.Remove(dbPath)
+
+	db, err := Open("test-key", dbPath)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+
+	// 1. Changes and LastInsertRowID
+	if err := db.Exec("CREATE TABLE items (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, data BLOB, num BIGINT)"); err != nil {
+		t.Fatalf("create items table: %v", err)
+	}
+	if err := db.Exec("INSERT INTO items (name, num) VALUES ('test1', 1234567890123)"); err != nil {
+		t.Fatalf("insert item: %v", err)
+	}
+	if db.Changes() != 1 {
+		t.Fatalf("expected 1 change, got %d", db.Changes())
+	}
+	if db.LastInsertRowID() != 1 {
+		t.Fatalf("expected last insert rowid 1, got %d", db.LastInsertRowID())
+	}
+
+	// 2. Prepared statement with typed bindings: BindBlob, BindInt64, BindNull
+	stmt, err := db.Prepare("INSERT INTO items (name, data, num) VALUES (?, ?, ?)")
+	if err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	blobPayload := []byte{0x00, 0xFF, 0xFE, 0x42, 0x00, 0x01}
+	if err := stmt.BindText(1, "blob_item"); err != nil {
+		t.Fatalf("bind text: %v", err)
+	}
+	if err := stmt.BindBlob(2, blobPayload); err != nil {
+		t.Fatalf("bind blob: %v", err)
+	}
+	if err := stmt.BindInt64(3, 987654321098765); err != nil {
+		t.Fatalf("bind int64: %v", err)
+	}
+	ok, err := stmt.Step()
+	if err != nil {
+		t.Fatalf("step insert blob: %v", err)
+	}
+	_ = ok
+	stmt.Finalize()
+
+	// Query it back with ColumnType, ColumnBlob, ColumnInt64, ColumnValue
+	qstmt, err := db.Prepare("SELECT name, data, num FROM items WHERE id = 2")
+	if err != nil {
+		t.Fatalf("prepare select: %v", err)
+	}
+	hasRow, err := qstmt.Step()
+	if err != nil || !hasRow {
+		t.Fatalf("expected row: %v", err)
+	}
+	if qstmt.ColumnType(0) != ColumnText {
+		t.Fatalf("expected text type, got %d", qstmt.ColumnType(0))
+	}
+	if qstmt.ColumnType(1) != ColumnBlob {
+		t.Fatalf("expected blob type, got %d", qstmt.ColumnType(1))
+	}
+	retrievedBlob := qstmt.ColumnBlob(1)
+	if !bytes.Equal(retrievedBlob, blobPayload) {
+		t.Fatalf("blob mismatch: got %v, expected %v", retrievedBlob, blobPayload)
+	}
+	if qstmt.ColumnInt64(2) != 987654321098765 {
+		t.Fatalf("int64 mismatch: got %d", qstmt.ColumnInt64(2))
+	}
+	valMap := qstmt.ColumnValue(1)
+	if valBlob, ok := valMap.([]byte); !ok || !bytes.Equal(valBlob, blobPayload) {
+		t.Fatalf("ColumnValue blob mismatch: %v", valMap)
+	}
+	qstmt.Finalize()
+
+	// 3. Backup controls
+	db.SetBackupEnabled(true)
+	if !db.IsBackupEnabled() {
+		t.Fatalf("expected backup to be enabled")
+	}
+	db.SetAutoResyncTriggers(true)
+	if !db.AutoResyncTriggers() {
+		t.Fatalf("expected auto resync triggers to be true")
+	}
+	db.ResyncTriggers()
+	_ = db.TriggersDirty()
+	_ = db.CapturePaused()
+
+	// 4. Monitoring & Health flags
+	_ = db.BackupQueueDepth()
+	_ = db.BackupOldestPendingAgeSec()
+	_ = db.BackupDeadLetterCount()
+	_ = db.BackupThreadHeartbeatAgeMs()
+	_ = db.BackupSnapshotHeartbeatAgeMs()
+	_ = db.BackupTriggerCoverage()
+	_ = db.BackupSkippedTableCount()
+	_ = db.BackupChunkCount()
+	_ = db.BackupLastChunkFlushAgeMs()
+	_ = db.BackupHealthFlags()
+	_ = db.BackupIsHealthy()
+
+	if HealthFlagCoreMask != 0x03FF {
+		t.Fatalf("expected HealthFlagCoreMask 0x03FF, got 0x%X", HealthFlagCoreMask)
+	}
+}
+

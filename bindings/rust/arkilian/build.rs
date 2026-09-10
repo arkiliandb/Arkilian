@@ -10,6 +10,10 @@ fn main() {
         println!("cargo:rustc-link-search=native={}", p.display());
         println!("cargo:rustc-link-arg=-Wl,-rpath,{}", p.display());
     }
+    if let Ok(p) = manifest_dir.join("../../../build-c").canonicalize() {
+        println!("cargo:rustc-link-search=native={}", p.display());
+        println!("cargo:rustc-link-arg=-Wl,-rpath,{}", p.display());
+    }
     if let Ok(p) = manifest_dir.join("../../../build/Release").canonicalize() {
         println!("cargo:rustc-link-search=native={}", p.display());
         println!("cargo:rustc-link-arg=-Wl,-rpath,{}", p.display());
@@ -32,8 +36,13 @@ fn main() {
     
     let bindings = bindgen::Builder::default()
         .header("src/bindings.h")
-        .allowlist_type("arkilian")
+        .allowlist_type("arkilian.*")
+        .allowlist_type("sqlite3.*")
         .allowlist_function("db_.*")
+        .allowlist_function("arkilian_.*")
+        .allowlist_var("ARK_.*")
+        .allowlist_var("HYDRATION_.*")
+        .allowlist_var("SQLITE_.*")
         .generate()
         .expect("Unable to generate bindings");
     

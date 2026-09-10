@@ -3312,6 +3312,11 @@ int db_bind_null(arkilian *db, int idx) {
   return stmt ? sqlite3_bind_null(stmt, idx) : SQLITE_ERROR;
 }
 
+int db_bind_blob(arkilian *db, int idx, const void *val, int n) {
+  sqlite3_stmt *stmt = get_current_stmt(db);
+  return stmt ? sqlite3_bind_blob(stmt, idx, val, n, SQLITE_TRANSIENT) : SQLITE_ERROR;
+}
+
 int db_changes(arkilian *db) {
   return (db && db->handle) ? sqlite3_changes(db->handle) : 0;
 }

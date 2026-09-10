@@ -119,6 +119,27 @@ class Arkilian {
     return native.db_backup_snapshot_heartbeat_age_ms(this.id);
   }
 
+  get backupChunkCount() {
+    return native.db_backup_chunk_count(this.id);
+  }
+
+  get backupLastChunkFlushAgeMs() {
+    return native.db_backup_last_chunk_flush_age_ms(this.id);
+  }
+
+  get walPending() {
+    return native.db_wal_pending(this.id);
+  }
+
+  walFlush() {
+    native.db_wal_flush(this.id);
+    return this;
+  }
+
+  get walLastSql() {
+    return native.db_wal_last_sql(this.id);
+  }
+
   get backupTriggerCoverage() {
     return native.db_backup_trigger_coverage(this.id);
   }
@@ -398,6 +419,53 @@ class Arkilian {
   static get SQLITE_DONE() {
     return SQLITE_DONE;
   }
+
+  static get HealthFlags() {
+    return HealthFlags;
+  }
+
+  static get HydrationErrors() {
+    return HydrationErrors;
+  }
+
+  static get LogLevels() {
+    return LogLevels;
+  }
 }
+
+export const HealthFlags = Object.freeze({
+  BACKUP_ENABLED: native.ARK_HF_BACKUP_ENABLED ?? (1 << 0),
+  DEST_CONFIGURED: native.ARK_HF_DEST_CONFIGURED ?? (1 << 1),
+  FLUSH_ALIVE: native.ARK_HF_FLUSH_ALIVE ?? (1 << 2),
+  SNAPSHOT_ALIVE: native.ARK_HF_SNAPSHOT_ALIVE ?? (1 << 3),
+  QUEUE_BELOW_CAP: native.ARK_HF_QUEUE_BELOW_CAP ?? (1 << 4),
+  SCHEMA_IN_SYNC: native.ARK_HF_SCHEMA_IN_SYNC ?? (1 << 5),
+  NO_DEAD_LETTER: native.ARK_HF_NO_DEAD_LETTER ?? (1 << 6),
+  MANIFEST_RESOLVED: native.ARK_HF_MANIFEST_RESOLVED ?? (1 << 7),
+  NO_CAPTURE_GAP: native.ARK_HF_NO_CAPTURE_GAP ?? (1 << 8),
+  DURABLE_CAPTURE: native.ARK_HF_DURABLE_CAPTURE ?? (1 << 9),
+  ALL_CORE: native.ARK_HF_ALL_CORE ?? 0x1ff,
+});
+
+export const HydrationErrors = Object.freeze({
+  OK: native.HYDRATION_OK ?? 0,
+  ERR_NET: native.HYDRATION_ERR_NET ?? -1,
+  ERR_DISK: native.HYDRATION_ERR_DISK ?? -2,
+  ERR_MEM: native.HYDRATION_ERR_MEM ?? -3,
+  ERR_PROTO: native.HYDRATION_ERR_PROTO ?? -4,
+  ERR_SQL: native.HYDRATION_ERR_SQL ?? -5,
+  ERR_DECOMP: native.HYDRATION_ERR_DECOMP ?? -6,
+  ERR_EXPIRED: native.HYDRATION_ERR_EXPIRED ?? -7,
+  ERR_NOTFOUND: native.HYDRATION_ERR_NOTFOUND ?? -8,
+  ERR_NEWER: native.HYDRATION_ERR_NEWER ?? -9,
+  ERR_BUSY: native.HYDRATION_ERR_BUSY ?? -10,
+});
+
+export const LogLevels = Object.freeze({
+  ERROR: native.ARK_LOG_ERROR ?? 0,
+  WARN: native.ARK_LOG_WARN ?? 1,
+  INFO: native.ARK_LOG_INFO ?? 2,
+  DEBUG: native.ARK_LOG_DEBUG ?? 3,
+});
 
 export default Arkilian;
