@@ -1,7 +1,7 @@
 /* tests/ark_test_env.h — portable setenv/unsetenv shim for test programs.
    POSIX exposes setenv()/unsetenv() via <stdlib.h>; MinGW-w64 does not.
-   The Windows CRT provides _putenv("NAME=value") to set and _putenv("NAME")
-   (no `=`) to remove an entry, which makes getenv() return NULL — matching
+   The Windows CRT provides _putenv("NAME=value") to set and _putenv("NAME=")
+   (empty value after `=`) to remove an entry, which makes getenv() return NULL — matching
    unsetenv() semantics. Both are wrapped so test files can call
    ark_setenv()/ark_unsetenv() uniformly across Linux/macOS/Windows CI legs.   */
 #ifndef ARK_TEST_ENV_H

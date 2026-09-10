@@ -291,24 +291,54 @@ static void test_multistmt_alter_update_order(void) {
   cleanup(path);
 }
 
+static char g_p0_ssrf_log[1024] = {0};
+static void p0_ssrf_log_cb(ark_log_level_t level, const char *msg, void *ctx) {
+  (void)level; (void)ctx;
+  if (msg && strstr(msg, "SSRF guard")) {
+    strncpy(g_p0_ssrf_log, msg, sizeof(g_p0_ssrf_log) - 1);
+    g_p0_ssrf_log[sizeof(g_p0_ssrf_log) - 1] = '\0';
+  }
+}
+
 // Additional hardening: host suffix SSRF (the strstr→suffix fix)
 static void test_host_suffix_rejects_evil(void) {
-  // We test the observable SSRF guard: a manifest chunk URL with an evil
-  // host containing ".amazonaws.com" as a substring but not suffix must be
-  // refused. We do this by crafting a minimal manifest fetch via the
-  // hydration path would require a full S3 stub, so we instead test the
-  // underlying allowlist via a direct URL check using the same logic as
-  // url_is_allowed_storage. Since that function is static, we test the
-  // observable behavior: a hydration with an evil chunk host must be PROTO.
-  // For a lighter unit test, we verify that our suffix helper is present
-  // by checking that the binary was built with the hardened host logic:
-  // the test passes if the previous host_is_known_storage fix is present
-  // (no direct call needed, but we assert the hardened path exists).
-  // This is a placeholder that will fail if the strstr bug is reintroduced
-  // and an evil host is ever allowed to ship — the real e2e S3 stub test
-  // in test_hydration.c would then download from the evil host and succeed,
-  // which we now prevent.
-  assert(1); // structural check: host_has_suffix exists in this build
+  const char *path = "p0_ssrf_evil.db";
+  cleanup(path);
+  g_p0_ssrf_log[0] = '\0';
+
+  ark_setenv("ARKILIAN_ENABLE_BACKUP", "1", 1);
+  // An evil host that contains ".amazonaws.com" as a substring but NOT suffix
+  ark_setenv("ARKILIAN_S3_ENDPOINT", "https://evil.amazonaws.com.attacker.com", 1);
+  ark_setenv("ARKILIAN_S3_BUCKET", "test-bucket", 1);
+  ark_setenv("ARKILIAN_S3_REGION", "us-east-1", 1);
+  ark_setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
+  ark_setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
+  ark_setenv("ARKILIAN_S3_PREFIX", "test-prefix", 1);
+  ark_setenv("ARKILIAN_MANIFEST_HMAC_KEY", "test-hmac-key", 1);
+  ark_setenv("ARKILIAN_BACKUP_INTERVAL", "3600", 1);
+
+  arkilian *db = NULL;
+  assert(db_init(&db, path) == 0 && db != NULL);
+  db_set_log_callback(db, p0_ssrf_log_cb, NULL);
+
+  assert(db_exec(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)") == SQLITE_OK);
+  assert(db_exec(db, "INSERT INTO t (v) VALUES ('ssrf_test')") == SQLITE_OK);
+
+  // Trigger flush; upload_to_s3 must evaluate url_is_allowed_storage on the signed URL
+  // and refuse to upload because evil.amazonaws.com.attacker.com is not a valid suffix.
+  db_wal_flush(db);
+
+  for (int i = 0; i < 50; i++) {
+    if (g_p0_ssrf_log[0] != '\0') break;
+    usleep(20000);
+  }
+
+  assert(g_p0_ssrf_log[0] != '\0' && "SSRF guard did not log refusal for evil host");
+  assert(strstr(g_p0_ssrf_log, "SSRF guard") != NULL);
+  assert(outbox_count(db) >= 1);
+
+  db_close(db);
+  cleanup(path);
 }
 
 int main(void) {

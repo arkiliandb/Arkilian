@@ -93,7 +93,9 @@ run      test_monitoring      tests/test_monitoring.c
 run      test_virtual_tables  tests/test_virtual_tables.c
 run      test_deterministic   tests/test_deterministic.c
 run      test_hardening       tests/test_hardening.c
+run      test_p0_hardening    tests/test_p0_hardening.c
 run      test_health_flags    tests/test_health_flags.c
+run      test_sha256          tests/test_sha256.c
 run_hydration
 run_snapshot_watermark
 run_manifest_protocol
@@ -111,8 +113,14 @@ rm -f bench_1m
 
 echo "── all C tests passed ──"
 
-
-# test 
-cmake -S . -B build-tsan -DCMAKE_BUILD_TYPE=Debug -DARKILIAN_BUILD_TESTS=ON -DCMAKE_C_FLAGS="-fsanitize=thread -g -O1"
-cmake --build build-tsan -j4
-ctest --test-dir build-tsan
+# Optional ThreadSanitizer build and test execution
+if [ "${RUN_TSAN:-0}" = "1" ]; then
+  echo "── Running ThreadSanitizer suite ──"
+  cmake -S . -B build-tsan -DCMAKE_BUILD_TYPE=Debug -DARKILIAN_BUILD_TESTS=ON \
+        -DCMAKE_C_FLAGS="-fsanitize=thread -g -O1" \
+        -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=thread"
+  cmake --build build-tsan -j4
+  TSAN_OPTIONS="halt_on_error=1:abort_on_error=1:suppressions=tests/tsan-suppressions.txt" \
+    ctest --test-dir build-tsan --output-on-failure
+  rm -rf build-tsan
+fi

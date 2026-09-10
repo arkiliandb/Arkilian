@@ -26,6 +26,8 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include "ark_test_env.h"
+
 #define STUB_MAX_OBJECTS 512
 
 typedef struct {
@@ -39,6 +41,7 @@ static int         g_stub_object_count = 0;
 static pthread_mutex_t g_stub_store_mutex = PTHREAD_MUTEX_INITIALIZER;
 static atomic_int  g_stub_port = 0;
 static atomic_int  g_stub_server_up = 0;
+static pthread_t   g_stub_thread;
 
 static inline void stub_put(const char *key, const char *data, size_t len) {
   pthread_mutex_lock(&g_stub_store_mutex);
@@ -248,23 +251,40 @@ static const char *BUCKET = "test-bucket";
 static const char *PREFIX = "user-42-appdb";
 
 static inline void stub_start(void) {
+  if (atomic_load(&g_stub_server_up)) return;
   signal(SIGPIPE, SIG_IGN);
-  pthread_t t;
-  pthread_create(&t, NULL, stub_server_thread, NULL);
+  pthread_create(&g_stub_thread, NULL, stub_server_thread, NULL);
   while (!atomic_load(&g_stub_server_up)) usleep(1000);
   snprintf(g_endpoint, sizeof(g_endpoint), "http://127.0.0.1:%d",
            atomic_load(&g_stub_port));
 }
 
+static inline void stub_stop(void) {
+  if (!atomic_load(&g_stub_server_up)) return;
+  atomic_store(&g_stub_server_up, 0);
+  int fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (fd >= 0) {
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = htons((unsigned short)atomic_load(&g_stub_port));
+    connect(fd, (struct sockaddr *)&addr, sizeof(addr));
+    close(fd);
+  }
+  pthread_join(g_stub_thread, NULL);
+  stub_reset();
+}
+
 static inline void set_s3_env(void) {
-  setenv("ARKILIAN_S3_ENDPOINT", g_endpoint, 1);
-  setenv("ARKILIAN_S3_BUCKET", BUCKET, 1);
-  setenv("ARKILIAN_S3_REGION", "us-east-1", 1);
-  setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
-  setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
-  setenv("ARKILIAN_S3_PREFIX", PREFIX, 1);
+  ark_setenv("ARKILIAN_S3_ENDPOINT", g_endpoint, 1);
+  ark_setenv("ARKILIAN_S3_BUCKET", BUCKET, 1);
+  ark_setenv("ARKILIAN_S3_REGION", "us-east-1", 1);
+  ark_setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
+  ark_setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
+  ark_setenv("ARKILIAN_S3_PREFIX", PREFIX, 1);
   // HMAC is required (no legacy); use a deterministic test key for the stub.
-  setenv("ARKILIAN_MANIFEST_HMAC_KEY", "test-hmac-key-for-unit-tests-32b", 1);
+  ark_setenv("ARKILIAN_MANIFEST_HMAC_KEY", "test-hmac-key-for-unit-tests-32b", 1);
 }
 
 static inline int stub_manifest_contains(const char *needle, int timeout_s) {

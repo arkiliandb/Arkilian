@@ -9,6 +9,7 @@
     "build": "node-gyp configure && node-gyp build",
     "build:cmake": "cmake-js compile -T arkilian_napi",
     "clean": "node-gyp clean",
+    "pretest": "node-gyp configure && node-gyp build",
     "test": "node test.js",
     "prebuildify": "prebuildify --napi --strip"
   },

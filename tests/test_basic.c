@@ -39,7 +39,15 @@ static arkilian *open_test_db(void) {
 
 static void cleanup_files(void) {
   remove(TEST_DB);
+  remove(TEST_DB "-wal");
+  remove(TEST_DB "-shm");
+  remove(TEST_DB "-journal");
+  remove(TEST_DB ".arklock");
   remove(TEST_BACKUP);
+  remove(TEST_BACKUP "-wal");
+  remove(TEST_BACKUP "-shm");
+  remove(TEST_BACKUP "-journal");
+  remove(TEST_BACKUP ".arklock");
 }
 
 // ---------------------------------------------------------------------------

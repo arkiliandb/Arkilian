@@ -47,6 +47,7 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <stdatomic.h>
 
 static int tests_run = 0;
 static int tests_passed = 0;
@@ -67,6 +68,7 @@ static void cleanup(const char *path) {
   snprintf(side, sizeof(side), "%s-wal", path); remove(side);
   snprintf(side, sizeof(side), "%s-shm", path); remove(side);
   snprintf(side, sizeof(side), "%s-journal", path); remove(side);
+  snprintf(side, sizeof(side), "%s.arklock", path); remove(side);
 }
 
 // ── Recording mock destination ──────────────────────────────────────
@@ -78,8 +80,8 @@ typedef struct {
   int port;
   int delay_ms;
   pthread_t thread;
-  volatile int stop;
-  volatile int requests;
+  atomic_int stop;
+  atomic_int requests;
   int count;
   sqlite3_int64 ids[200000];
 } rec_server;
@@ -105,7 +107,7 @@ static void *rec_server_run(void *arg) {
       if (got >= 4 && memcmp(buf + got - 4, "\r\n\r\n", 4) == 0) break;
     }
     buf[got] = '\0';
-    if (s->stop) { close(fd); break; } // stop-kick connection: exit now
+    if (atomic_load(&s->stop)) { close(fd); break; } // stop-kick connection: exit now
     if (got > 0) {
       // libcurl sends Expect: 100-continue for >1 KiB payloads (chunks);
       // answer it or curl stalls 1s per upload.
@@ -155,7 +157,7 @@ static void *rec_server_run(void *arg) {
           }
         }
       }
-      s->requests++;
+      atomic_fetch_add(&s->requests, 1);
       if (s->delay_ms > 0) usleep((useconds_t)s->delay_ms * 1000);
       const char *resp = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK";
       send(fd, resp, strlen(resp), 0);
@@ -187,7 +189,7 @@ static int rec_server_start(rec_server *s, int delay_ms) {
 }
 
 static void rec_server_stop(rec_server *s) {
-  s->stop = 1;
+  atomic_store(&s->stop, 1);
   int fd = socket(AF_INET, SOCK_STREAM, 0);
   if (fd >= 0) {
     struct sockaddr_in addr;
@@ -407,7 +409,7 @@ static void run_kill_scenario(int kill_mode) {
   posix_spawn_file_actions_addclose(&fa, pipefd[1]);
 
   pid_t pid = -1;
-  int sp = posix_spawn(&pid, child_argv[0], &fa, NULL, child_argv, environ);
+  int sp = posix_spawnp(&pid, child_argv[0], &fa, NULL, child_argv, environ);
   posix_spawn_file_actions_destroy(&fa);
   close(pipefd[1]);
   assert(sp == 0 && pid > 0);

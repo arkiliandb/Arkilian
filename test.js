@@ -1,16 +1,26 @@
 import Arkilian from "./index.js";
 import { join } from "path";
-
-import { fileURLToPath } from "url";
+import { fileURLToPath, pathToFileURL } from "url";
+import { unlinkSync, existsSync } from "fs";
 
 // Recreate __dirname functionality for ESM
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = join(__filename, "..");
 
-// No API key exists in the S3-only client; the backup destination is
-// configured via ARKILIAN_S3_* environment variables (a ./.env file works
-// too). This test runs without any destination — capture-only.
+process.env.ARKILIAN_ENABLE_BACKUP = "0";
+process.env.ARKILIAN_S3_ENDPOINT = "";
+
+function cleanupDb(basePath) {
+  for (const ext of ["", "-wal", "-shm", "-journal", ".arklock"]) {
+    const p = basePath + ext;
+    if (existsSync(p)) {
+      try { unlinkSync(p); } catch {}
+    }
+  }
+}
+
 const dbPath = join(__dirname, "test.db");
+cleanupDb(dbPath);
 const db = new Arkilian(dbPath);
 
 console.log("1. Drop old table if exists and recreate...");
@@ -100,21 +110,24 @@ console.log("\n10. Worker-thread concurrent cursor use (regression)...");
 const { Worker } = await import("worker_threads");
 const workerCode = `
   const { parentPort } = require("worker_threads");
-  const Arkilian = require(${JSON.stringify(join(__dirname, "index.js"))}).default;
-  const db = new Arkilian(
-    ${JSON.stringify(dbPath)});
-  try {
-    for (let i = 0; i < 500; i++) {
-      db.exec("INSERT INTO thrash (v) VALUES (" + i + ")");
-      const rows = db.all("SELECT COUNT(*) AS c FROM thrash");
-      if (!rows || rows[0].c === undefined) throw new Error("bad result");
+  (async () => {
+    try {
+      const Arkilian = (await import(${JSON.stringify(pathToFileURL(join(__dirname, "index.js")).href)})).default;
+      const db = new Arkilian(${JSON.stringify(dbPath)});
+      try {
+        for (let i = 0; i < 500; i++) {
+          await db.exec("INSERT INTO thrash (v) VALUES (" + i + ")");
+          const rows = await db.all("SELECT COUNT(*) AS c FROM thrash");
+          if (!rows || rows[0].c === undefined) throw new Error("bad result");
+        }
+        parentPort.postMessage("ok");
+      } finally {
+        await db.close();
+      }
+    } catch (e) {
+      parentPort.postMessage("fail: " + e.message);
     }
-    parentPort.postMessage("ok");
-  } catch (e) {
-    parentPort.postMessage("fail: " + e.message);
-  } finally {
-    db.close();
-  }
+  })();
 `;
 await db.exec("DROP TABLE IF EXISTS thrash");
 await db.exec("CREATE TABLE thrash (v INTEGER)");
@@ -148,4 +161,5 @@ await db.exec("DROP TABLE thrash");
 console.log("   OK");
 
 await db.close();
+cleanupDb(dbPath);
 console.log("\nAll tests passed!");

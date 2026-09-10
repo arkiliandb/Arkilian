@@ -26,6 +26,20 @@
 #define STRESS_READ_GOAL  200000000ULL
 #define BATCH_WRITE_SIZE  1000
 
+static void cleanup_db(const char *path) {
+  char buf[512];
+  snprintf(buf, sizeof(buf), "%s", path);
+  remove(buf);
+  snprintf(buf, sizeof(buf), "%s-wal", path);
+  remove(buf);
+  snprintf(buf, sizeof(buf), "%s-shm", path);
+  remove(buf);
+  snprintf(buf, sizeof(buf), "%s-journal", path);
+  remove(buf);
+  snprintf(buf, sizeof(buf), "%s.arklock", path);
+  remove(buf);
+}
+
 static double now_ms(void) {
   struct timespec ts;
   clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -54,18 +68,21 @@ int main(int argc, char **argv) {
          getenv("ARKILIAN_S3_ENDPOINT") ? getenv("ARKILIAN_S3_ENDPOINT") : "Disabled");
   printf("===============================================================\n\n");
 
+  cleanup_db("stress_app.db");
+
   arkilian *db = NULL;
   int rc = db_init(&db, "stress_app.db");
   assert(rc == 0 && "db_init failed");
   assert(db != NULL);
 
   // 1. Create table schema
-  db_exec(db, "CREATE TABLE IF NOT EXISTS stress_data ("
-              "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
-              "  user_id INT NOT NULL,"
-              "  payload TEXT NOT NULL,"
-              "  ts INT NOT NULL"
-              ");");
+  rc = db_exec(db, "CREATE TABLE IF NOT EXISTS stress_data ("
+                   "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                   "  user_id INT NOT NULL,"
+                   "  payload TEXT NOT NULL,"
+                   "  ts INT NOT NULL"
+                   ");");
+  assert(rc == SQLITE_OK && "CREATE TABLE failed");
 
   // 2. High-Throughput Batched Writes Phase
   printf("Phase 1: Executing %llu Writes in transactions of %d rows...\n",
@@ -80,7 +97,8 @@ int main(int argc, char **argv) {
       snprintf(sql, sizeof(sql),
                "INSERT INTO stress_data (user_id, payload, ts) VALUES (%llu, 'stress-payload-%llu', %ld)",
                written % 1000000, written, (long)time(NULL));
-      db_exec(db, sql);
+      rc = db_exec(db, sql);
+      assert(rc == SQLITE_OK && "INSERT failed");
     }
     db_commit(db);
 
@@ -102,7 +120,8 @@ int main(int argc, char **argv) {
   unsigned long long read_count = 0;
 
   while (read_count < read_target) {
-    db_prepare(db, "SELECT * FROM stress_data WHERE user_id = ?");
+    rc = db_prepare(db, "SELECT * FROM stress_data WHERE user_id = ?");
+    assert(rc == SQLITE_OK && "db_prepare failed");
     db_bind_int(db, 1, (int)(read_count % 1000000));
     while (db_step(db) == SQLITE_ROW) {
       db_column_int64(db, 0);
@@ -128,9 +147,15 @@ int main(int argc, char **argv) {
 
   int pending = db_wal_pending(db);
   printf("  Pending items remaining in outbox: %d\n", pending);
+  if (getenv("ARKILIAN_S3_ENDPOINT")) {
+    assert(pending == 0 && "Expected zero pending outbox items when S3 endpoint is configured");
+  } else if (write_target > 0) {
+    assert(pending > 0 && "Expected pending outbox items when S3 endpoint is disabled");
+  }
 
   // 5. Cleanup
   db_close(db);
+  cleanup_db("stress_app.db");
   printf("===============================================================\n");
   printf("  STRESS TEST COMPLETED SUCCESSFULLY WITH ZERO ERRORS\n");
   printf("===============================================================\n");

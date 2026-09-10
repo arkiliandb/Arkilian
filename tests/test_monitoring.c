@@ -40,6 +40,7 @@ static void cleanup(const char *path) {
   snprintf(side, sizeof(side), "%s-wal", path); remove(side);
   snprintf(side, sizeof(side), "%s-shm", path); remove(side);
   snprintf(side, sizeof(side), "%s-journal", path); remove(side);
+  snprintf(side, sizeof(side), "%s.arklock", path); remove(side);
 }
 
 static void hermetic_env(void) {
@@ -63,6 +64,31 @@ static void hermetic_env(void) {
   ark_setenv("ARKILIAN_S3_PREFIX", "", 1);
 }
 
+#ifdef _WIN32
+#include <windows.h>
+static CRITICAL_SECTION g_log_cs;
+static int g_log_cs_init = 0;
+static void lock_log(void) {
+  if (!g_log_cs_init) {
+    InitializeCriticalSection(&g_log_cs);
+    g_log_cs_init = 1;
+  }
+  EnterCriticalSection(&g_log_cs);
+}
+static void unlock_log(void) {
+  LeaveCriticalSection(&g_log_cs);
+}
+#else
+#include <pthread.h>
+static pthread_mutex_t g_log_mutex = PTHREAD_MUTEX_INITIALIZER;
+static void lock_log(void) {
+  pthread_mutex_lock(&g_log_mutex);
+}
+static void unlock_log(void) {
+  pthread_mutex_unlock(&g_log_mutex);
+}
+#endif
+
 // ── Log capture ─────────────────────────────────────────────────────
 
 static char g_captured[2048];
@@ -70,11 +96,30 @@ static int g_capture_count = 0;
 
 static void capture_log(ark_log_level_t level, const char *msg, void *ctx) {
   (void)ctx;
+  lock_log();
   if ((level == ARK_LOG_WARN || level == ARK_LOG_ERROR) && g_capture_count < 10) {
     g_captured[0] = '\0';
     strncat(g_captured, msg, sizeof(g_captured) - 1);
     g_capture_count++;
   }
+  unlock_log();
+}
+
+static void reset_captured_log(void) {
+  lock_log();
+  g_captured[0] = '\0';
+  g_capture_count = 0;
+  unlock_log();
+}
+
+static void get_captured_log(char *out, size_t out_cap, int *out_count) {
+  lock_log();
+  if (out && out_cap) {
+    strncpy(out, g_captured, out_cap - 1);
+    out[out_cap - 1] = '\0';
+  }
+  if (out_count) *out_count = g_capture_count;
+  unlock_log();
 }
 
 // ── Tests ───────────────────────────────────────────────────────────
@@ -85,13 +130,9 @@ static void test_queue_depth_and_oldest_age(void) {
   ark_setenv("ARKILIAN_S3_ACCESS_KEY", "test-key", 1);
   ark_setenv("ARKILIAN_S3_ENDPOINT", "http://127.0.0.1:1", 1);
   ark_setenv("ARKILIAN_S3_BUCKET", "test-bucket", 1);
-  ark_setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
+  ark_setenv("ARKILIAN_S3_REGION", "us-east-1", 1);
   ark_setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
   ark_setenv("ARKILIAN_S3_PREFIX", "test-prefix", 1);
-  ark_setenv("ARKILIAN_S3_BUCKET", "test-bucket", 1);
-  ark_setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
-  ark_setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
-  ark_setenv("ARKILIAN_S3_PREFIX", "test-prefix", 1); // failing dest
   arkilian *db = NULL;
   assert(db_init(&db, "test_mon_depth.db") == 0);
   assert(db_exec(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)") == SQLITE_OK);
@@ -318,14 +359,16 @@ static void test_log_callback_captures_init_warning(void) {
   // Backup enabled but NO destination — db_init must emit a loud warning
   // through the (global, pre-handle) log callback.
   ark_unsetenv("ARKILIAN_S3_ENDPOINT");
-  g_captured[0] = '\0';
-  g_capture_count = 0;
+  reset_captured_log();
   db_set_default_log_callback(capture_log, NULL);
 
   arkilian *db = NULL;
   assert(db_init(&db, "test_mon_log.db") == 0);
-  assert(g_capture_count > 0);
-  assert(strstr(g_captured, "ARKILIAN_S3_ENDPOINT") != NULL);
+  char buf[2048] = {0};
+  int count = 0;
+  get_captured_log(buf, sizeof(buf), &count);
+  assert(count > 0);
+  assert(strstr(buf, "ARKILIAN_S3_ENDPOINT") != NULL);
   // Enabled but destinationless must never read as healthy: rows
   // accumulate forever without shipping.
   assert(db_backup_is_healthy(db) == 0);
@@ -340,25 +383,24 @@ static void test_log_callback_per_handle(void) {
   hermetic_env();
   ark_setenv("ARKILIAN_S3_ENDPOINT", "http://127.0.0.1:1", 1);
   ark_setenv("ARKILIAN_S3_BUCKET", "test-bucket", 1);
-  ark_setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
-  ark_setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
-  ark_setenv("ARKILIAN_S3_PREFIX", "test-prefix", 1);
-  ark_setenv("ARKILIAN_S3_BUCKET", "test-bucket", 1);
+  ark_setenv("ARKILIAN_S3_REGION", "us-east-1", 1);
   ark_setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
   ark_setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
   ark_setenv("ARKILIAN_S3_PREFIX", "test-prefix", 1);
   arkilian *db = NULL;
   assert(db_init(&db, "test_mon_log2.db") == 0);
 
-  g_captured[0] = '\0';
-  g_capture_count = 0;
+  reset_captured_log();
   db_set_log_callback(db, capture_log, NULL);
   // Force a per-handle log: resync failure is logged via ark_log.
   db_resync_triggers(db); // succeeds — no log; use an error path instead
-  if (g_captured[0] != '\0') {
-    fprintf(stderr, "DIAG unexpected log: %s count=%d\n", g_captured, g_capture_count);
+  char buf[2048] = {0};
+  int count = 0;
+  get_captured_log(buf, sizeof(buf), &count);
+  if (buf[0] != '\0') {
+    fprintf(stderr, "DIAG unexpected log: %s count=%d\n", buf, count);
   }
-  assert(g_captured[0] == '\0' && "unexpected log on healthy resync");
+  assert(buf[0] == '\0' && "unexpected log on healthy resync");
 
   db_close(db);
   cleanup("test_mon_log2.db");

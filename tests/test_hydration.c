@@ -265,9 +265,18 @@ static long long count_rows(const char *db_path, const char *table) {
   return n;
 }
 
+static void cleanup_db_path(const char *path) {
+  remove(path);
+  char side[256];
+  snprintf(side, sizeof(side), "%s-wal", path); remove(side);
+  snprintf(side, sizeof(side), "%s-shm", path); remove(side);
+  snprintf(side, sizeof(side), "%s-journal", path); remove(side);
+  snprintf(side, sizeof(side), "%s.arklock", path); remove(side);
+}
+
 static void cleanup_files(void) {
-  remove("hydrate_src.db");
-  remove("hydrate_dst.db");
+  cleanup_db_path("hydrate_src.db");
+  cleanup_db_path("hydrate_dst.db");
   pthread_mutex_lock(&g_store_mutex);
   for (int i = 0; i < g_object_count; i++) free(g_objects[i].data);
   g_object_count = 0;
@@ -302,7 +311,7 @@ static void test_roundtrip(void) {
   db_close(db);
 
   // Restore into a fresh file.
-  remove("hydrate_dst.db");
+  cleanup_db_path("hydrate_dst.db");
   int rc = arkilian_hydrate_s3("hydrate_dst.db", g_endpoint, BUCKET,
                                "us-east-1", "test-access", "test-secret",
                                PREFIX, NULL, NULL);
@@ -316,6 +325,9 @@ static void test_roundtrip(void) {
   }
   assert(rc == HYDRATION_OK);
   assert(count_rows("hydrate_dst.db", "users") == 50);
+  // Restored database must have sanitized outbox state
+  assert(count_rows("hydrate_dst.db", "_pending_backup") == 0);
+  assert(count_rows("hydrate_dst.db", "_dead_backup") == 0);
   cleanup_files();
   printf("  roundtrip (capture → ship → restore): OK\n");
 }
@@ -337,7 +349,7 @@ static void test_sha_mismatch(void) {
   snprintf(mkey, sizeof(mkey), "%s/manifest.json", PREFIX);
   stub_put(mkey, manifest, strlen(manifest));
 
-  remove("hydrate_dst.db");
+  cleanup_db_path("hydrate_dst.db");
   int rc = arkilian_hydrate_s3("hydrate_dst.db", g_endpoint, BUCKET,
                                "us-east-1", "test-access", "test-secret",
                                PREFIX, NULL, NULL);
@@ -393,7 +405,7 @@ static void test_lsn_gap(void) {
   snprintf(mkey, sizeof(mkey), "%s/manifest.json", PREFIX);
   stub_put(mkey, manifest, strlen(manifest));
 
-  remove("hydrate_dst.db");
+  cleanup_db_path("hydrate_dst.db");
   int rc = arkilian_hydrate_s3("hydrate_dst.db", g_endpoint, BUCKET,
                                "us-east-1", "test-access", "test-secret",
                                PREFIX, NULL, NULL);
@@ -408,7 +420,7 @@ static void test_lsn_gap(void) {
 // state, not a silently-created empty database.
 static void test_no_manifest(void) {
   cleanup_files();
-  remove("hydrate_dst.db");
+  cleanup_db_path("hydrate_dst.db");
   int rc = arkilian_hydrate_s3("hydrate_dst.db", g_endpoint, BUCKET,
                                "us-east-1", "test-access", "test-secret",
                                PREFIX, NULL, NULL);

@@ -39,12 +39,7 @@ static arkilian *open_test_db(void) {
   ark_setenv("ARKILIAN_ENABLE_BACKUP", "0", 1);
   // Set a dummy push URL so the double-buffer accumulates entries.
   // The flush thread will start but fail-fast on this non-routable address.
-  ark_setenv("ARKILIAN_S3_ACCESS_KEY", "test-key", 1);
   ark_setenv("ARKILIAN_S3_ENDPOINT", "http://127.0.0.1:1", 1);
-  ark_setenv("ARKILIAN_S3_BUCKET", "test-bucket", 1);
-  ark_setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
-  ark_setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
-  ark_setenv("ARKILIAN_S3_PREFIX", "test-prefix", 1);
   ark_setenv("ARKILIAN_S3_BUCKET", "test-bucket", 1);
   ark_setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
   ark_setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
@@ -56,7 +51,13 @@ static arkilian *open_test_db(void) {
   return db;
 }
 
-static void cleanup_files(void) { remove(TEST_DB); }
+static void cleanup_files(void) {
+  remove(TEST_DB);
+  remove(TEST_DB "-wal");
+  remove(TEST_DB "-shm");
+  remove(TEST_DB "-journal");
+  remove(TEST_DB ".arklock");
+}
 
 // Verify PRAGMA value via query (returns static buffer)
 static const char *get_pragma(arkilian *db, const char *pragma) {
@@ -690,13 +691,10 @@ static void test_perf_select_1000_reads(void) {
 // ── Main ────────────────────────────────────────────────────────────
 
 int main(void) {
+  cleanup_files();
   ark_setenv("ARKILIAN_ENABLE_BACKUP", "0", 1);
   ark_setenv("ARKILIAN_OUTBOX_DURABLE", "0", 1); // test expects synchronous=NORMAL
   ark_setenv("ARKILIAN_S3_ENDPOINT", "http://127.0.0.1:1", 1);
-  ark_setenv("ARKILIAN_S3_BUCKET", "test-bucket", 1);
-  ark_setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
-  ark_setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
-  ark_setenv("ARKILIAN_S3_PREFIX", "test-prefix", 1);
   ark_setenv("ARKILIAN_S3_BUCKET", "test-bucket", 1);
   ark_setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
   ark_setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);

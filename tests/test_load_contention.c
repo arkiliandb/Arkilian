@@ -31,6 +31,7 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <stdatomic.h>
 
 static int tests_run = 0;
 static int tests_passed = 0;
@@ -50,6 +51,7 @@ static void cleanup(const char *path) {
   snprintf(side, sizeof(side), "%s-wal", path); remove(side);
   snprintf(side, sizeof(side), "%s-shm", path); remove(side);
   snprintf(side, sizeof(side), "%s-journal", path); remove(side);
+  snprintf(side, sizeof(side), "%s.arklock", path); remove(side);
 }
 
 static double now_ms(void) {
@@ -65,8 +67,8 @@ typedef struct {
   int listen_fd;
   int port;
   int delay_ms;
-  volatile int requests;
-  volatile int stop;
+  atomic_int requests;
+  atomic_int stop;
   pthread_t thread;
 } slow_server;
 
@@ -79,27 +81,39 @@ static void *slow_server_run(void *arg) {
     int on = 1;
     setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof(on));
 #endif
-    // Drain request body (bounded; small payloads in tests).
-    char buf[8192];
-    ssize_t n = recv(fd, buf, sizeof(buf) - 1, 0);
-    if (n > 0) {
-      buf[n] = '\0';
+    char buf[16384];
+    size_t got = 0;
+    while (got < sizeof(buf) - 1) {
+      char c;
+      if (recv(fd, &c, 1, 0) != 1) break;
+      buf[got++] = c;
+      if (got >= 4 && memcmp(buf + got - 4, "\r\n\r\n", 4) == 0) break;
+    }
+    buf[got] = '\0';
+    if (atomic_load(&s->stop)) { close(fd); break; }
+
+    if (got > 0) {
+      if (strcasestr(buf, "expect: 100-continue")) {
+        send(fd, "HTTP/1.1 100 Continue\r\n\r\n", 25, 0);
+      }
       long body_len = 0;
-      char *cl = strstr(buf, "Content-Length:");
+      char *cl = strcasestr(buf, "content-length:");
       if (cl) body_len = atol(cl + 15);
       char *hdr_end = strstr(buf, "\r\n\r\n");
-      long have = hdr_end ? n - (hdr_end + 4 - buf) : 0;
+      long have = hdr_end ? (long)(got - (hdr_end + 4 - buf)) : 0;
+      char dummy[8192];
       while (have < body_len) {
-        n = recv(fd, buf, sizeof(buf) - 1, 0);
+        long need = body_len - have;
+        if (need > (long)sizeof(dummy)) need = sizeof(dummy);
+        ssize_t n = recv(fd, dummy, (size_t)need, 0);
         if (n <= 0) break;
         have += n;
       }
+      atomic_fetch_add(&s->requests, 1);
+      if (s->delay_ms > 0) usleep((useconds_t)s->delay_ms * 1000);
+      const char *resp = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK";
+      send(fd, resp, strlen(resp), 0);
     }
-    if (s->stop) { close(fd); break; }
-    s->requests++;
-    if (s->delay_ms > 0) usleep((useconds_t)s->delay_ms * 1000);
-    const char *resp = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK";
-    send(fd, resp, strlen(resp), 0);
     close(fd);
   }
   return NULL;
@@ -127,7 +141,7 @@ static int slow_server_start(slow_server *s, int delay_ms) {
 }
 
 static void slow_server_stop(slow_server *s) {
-  s->stop = 1;
+  atomic_store(&s->stop, 1);
   int fd = socket(AF_INET, SOCK_STREAM, 0);
   if (fd >= 0) {
     struct sockaddr_in addr;

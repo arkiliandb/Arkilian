@@ -13,6 +13,7 @@
 //   cc tests/test_kill_switch.c src/class.c src/deps/sqlite/sqlite3.c -Isrc -Isrc/deps/sqlite -lcurl -lpthread -o test_kill_switch
 
 #include "class.h"
+#include "ark_test_env.h"
 #include <assert.h>
 #include <signal.h>
 #include <stdio.h>
@@ -23,6 +24,7 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <stdatomic.h>
 
 static int tests_run = 0;
 static int tests_passed = 0;
@@ -42,6 +44,7 @@ static void cleanup(const char *path) {
   snprintf(side, sizeof(side), "%s-wal", path); remove(side);
   snprintf(side, sizeof(side), "%s-shm", path); remove(side);
   snprintf(side, sizeof(side), "%s-journal", path); remove(side);
+  snprintf(side, sizeof(side), "%s.arklock", path); remove(side);
 }
 
 // ── Mock HTTP destination ───────────────────────────────────────────
@@ -52,8 +55,8 @@ static void cleanup(const char *path) {
 typedef struct {
   int listen_fd;
   int port;
-  volatile int requests;
-  volatile int stop;
+  atomic_int requests;
+  atomic_int stop;
   pthread_t thread;
 } mock_server;
 
@@ -90,8 +93,8 @@ static void *mock_server_run(void *arg) {
     setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof(on));
 #endif
     drain_request(fd);
-    if (s->stop) { close(fd); break; }
-    s->requests++;
+    if (atomic_load(&s->stop)) { close(fd); break; }
+    atomic_fetch_add(&s->requests, 1);
     const char *resp = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK";
     ssize_t sent = send(fd, resp, strlen(resp), 0);
     (void)sent;
@@ -124,7 +127,7 @@ static int mock_server_start(mock_server *s) {
 }
 
 static void mock_server_stop(mock_server *s) {
-  s->stop = 1;
+  atomic_store(&s->stop, 1);
   // Kick the accept loop with a connect so it observes stop and exits.
   int fd = socket(AF_INET, SOCK_STREAM, 0);
   if (fd >= 0) {

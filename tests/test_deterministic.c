@@ -40,12 +40,7 @@ static int tests_passed = 0;
 
 static arkilian *open_test_db(void) {
   ark_setenv("ARKILIAN_ENABLE_BACKUP", "0", 1);
-  ark_setenv("ARKILIAN_S3_ACCESS_KEY", "test-key", 1);
   ark_setenv("ARKILIAN_S3_ENDPOINT", "http://127.0.0.1:9", 1);
-  ark_setenv("ARKILIAN_S3_BUCKET", "test-bucket", 1);
-  ark_setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
-  ark_setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
-  ark_setenv("ARKILIAN_S3_PREFIX", "test-prefix", 1);
   ark_setenv("ARKILIAN_S3_BUCKET", "test-bucket", 1);
   ark_setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
   ark_setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
@@ -57,7 +52,13 @@ static arkilian *open_test_db(void) {
   return db;
 }
 
-static void cleanup_files(void) { remove(TEST_DB); }
+static void cleanup_files(void) {
+  remove(TEST_DB);
+  remove(TEST_DB "-wal");
+  remove(TEST_DB "-shm");
+  remove(TEST_DB "-journal");
+  remove(TEST_DB ".arklock");
+}
 
 static int str_contains(const char *haystack, const char *needle) {
   return strstr(haystack, needle) != NULL;
@@ -298,6 +299,7 @@ static void test_shipped_sql_can_be_replayed(void) {
 // ── Main ─────────────────────────────────────────────────────────────
 
 int main(void) {
+  cleanup_files();
   printf("\n=== Arkilian Deterministic SQL Expansion Tests ===\n\n");
 
   // Prepare / bind / step / finalize path
@@ -319,6 +321,7 @@ int main(void) {
   RUN_TEST(test_data_integrity_after_expansion);
   RUN_TEST(test_shipped_sql_can_be_replayed);
 
+  cleanup_files();
   printf("\n  %d/%d tests passed\n\n", tests_passed, tests_run);
   return tests_passed == tests_run ? 0 : 1;
 }
