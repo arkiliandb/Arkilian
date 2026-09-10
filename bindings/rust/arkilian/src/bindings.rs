@@ -18,12 +18,6 @@ extern "C" {
     pub fn db_errmsg(db: *mut arkilian) -> *const ::std::os::raw::c_char;
 }
 extern "C" {
-    pub fn db_set_token(
-        db: *mut arkilian,
-        token: *const ::std::os::raw::c_char,
-    ) -> ::std::os::raw::c_int;
-}
-extern "C" {
     pub fn db_exec(db: *mut arkilian, sql: *const ::std::os::raw::c_char) -> ::std::os::raw::c_int;
 }
 extern "C" {
@@ -33,10 +27,7 @@ extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 extern "C" {
-    pub fn db_use_stmt(
-        db: *mut arkilian,
-        index: ::std::os::raw::c_int,
-    ) -> ::std::os::raw::c_int;
+    pub fn db_use_stmt(db: *mut arkilian, index: ::std::os::raw::c_int) -> ::std::os::raw::c_int;
 }
 extern "C" {
     pub fn db_stmt_count(db: *mut arkilian) -> ::std::os::raw::c_int;

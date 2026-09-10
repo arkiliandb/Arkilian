@@ -10,7 +10,6 @@ typedef struct arkilian arkilian;
 int db_init(arkilian **db, const char *connection_url);
 void db_close(arkilian *db);
 const char* db_errmsg(arkilian *db);
-int db_set_token(arkilian *db, const char *token);
 
 int db_exec(arkilian *db, const char *sql);
 int db_prepare(arkilian *db, const char *sql);
@@ -30,26 +29,65 @@ int db_bind_double(arkilian *db, int idx, double val);
 """)
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
-src_dir = os.path.join(this_dir, "..", "..", "..", "build")
 
-lib_name = "libarkilian.dylib" if sys.platform == "darwin" else "libarkilian.so"
-lib_path = os.path.join(src_dir, lib_name)
+if sys.platform == "darwin":
+    lib_names = ["libarkilian.dylib", "libarkilian.1.dylib", "libarkilian.1.0.0.dylib"]
+elif sys.platform == "win32":
+    lib_names = ["arkilian.dll", "libarkilian.dll"]
+else:
+    lib_names = ["libarkilian.so", "libarkilian.so.1", "libarkilian.1.0.0.so"]
 
-if not os.path.exists(lib_path):
-    lib_path = os.path.join(src_dir, "Release", lib_name)
+candidate_paths = []
 
-if not os.path.exists(lib_path):
-    lib_path = os.path.join(src_dir, "Release", "libarkilian.1.0.0.dylib")
+# 1. Explicit env var override
+if "ARKILIAN_LIB_PATH" in os.environ and os.path.exists(os.environ["ARKILIAN_LIB_PATH"]):
+    candidate_paths.append(os.environ["ARKILIAN_LIB_PATH"])
 
-if not os.path.exists(lib_path):
-    lib_path = os.path.join(src_dir, "Release", "libarkilian.1.dylib")
+# 2. Bundled inside package directory (e.g. from binary wheel)
+for name in lib_names:
+    candidate_paths.append(os.path.join(this_dir, name))
+    candidate_paths.append(os.path.join(this_dir, "lib", name))
 
-if not os.path.exists(lib_path):
-    lib_path = os.path.join(src_dir, "Release", "libarkilian.1.0.0.so")
+# 3. Standard build output directories (dev/repo build)
+repo_build_dirs = [
+    os.path.join(this_dir, "..", "..", "..", "build"),
+    os.path.join(this_dir, "..", "..", "..", "build", "Release"),
+    os.path.join(this_dir, "..", "..", "build"),
+    os.path.join(this_dir, "..", "build"),
+]
+for b_dir in repo_build_dirs:
+    for name in lib_names:
+        candidate_paths.append(os.path.join(b_dir, name))
 
-if not os.path.exists(lib_path):
-    raise RuntimeError(f"Library not found at {lib_path}")
+# 4. Standard system search paths
+system_dirs = ["/usr/local/lib", "/usr/lib", "/opt/homebrew/lib", "/lib"]
+for s_dir in system_dirs:
+    for name in lib_names:
+        candidate_paths.append(os.path.join(s_dir, name))
 
-lib = ffi.dlopen(lib_path)
+resolved_path = None
+for p in candidate_paths:
+    if os.path.exists(p):
+        resolved_path = p
+        break
+
+if not resolved_path:
+    # Try system loader lookup as final fallback
+    for name in lib_names:
+        try:
+            lib = ffi.dlopen(name)
+            resolved_path = name
+            break
+        except Exception:
+            pass
+
+if not resolved_path:
+    raise RuntimeError(
+        f"Arkilian shared library not found ({', '.join(lib_names)}). "
+        "Set ARKILIAN_LIB_PATH or compile via 'cmake --build build'."
+    )
+
+if "lib" not in locals():
+    lib = ffi.dlopen(resolved_path)
 
 __all__ = ["ffi", "lib"]

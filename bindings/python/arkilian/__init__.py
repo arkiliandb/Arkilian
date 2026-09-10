@@ -18,9 +18,8 @@ class Arkilian:
             self.set_token(token)
 
     def set_token(self, token):
-        result = lib.db_set_token(self._db[0], token.encode())
-        if result != 0:
-            raise RuntimeError("Failed to set account token")
+        # In Arkilian v2, S3 SigV4 credentials are configured via environment variables.
+        # This method is maintained as a no-op for backward compatibility.
         return self
 
     def close(self):

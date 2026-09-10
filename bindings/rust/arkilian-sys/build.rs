@@ -10,12 +10,16 @@ fn main() {
         .warnings(false) // sqlite3.c has many warnings
         .compile("sqlite3_embedded");
 
-    // 2. Compile class.c (needs _POSIX_C_SOURCE for setenv/strdup)
+    // 2. Compile class.c, hydration.c, and sha256.c
     let mut build = cc::Build::new();
     build
         .file("../../../src/class.c")
+        .file("../../../src/hydration.c")
+        .file("../../../src/sha256.c")
         .include("../../../src")
         .include("../../../src/deps/sqlite")
+        .define("SQLITE_ENABLE_PREUPDATE_HOOK", None)
+        .define("SQLITE_ENABLE_FTS5", None)
         .warnings(false);
 
     // Only define _POSIX_C_SOURCE on Linux (macOS doesn't need it for setenv)
@@ -38,10 +42,16 @@ fn main() {
         println!("cargo:rustc-link-lib=m");
     } else if cfg!(target_os = "macos") {
         println!("cargo:rustc-link-lib=pthread");
+        println!("cargo:rustc-link-lib=framework=CoreFoundation");
+        println!("cargo:rustc-link-lib=framework=Security");
     }
 
     // Rebuild if sources change
     println!("cargo:rerun-if-changed=../../../src/class.c");
     println!("cargo:rerun-if-changed=../../../src/class.h");
+    println!("cargo:rerun-if-changed=../../../src/hydration.c");
+    println!("cargo:rerun-if-changed=../../../src/hydration.h");
+    println!("cargo:rerun-if-changed=../../../src/sha256.c");
+    println!("cargo:rerun-if-changed=../../../src/sha256.h");
     println!("cargo:rerun-if-changed=../../../src/deps/sqlite/sqlite3.c");
 }

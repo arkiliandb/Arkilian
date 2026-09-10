@@ -32,4 +32,4 @@ where = ["."]
 include = ["arkilian*"]
 
 [tool.setuptools.package-data]
-arkilian = ["*.h"]
+arkilian = ["*.h", "*.so*", "*.dylib*", "*.dll"]

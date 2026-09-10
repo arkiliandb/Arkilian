@@ -89,14 +89,11 @@ func (db *DB) Close() error {
 	return nil
 }
 
-// SetToken updates the authentication token used for WAL push / backup.
+// SetToken updates the authentication token.
+// In Arkilian v2, S3 SigV4 credentials are configured via environment variables;
+// this method is maintained as a no-op for backward compatibility.
 func (db *DB) SetToken(token string) error {
-	cToken := C.CString(token)
-	defer C.free(unsafe.Pointer(cToken))
-	rc := C.db_set_token(db.ptr, cToken)
-	if rc != 0 {
-		return fmt.Errorf("arkilian: set_token failed (rc=%d)", rc)
-	}
+	_ = token
 	return nil
 }
 

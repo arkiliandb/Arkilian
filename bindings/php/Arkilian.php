@@ -45,7 +45,6 @@ class Arkilian {
             int db_init(arkilian **db, const char *connection_url);
             void db_close(arkilian *db);
             const char* db_errmsg(arkilian *db);
-            int db_set_token(arkilian *db, const char *token);
             
             int db_exec(arkilian *db, const char *sql);
             int db_prepare(arkilian *db, const char *sql);
@@ -70,10 +69,21 @@ class Arkilian {
     }
 
     private function findLibrary(): string {
+        $envPath = getenv('ARKILIAN_LIB_PATH');
+        if ($envPath !== false && file_exists($envPath)) {
+            return $envPath;
+        }
+
         $paths = [
+            __DIR__ . '/libarkilian.dylib',
+            __DIR__ . '/libarkilian.so',
+            __DIR__ . '/../../build/libarkilian.dylib',
+            __DIR__ . '/../../build/libarkilian.so',
             __DIR__ . '/../../build/Release/libarkilian.dylib',
             __DIR__ . '/../../build/Release/libarkilian.so',
+            '/opt/homebrew/lib/libarkilian.dylib',
             '/usr/local/lib/libarkilian.dylib',
+            '/usr/local/lib/libarkilian.so',
             '/usr/lib/libarkilian.so',
         ];
 
@@ -95,12 +105,8 @@ class Arkilian {
     }
 
     public function setToken(string $token): self {
-        $result = $this->ffi->db_set_token($this->db, $token);
-        
-        if ($result !== SQLITE_OK) {
-            throw new RuntimeException("Failed to set account token");
-        }
-        
+        // In Arkilian v2, S3 SigV4 credentials are configured via environment variables.
+        // Maintained as a no-op for backward compatibility.
         return $this;
     }
 

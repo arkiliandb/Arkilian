@@ -92,3 +92,4 @@ cmake-napi-build/
 **.md
 **.db.**
 **.sqlite.**
+bindings/rust/arkilian-sys/target/*

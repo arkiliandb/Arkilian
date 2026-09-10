@@ -18,7 +18,6 @@ mod bindings {
         pub fn db_init(db: *mut *mut Arkilian, path: *const c_char) -> i32;
         pub fn db_close(db: *mut Arkilian);
         pub fn db_errmsg(db: *mut Arkilian) -> *const c_char;
-        pub fn db_set_token(db: *mut Arkilian, token: *const c_char) -> i32;
         
         pub fn db_exec(db: *mut Arkilian, sql: *const c_char) -> i32;
         pub fn db_prepare(db: *mut Arkilian, sql: *const c_char) -> i32;
@@ -73,12 +72,9 @@ impl Database {
         }
     }
     
-    pub fn set_token(&self, token: &str) -> Result<(), String> {
-        let c_token = CString::new(token).map_err(|_| "Invalid token")?;
-        let result = unsafe { bindings::db_set_token(self.ptr, c_token.as_ptr()) };
-        if result != SQLITE_OK {
-            return Err("Failed to set account token".to_string());
-        }
+    pub fn set_token(&self, _token: &str) -> Result<(), String> {
+        // In Arkilian v2, S3 SigV4 credentials are configured via environment variables.
+        // Maintained as a no-op for backward compatibility.
         Ok(())
     }
     
