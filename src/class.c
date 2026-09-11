@@ -2348,6 +2348,7 @@ static int wal_chunk_flush_to_s3(arkilian *db, wal_chunk *c,
       // replay-safe duplicates (REPLACE/DELETE semantics) that the next
       // flush cycle re-deletes.
     }
+    sqlite3_reset(delete_stmt);
   }
   db->chunk_flushed_upto = c->lsn_end;
   c->last_s3_flush = time(NULL);
