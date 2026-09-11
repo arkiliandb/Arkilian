@@ -2438,13 +2438,15 @@ static int prepare_outbox_statements(sqlite3 *db, sqlite3_stmt **select_stmt,
                                      sqlite3_stmt **attempts_stmt,
                                      sqlite3_stmt **attempts_max_stmt,
                                      sqlite3_stmt **dead_letter_stmt,
-                                     sqlite3_stmt **dlq_delete_stmt) {
+                                     sqlite3_stmt **dlq_delete_stmt,
+                                     sqlite3_stmt **count_stmt) {
   *select_stmt = NULL;
   *delete_stmt = NULL;
   *attempts_stmt = NULL;
   *attempts_max_stmt = NULL;
   *dead_letter_stmt = NULL;
   *dlq_delete_stmt = NULL;
+  *count_stmt = NULL;
 
   if (sqlite3_prepare_v2(db,
         "SELECT id, payload, attempts, COALESCE(last_attempt_at, 0) FROM _pending_backup "
@@ -2472,6 +2474,9 @@ static int prepare_outbox_statements(sqlite3 *db, sqlite3_stmt **select_stmt,
   if (sqlite3_prepare_v2(db,
         "DELETE FROM _pending_backup WHERE id >= ?1 AND id <= ?2",
         -1, dlq_delete_stmt, NULL) != SQLITE_OK) goto fail;
+  if (sqlite3_prepare_v2(db,
+        "SELECT COUNT(*) FROM _pending_backup",
+        -1, count_stmt, NULL) != SQLITE_OK) goto fail;
   return 1;
 
 fail:
@@ -2481,6 +2486,7 @@ fail:
   if (*attempts_max_stmt) { sqlite3_finalize(*attempts_max_stmt); *attempts_max_stmt = NULL; }
   if (*dead_letter_stmt) { sqlite3_finalize(*dead_letter_stmt); *dead_letter_stmt = NULL; }
   if (*dlq_delete_stmt) { sqlite3_finalize(*dlq_delete_stmt); *dlq_delete_stmt = NULL; }
+  if (*count_stmt) { sqlite3_finalize(*count_stmt); *count_stmt = NULL; }
   return 0;
 }
 
@@ -2538,6 +2544,7 @@ void *run_wal_flush(void *arg) {
   sqlite3_stmt *attempts_max_stmt = NULL;
   sqlite3_stmt *dead_letter_stmt = NULL;
   sqlite3_stmt *dlq_delete_stmt = NULL;
+  sqlite3_stmt *count_stmt = NULL;
 
   // Prepare once, reuse via sqlite3_reset — avoids re-parsing SQL every
   // loop. Every prepare below is checked. On failure (e.g. the outbox
@@ -2549,7 +2556,8 @@ void *run_wal_flush(void *arg) {
   while (!ARK_LOAD(&db->shutdown_requested)) {
     if (prepare_outbox_statements(db->backup_db, &select_stmt, &delete_stmt,
                                   &attempts_stmt, &attempts_max_stmt,
-                                  &dead_letter_stmt, &dlq_delete_stmt)) {
+                                  &dead_letter_stmt, &dlq_delete_stmt,
+                                  &count_stmt)) {
       break;
     }
     ark_log(db, ARK_LOG_WARN,
@@ -2624,9 +2632,14 @@ void *run_wal_flush(void *arg) {
     // CDC rows are being dropped and only the hourly snapshot will recover
     // them. Set the sticky flag so monitoring surfaces the gap even after
     // the queue drains (the snapshot thread clears it on successful upload).
-    // One COUNT(*) per poll cycle (~2s) is negligible vs the drain workload.
-    if (db_backup_queue_depth(db) >= outbox_cap()) {
-      ARK_STORE(&db->capture_paused, 1);
+    // Queried on backup_db (spec §3.1) so the flush thread never contends
+    // on the app connection.
+    if (ARK_LOAD(&db->backup_enabled) && count_stmt) {
+      if (sqlite3_step(count_stmt) == SQLITE_ROW &&
+          sqlite3_column_int(count_stmt, 0) >= outbox_cap()) {
+        ARK_STORE(&db->capture_paused, 1);
+      }
+      sqlite3_reset(count_stmt);
     }
 
     if (!drained) {
@@ -2662,6 +2675,7 @@ void *run_wal_flush(void *arg) {
   if (attempts_max_stmt) sqlite3_finalize(attempts_max_stmt);
   if (dead_letter_stmt) sqlite3_finalize(dead_letter_stmt);
   if (dlq_delete_stmt) sqlite3_finalize(dlq_delete_stmt);
+  if (count_stmt) sqlite3_finalize(count_stmt);
 
 #ifdef _WIN32
   return 0;
