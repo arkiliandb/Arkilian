@@ -2336,7 +2336,6 @@ static int wal_chunk_flush_to_s3(arkilian *db, wal_chunk *c,
   }
   db->chunk_flushed_upto = c->lsn_end;
   c->last_s3_flush = time(NULL);
-  ARK_STORE(&db->capture_paused, 0);
   return SHIP_OK;
 }
 
@@ -4752,8 +4751,8 @@ static int manifest_registry_append(arkilian *db, char *s3_key, char *sha256,
 
 // Drop chunk records fully covered by the new baseline snapshot: their
 // rows are already IN the snapshot, so replaying them is redundant.
+// Caller must hold manifest_registry_lock.
 static void manifest_registry_prune_upto(arkilian *db, uint64_t baseline_lsn) {
-  manifest_registry_lock(db);
   int w = 0;
   for (int i = 0; i < db->manifest_chunk_count; i++) {
     ark_manifest_chunk *rec = &db->manifest_chunks[i];
@@ -4765,13 +4764,13 @@ static void manifest_registry_prune_upto(arkilian *db, uint64_t baseline_lsn) {
     }
   }
   db->manifest_chunk_count = w;
-  manifest_registry_unlock(db);
 }
 
 // Rebuild and PUT {prefix}/manifest.json from the in-memory registry.
 // snapshot_key/sha may be NULL to keep the previously recorded baseline.
-// Returns 0 on success. The registry itself is untouched on failure —
-// a later flush or snapshot retries the upload.
+// Returns 0 on success. Manifest publication is the transactional commit
+// point: the registry itself and capture_paused are untouched on failure —
+// preserving full local state so a later flush or snapshot retries safely.
 static int manifest_registry_upload(arkilian *db, const char *snapshot_key,
                                     const char *snapshot_sha,
                                     uint64_t baseline_lsn) {
@@ -4786,46 +4785,55 @@ static int manifest_registry_upload(arkilian *db, const char *snapshot_key,
   if (ARK_LOAD(&db->manifest_seed_resolved) != 1) return -1;
 
   manifest_registry_lock(db);
+
+  char *cand_nk = NULL;
+  char *cand_ns = NULL;
+  const char *use_skey = db->manifest_snapshot_key ? db->manifest_snapshot_key : "";
+  const char *use_ssha = db->manifest_snapshot_sha ? db->manifest_snapshot_sha : "";
+  uint64_t cand_baseline = db->manifest_baseline_lsn;
+
   if (snapshot_key) {
-    char *nk = strdup(snapshot_key);
-    char *ns = snapshot_sha ? strdup(snapshot_sha) : NULL;
-    if (!nk || (snapshot_sha && !ns)) {
-      free(nk); free(ns);
+    cand_nk = strdup(snapshot_key);
+    cand_ns = snapshot_sha ? strdup(snapshot_sha) : NULL;
+    if (!cand_nk || (snapshot_sha && !cand_ns)) {
+      free(cand_nk); free(cand_ns);
       manifest_registry_unlock(db);
       return -1;
     }
-    free(db->manifest_snapshot_key);
-    free(db->manifest_snapshot_sha);
-    db->manifest_snapshot_key = nk;
-    db->manifest_snapshot_sha = ns;
-    db->manifest_baseline_lsn = baseline_lsn;
+    use_skey = cand_nk;
+    use_ssha = cand_ns ? cand_ns : "";
+    cand_baseline = baseline_lsn;
   }
 
   char *json = NULL;
   size_t jlen = 0, jcap = 0;
   char *prefix_json = json_escape_str(db->s3_prefix);
-  char *skey_json = json_escape_str(db->manifest_snapshot_key
-                                        ? db->manifest_snapshot_key : "");
-  char *ssha_json = json_escape_str(db->manifest_snapshot_sha
-                                        ? db->manifest_snapshot_sha : "");
+  char *skey_json = json_escape_str(use_skey);
+  char *ssha_json = json_escape_str(use_ssha);
   int bad = !prefix_json || !skey_json || !ssha_json ||
             jbuf_append(&json, &jlen, &jcap,
                         "{\"version\":3,\"prefix\":\"%s\","
                         "\"snapshot\":{\"s3_key\":\"%s\",\"sha256\":\"%s\","
                         "\"baseline_lsn\":%lld},\"chunks\":[",
                         prefix_json, skey_json, ssha_json,
-                        (long long)db->manifest_baseline_lsn) != 0;
+                        (long long)cand_baseline) != 0;
+  int chunks_written = 0;
   for (int i = 0; !bad && i < db->manifest_chunk_count; i++) {
     ark_manifest_chunk *rec = &db->manifest_chunks[i];
+    if (snapshot_key && rec->lsn_end <= cand_baseline) {
+      // Covered by candidate snapshot baseline: omitted from manifest JSON
+      continue;
+    }
     char *k = json_escape_str(rec->s3_key);
     char *s = json_escape_str(rec->sha256 ? rec->sha256 : "");
     bad = !k || !s ||
           jbuf_append(&json, &jlen, &jcap,
                       "%s{\"s3_key\":\"%s\",\"sha256\":\"%s\","
                       "\"lsn_start\":%llu,\"lsn_end\":%llu}",
-                      i ? "," : "", k, s,
+                      chunks_written ? "," : "", k, s,
                       (unsigned long long)rec->lsn_start,
                       (unsigned long long)rec->lsn_end) != 0;
+    chunks_written++;
     free(k);
     free(s);
   }
@@ -4835,6 +4843,8 @@ static int manifest_registry_upload(arkilian *db, const char *snapshot_key,
   if (!bad) bad = jbuf_append(&json, &jlen, &jcap, "]}") != 0;
   if (bad) {
     free(json);
+    free(cand_nk);
+    free(cand_ns);
     manifest_registry_unlock(db);
     return -1;
   }
@@ -4846,6 +4856,8 @@ static int manifest_registry_upload(arkilian *db, const char *snapshot_key,
                                 tmp_path, sizeof(tmp_path));
   if (!f) {
     free(json);
+    free(cand_nk);
+    free(cand_ns);
     manifest_registry_unlock(db);
     return -1;
   }
@@ -4853,6 +4865,8 @@ static int manifest_registry_upload(arkilian *db, const char *snapshot_key,
   fclose(f);
   if (wrote != jlen) {
     free(json);
+    free(cand_nk);
+    free(cand_ns);
     unlink(tmp_path);
     manifest_registry_unlock(db);
     return -1;
@@ -4871,6 +4885,8 @@ static int manifest_registry_upload(arkilian *db, const char *snapshot_key,
             "ARKILIAN_MANIFEST_HMAC_KEY not configured — refusing to publish "
             "unauthenticated manifest (no legacy)");
     free(json);
+    free(cand_nk);
+    free(cand_ns);
     manifest_registry_unlock(db);
     return -1;
   }
@@ -4885,6 +4901,8 @@ static int manifest_registry_upload(arkilian *db, const char *snapshot_key,
       if (sf) fclose(sf);
       unlink(sig_path);
       free(json);
+      free(cand_nk);
+      free(cand_ns);
       manifest_registry_unlock(db);
       ark_log(db, ARK_LOG_ERROR,
               "manifest.sig staging failed — refusing to publish an "
@@ -4901,6 +4919,8 @@ static int manifest_registry_upload(arkilian *db, const char *snapshot_key,
   char *put_url = s3_presign_put(db, manifest_key, 600L);
   if (!put_url) {
     free(json);
+    free(cand_nk);
+    free(cand_ns);
     unlink(tmp_path);
     if (have_sig) unlink(sig_path);
     manifest_registry_unlock(db);
@@ -4923,6 +4943,8 @@ static int manifest_registry_upload(arkilian *db, const char *snapshot_key,
               "refuse manifest.json until the signature publish succeeds");
       free(sig_url);
       free(json);
+      free(cand_nk);
+      free(cand_ns);
       unlink(sig_path);
       manifest_registry_unlock(db);
       return -1;
@@ -4933,14 +4955,26 @@ static int manifest_registry_upload(arkilian *db, const char *snapshot_key,
   free(json);
 
   if (rc == 0) {
+    // ── COMMIT POINT ──
+    // Both manifest.json and manifest.sig are durably published.
+    // Atomically commit candidate snapshot metadata and prune covered chunks.
+    if (snapshot_key) {
+      free(db->manifest_snapshot_key);
+      free(db->manifest_snapshot_sha);
+      db->manifest_snapshot_key = cand_nk;
+      db->manifest_snapshot_sha = cand_ns;
+      db->manifest_baseline_lsn = cand_baseline;
+      cand_nk = cand_ns = NULL; // ownership transferred
+      manifest_registry_prune_upto(db, cand_baseline);
+      // Both snapshot object and manifest baseline published successfully.
+      // The new baseline covers the capture gap: clear sticky gap flag.
+      ARK_STORE(&db->capture_paused, 0);
+    }
     db->manifest_pending = 0;
     db->manifest_last_upload = time(NULL);
-    // The manifest (and its signature) are durable: chunk records it
-    // names are now reachable by hydration. Outbox rows for those chunks
-    // were already deleted on flush ack (delete-on-flush-ack); any chunk
-    // PUT in the batching window but not yet named here is re-covered by
-    // the next hourly snapshot baseline, so nothing accumulates.
   }
+  free(cand_nk);
+  free(cand_ns);
   manifest_registry_unlock(db);
   return rc;
 }
@@ -5128,12 +5162,12 @@ int arkilian_run_snapshot_cycle(arkilian *db) {
       free(upload_url);
     } else {
       free(upload_url);
-      ARK_STORE(&db->capture_paused, 0);
-      // Baseline + prune + publish: everything up to the PRE-COPY
-      // watermark is inside this snapshot, so its chunk records leave
-      // the registry. Chunks registered during the copy stay.
+      // Baseline + prune + publish: manifest publication is the commit point.
+      // On success, manifest_registry_upload commits the in-memory registry,
+      // prunes chunks covered by snapshot_upto, and clears capture_paused.
+      // On failure, the in-memory registry and capture_paused remain untouched
+      // so the gap stays asserted and the publish can be retried safely.
       if (snap_sha256[0]) {
-        manifest_registry_prune_upto(db, snapshot_upto);
         if (manifest_registry_upload(db, s3_key, snap_sha256,
                                      snapshot_upto) != 0) {
           // Loud, every occurrence: a failed publish means remote

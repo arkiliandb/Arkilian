@@ -53,6 +53,7 @@ static atomic_int g_stub_requests_total = 0;
 static atomic_int g_stub_status_override = 0; // e.g. 503 SlowDown, 500 InternalError (all methods)
 static atomic_int g_stub_status_override_put = 0; // overrides PUT only
 static atomic_int g_stub_status_override_get = 0; // overrides GET only
+static atomic_int g_stub_status_override_manifest = 0; // overrides PUT of manifest.json / manifest.sig
 static atomic_int g_stub_delay_ms = 0;
 static atomic_int g_stub_drop_connection = 0;
 static atomic_int g_stub_require_presign = 0;
@@ -146,6 +147,7 @@ static inline void stub_reset(void) {
   atomic_store(&g_stub_status_override, 0);
   atomic_store(&g_stub_status_override_put, 0);
   atomic_store(&g_stub_status_override_get, 0);
+  atomic_store(&g_stub_status_override_manifest, 0);
   atomic_store(&g_stub_delay_ms, 0);
   atomic_store(&g_stub_drop_connection, 0);
   atomic_store(&g_stub_require_presign, 0);
@@ -161,6 +163,10 @@ static inline void stub_set_status_override_put(int status_code) {
 
 static inline void stub_set_status_override_get(int status_code) {
   atomic_store(&g_stub_status_override_get, status_code);
+}
+
+static inline void stub_set_status_override_manifest(int status_code) {
+  atomic_store(&g_stub_status_override_manifest, status_code);
 }
 
 static inline void stub_set_delay_ms(int ms) {
@@ -259,8 +265,14 @@ static inline void stub_handle(int fd) {
   // Check fault injection / status override
   int override_status = atomic_load(&g_stub_status_override);
   if (override_status <= 0) {
-    if (strcmp(method, "PUT") == 0) override_status = atomic_load(&g_stub_status_override_put);
-    else if (strcmp(method, "GET") == 0) override_status = atomic_load(&g_stub_status_override_get);
+    if (atomic_load(&g_stub_status_override_manifest) > 0 &&
+        (strstr(key, "manifest.json") != NULL || strstr(key, "manifest.sig") != NULL)) {
+      override_status = atomic_load(&g_stub_status_override_manifest);
+    } else if (strcmp(method, "PUT") == 0) {
+      override_status = atomic_load(&g_stub_status_override_put);
+    } else if (strcmp(method, "GET") == 0) {
+      override_status = atomic_load(&g_stub_status_override_get);
+    }
   }
   if (override_status > 0) {
     const char *code_str = override_status == 503 ? "SlowDown" :
