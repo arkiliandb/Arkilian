@@ -471,8 +471,8 @@ ctest --test-dir build-asan --output-on-failure
 
 ## Contributing
 
-Please review [CONTRIBUTING.md](file:///Users/friday/Desktop/opensource/birth-of-Arkilian/CONTRIBUTING.md) for contribution guidelines, coding standards, and verification requirements.
+Please review [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidelines, coding standards, and verification requirements.
 
 ## License
 
-Arkilian is licensed under the [MIT License](file:///Users/friday/Desktop/opensource/birth-of-Arkilian/LICENSE).
+Arkilian is licensed under the [MIT License](LICENSE).
