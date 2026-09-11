@@ -32,7 +32,7 @@
 #define STUB_MAX_OBJECTS 1024
 
 typedef struct {
-  char   key[512];
+  char   key[1024];
   char  *data;
   size_t len;
 } stub_object;
@@ -290,12 +290,12 @@ static inline void stub_handle(int fd) {
     const char *msg_str = override_status == 503 ? "Please reduce your request rate." :
                           override_status == 500 ? "We encountered an internal error." :
                           override_status == 403 ? "Access Denied." : "An error occurred.";
-    char err_body[512];
+    char err_body[2048];
     snprintf(err_body, sizeof(err_body),
              "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
-             "<Error><Code>%s</Code><Message>%s</Message><Key>%s</Key></Error>\n",
+             "<Error><Code>%s</Code><Message>%s</Message><Key>%.512s</Key></Error>\n",
              code_str, msg_str, key);
-    char resp[1024];
+    char resp[4096];
     snprintf(resp, sizeof(resp),
              "HTTP/1.1 %d %s\r\n"
              "Content-Type: application/xml\r\n"

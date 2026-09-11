@@ -16,7 +16,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#include <windows.h>
+#define sleep(s) Sleep((s)*1000)
+#define usleep(us) Sleep((us)/1000)
+#else
 #include <unistd.h>
+#endif
 
 static int tests_run = 0, tests_passed = 0;
 #define RUN_TEST(fn) do { \
