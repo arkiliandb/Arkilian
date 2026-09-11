@@ -1,182 +1,71 @@
-<br/>
-<h1 align="center">Arkilian</h1>  
-<p align="center">
-  <a href="https://github.com/arkiliandb/Arkilian">
-    <img src="https://avatars.githubusercontent.com/u/261335565?s=88&v=4" alt="Arkilian Database"   
-    >
-  </a>
-</p>
+# Arkilian Rust Bindings
 
-[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/arkiliandb/Arkilian/blob/next/contributing.md)
-![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
-[![Stargazers](https://img.shields.io/github/stars/arkiliandb/Arkilian?style=social)](https://github.com/arkiliandb/Arkilian)
+Safe, idiomatic Rust abstractions on top of the Arkilian managed SQLite database engine (`arkilian-sys`).
 
+## Features
 
-# Arkilian
+- **Automated S3 Replication:** Point-in-time full snapshots and real-time CDC SQL chunk streaming directly to S3-compatible storage.
+- **Fail-Safe Isolation:** CDC capture never blocks or fails application transactions.
+- **Idiomatic Rust API:** Safe statements, parameter bindings, transactions, and row iteration.
+- **Deep Telemetry:** Query outbox queue depth, flush and snapshot thread heartbeats, and 32-bit health bitmasks (`ARK_HF_*`).
+- **Cold S3 Hydration:** Restore a database from S3 before opening with full HMAC manifest verification and SHA-256 digest checks.
 
+## Installation
 
-Arkilian is a managed embedded databas that wraps SQLite and is written in C, designed to extend SQLite with  automated cloud backup functionality and horizontal scaling (in the coming updates).
+Add `arkilian` to your `Cargo.toml`:
 
-### Key Features
-* **Simplified SQLite Binding:** Exposes fundamental SQLite session management alongside fully permissive raw handle extraction.
-* **Background Data Protection:** Features an integrated background thread that continuously executes unblocking online snapshots and securely replicates the database to AWS S3 using presigned URLs. 
-* **Cross-platform CMake Integration:** Configured to compile seamlessly across macOS, Linux, and Windows.
-* **Multi-language Support:** Build as shared library for Node.js/Python FFI or static library for embedded C/C++ applications.
-* **Environment-based Configuration:** All settings configurable via `ARKILIAN_` prefixed environment variables.
-
-## Getting Started
-
-### Prerequisites
-* A C99 compliant compiler (GCC, Clang, or MSVC)
-* CMake 3.10 or higher
-* `libcurl` (e.g., `libcurl4-openssl-dev` on Debian/Ubuntu, or native via Xcode SDK on macOS)
-* A POSIX environment or compatibility layer (for Windows)
-
-### Build Instructions
-
-You can build the library using CMake. Both static and shared libraries are built by default.
-
-```bash
-# Clone the repository
-git clone https://github.com/arkiliandb/Arkilian.git
-cd birth-of-Arkilian
-
-# Generate build files
-cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
-
-# Compile the target
-cmake --build build --config Release
-
-# Install to system (optional)
-sudo cmake --install build
+```toml
+[dependencies]
+arkilian = { path = "bindings/rust/arkilian" }
 ```
 
-### Configuration
+## Quick Start
 
-Arkilian uses environment variables with the `ARKILIAN_` prefix for configuration
-(read from the environment or a `./.env` file — real environment variables always
-win over `.env` values). Endpoint variables default to empty; nothing phones home
-unless explicitly configured.
+```rust
+use arkilian::Database;
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `ARKILIAN_DB_PATH` | `app.sqlite` | Path to the SQLite database file |
-| `ARKILIAN_BACKUP_PATH` | `backup.sqlite` | Local path for hourly snapshot copies |
-| `ARKILIAN_BACKUP_INTERVAL` | `3600` | Hourly snapshot interval in seconds (min 1) |
-| `ARKILIAN_WAL_PUSH_URL` | (none) | Realtime destination for row changes (e.g. control plane `POST /v1/wal/push`) |
-| `ARKILIAN_SIGNED_URL_ENDPOINT` | (none) | Signed-URL issuer for hourly snapshot uploads (e.g. control plane `POST /v1/upload/request`). Independent of `ARKILIAN_WAL_PUSH_URL` |
-| `ARKILIAN_DATABASE_TOKEN` | (none) | Bearer token sent with both endpoints |
-| `ARKILIAN_ENABLE_BACKUP` | `1` | `0`/`false` disables outbound backup at startup |
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Open database (loads ARKILIAN_* environment variables or .env)
+    let mut db = Database::new("app.sqlite")?;
 
-Example `.env` file:
-```
-ARKILIAN_DB_PATH=myapp.db
-ARKILIAN_BACKUP_PATH=/backups/myapp-backup.db
-ARKILIAN_BACKUP_INTERVAL=7200
-ARKILIAN_WAL_PUSH_URL=https://api.example.com/v1/wal/push
-ARKILIAN_SIGNED_URL_ENDPOINT=https://api.example.com/v1/upload/request
-ARKILIAN_DATABASE_TOKEN=ak_...
-ARKILIAN_ENABLE_BACKUP=1
-```
+    // Execute DDL (automatically installs CDC capture triggers)
+    db.exec("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, name TEXT, age INT)")?;
 
-### Build Options
+    // Parameterized inserts
+    db.run(
+        "INSERT INTO users (name, age) VALUES (?, ?)",
+        &[&"Alice" as &dyn arkilian::ToSql, &30_i32],
+    )?;
 
-| Option | Default | Description |
-|--------|---------|-------------|
-| `ARKILIAN_BUILD_SHARED` | `ON` | Build shared library for FFI (Node.js/Python) |
-| `ARKILIAN_BUILD_STATIC` | `ON` | Build static library for embedded use |
-| `ARKILIAN_BUILD_EXAMPLES` | `ON` | Build example programs |
-| `ARKILIAN_BUILD_TESTS` | `OFF` | Build test programs |
-
-## Usage Examples
-
-### C/C++ Static Linking
-
-```c
-#include "class.h"
-#include <stdio.h>
-#include <sqlite3.h>
-
-int main(void) {
-    arkilian *db = NULL;
-    
-    // Initialize Arkilian database context
-    if (db_init(&db, "app.sqlite") != 0) {
-        fprintf(stderr, "Initialization failed: %s\n", 
-                db ? db_errmsg(db) : "Memory allocation error");
-        if (db) db_close(db);
-        return 1;
+    // Query rows
+    let rows = db.all("SELECT id, name, age FROM users", &[])?;
+    for row in rows {
+        println!("User: {:?}", row);
     }
 
-    // Extract the raw sqlite3 handle to execute arbitrary statements
-    sqlite3 *raw_db = db_get_handle(db);
-    int rc = sqlite3_exec(raw_db, "CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, name TEXT);", 0, 0, NULL);
-    
-    if (rc != SQLITE_OK) {
-        fprintf(stderr, "SQL Execution failed: %s\n", db_errmsg(db));
-    }
+    // Health diagnostics
+    println!("Healthy: {}", db.backup_is_healthy());
+    println!("Queue depth: {}", db.backup_queue_depth());
 
-    // Release resources gracefully
-    db_close(db);
-    return 0;
+    Ok(())
 }
 ```
 
-Compile with static library:
-```bash
-gcc -I/usr/local/include/arkilian -L/usr/local/lib -larkilian myapp.c -o myapp
-```
+## Configuration
 
-### Node.js FFI (using node-ffi or similar)
+Arkilian reads its configuration from the process environment or a local `.env` file:
 
-The shared library (`libarkilian.so`/`libarkilian.dylib`/`arkilian.dll`) exports C functions that can be called from Node.js using FFI libraries like `ffi-napi` or `koffi`.
-
-### Python FFI (using ctypes)
-
-```python
-import ctypes
-import os
-
-# Load the shared library
-if os.name == 'nt':  # Windows
-    arkilian = ctypes.CDLL('./libarkilian.dll')
-else:  # Unix-like
-    arkilian = ctypes.CDLL('./libarkilian.so')
-
-# Define function signatures
-arkilian.db_init.restype = ctypes.c_int
-arkilian.db_init.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_char_p]
-
-# Use the library
-db = ctypes.c_void_p()
-ret = arkilian.db_init(ctypes.byref(db), b"app.sqlite")
-```
-
-## NPM Package
-
-For Node.js projects, you can install via npm:
-
-```bash
-npm install arkilian
-```
-
-The package will attempt to download prebuilt binaries for your platform. If no prebuilt binary is available, it will fall back to building from source using cmake-js.
-
-## System Constraints and Design Choices
-Unlike complex distributed SQLite systems (e.g., LiteFS or rqlite), Arkilian embraces single-writer architectures partitioned by micro-datasets. It purposefully avoids:
-* Virtual File System (VFS) complexities.
-* Multi-writer coordination overhead and distributed consensus mechanisms.
-
-## Running Tests
-
-```bash
-cmake -B build -S . -DCMAKE_BUILD_TYPE=Debug -DARKILIAN_BUILD_TESTS=ON
-cmake --build build --config Debug
-./build/test_basic
-```
-
-## Contributing
-Please see `CONTRIBUTING.md` for details on submitting patches and the contribution workflow.
+- `ARKILIAN_DB_PATH`: Local database path (default: `app.sqlite`)
+- `ARKILIAN_S3_ENDPOINT`: S3-compatible endpoint URL (e.g. `https://s3.amazonaws.com`)
+- `ARKILIAN_S3_BUCKET`: Target bucket name
+- `ARKILIAN_S3_REGION`: SigV4 signing region (default: `us-east-1`)
+- `ARKILIAN_S3_ACCESS_KEY`: SigV4 access key ID
+- `ARKILIAN_S3_SECRET_KEY`: SigV4 secret access key
+- `ARKILIAN_S3_PREFIX`: Object key prefix (default: `db_default`)
+- `ARKILIAN_MANIFEST_HMAC_KEY`: Secret HMAC key for manifest authenticity (REQUIRED for publishing and hydration)
+- `ARKILIAN_OUTBOX_DURABLE`: `1` (default) for `PRAGMA synchronous=FULL;`, `0` for `NORMAL`
+- `ARKILIAN_ENABLE_BACKUP`: `1` (default) enables background streaming
 
 ## License
-Arkilian is licensed under the MIT License. See the `LICENSE` file for details.
+
+Licensed under the MIT License.
