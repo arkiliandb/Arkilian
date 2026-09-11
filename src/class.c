@@ -2343,10 +2343,21 @@ static int wal_chunk_flush_to_s3(arkilian *db, wal_chunk *c,
   // 6. Durability ack: the chunk object is durable AND registered — delete
   // the covered outbox rows and advance the flush watermark.
   if (delete_stmt) {
-    sqlite3_reset(delete_stmt);
-    sqlite3_clear_bindings(delete_stmt);
-    sqlite3_bind_int64(delete_stmt, 1, (sqlite3_int64)c->lsn_end);
-    if (sqlite3_step(delete_stmt) != SQLITE_DONE) {
+    int del_rc = SQLITE_BUSY;
+    for (int retry = 0; retry < 50; retry++) {
+      sqlite3_reset(delete_stmt);
+      sqlite3_clear_bindings(delete_stmt);
+      sqlite3_bind_int64(delete_stmt, 1, (sqlite3_int64)c->lsn_end);
+      del_rc = sqlite3_step(delete_stmt);
+      if (del_rc == SQLITE_DONE) break;
+      if (del_rc != SQLITE_BUSY && del_rc != SQLITE_LOCKED) break;
+#ifdef _WIN32
+      Sleep(20);
+#else
+      usleep(20000);
+#endif
+    }
+    if (del_rc != SQLITE_DONE) {
       ark_log(db, ARK_LOG_ERROR,
               "outbox delete after chunk flush failed: %s",
               sqlite3_errmsg(db->backup_db));
