@@ -14,17 +14,17 @@
 
 # Arkilian
 
+Arkilian is a managed embedded database engine that wraps SQLite in C, extending it with automated, real-time CDC chunk streaming to S3-compatible object storage and periodic full snapshot backups.
 
-Arkilian is a managed embedded database that wraps SQLite and is written in C, designed to extend SQLite with automated cloud backup functionality and horizontal scaling (in the coming updates).
-
-> **Recent Improvements:** Full 1:1 API parity across Node.js, Python, Go, Rust, and PHP bindings with deep health monitoring, cold S3 hydration, and a 1:1 REST-compliant S3 mock engine for reliable, zero-noise testing.
+> **Key Capabilities:** Continuous row-level CDC shipping, hourly consistent snapshots via `backup.sqlite`, cold-start S3 hydration with SHA-256 verification and mandatory HMAC manifest authenticity, deep multi-flag health telemetry, and native bindings across Node.js, Python, Go, Rust, and PHP.
 
 ### Key Features
-* **Simplified SQLite Binding:** Exposes fundamental SQLite session management alongside fully permissive raw handle extraction.
-* **Background Data Protection:** Features two integrated background threads — a flush thread that continuously ships row-level changes to a push endpoint, and a snapshot thread that uploads full hourly backups to S3 via presigned URLs.
-* **Cross-platform:** Compiles natively on macOS, Linux, and Windows (MSVC and MinGW) without a POSIX compatibility layer.
-* **Multi-language Support:** Complete 1:1 feature parity across Node.js, Python, Go, Rust, and PHP (FFI, N-API, cgo, bindgen) with typed bindings, cold S3 hydration, and deep health diagnostics.
-* **Environment-based Configuration:** All settings configurable via `ARKILIAN_` prefixed environment variables.
+* **Simplified SQLite Binding:** Exposes SQLite session and statement management alongside direct raw handle extraction (`db_get_handle`).
+* **Direct-to-S3 Data Protection:** Two integrated background threads — a flush thread that packages row-level CDC writes into content-addressed, SHA-256-verified SQL chunks uploaded via AWS SigV4 presigned PUTs, and a snapshot thread that produces point-in-time full database backups.
+* **Deterministic Manifest Protocol:** Manages a versioned, atomic manifest registry (`manifest.json` and HMAC-SHA256 `manifest.sig`) on S3 to guarantee restore ordering, zero capture gap leakage, and tamper resistance.
+* **Cross-platform:** Native C99 compiling on macOS, Linux, and Windows (MSVC and MinGW).
+* **Multi-language Support:** Complete feature parity across Node.js (N-API with prebuilt binaries), Python (ctypes), Go (cgo), Rust, and PHP with cold S3 hydration and deep health monitoring.
+* **Environment-based Configuration:** All settings configurable via `ARKILIAN_` prefixed environment variables or a local `.env` file.
 
 ## Getting Started
 
@@ -55,39 +55,47 @@ sudo cmake --install build
 ### Configuration
 
 Arkilian uses environment variables with the `ARKILIAN_` prefix for configuration
-(read from the environment or a `./.env` file in the working directory — real
-environment variables always win over `.env` values). Both endpoint variables
-default to empty; nothing phones home unless explicitly configured.
+(read from the process environment or a `./.env` file in the working directory; real
+environment variables always take precedence over `.env` values). The S3 endpoint
+defaults to empty; nothing ships or phones home unless explicitly configured.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `ARKILIAN_DB_PATH` | `app.sqlite` | Path to the SQLite database file |
-| `ARKILIAN_BACKUP_PATH` | `backup.sqlite` | Local path for hourly snapshot copies |
-| `ARKILIAN_BACKUP_INTERVAL` | `3600` | Hourly snapshot interval in seconds (min 1) |
-| `ARKILIAN_S3_ENDPOINT` | (none) | Base URL of the S3-compatible endpoint (path-style addressing, e.g. `https://s3.amazonaws.com` or `https://minio.internal:9000`). No default — nothing ships until it is configured |
-| `ARKILIAN_S3_BUCKET` | (none) | Bucket holding the `backup.sqlite` snapshot, `chunks/…`, and `manifest.json` objects |
-| `ARKILIAN_S3_REGION` | `us-east-1` | Signature region used in AWS SigV4 request signing |
-| `ARKILIAN_S3_ACCESS_KEY` | (none) | SigV4 access key — requests are signed locally |
-| `ARKILIAN_S3_SECRET_KEY` | (none) | SigV4 secret key — used only for local signing, never transmitted |
-| `ARKILIAN_S3_PREFIX` | `db_default` | Per-database key prefix (e.g. `user-42-appdb`) — isolates tenants in a shared bucket |
-| `ARKILIAN_ENABLE_BACKUP` | `1` | `0`/`false` disables outbound backup at startup; can be toggled at runtime with `db_backup_set_enabled()` |
-| `ARKILIAN_MAX_QUEUE_DEPTH` | `100000` | Soft ceiling on `_pending_backup` rows. Once the queue reaches this depth the capture triggers pause INSERTs into the outbox (the application's own writes are unaffected, per the spec §0 "backup must never break the application" rule), and `db_backup_is_healthy()` flips to 0 so the loss of capture is visible via monitoring. Shipping drains the queue and capture resumes automatically when the depth drops back below the cap |
-| `ARKILIAN_MANIFEST_HMAC_KEY` | *(empty)* | Optional HMAC-SHA-256 key for **manifest authenticity**. When set, every published `manifest.json` is accompanied by `{prefix}/manifest.sig` (HMAC over the exact manifest bytes), and hydrators/seeds configured with the same key **refuse** manifests that are missing or fail signature verification (fail-closed — the object store is no longer trusted as the root of the restore protocol). The key must live OUTSIDE the storage it protects: set it as a real environment variable (the shipper also accepts a `./.env` value; the hydration path reads the process environment). Without a key, unsigned manifests are accepted as before (legacy buckets) |
-| `ARKILIAN_ALLOW_INSECURE` | `0` | Opt-in for cleartext `http://` endpoints that are NOT loopback / RFC1918 (e.g. an internal S3-compatible endpoint). Default `0`: a non-HTTPS non-local endpoint is refused at startup and backup is disabled, so a misconfiguration cannot leak request signatures in cleartext. Loopback (`127.x`, `::1`, `localhost`) and RFC1918 / link-local / ULA addresses are always permitted for dev without opt-in |
-| `ARKILIAN_STORAGE_HOSTS` | (none) | Comma-separated suffix-allowlist of self-hosted storage hosts (e.g. `minio.internal.corp,s3.example.com`). The SSRF guard refuses to upload a snapshot or download a hydration chunk to/from a host that is not a well-known storage provider (AWS S3, GCS, Azure Blob, Backblaze B2, Cloudflare R2, Wasabi, DigitalOcean Spaces), a loopback / RFC1918 address, or in this allowlist. Prevents a tampered manifest or compromised storage configuration from exfiltrating the database to cloud metadata or an internal service |
+| `ARKILIAN_DB_PATH` | `app.sqlite` | Path to the primary SQLite database file |
+| `ARKILIAN_BACKUP_PATH` | `backup.sqlite` | Local path for point-in-time snapshot copies |
+| `ARKILIAN_BACKUP_INTERVAL` | `3600` | Snapshot backup interval in seconds (min 1) |
+| `ARKILIAN_CHUNK_INTERVAL_SEC` | `1` | Cadence in seconds for shipping pending outbox CDC rows to S3 chunks |
+| `ARKILIAN_MANIFEST_INTERVAL_SEC` | `30` | Minimum interval in seconds between manifest publishing to avoid excessive metadata PUTs |
+| `ARKILIAN_S3_ENDPOINT` | (none) | Base URL of the S3-compatible endpoint (path-style addressing, e.g. `https://s3.amazonaws.com` or `https://minio.internal:9000`). When unset, shipping is disabled |
+| `ARKILIAN_S3_BUCKET` | (none) | Destination bucket holding `backup.sqlite`, `chunks/…`, and `manifest.json` |
+| `ARKILIAN_S3_REGION` | `us-east-1` | AWS SigV4 request signing region |
+| `ARKILIAN_S3_ACCESS_KEY` | (none) | SigV4 access key (used exclusively for local signing) |
+| `ARKILIAN_S3_SECRET_KEY` | (none) | SigV4 secret key (used exclusively for local signing, never transmitted) |
+| `ARKILIAN_S3_PREFIX` | `db_default` | Key prefix (e.g. `tenant-42-db`) isolating tenants within a shared bucket |
+| `ARKILIAN_ENABLE_BACKUP` | `1` | `0`/`false` disables outbound shipping at startup; togglable at runtime via `db_backup_set_enabled()` |
+| `ARKILIAN_OUTBOX_DURABLE` | `1` | `1` sets `PRAGMA synchronous=FULL;` on the application connection ensuring outbox CDC rows are durable at commit with zero loss on power failure. Set `0` (`PRAGMA synchronous=NORMAL;`) to prioritize high write throughput |
+| `ARKILIAN_MAX_QUEUE_DEPTH` | `100000` | Soft ceiling on `_pending_backup` rows. If the queue reaches this limit, capture triggers pause inserts into the outbox so the application's own writes continue uninterrupted (spec §0 rule). Surfaces via `db_backup_capture_paused()` and clears on next successful snapshot |
+| `ARKILIAN_MAX_ATTEMPTS` | `100` | Maximum upload retries for an outbox chunk before poison rows are dead-lettered to `_dead_backup` (inspectable via `arkilian-dlq`) |
+| `ARKILIAN_MANIFEST_HMAC_KEY` | *(empty)* | HMAC-SHA-256 secret key for **manifest authenticity**. REQUIRED for publishing and S3 hydration: manifests are accompanied by `{prefix}/manifest.sig`. Hydration enforces fail-closed verification (unauthenticated or mismatched manifests are strictly refused) |
+| `ARKILIAN_ALLOW_INSECURE` | `0` | Opt-in for cleartext `http://` endpoints that are NOT loopback / RFC1918. Default `0` refuses cleartext remote endpoints at startup to prevent leaking signatures |
+| `ARKILIAN_STORAGE_HOSTS` | (none) | Comma-separated allowlist of custom storage hostnames (e.g. `minio.corp.internal,s3.example.com`). Prevents SSRF attacks to cloud metadata or internal networks |
 
 Example `.env` file:
 ```
 ARKILIAN_DB_PATH=myapp.db
 ARKILIAN_BACKUP_PATH=/backups/myapp-backup.db
 ARKILIAN_BACKUP_INTERVAL=7200
+ARKILIAN_CHUNK_INTERVAL_SEC=1
+ARKILIAN_MANIFEST_INTERVAL_SEC=30
 ARKILIAN_S3_ENDPOINT=https://s3.amazonaws.com
 ARKILIAN_S3_BUCKET=myapp-backups
 ARKILIAN_S3_REGION=us-east-1
 ARKILIAN_S3_ACCESS_KEY=AKIA...
 ARKILIAN_S3_SECRET_KEY=...
 ARKILIAN_S3_PREFIX=myapp
+ARKILIAN_MANIFEST_HMAC_KEY=your-32-byte-secret-hmac-key
 ARKILIAN_ENABLE_BACKUP=1
+ARKILIAN_OUTBOX_DURABLE=1
 ```
 
 ### Build Options
@@ -110,25 +118,25 @@ ARKILIAN_ENABLE_BACKUP=1
 int main(void) {
     arkilian *db = NULL;
     
-    // Initialize Arkilian database context
+    // Initialize Arkilian database context (loads config from env / .env)
     if (db_init(&db, "app.sqlite") != 0) {
         fprintf(stderr, "Initialization failed: %s\n", 
-                db ? db_errmsg(db) : "Memory allocation error");
+                db ? db_errmsg(db) : "Allocation error");
         if (db) db_close(db);
         return 1;
     }
 
-    // Execute SQL directly through the wrapper
+    // Execute SQL with automated CDC trigger wiring
     int rc = db_exec(db, "CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, name TEXT);");
-    
     if (rc != SQLITE_OK) {
         fprintf(stderr, "SQL Execution failed: %s\n", db_errmsg(db));
     }
 
-    // Or extract the raw sqlite3 handle for direct SQLite API access
+    // Direct raw handle extraction for third-party libraries / raw SQLite APIs
     sqlite3 *raw_db = db_get_handle(db);
-    // Note: DDL via the raw handle bypasses capture triggers.
-    // Call db_resync_triggers(db) afterwards to re-sync them.
+    (void)raw_db;
+    // Note: DDL executed directly on raw_db sets db_backup_triggers_dirty(db).
+    // Call db_resync_triggers(db) or enable db_set_auto_resync_triggers(db, 1).
 
     // Release resources gracefully
     db_close(db);
@@ -152,26 +160,38 @@ npm install arkilian
 ```js
 import Arkilian from 'arkilian';
 
-const db = new Arkilian('your-api-key', 'app.sqlite');
+// Optional: Cold-start restore from S3 before opening the database
+// Requires ARKILIAN_MANIFEST_HMAC_KEY configured in environment.
+/*
+Arkilian.hydrateS3('app.sqlite', {
+  endpoint: 'https://s3.amazonaws.com',
+  bucket: 'myapp-backups',
+  region: 'us-east-1',
+  accessKey: process.env.ARKILIAN_S3_ACCESS_KEY,
+  secretKey: process.env.ARKILIAN_S3_SECRET_KEY,
+  prefix: 'myapp',
+});
+*/
+
+// Initialize database instance
+const db = new Arkilian('app.sqlite');
 
 // Execute SQL
 db.exec('CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, name TEXT)');
 
-// Prepared statements
+// Prepared statements with binding
 db.prepare('INSERT INTO users (name) VALUES (?)');
 db.bindText(1, 'Alice');
 db.step();
 db.finalize();
 
-// Cold-start restore from S3-compatible storage (call before new Arkilian())
-Arkilian.hydrateS3('app.sqlite', {
-  endpoint: 'https://s3.amazonaws.com',
-  bucket: 'myapp-backups',
-  region: 'us-east-1',
-  accessKey: 'AKIA...',
-  secretKey: '...',
-  prefix: 'myapp',
-});
+// Helper query execution
+db.run('INSERT INTO users (name) VALUES (?)', ['Bob']);
+console.log('Last insert rowid:', db.lastInsertRowid);
+
+// Check health metrics
+console.log('Subsystem healthy:', db.backupHealthy);
+console.log('Outbox queue depth:', db.backupQueueDepth);
 
 db.close();
 ```
@@ -220,8 +240,8 @@ npm install arkilian --build-from-source
 ### 1 — Multi-tenant SaaS: one database per tenant, zero ops
 
 Each tenant gets their own isolated SQLite file. Arkilian runs inside every
-Cloud Run instance and streams row changes to S3-compatible storage in real time.
-If an instance is torn down, the next cold start calls `Arkilian.hydrate()` and
+container instance and streams row changes to S3-compatible storage in real time.
+If an instance is torn down, the next cold start calls `Arkilian.hydrateS3()` and
 is back to the exact state it left off — including every write that shipped
 while the old instance was live.
 
@@ -240,7 +260,7 @@ db.exec(`CREATE TABLE IF NOT EXISTS orders (
   ts    INTEGER NOT NULL DEFAULT (unixepoch())
 )`);
 
-// Every INSERT is captured and shipped in < 2 s.
+// Every INSERT is captured and shipped within chunk interval (default 1s).
 export function placeOrder(item, qty) {
   db.run('INSERT INTO orders (item, qty) VALUES (?, ?)', [item, qty]);
   return db.lastInsertRowid;
@@ -281,7 +301,7 @@ db.exec(`CREATE TABLE IF NOT EXISTS users (
 
 ### 3 — Offline-first Go Backend
 
-Link the native library directly into your Go binaries. Acquire the client SDK assets and environment configuration templates from [arkilian.com](https://arkilian.com).
+Link the native library directly into your Go binaries using standard cgo and environment configuration.
 
 ```go
 // main.go
@@ -294,7 +314,6 @@ package main
 */
 import "C"
 import (
-    "fmt"
     "log"
     "unsafe"
 )
@@ -304,7 +323,7 @@ func main() {
     path := C.CString("app.sqlite")
     defer C.free(unsafe.Pointer(path))
 
-    // Initialize using configuration obtained from https://arkilian.com
+    // Initialize using environment variables (ARKILIAN_S3_*)
     if C.db_init(&db, path) != 0 {
         log.Fatal("db_init failed")
     }
@@ -340,7 +359,6 @@ db.setBackupEnabled(true);
 
 db.close();
 ```
-```
 
 ## System Constraints and Design Choices
 Unlike complex distributed SQLite systems (e.g., LiteFS or rqlite), Arkilian embraces single-writer architectures partitioned by micro-datasets. It purposefully avoids:
@@ -351,36 +369,38 @@ Unlike complex distributed SQLite systems (e.g., LiteFS or rqlite), Arkilian emb
 
 * **Ordering** — delivery is strictly in `_pending_backup` id order; a
   retryable failure stops the drain so the first unshipped row is
-  retried first (never skip-and-continue). This is a reviewed decision
-  (spec §8.1): if your destination does not require ordering,
-  skip-and-continue is the higher-throughput alternative.
+  retried first (never skip-and-continue).
 * **Delivery** — at-least-once. A crash between the storage ack and the
   local outbox delete re-ships the rows in a new chunk. Replay is
-  idempotent (chunks are REPLACE/DELETE statements), so overlapping LSN
-  ranges after a restart are safe to replay twice.
-* **Durability** — `PRAGMA synchronous=NORMAL` (WAL): durable across
-  process crashes; the most recent transactions can be lost on OS
-  crash/power loss (spec §3.2). If that window is unacceptable for your
-  data, set `synchronous=FULL` on the game connection — the backup
-  connection's setting matters less since it only deletes already-durable
-  rows.
+  idempotent (chunks use REPLACE/DELETE statements), so overlapping LSN
+  ranges after a restart are safely replayed.
+* **Durability** — by default, `ARKILIAN_OUTBOX_DURABLE=1` sets `PRAGMA synchronous=FULL;`
+  on the application connection, guaranteeing committed outbox CDC rows are fsynced to disk
+  before commit returns. Operators prioritizing maximum write throughput over power-loss
+  durability can set `ARKILIAN_OUTBOX_DURABLE=0` (`PRAGMA synchronous=NORMAL;`).
+* **Authenticity** — every manifest is authenticated with HMAC-SHA256 via `ARKILIAN_MANIFEST_HMAC_KEY`.
+  Hydrators fail closed and refuse unauthenticated or tampered manifests.
 
-## Monitoring & operations
+## Monitoring & Operations
 
-The client exposes spec §9 monitoring signals as C APIs and Node getters:
+The client exposes spec §9 monitoring signals as C APIs and Node.js getters:
 
 | Getter (Node.js) | C API | Description |
 |---|---|---|
-| `backupQueueDepth` | `db_backup_queue_depth` | Rows in outbox not yet delivered |
-| `backupOldestPendingAgeSec` | `db_backup_oldest_pending_age_sec` | Realtime-lag metric; 0 when queue is empty |
-| `backupDeadLetterCount` | `db_backup_dead_letter_count` | Rows dead-lettered after max retries |
-| `backupThreadHeartbeatAgeMs` | `db_backup_thread_heartbeat_age_ms` | Flush thread liveness; -1 if not running |
-| `backupSnapshotHeartbeatAgeMs` | `db_backup_snapshot_heartbeat_age_ms` | Snapshot thread liveness; -1 if not running |
-| `backupTriggerCoverage` | `db_backup_trigger_coverage` | 0 = all tables covered; N = N triggers missing |
-| `backupSkippedTableCount` | `db_backup_skipped_table_count` | Tables with no PK skipped by capture (must be 0) |
-| `backupHealthy` | `db_backup_is_healthy` | 1 = subsystem fully healthy; 0 = investigate |
-| `triggersDirty` | `db_backup_triggers_dirty` | 1 = raw-handle DDL desynchronized triggers |
-| `capturePaused` | `db_backup_capture_paused` | Sticky: CDC rows dropped since last snapshot |
+| `backupQueueDepth` | `db_backup_queue_depth` | Rows in outbox not yet delivered to S3 |
+| `backupOldestPendingAgeSec` | `db_backup_oldest_pending_age_sec` | Realtime-lag metric (seconds since oldest pending row); 0 when queue is empty |
+| `backupDeadLetterCount` | `db_backup_dead_letter_count` | Rows dead-lettered into `_dead_backup` after exceeding max retry attempts |
+| `backupThreadHeartbeatAgeMs` | `db_backup_thread_heartbeat_age_ms` | Flush thread heartbeat age in ms (-1 if not running) |
+| `backupSnapshotHeartbeatAgeMs` | `db_backup_snapshot_heartbeat_age_ms` | Snapshot thread heartbeat age in ms (-1 if not running) |
+| `backupTriggerCoverage` | `db_backup_trigger_coverage` | Trigger sanity check: 0 = all PK-capable tables covered; N > 0 = missing triggers |
+| `backupSkippedTableCount` | `db_backup_skipped_table_count` | Tables with no PRIMARY KEY skipped by capture (must be 0) |
+| `backupHealthy` | `db_backup_is_healthy` | 1 = subsystem fully healthy; 0 = degraded |
+| `backupHealthFlags` | `db_backup_health_flags` | Bitmask of `ARK_HF_*` status flags isolating specific degraded conditions |
+| `triggersDirty` | `db_backup_triggers_dirty` | 1 = raw-handle DDL bypassed the wrapper and desynchronized triggers |
+| `capturePaused` | `db_backup_capture_paused` | Sticky flag: 1 = CDC rows were dropped due to queue hitting `ARKILIAN_MAX_QUEUE_DEPTH` (cleared on snapshot) |
+| `autoResyncTriggers` | `db_get_auto_resync_triggers` | Boolean: whether auto-repair of raw DDL triggers is enabled |
+| `backupChunkCount` | `db_backup_chunk_count` | Total number of chunks successfully flushed to S3 |
+| `backupLastChunkFlushAgeMs` | `db_backup_last_chunk_flush_age_ms` | Milliseconds elapsed since the last successful chunk flush |
 
 Diagnostics are routed through `db_set_log_callback()` / `setLogCallback(fn)` (level, message).
 
@@ -393,22 +413,22 @@ cc tools/arkilian-dlq.c src/deps/sqlite/sqlite3.c -Isrc/deps/sqlite -o arkilian-
 ./arkilian-dlq app.sqlite --replay
 ```
 
-See `docs/operations.md` for alert thresholds, the dead-letter runbook,
-the kill-switch procedure, and incident response.
-
 ## Running Tests
+
+Build the test suites with CMake:
 
 ```bash
 cmake -B build -S . -DCMAKE_BUILD_TYPE=Debug -DARKILIAN_BUILD_TESTS=ON
 cmake --build build --config Debug
 
-# Run all 11 test suites
-for t in test_basic test_interception test_regressions test_monitoring \
-          test_deterministic test_virtual_tables test_hardening \
-          test_kill_switch test_kill_resilience test_load_contention \
-          test_dst_backpressure; do
-  ./build/$t
-done
+# Run all 19 test suites via CTest
+ctest --output-on-failure
+```
+
+To run the client-only production stress harness:
+
+```bash
+bash scripts/stress.sh --client-only
 ```
 
 ## Contributing
@@ -416,5 +436,4 @@ Please see `CONTRIBUTING.md` for details on submitting patches and the contribut
 
 ## License
 Arkilian is licensed under the MIT License. See the `LICENSE` file for details.
-
-<!-- check out arkilian.com for more detailed info beyond what we can provide here-->
+```check out arkilian.com for more detailed info beyond what we can provide here```
