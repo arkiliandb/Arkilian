@@ -43,6 +43,7 @@
 #ifdef _WIN32
 #include <windows.h>
 #include <share.h>
+#include <process.h>
 #ifndef __MINGW32__
 #define strcasecmp _stricmp
 #define strncasecmp _strnicmp
@@ -926,9 +927,21 @@ static int sidecar_append_txn(arkilian *db, uint64_t txid, struct pending_ddl *h
   return 0;
 }
 
+static const char *ark_strcasestr(const char *haystack, const char *needle) {
+  if (!haystack || !needle) return NULL;
+  size_t nlen = strlen(needle);
+  if (nlen == 0) return haystack;
+  for (; *haystack; haystack++) {
+    if (strncasecmp(haystack, needle, nlen) == 0) {
+      return haystack;
+    }
+  }
+  return NULL;
+}
+
 static char *extract_savepoint_name(const char *sql, const char *after_keyword) {
   if (!sql || !after_keyword) return NULL;
-  const char *p = strcasestr(sql, after_keyword);
+  const char *p = ark_strcasestr(sql, after_keyword);
   if (!p) return NULL;
   p += strlen(after_keyword);
   while (*p && isspace((unsigned char)*p)) p++;
