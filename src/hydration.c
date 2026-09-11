@@ -886,8 +886,8 @@ int ark_manifest_fetch(const char *endpoint, const char *bucket,
     // (a genuine cold start) from a transient error that must be retried —
     // publishing a registry over an unreadable manifest would orphan the
     // predecessor's chunks.
-    if (err == HYDRATION_ERR_NOTFOUND) return HYDRATION_ERR_NOTFOUND;
     free(manifest_url);
+    if (err == HYDRATION_ERR_NOTFOUND) return HYDRATION_ERR_NOTFOUND;
     return err ? err : HYDRATION_ERR_NET;
   }
 

@@ -111,8 +111,10 @@ static int hydrate(void) {
 
 static long long count_rows(const char *table) {
   sqlite3 *db = NULL;
-  if (sqlite3_open_v2(DST, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK)
+  if (sqlite3_open_v2(DST, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
+    if (db) sqlite3_close(db);
     return -1;
+  }
   sqlite3_stmt *stmt = NULL;
   char sql[256];
   snprintf(sql, sizeof(sql), "SELECT COUNT(*) FROM \"%s\"", table);
