@@ -291,12 +291,33 @@ static void test_multistmt_alter_update_order(void) {
   cleanup(path);
 }
 
+#ifndef _WIN32
+#include <pthread.h>
+static pthread_mutex_t g_p0_ssrf_mutex = PTHREAD_MUTEX_INITIALIZER;
+#define P0_SSRF_LOCK()   pthread_mutex_lock(&g_p0_ssrf_mutex)
+#define P0_SSRF_UNLOCK() pthread_mutex_unlock(&g_p0_ssrf_mutex)
+#else
+#include <windows.h>
+static CRITICAL_SECTION g_p0_ssrf_cs;
+static int g_p0_ssrf_cs_init = 0;
+static inline void p0_ssrf_init_cs(void) {
+  if (!g_p0_ssrf_cs_init) {
+    InitializeCriticalSection(&g_p0_ssrf_cs);
+    g_p0_ssrf_cs_init = 1;
+  }
+}
+#define P0_SSRF_LOCK()   do { p0_ssrf_init_cs(); EnterCriticalSection(&g_p0_ssrf_cs); } while (0)
+#define P0_SSRF_UNLOCK() LeaveCriticalSection(&g_p0_ssrf_cs)
+#endif
+
 static char g_p0_ssrf_log[1024] = {0};
 static void p0_ssrf_log_cb(ark_log_level_t level, const char *msg, void *ctx) {
   (void)level; (void)ctx;
   if (msg && strstr(msg, "SSRF guard")) {
+    P0_SSRF_LOCK();
     strncpy(g_p0_ssrf_log, msg, sizeof(g_p0_ssrf_log) - 1);
     g_p0_ssrf_log[sizeof(g_p0_ssrf_log) - 1] = '\0';
+    P0_SSRF_UNLOCK();
   }
 }
 
@@ -304,7 +325,9 @@ static void p0_ssrf_log_cb(ark_log_level_t level, const char *msg, void *ctx) {
 static void test_host_suffix_rejects_evil(void) {
   const char *path = "p0_ssrf_evil.db";
   cleanup(path);
+  P0_SSRF_LOCK();
   g_p0_ssrf_log[0] = '\0';
+  P0_SSRF_UNLOCK();
 
   ark_setenv("ARKILIAN_ENABLE_BACKUP", "1", 1);
   // An evil host that contains ".amazonaws.com" as a substring but NOT suffix
@@ -328,13 +351,19 @@ static void test_host_suffix_rejects_evil(void) {
   // and refuse to upload because evil.amazonaws.com.attacker.com is not a valid suffix.
   db_wal_flush(db);
 
+  int has_log = 0;
   for (int i = 0; i < 50; i++) {
-    if (g_p0_ssrf_log[0] != '\0') break;
+    P0_SSRF_LOCK();
+    has_log = (g_p0_ssrf_log[0] != '\0');
+    P0_SSRF_UNLOCK();
+    if (has_log) break;
     usleep(20000);
   }
 
+  P0_SSRF_LOCK();
   assert(g_p0_ssrf_log[0] != '\0' && "SSRF guard did not log refusal for evil host");
   assert(strstr(g_p0_ssrf_log, "SSRF guard") != NULL);
+  P0_SSRF_UNLOCK();
   assert(outbox_count(db) >= 1);
 
   db_close(db);

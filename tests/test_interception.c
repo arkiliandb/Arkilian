@@ -35,7 +35,16 @@ static int tests_passed = 0;
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
+static void cleanup_files(void) {
+  remove(TEST_DB);
+  remove(TEST_DB "-wal");
+  remove(TEST_DB "-shm");
+  remove(TEST_DB "-journal");
+  remove(TEST_DB ".arklock");
+}
+
 static arkilian *open_test_db(void) {
+  cleanup_files();
   ark_setenv("ARKILIAN_ENABLE_BACKUP", "0", 1);
   // Set a dummy push URL so the double-buffer accumulates entries.
   // The flush thread will start but fail-fast on this non-routable address.
@@ -49,14 +58,6 @@ static arkilian *open_test_db(void) {
   assert(rc == 0 && "db_init failed");
   assert(db != NULL);
   return db;
-}
-
-static void cleanup_files(void) {
-  remove(TEST_DB);
-  remove(TEST_DB "-wal");
-  remove(TEST_DB "-shm");
-  remove(TEST_DB "-journal");
-  remove(TEST_DB ".arklock");
 }
 
 // Verify PRAGMA value via query (returns static buffer)
@@ -190,7 +191,8 @@ static void test_exec_create_table_pushes_to_ring(void) {
 
 static void test_exec_drop_table_pushes_to_ring(void) {
   arkilian *db = open_test_db();
-  db_exec(db, "CREATE TABLE t_drop (x INT)");
+  int rc_create = db_exec(db, "CREATE TABLE t_drop (x INT)");
+  assert(rc_create == SQLITE_OK);
   int before = db_wal_pending(db);
   int rc = db_exec(db, "DROP TABLE t_drop");
   assert(rc == SQLITE_OK);

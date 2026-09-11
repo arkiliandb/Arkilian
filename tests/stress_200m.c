@@ -147,10 +147,11 @@ int main(int argc, char **argv) {
 
   int pending = db_wal_pending(db);
   printf("  Pending items remaining in outbox: %d\n", pending);
-  if (getenv("ARKILIAN_S3_ENDPOINT")) {
-    assert(pending == 0 && "Expected zero pending outbox items when S3 endpoint is configured");
+  const char *ep = getenv("ARKILIAN_S3_ENDPOINT");
+  if (ep && strcmp(ep, "http://127.0.0.1:1") != 0 && strlen(ep) > 0) {
+    assert(pending == 0 && "Expected zero pending outbox items when reachable S3 endpoint is configured");
   } else if (write_target > 0) {
-    assert(pending > 0 && "Expected pending outbox items when S3 endpoint is disabled");
+    assert(pending > 0 && "Expected pending outbox items when S3 endpoint is disabled or failing");
   }
 
   // 5. Cleanup
