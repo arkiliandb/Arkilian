@@ -52,6 +52,7 @@
 #ifdef _WIN32
   #include <windows.h>
   #include <io.h>
+  #include <process.h>
   #include <sys/locking.h>
   #define strcasecmp _stricmp
   #define ARK_FILENO(f) _fileno(f)
