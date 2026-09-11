@@ -83,6 +83,8 @@ int main(int argc, char **argv) {
                    "  ts INT NOT NULL"
                    ");");
   assert(rc == SQLITE_OK && "CREATE TABLE failed");
+  rc = db_exec(db, "CREATE INDEX IF NOT EXISTS idx_stress_user_id ON stress_data (user_id);");
+  assert(rc == SQLITE_OK && "CREATE INDEX failed");
 
   // 2. High-Throughput Batched Writes Phase
   printf("Phase 1: Executing %llu Writes in transactions of %d rows...\n",
