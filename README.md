@@ -441,13 +441,13 @@ cc tools/arkilian-dlq.c src/deps/sqlite/sqlite3.c -Isrc/deps/sqlite -o arkilian-
 
 ## Running Tests
 
-Build all 19 test suites with CMake:
+Build all 21 test suites with CMake:
 
 ```bash
 cmake -B build -S . -DCMAKE_BUILD_TYPE=Debug -DARKILIAN_BUILD_TESTS=ON
 cmake --build build --config Debug
 
-# Run all 19 test suites via CTest
+# Run all 21 test suites via CTest
 ctest --output-on-failure
 ```
 
