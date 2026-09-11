@@ -42,8 +42,10 @@
 
 #ifdef _WIN32
 #include <windows.h>
-#include <share.h>
+#include <io.h>
 #include <process.h>
+#include <share.h>
+#include <sys/locking.h>
 #ifndef __MINGW32__
 #define strcasecmp _stricmp
 #define strncasecmp _strnicmp

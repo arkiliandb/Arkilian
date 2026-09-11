@@ -13,6 +13,63 @@
 #ifndef ARK_STUB_S3_H
 #define ARK_STUB_S3_H
 
+#ifdef _WIN32
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "ark_test_env.h"
+
+// Raw BSD socket mock server is disabled on Windows (MinGW/MSVC).
+// Provide portable stubs so translation units including ark_stub_s3.h compile cleanly.
+static char g_endpoint[64] = "http://127.0.0.1:1";
+static const char *BUCKET = "test-bucket";
+static const char *PREFIX = "user-42-appdb";
+
+static inline void stub_start(void) {}
+static inline void stub_stop(void) {}
+static inline void stub_reset(void) {}
+static inline void stub_set_status_override(int sc) { (void)sc; }
+static inline void stub_set_status_override_put(int sc) { (void)sc; }
+static inline void stub_set_status_override_get(int sc) { (void)sc; }
+static inline void stub_set_status_override_manifest(int sc) { (void)sc; }
+static inline void stub_set_status_override_manifest_sig(int sc) { (void)sc; }
+static inline void stub_set_delay_ms(int ms) { (void)ms; }
+static inline void stub_set_drop_connection(int d) { (void)d; }
+static inline void stub_set_require_presign(int r) { (void)r; }
+static inline int stub_manifest_contains(const char *needle, int timeout_s) {
+  (void)needle; (void)timeout_s; return 0;
+}
+static inline int stub_contains(const char *needle) { (void)needle; return 0; }
+static inline int stub_object_count(void) { return 0; }
+static inline void stub_put(const char *key, const char *data, size_t len) {
+  (void)key; (void)data; (void)len;
+}
+static inline int stub_get(const char *key, char **out, size_t *out_len) {
+  (void)key; (void)out; (void)out_len; return 0;
+}
+static inline int stub_delete(const char *key) { (void)key; return 0; }
+
+static inline void set_s3_env(void) {
+  ark_setenv("ARKILIAN_S3_ENDPOINT", g_endpoint, 1);
+  ark_setenv("ARKILIAN_S3_BUCKET", BUCKET, 1);
+  ark_setenv("ARKILIAN_S3_REGION", "us-east-1", 1);
+  ark_setenv("ARKILIAN_S3_ACCESS_KEY", "test-access", 1);
+  ark_setenv("ARKILIAN_S3_SECRET_KEY", "test-secret", 1);
+  ark_setenv("ARKILIAN_S3_PREFIX", PREFIX, 1);
+  ark_setenv("ARKILIAN_MANIFEST_HMAC_KEY", "test-hmac-key-for-unit-tests-32b", 1);
+}
+
+static inline void clear_s3_env(void) {
+  ark_unsetenv("ARKILIAN_S3_ENDPOINT");
+  ark_unsetenv("ARKILIAN_S3_BUCKET");
+  ark_unsetenv("ARKILIAN_S3_REGION");
+  ark_unsetenv("ARKILIAN_S3_ACCESS_KEY");
+  ark_unsetenv("ARKILIAN_S3_SECRET_KEY");
+  ark_unsetenv("ARKILIAN_S3_PREFIX");
+  ark_unsetenv("ARKILIAN_MANIFEST_HMAC_KEY");
+}
+#else
+
 #include <arpa/inet.h>
 #include <assert.h>
 #include <netinet/in.h>
@@ -489,5 +546,7 @@ static inline int stub_manifest_contains(const char *needle, int timeout_s) {
   }
   return 0;
 }
+
+#endif /* !_WIN32 */
 
 #endif /* ARK_STUB_S3_H */
