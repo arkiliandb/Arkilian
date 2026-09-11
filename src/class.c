@@ -2179,7 +2179,9 @@ static int chunk_failure_logic(arkilian *db, wal_chunk *c,
   sqlite3_clear_bindings(attempts_stmt);
   sqlite3_bind_int64(attempts_stmt, 1, (sqlite3_int64)c->lsn_start);
   sqlite3_bind_int64(attempts_stmt, 2, (sqlite3_int64)c->lsn_end);
-  if (sqlite3_step(attempts_stmt) != SQLITE_DONE) return 0;
+  int step_rc = sqlite3_step(attempts_stmt);
+  sqlite3_reset(attempts_stmt);
+  if (step_rc != SQLITE_DONE) return 0;
 
   sqlite3_reset(attempts_max_stmt);
   sqlite3_clear_bindings(attempts_max_stmt);
@@ -2189,6 +2191,7 @@ static int chunk_failure_logic(arkilian *db, wal_chunk *c,
   if (sqlite3_step(attempts_max_stmt) == SQLITE_ROW) {
     attempts = sqlite3_column_int(attempts_max_stmt, 0);
   }
+  sqlite3_reset(attempts_max_stmt);
   if (attempts < max_attempts()) return attempts;
 
   ark_log(db, ARK_LOG_ERROR,
@@ -2202,7 +2205,9 @@ static int chunk_failure_logic(arkilian *db, wal_chunk *c,
                     SQLITE_STATIC);
   sqlite3_bind_int64(dead_letter_stmt, 2, (sqlite3_int64)c->lsn_start);
   sqlite3_bind_int64(dead_letter_stmt, 3, (sqlite3_int64)c->lsn_end);
-  if (sqlite3_step(dead_letter_stmt) != SQLITE_DONE) return 0;
+  int dl_rc = sqlite3_step(dead_letter_stmt);
+  sqlite3_reset(dead_letter_stmt);
+  if (dl_rc != SQLITE_DONE) return 0;
   // INSERT OR IGNORE above absorbed any pre-existing dead copy (the
   // "dead-letter succeeded, delete failed" zombie residue); this DELETE
   // resolves that double state by removing the live copy.
@@ -2211,6 +2216,7 @@ static int chunk_failure_logic(arkilian *db, wal_chunk *c,
   sqlite3_bind_int64(dlq_delete_stmt, 1, (sqlite3_int64)c->lsn_start);
   sqlite3_bind_int64(dlq_delete_stmt, 2, (sqlite3_int64)c->lsn_end);
   sqlite3_step(dlq_delete_stmt);
+  sqlite3_reset(dlq_delete_stmt);
   return -1;
 }
 
