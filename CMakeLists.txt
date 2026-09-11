@@ -307,7 +307,8 @@ if(ARKILIAN_BUILD_TESTS)
         # socket headers, so those stay on the POSIX CI legs.
         foreach(t test_basic test_interception test_regressions test_monitoring
                  test_deterministic test_virtual_tables test_hardening
-                 test_health_flags test_p0_hardening)
+                 test_health_flags test_p0_hardening test_sidecar_faults
+                 test_raw_transaction_recovery)
             ark_add_test(${t} tests/${t}.c)
         endforeach()
 
@@ -358,6 +359,16 @@ if(ARKILIAN_BUILD_TESTS)
             target_compile_options(test_manifest_protocol PRIVATE -UNDEBUG)
             target_compile_definitions(test_manifest_protocol PRIVATE ${ARK_POSIX_DEFS})
             add_test(NAME test_manifest_protocol COMMAND test_manifest_protocol)
+
+            # ── Capture-gap lifecycle & transactional manifest publication ──
+            add_executable(test_capture_gap_lifecycle tests/test_capture_gap_lifecycle.c
+                           src/class.c src/hydration.c src/sha256.c src/deps/sqlite/sqlite3.c)
+            target_include_directories(test_capture_gap_lifecycle PRIVATE src src/deps/sqlite)
+            target_link_libraries(test_capture_gap_lifecycle PRIVATE ${CMAKE_THREAD_LIBS_INIT}
+                                  ${CURL_LIBRARIES} ${ARK_LIBM})
+            target_compile_options(test_capture_gap_lifecycle PRIVATE -UNDEBUG)
+            target_compile_definitions(test_capture_gap_lifecycle PRIVATE ${ARK_POSIX_DEFS})
+            add_test(NAME test_capture_gap_lifecycle COMMAND test_capture_gap_lifecycle)
         endif()
 
         # ── SHA-256 NIST vectors ──
