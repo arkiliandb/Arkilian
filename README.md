@@ -19,7 +19,7 @@ Arkilian is an embedded SQLite database engine written in C99, extending SQLite 
 ### Key Features
 * **Simplified SQLite Binding:** Comprehensive SQLite statement, parameter, and transaction management alongside raw handle extraction (`db_get_handle`).
 * **Direct-to-S3 Data Protection:** Two integrated background threads — a flush thread that batches row-level CDC writes into SHA-256-verified SQL chunks uploaded via AWS SigV4 presigned PUTs, and a snapshot thread that uploads consistent point-in-time database backups.
-* **Tamper-Resistant Manifest Protocol:** Maintains an atomic manifest registry (`manifest.json`) and HMAC-SHA256 signature (`manifest.sig`) on S3 to enforce ordering, verify chunk digests, and prevent restore tampering.
+* **Transactional Manifest Publication:** Arkilian publishes the manifest (`manifest.json`) and HMAC-SHA256 signature (`manifest.sig`) as a commit pair; local state advances only after both succeed, and hydrators fail closed on incomplete or invalid publication.
 * **Fail-Safe Application Isolation (Spec §0):** Backup operations never block or fail application transactions. If the outbox exceeds capacity (`ARKILIAN_MAX_QUEUE_DEPTH`), capture safely pauses while application writes continue unimpeded, and the condition is flagged until the next snapshot re-baselines.
 * **Cross-Platform:** Pure C99 building natively on macOS, Linux, and Windows (MSVC and MinGW).
 * **Multi-Language Support:** First-class bindings across Node.js/Bun (prebuilt N-API addons), Python (CFFI), Go (cgo), Rust (safe abstractions), and PHP (FFI).
@@ -79,7 +79,7 @@ Arkilian reads configuration from process environment variables or a `./.env` fi
 | `ARKILIAN_S3_SECRET_KEY` | *(empty)* | AWS SigV4 secret access key (used only for local signing, never transmitted) |
 | `ARKILIAN_S3_PREFIX` | `db_default` | Object key prefix isolating database instances within a shared bucket |
 | `ARKILIAN_ENABLE_BACKUP` | `1` | `1` enables background backup; `0` disables outbound shipping (toggled via `db_backup_set_enabled`) |
-| `ARKILIAN_OUTBOX_DURABLE` | `1` | `1` sets `PRAGMA synchronous=FULL;` ensuring CDC outbox writes survive OS crash/power loss. `0` uses `NORMAL` for maximum throughput |
+| `ARKILIAN_OUTBOX_DURABLE` | `1` | `1` sets `PRAGMA synchronous=FULL;` so committed outbox records are durably flushed according to SQLite's full-synchronous durability semantics. `0` uses `NORMAL` for maximum throughput |
 | `ARKILIAN_MAX_QUEUE_DEPTH` | `100000` | Maximum pending outbox rows before capture pauses to protect application writes |
 | `ARKILIAN_MAX_ATTEMPTS` | `100` | Maximum upload retry attempts per chunk before moving rows to `_dead_backup` (DLQ) |
 | `ARKILIAN_MANIFEST_HMAC_KEY` | *(empty)* | Secret key for HMAC-SHA256 **manifest authentication**. REQUIRED for manifest publishing and cold-start hydration (fail closed) |
@@ -369,7 +369,7 @@ gcc -I/usr/local/include/arkilian myapp.c -L/usr/local/lib -larkilian -lcurl -lp
 
 * **Ordering:** CDC outbox rows are shipped in strict `_pending_backup` sequence order (LSN order). Any transient S3 network error halts the drain and triggers retries with exponential backoff so changes are never uploaded out of order.
 * **Delivery:** At-least-once. If an upload completes but the local outbox deletion is interrupted by crash or power loss, rows are safely re-shipped in a subsequent chunk. Replay statements use idempotent SQL (`REPLACE INTO ...` and `DELETE FROM ...`), making replay of overlapping ranges completely safe.
-* **Durability:** By default, `ARKILIAN_OUTBOX_DURABLE=1` sets `PRAGMA synchronous=FULL;` on the application database connection. Outbox CDC records are guaranteed to be flushed to disk before commit returns, ensuring zero capture loss across OS crashes or power failures. Setting `ARKILIAN_OUTBOX_DURABLE=0` opts in to `PRAGMA synchronous=NORMAL;` for applications prioritizing write throughput.
+* **Durability:** With `ARKILIAN_OUTBOX_DURABLE=1` (the default), Arkilian configures `PRAGMA synchronous=FULL;` on the application connection so committed outbox records are durably flushed according to SQLite's full-synchronous durability semantics. Operators prioritizing maximum write throughput over power-loss durability can opt in to `ARKILIAN_OUTBOX_DURABLE=0` (`PRAGMA synchronous=NORMAL;`).
 * **Integrity:** Every uploaded chunk and snapshot is content-addressed and digest-verified. The SHA-256 hash is recorded in the manifest, and hydrators strictly verify object content before applying any SQL chunks.
 * **Authenticity:** Manifest publication and hydration require HMAC-SHA256 signing via `ARKILIAN_MANIFEST_HMAC_KEY`. A companion signature `{prefix}/manifest.sig` is stored alongside `{prefix}/manifest.json`. Hydration strictly refuses unauthenticated, missing, or mismatched manifest signatures (fail closed).
 

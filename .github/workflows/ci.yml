@@ -129,7 +129,7 @@ jobs:
       shell: msys2 {0}
       run: cmake --build build --config Debug
 
-    - name: C test suites (ctest — all 10, Unix)
+    - name: C test suites (ctest — all 21, Unix)
       if: matrix.os != 'windows-latest'
       working-directory: build
       run: ctest --output-on-failure
