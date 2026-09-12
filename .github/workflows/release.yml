@@ -142,7 +142,8 @@ jobs:
 
         # Create platform archive
         if [[ "${{ matrix.suffix }}" == *"windows"* ]]; then
-          (cd "$STAGE_DIR" && powershell -Command "Compress-Archive -Path (Get-ChildItem -Path .) -DestinationPath '\$env:GITHUB_WORKSPACE/dist/arkilian-c-v${VERSION}-${{ matrix.suffix }}.zip' -Force")
+          DEST_ZIP="$GITHUB_WORKSPACE/dist/arkilian-c-v${VERSION}-${{ matrix.suffix }}.zip"
+          (cd "$STAGE_DIR" && 7z a "$DEST_ZIP" . || powershell -Command "Compress-Archive -Path (Get-ChildItem -Path .) -DestinationPath '$DEST_ZIP' -Force")
         else
           tar -czf "dist/arkilian-c-v${VERSION}-${{ matrix.suffix }}.tar.gz" -C "$STAGE_DIR" .
         fi
@@ -247,7 +248,7 @@ jobs:
         $vcpkgPath = "${{ runner.temp }}/vcpkg"
         git clone https://github.com/microsoft/vcpkg.git $vcpkgPath
         & "$vcpkgPath/bootstrap-vcpkg.bat"
-        & "$vcpkgPath/vcpkg" install curl:x64-windows
+        & "$vcpkgPath/vcpkg" install curl:x64-windows curl:x64-windows-static-md
         echo "VCPKG_ROOT=$vcpkgPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
       shell: pwsh
 
@@ -270,6 +271,8 @@ jobs:
       run: |
         echo "CC=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
         echo "CXX=aarch64-linux-gnu-g++" >> "$GITHUB_ENV"
+        echo "STRIP=aarch64-linux-gnu-strip" >> "$GITHUB_ENV"
+        sudo ln -sf /usr/bin/aarch64-linux-gnu-strip /usr/local/bin/strip
         echo "npm_config_arch=arm64" >> "$GITHUB_ENV"
         echo "CFLAGS=-I/usr/include/aarch64-linux-gnu" >> "$GITHUB_ENV"
         echo "CXXFLAGS=-I/usr/include/aarch64-linux-gnu" >> "$GITHUB_ENV"
