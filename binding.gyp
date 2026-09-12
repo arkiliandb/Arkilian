@@ -40,6 +40,12 @@
           "cflags_cc": ["-fPIC"],
           "libraries": ["-lcurl"]
         }],
+        ["target_arch=='arm64' and OS=='linux'", {
+          "include_dirs": ["/usr/include/aarch64-linux-gnu"],
+          "link_settings": {
+            "libraries": ["-L/usr/lib/aarch64-linux-gnu"]
+          }
+        }],
         ["OS=='win'", {
           "defines": ["_CRT_SECURE_NO_WARNINGS", "_CRT_NONSTDC_NO_WARNINGS"],
           "libraries": ["libcurl.lib", "zlib.lib", "ws2_32.lib",
