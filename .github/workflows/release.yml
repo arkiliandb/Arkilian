@@ -524,10 +524,9 @@ jobs:
     - name: cosign sign-blob
       run: |
         cosign sign-blob --yes \
-          --output-signature arkilian.spdx.json.sig \
-          --output-certificate arkilian.spdx.json.pem \
+          --bundle arkilian.spdx.json.bundle \
           arkilian.spdx.json
-        cp arkilian.spdx.json arkilian.spdx.json.sig arkilian.spdx.json.pem final-artifacts/
+        cp arkilian.spdx.json arkilian.spdx.json.bundle final-artifacts/
 
     - name: Drop artifacts on GitHub Release
       env:
