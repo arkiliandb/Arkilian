@@ -342,6 +342,12 @@ jobs:
         name: ${{ matrix.native-asset-name }}
         path: native-lib-dl
 
+    - name: Install dependencies (Linux)
+      if: matrix.platform == 'linux'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libcurl4-openssl-dev zip
+
     - name: Setup Python
       uses: actions/setup-python@v5
       with:
