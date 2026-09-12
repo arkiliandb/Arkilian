@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.10 FATAL_ERROR)
 
-project(arkilian C)
+project(arkilian VERSION 1.5.0 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 99)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -230,7 +230,7 @@ file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/arkilianConfig.cmake
 "include(\${CMAKE_CURRENT_LIST_DIR}/arkilianTargets.cmake)
 ")
 file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/arkilianConfigVersion.cmake
-"set(PACKAGE_VERSION \"1.1.0\")
+"set(PACKAGE_VERSION \"\${PROJECT_VERSION}\")
 if(\"\${PACKAGE_FIND_VERSION}\" VERSION_LESS_EQUAL \"\${PACKAGE_VERSION}\")
   set(PACKAGE_VERSION_COMPATIBLE TRUE)
 else()

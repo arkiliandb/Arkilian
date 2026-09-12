@@ -204,8 +204,9 @@ if command -v cargo >/dev/null 2>&1; then
     (
       cd bindings/rust/arkilian-sys
       cargo package --allow-dirty --no-verify 2>/dev/null || true
-      if [ -f "target/package/arkilian-sys-1.0.0.crate" ]; then
-        cp target/package/arkilian-sys-1.0.0.crate "$DIST_DIR/arkilian-sys-v${VERSION}.crate"
+      CRATE_FILE=$(ls target/package/arkilian-sys-*.crate 2>/dev/null | head -n 1)
+      if [ -n "$CRATE_FILE" ] && [ -f "$CRATE_FILE" ]; then
+        cp "$CRATE_FILE" "$DIST_DIR/arkilian-sys-v${VERSION}.crate"
         echo "  -> Created: arkilian-sys-v${VERSION}.crate"
       fi
     )
@@ -216,8 +217,9 @@ if command -v cargo >/dev/null 2>&1; then
     (
       cd bindings/rust/arkilian
       cargo package --allow-dirty --no-verify 2>/dev/null || true
-      if [ -f "target/package/arkilian-1.0.0.crate" ]; then
-        cp target/package/arkilian-1.0.0.crate "$DIST_DIR/arkilian-rust-v${VERSION}.crate"
+      CRATE_FILE=$(ls target/package/arkilian-*.crate 2>/dev/null | head -n 1)
+      if [ -n "$CRATE_FILE" ] && [ -f "$CRATE_FILE" ]; then
+        cp "$CRATE_FILE" "$DIST_DIR/arkilian-rust-v${VERSION}.crate"
         echo "  -> Created: arkilian-rust-v${VERSION}.crate"
       fi
 
