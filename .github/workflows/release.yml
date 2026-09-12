@@ -63,7 +63,7 @@ jobs:
             shared-lib: libarkilian.so
             static-lib: libarkilian.a
             dlq-bin: arkilian-dlq
-          - os: macos-13
+          - os: macos-15-intel
             suffix: darwin-x64
             artifact-dir: build
             shared-lib: libarkilian.dylib
@@ -186,7 +186,7 @@ jobs:
             libc: musl
             container: alpine:3.20
           # macOS x64 (Intel)
-          - os: macos-13
+          - os: macos-15-intel
             platform: darwin
             arch: x64
             libc: ""
