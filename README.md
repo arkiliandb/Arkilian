@@ -25,6 +25,18 @@ Arkilian is an embedded SQLite database engine written in C99, extending SQLite 
 * **Multi-Language Support:** First-class bindings across Node.js/Bun (prebuilt N-API addons), Python (CFFI), Go (cgo), Rust (safe abstractions), and PHP (FFI).
 * **Zero-Config Defaults:** Ready to run out of the box; fully configurable via `ARKILIAN_` environment variables or a local `.env` file.
 
+---
+
+## Architecture
+
+<p align="center">
+  <img src="./arkilian_architecture.svg" alt="Arkilian Engine Architecture" width="100%">
+</p>
+
+Arkilian operates with **three dedicated SQLite connections** (`db->handle`, `db->backup_db`, and `db->snapshot_db`) to eliminate cross-thread lock contention. Application writes are captured via automated DML triggers (`sync_backup_triggers`) and a transaction-aware sidecar journal (`.arkddlqueue`). A background **Flush Thread** batches outbox rows and uploads SHA-256 verified SQL chunks to S3 alongside an HMAC-SHA256 authenticated manifest (`manifest.json` + `manifest.sig`), while an independent **Snapshot Thread** performs periodic non-blocking online snapshots (`backup.sqlite`). Client processes can cold-start restore from object storage at any time using `arkilian_hydrate_s3()`.
+
+---
+
 ## Getting Started
 
 ### Prerequisites
