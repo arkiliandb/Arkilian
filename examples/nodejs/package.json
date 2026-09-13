@@ -1,21 +1,24 @@
 {
-  "name": "nodejs",
-  "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "name": "arkilian-nodejs-ts-examples",
+  "version": "1.5.0",
+  "description": "Arkilian Node.js / TypeScript SDK Examples",
+  "main": "01_simple_quickstart.ts",
+  "type": "module",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start:simple": "tsx 01_simple_quickstart.ts",
+    "start:advanced": "tsx 02_advanced_s3_failover.ts",
+    "typecheck": "tsc --noEmit",
+    "build": "tsc"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
-  "type": "commonjs",
+  "keywords": ["arkilian", "sqlite", "typescript", "s3", "replication"],
+  "author": "CodeDynasty-dev",
+  "license": "MIT",
   "dependencies": {
     "arkilian": "file:arkilian-1.5.0.tgz"
   },
   "devDependencies": {
-    "@types/node": "^22.20.2",
-    "tsx": "^4.23.13",
-    "typescript": "^7.0.2"
+    "@types/node": "^22.13.9",
+    "tsx": "^4.19.3",
+    "typescript": "^5.8.2"
   }
 }
