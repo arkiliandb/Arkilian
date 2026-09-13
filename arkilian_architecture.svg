@@ -1,108 +1,167 @@
-<svg width="100%" viewBox="0 0 680 580" role="img" xmlns="http://www.w3.org/2000/svg">
+<svg width="100%" viewBox="0 0 760 620" role="img" xmlns="http://www.w3.org/2000/svg">
   <title>Arkilian Architecture</title>
-  <desc>Your app calls into the arkilian connection. Write triggers automatically populate the internal _pending_backup outbox table. An independent Flush Thread reads batches from the outbox, chunks them, and PUTs each chunk to S3-compatible object storage via a locally presigned URL. The Snapshot Thread independently performs an hourly online backup to S3-compatible storage. The manifest at {prefix}/manifest.json is the durable registry that hydration replays.</desc>
+  <desc>Your app calls into the arkilian connection. Arkilian uses three dedicated SQLite connections (db->handle for App writes, db->backup_db for WAL chunk shipping, db->snapshot_db for hourly backups) to eliminate cross-thread lock contention. Writes are captured via DML triggers (sync_backup_triggers) and transaction-aware sidecar DDL (.arkddlqueue) into the _pending_backup outbox table. The Flush Thread batches outbox rows and PUTs chunks to S3, updating the HMAC-signed manifest registry. The Snapshot Thread performs non-blocking online snapshots (sqlite3_backup_step) to backup.sqlite. Cold-start disaster recovery (arkilian_hydrate_s3) replays the signed manifest, snapshot, and chunks.</desc>
   <defs>
-    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
-      <path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+    <marker id="arrow" viewBox="0 0 10 10" refX="7" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M1.5 1.5L7.5 5L1.5 8.5" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
     </marker>
     <style>
-      .text-base { font-family: "Anthropic Sans", -apple-system, system-ui, "Segoe UI", sans-serif; font-size: 16px; font-weight: 400; text-anchor: start; dominant-baseline: auto; }
-      .text-title { font-family: "Anthropic Sans", -apple-system, system-ui, "Segoe UI", sans-serif; font-size: 14px; font-weight: 500; text-anchor: middle; dominant-baseline: central; }
-      .text-desc { font-family: "Anthropic Sans", -apple-system, system-ui, "Segoe UI", sans-serif; font-size: 12px; font-weight: 400; text-anchor: middle; dominant-baseline: central; }
-      .text-header { font-family: "Anthropic Sans", -apple-system, system-ui, "Segoe UI", sans-serif; font-size: 14px; font-weight: 500; text-anchor: start; dominant-baseline: auto; }
-      .text-sub { font-family: "Anthropic Sans", -apple-system, system-ui, "Segoe UI", sans-serif; font-size: 12px; font-weight: 400; text-anchor: start; dominant-baseline: auto; }
+      .text-base { font-family: "Anthropic Sans", -apple-system, system-ui, "Segoe UI", sans-serif; font-size: 14px; font-weight: 400; text-anchor: start; }
+      .text-title { font-family: "Anthropic Sans", -apple-system, system-ui, "Segoe UI", sans-serif; font-size: 13px; font-weight: 600; text-anchor: middle; }
+      .text-desc { font-family: "Anthropic Sans", -apple-system, system-ui, "Segoe UI", sans-serif; font-size: 11px; font-weight: 400; text-anchor: middle; }
+      .text-header { font-family: "Anthropic Sans", -apple-system, system-ui, "Segoe UI", sans-serif; font-size: 14px; font-weight: 700; text-anchor: start; }
+      .text-sub { font-family: "Anthropic Sans", -apple-system, system-ui, "Segoe UI", sans-serif; font-size: 11px; font-weight: 400; text-anchor: start; }
+      .text-mono { font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, Courier, monospace; font-size: 10.5px; }
+      
       .line-conn { fill: none; stroke: rgb(115, 114, 108); stroke-width: 1.5; }
-      .line-dashed { fill: none; stroke: rgb(153, 60, 29); stroke-width: 1.5; stroke-dasharray: 4,4; }
+      .line-green { fill: none; stroke: rgb(15, 110, 86); stroke-width: 1.5; }
+      .line-orange { fill: none; stroke: rgb(180, 75, 40); stroke-width: 1.5; }
+      .line-purple { fill: none; stroke: rgb(99, 87, 219); stroke-width: 1.5; stroke-dasharray: 4,4; }
     </style>
   </defs>
 
-  <!-- 1. YOUR APP CODE -->
+  <!-- ================================================================== -->
+  <!-- 1. YOUR APP CODE                                                   -->
+  <!-- ================================================================== -->
   <g class="text-base">
-    <rect x="230" y="40" width="220" height="56" rx="8" stroke-width="0.5" style="fill:rgb(241, 239, 232);stroke:rgb(95, 94, 90);"/>
-    <text x="340" y="58" class="text-title" style="fill:rgb(68, 68, 65);">Your app code</text>
-    <text x="340" y="76" class="text-desc" style="fill:rgb(95, 94, 90);">Calls the public API</text>
+    <rect x="270" y="20" width="220" height="52" rx="8" stroke-width="0.8" style="fill:rgb(241, 239, 232);stroke:rgb(95, 94, 90);"/>
+    <text x="380" y="41" class="text-title" style="fill:rgb(50, 50, 48);">Your Application Code</text>
+    <text x="380" y="58" class="text-desc" style="fill:rgb(100, 100, 95);">Calls public API (db_exec, db_step)</text>
   </g>
 
-  <!-- Connection to Main Handle -->
-  <line x1="340" y1="96" x2="340" y2="138" marker-end="url(#arrow)" class="line-conn"/>
+  <!-- Connection line from App Code to Primary Handle -->
+  <line x1="380" y1="72" x2="380" y2="105" marker-end="url(#arrow)" class="line-conn"/>
 
-  <!-- 2. ARKILIAN CONNECTION (CONTAINER) -->
+  <!-- ================================================================== -->
+  <!-- 2. ARKILIAN CONNECTION CONTAINER (Spec §3.1 / §3.3)                 -->
+  <!-- ================================================================== -->
   <g class="text-base">
-    <rect x="50" y="140" width="580" height="310" rx="20" stroke-width="0.5" style="fill:rgb(238, 237, 254);stroke:rgb(83, 74, 183);"/>
-    <text x="80" y="172" class="text-header" style="fill:rgb(60, 52, 137);">arkilian connection</text>
-    <text x="80" y="190" class="text-sub" style="fill:rgb(83, 74, 183);">one per open database handle</text>
+    <rect x="25" y="105" width="710" height="340" rx="14" stroke-width="0.8" style="fill:rgb(243, 242, 255);stroke:rgb(99, 87, 219);"/>
+    <text x="45" y="130" class="text-header" style="fill:rgb(60, 52, 137);">arkilian connection</text>
+    <text x="45" y="146" class="text-sub" style="fill:rgb(99, 87, 219);">Three dedicated SQLite connections — eliminates cross-thread mutex contention (Spec §3.1)</text>
   </g>
 
-  <!-- Main Game Connection (left box) -->
+  <!-- ================================================================== -->
+  <!-- 2A. APP / WRITER THREAD (Primary Connection: db->handle)           -->
+  <!-- ================================================================== -->
   <g class="text-base">
-    <rect x="80" y="210" width="230" height="220" rx="12" stroke-width="0.5" style="fill:rgb(225, 245, 238);stroke:rgb(15, 110, 86);"/>
-    <text x="195" y="235" class="text-title" style="fill:rgb(8, 80, 65);">Main Connection</text>
-    <text x="195" y="253" class="text-desc" style="fill:rgb(15, 110, 86);">Game Thread</text>
+    <rect x="45" y="160" width="235" height="265" rx="10" stroke-width="0.8" style="fill:rgb(225, 245, 238);stroke:rgb(15, 110, 86);"/>
+    <text x="162" y="184" class="text-title" style="fill:rgb(8, 80, 65);">App / Writer Thread</text>
+    <text x="162" y="200" class="text-desc text-mono" style="fill:rgb(15, 110, 86);">db->handle (Primary)</text>
 
     <!-- SQLite Engine -->
-    <rect x="95" y="275" width="200" height="50" rx="8" stroke-width="0.5" style="fill:rgb(241, 239, 232);stroke:rgb(95, 94, 90);"/>
-    <text x="195" y="291" class="text-title" style="fill:rgb(68, 68, 65);">SQLite Engine</text>
-    <text x="195" y="309" class="text-desc" style="fill:rgb(95, 94, 90);">executes writes synchronously</text>
+    <rect x="60" y="215" width="205" height="54" rx="6" stroke-width="0.8" style="fill:rgb(248, 247, 243);stroke:rgb(120, 120, 115);"/>
+    <text x="162" y="235" class="text-title" style="fill:rgb(60, 60, 58);">SQLite Engine</text>
+    <text x="162" y="253" class="text-desc" style="fill:rgb(100, 100, 95);">executes writes synchronously (WAL)</text>
 
-    <!-- SQL Triggers -->
-    <rect x="95" y="340" width="200" height="70" rx="8" stroke-width="0.5" style="fill:rgb(241, 239, 232);stroke:rgb(95, 94, 90);"/>
-    <text x="195" y="358" class="text-title" style="fill:rgb(68, 68, 65);">SQL Triggers</text>
-    <text x="195" y="376" class="text-desc" style="fill:rgb(95, 94, 90);">captures write metadata to</text>
-    <text x="195" y="394" class="text-desc" style="font-family: monospace; font-size: 11px; fill:rgb(15, 110, 86);">_pending_backup</text>
+    <!-- Triggers & Sidecar DDL -->
+    <rect x="60" y="295" width="205" height="110" rx="6" stroke-width="0.8" style="fill:rgb(248, 247, 243);stroke:rgb(120, 120, 115);"/>
+    <text x="162" y="316" class="text-title" style="fill:rgb(60, 60, 58);">Triggers &amp; Sidecar DDL</text>
+    <text x="162" y="334" class="text-desc text-mono" style="fill:rgb(15, 110, 86);">sync_backup_triggers()</text>
+    <text x="162" y="352" class="text-desc" style="fill:rgb(90, 90, 85);">captures row DML on PK tables</text>
+    <text x="162" y="370" class="text-desc text-mono" style="fill:rgb(15, 110, 86);">trace_raw_ddl (.arkddlqueue)</text>
+    <text x="162" y="388" class="text-desc" style="fill:rgb(90, 90, 85);">journals transactions &amp; DDL</text>
   </g>
 
-  <!-- Outbox Table (center box) -->
+  <!-- Connectors within App Thread -->
+  <line x1="380" y1="105" x2="162" y2="105" class="line-conn"/>
+  <line x1="162" y1="105" x2="162" y2="215" marker-end="url(#arrow)" class="line-conn"/>
+  <line x1="162" y1="269" x2="162" y2="295" marker-end="url(#arrow)" class="line-conn"/>
+
+  <!-- ================================================================== -->
+  <!-- 2B. OUTBOX TABLE (In-Database CDC Storage)                         -->
+  <!-- ================================================================== -->
   <g class="text-base">
-    <rect x="330" y="250" width="130" height="140" rx="12" stroke-width="0.5" style="fill:rgb(225, 245, 238);stroke:rgb(15, 110, 86);"/>
-    <text x="395" y="275" class="text-title" style="fill:rgb(8, 80, 65);">Outbox Table</text>
-    <text x="395" y="295" class="text-desc" style="font-family: monospace; font-size: 11px; fill:rgb(15, 110, 86);">_pending_backup</text>
-    <path d="M 345,315 L 445,315 M 345,335 L 445,335 M 345,355 L 445,355" stroke="rgb(15, 110, 86)" stroke-width="1" />
-    <text x="395" y="375" class="text-desc" style="fill:rgb(15, 110, 86); font-weight: bold;">Cap: 100k</text>
+    <rect x="300" y="225" width="160" height="165" rx="10" stroke-width="0.8" style="fill:rgb(225, 245, 238);stroke:rgb(15, 110, 86);"/>
+    <text x="380" y="249" class="text-title" style="fill:rgb(8, 80, 65);">Outbox Table</text>
+    <text x="380" y="267" class="text-desc text-mono" style="fill:rgb(15, 110, 86); font-weight: 600;">_pending_backup</text>
+    
+    <path d="M 315,280 L 445,280" stroke="rgb(15, 110, 86)" stroke-width="0.8" stroke-dasharray="2,2"/>
+    
+    <text x="380" y="299" class="text-desc" style="fill:rgb(8, 80, 65); font-weight: 600;">Cap: 100,000 rows</text>
+    <text x="380" y="316" class="text-desc" style="fill:rgb(80, 110, 95); font-size: 10px;">Pauses capture if cap hit</text>
+    <text x="380" y="331" class="text-desc" style="fill:rgb(80, 110, 95); font-size: 10px;">(Never blocks app writes)</text>
+    
+    <path d="M 315,342 L 445,342" stroke="rgb(15, 110, 86)" stroke-width="0.8" stroke-dasharray="2,2"/>
+    
+    <text x="380" y="360" class="text-desc text-mono" style="fill:rgb(180, 60, 30); font-size: 10px;">_dead_backup (DLQ)</text>
+    <text x="380" y="375" class="text-desc text-mono" style="fill:rgb(15, 110, 86); font-size: 10px;">_arkilian_meta</text>
   </g>
 
-  <!-- Connectors between Connection, Engine, Triggers and Outbox -->
-  <!-- App API call hits SQLite Engine -->
-  <line x1="340" y1="138" x2="195" y2="138" class="line-conn"/>
-  <line x1="195" y1="138" x2="195" y2="275" marker-end="url(#arrow)" class="line-conn"/>
+  <!-- Flow: Triggers -> Outbox Table -->
+  <line x1="265" y1="350" x2="300" y2="350" marker-end="url(#arrow)" class="line-green"/>
+
+  <!-- ================================================================== -->
+  <!-- 2C. BACKGROUND THREADS (Flush & Snapshot)                          -->
+  <!-- ================================================================== -->
+  <!-- Flush Thread (Realtime shipping) -->
+  <g class="text-base">
+    <rect x="480" y="160" width="235" height="120" rx="10" stroke-width="0.8" style="fill:rgb(254, 242, 237);stroke:rgb(180, 75, 40);"/>
+    <text x="597" y="184" class="text-title" style="fill:rgb(130, 45, 20);">Flush Thread (Realtime)</text>
+    <text x="597" y="200" class="text-desc text-mono" style="fill:rgb(180, 75, 40);">db->backup_db (Dedicated)</text>
+    <text x="597" y="222" class="text-desc" style="fill:rgb(110, 50, 30);">Batches rows from outbox</text>
+    <text x="597" y="238" class="text-desc" style="fill:rgb(110, 50, 30);">AWS SigV4 PUT chunks to S3</text>
+    <text x="597" y="254" class="text-desc" style="fill:rgb(110, 50, 30);">Updates signed manifest.json</text>
+    <text x="597" y="270" class="text-desc" style="fill:rgb(110, 50, 30);">Deletes from outbox on ACK</text>
+  </g>
+
+  <!-- Snapshot Thread (Hourly full copy) -->
+  <g class="text-base">
+    <rect x="480" y="300" width="235" height="125" rx="10" stroke-width="0.8" style="fill:rgb(254, 242, 237);stroke:rgb(180, 75, 40);"/>
+    <text x="597" y="324" class="text-title" style="fill:rgb(130, 45, 20);">Snapshot Thread (Hourly)</text>
+    <text x="597" y="340" class="text-desc text-mono" style="fill:rgb(180, 75, 40);">db->snapshot_db (Dedicated)</text>
+    <text x="597" y="362" class="text-desc" style="fill:rgb(110, 50, 30);">Non-blocking online snapshot</text>
+    <text x="597" y="378" class="text-desc text-mono" style="fill:rgb(180, 75, 40); font-size: 10px;">sqlite3_backup_step()</text>
+    <text x="597" y="396" class="text-desc" style="fill:rgb(110, 50, 30);">PUTs backup.sqlite to S3</text>
+    <text x="597" y="412" class="text-desc" style="fill:rgb(110, 50, 30);">Advances baseline LSN &amp; prunes</text>
+  </g>
+
+  <!-- Flow: Outbox -> Flush Thread -->
+  <path d="M 460,260 L 480,225" marker-end="url(#arrow)" class="line-orange"/>
+
+  <!-- ================================================================== -->
+  <!-- 3. S3-COMPATIBLE STORAGE (Durability Registry & Artifacts)          -->
+  <!-- ================================================================== -->
+  <g class="text-base">
+    <rect x="25" y="475" width="710" height="125" rx="12" stroke-width="0.8" style="fill:rgb(245, 247, 252);stroke:rgb(70, 95, 150);"/>
+    <text x="45" y="498" class="text-header" style="fill:rgb(40, 65, 120);">S3-Compatible Object Storage</text>
+    <text x="255" y="498" class="text-sub" style="fill:rgb(90, 110, 150);">AWS S3 / MinIO / Cloudflare R2 / Ceph — Target prefix: {ARKILIAN_S3_PREFIX}/</text>
+    
+    <!-- Manifest Card -->
+    <rect x="45" y="512" width="200" height="74" rx="6" stroke-width="0.6" style="fill:rgb(255, 255, 255);stroke:rgb(180, 195, 225);"/>
+    <text x="145" y="532" class="text-title text-mono" style="fill:rgb(40, 65, 120);">manifest.json + .sig</text>
+    <text x="145" y="550" class="text-desc" style="fill:rgb(70, 70, 75);">Durable atomic registry</text>
+    <text x="145" y="568" class="text-desc" style="fill:rgb(180, 75, 40); font-weight: 600;">HMAC-SHA256 signature</text>
+
+    <!-- Chunks Card -->
+    <rect x="260" y="512" width="220" height="74" rx="6" stroke-width="0.6" style="fill:rgb(255, 255, 255);stroke:rgb(180, 195, 225);"/>
+    <text x="370" y="532" class="text-title text-mono" style="fill:rgb(40, 65, 120);">chunks/lsn_*.sql</text>
+    <text x="370" y="550" class="text-desc" style="fill:rgb(70, 70, 75);">Incremental CDC SQL chunks</text>
+    <text x="370" y="568" class="text-desc" style="fill:rgb(15, 110, 86);">SHA-256 verified per chunk</text>
+
+    <!-- Snapshot Card -->
+    <rect x="495" y="512" width="220" height="74" rx="6" stroke-width="0.6" style="fill:rgb(255, 255, 255);stroke:rgb(180, 195, 225);"/>
+    <text x="605" y="532" class="text-title text-mono" style="fill:rgb(40, 65, 120);">backup.sqlite</text>
+    <text x="605" y="550" class="text-desc" style="fill:rgb(70, 70, 75);">Hourly full database copy</text>
+    <text x="605" y="568" class="text-desc" style="fill:rgb(70, 70, 75);">Point-in-time baseline snapshot</text>
+  </g>
+
+  <!-- Connectors down to S3 Storage -->
+  <!-- Flush Thread -> Chunks / Manifest -->
+  <line x1="597" y1="280" x2="597" y2="475" marker-end="url(#arrow)" class="line-orange"/>
   
-  <!-- Engine feeds Triggers -->
-  <line x1="195" y1="325" x2="195" y2="340" marker-end="url(#arrow)" class="line-conn"/>
+  <!-- Snapshot Thread -> backup.sqlite -->
+  <line x1="605" y1="425" x2="605" y2="475" marker-end="url(#arrow)" class="line-orange"/>
 
-  <!-- Triggers write to Outbox -->
-  <line x1="295" y1="375" x2="330" y2="375" marker-end="url(#arrow)" class="line-conn"/>
-
-  <!-- 3. EXTERNAL THREADS (BOTTOM RED BOXES) -->
-  <!-- Snapshot Thread -->
-  <g class="text-base">
-    <rect x="95" y="470" width="220" height="56" rx="8" stroke-width="0.5" style="fill:rgb(250, 236, 231);stroke:rgb(153, 60, 29);"/>
-    <text x="205" y="488" class="text-title" style="fill:rgb(113, 43, 19);">Snapshot thread</text>
-    <text x="205" y="506" class="text-desc" style="fill:rgb(153, 60, 29);">hourly snapshot upload to S3 storage</text>
+  <!-- ================================================================== -->
+  <!-- 4. COLD-START HYDRATION (Return arrow)                             -->
+  <!-- ================================================================== -->
+  <!-- Replay arrow curving from S3 back to the app / local database -->
+  <path d="M 45,550 L 15,550 L 15,350 L 45,350" marker-end="url(#arrow)" class="line-purple"/>
+  
+  <g class="text-base" transform="translate(18, 430) rotate(-90)">
+    <text x="0" y="0" class="text-desc text-mono" style="fill:rgb(99, 87, 219); font-weight: 600;">arkilian_hydrate_s3()</text>
+    <text x="0" y="12" class="text-desc" style="fill:rgb(120, 110, 180); font-size: 9px;">replays snapshot + chunks</text>
   </g>
-
-  <!-- Flush Thread -->
-  <g class="text-base">
-    <rect x="365" y="470" width="220" height="56" rx="8" stroke-width="0.5" style="fill:rgb(250, 236, 231);stroke:rgb(153, 60, 29);"/>
-    <text x="475" y="488" class="text-title" style="fill:rgb(113, 43, 19);">Flush thread</text>
-    <text x="475" y="506" class="text-desc" style="fill:rgb(153, 60, 29);">chunks rows, PUTs to S3 storage</text>
-  </g>
-
-  <!-- Connectors from Outbox and SQLite Engine to Threads -->
-  <!-- Flush thread drains Outbox -->
-  <path d="M 395,390 L 395,440 L 475,440 L 475,470" marker-end="url(#arrow)" class="line-conn"/>
-
-  <!-- Snapshot thread runs Online Backup from SQLite Engine -->
-  <path d="M 195,430 L 195,450 L 205,450 L 205,470" marker-end="url(#arrow)" class="line-conn"/>
-
-  <!-- Sticky Flags / State Monitoring -->
-  <!-- Outbox Cap triggers sticky capture_paused -->
-  <path d="M 460,320 L 515,320 M 515,320 L 515,370" marker-end="url(#arrow)" class="line-dashed"/>
-
-  <g class="text-base" transform="translate(470, 375)">
-    <rect x="0" y="0" width="130" height="30" rx="4" stroke-width="0.5" style="fill:rgb(250, 236, 231);stroke:rgb(153, 60, 29);"/>
-    <text x="65" y="15" class="text-title" style="font-size: 10px; fill:rgb(113, 43, 19);">capture_paused = 1</text>
-  </g>
-
-  <!-- Snapshot thread clears sticky capture_paused -->
-  <path d="M 205,526 L 205,546 L 535,546 L 535,405" marker-end="url(#arrow)" class="line-dashed" style="stroke: rgb(15, 110, 86);"/>
 
 </svg>
