@@ -91,10 +91,10 @@ src/graphify-out
 graphify-out
 engineering/v2-upgrade-plan.md
 cmake-napi-build/
-**.md
 **.db.**
 **.sqlite.**
 bindings/rust/arkilian-sys/target/*
 all-tests.log
 arkilian-dlq
 newsite/
+files/
