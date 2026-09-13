@@ -28,24 +28,26 @@ npm install arkilian
 
 ---
 
-## Example 1: Simple Quickstart (`01_simple_quickstart.js`)
+## Example 1: Simple Quickstart (`01_simple_quickstart.ts`)
 
-A foundational guide covering:
+A foundational guide written in TypeScript covering:
 - Creating an embedded database connection (`new Arkilian('quickstart.sqlite')`)
-- Creating tables and running DDL
+- Creating tables and running idempotent DDL
 - Parameterized inserts with `db.run(sql, [params])`
-- Querying multiple records with `db.all(sql, [params])`
+- Querying multiple records with strongly-typed generics: `db.all<User>(sql, [params])`
 - ACID transactions with automatic rollback on error via `db.transaction(fn)`
 - Clean database teardown
 
 ### Run:
 ```bash
-node 01_simple_quickstart.js
+npx tsx 01_simple_quickstart.ts
+# or
+npm run start:simple
 ```
 
 ### Expected Output:
 ```text
-=== Arkilian Node.js SDK: Simple Quickstart ===
+=== Arkilian TypeScript SDK: Simple Quickstart ===
 
 [1] Initializing Arkilian database at './quickstart.sqlite'...
 [2] Creating schema...
@@ -53,7 +55,7 @@ node 01_simple_quickstart.js
 [3] Inserting sample records...
     ✓ 3 users inserted.
 
-[4] Querying all users:
+[4] Querying all users (typed User[]):
 ┌─────────┬────┬───────────┬────────────────────────┬─────────┐
 │ (index) │ id │ username  │ email                  │ balance │
 ├─────────┼────┼───────────┼────────────────────────┼─────────┤
@@ -62,7 +64,7 @@ node 01_simple_quickstart.js
 │ 2       │ 3  │ 'charlie' │ 'charlie@arkilian.dev' │ 220     │
 └─────────┴────┴───────────┴────────────────────────┴─────────┘
 [5] Querying single user (username = "alice"):
-    Found user: ID=1, Email=alice@arkilian.dev, Balance=$150.5
+    Found user: ID=1, Email=alice@arkilian.dev, Balance=$150.50
 
 [6] Running atomic transfer transaction ($30 from Alice to Bob)...
     ✓ Transaction committed successfully.
@@ -81,15 +83,15 @@ node 01_simple_quickstart.js
 
 ---
 
-## Example 2: Advanced S3 Streaming & Cold-Start Disaster Recovery (`02_advanced_s3_failover.js`)
+## Example 2: Advanced S3 Streaming & Cold-Start Disaster Recovery (`02_advanced_s3_failover.ts`)
 
-An advanced operational demonstration that shows:
-1. **Sidecar S3 WAL Streaming**: Continuous CDC and WAL shipping to MinIO / AWS S3.
+An advanced TypeScript operational demonstration that shows:
+1. **Sidecar S3 WAL Streaming**: Continuous CDC and WAL shipping to MinIO / AWS S3 with typed `S3Config`.
 2. **Real-time Telemetry**: Monitoring sidecar health (`db.backupHealthy`), health flags bitmask (`db.backupHealthFlags`), and pending outbox queue depth (`db.backupQueueDepth`).
 3. **Explicit WAL Flushes**: Flushing pending frames to ensure zero recovery lag via `db.walFlush()`.
 4. **Catastrophic Host Failure Simulation**: Deleting primary local database and WAL/SHM files.
 5. **Instant Cold-Start Disaster Recovery**: Using `Arkilian.hydrateS3()` to download the signed manifest, restore the baseline snapshot, replay incremental chunks, and verify HMAC signatures.
-6. **Data Parity Verification**: Reopening the restored database and validating exact row count and data fidelity.
+6. **Data Parity Verification**: Reopening the restored database and validating exact row count and data fidelity with typed row interfaces.
 
 ### Start Local MinIO (if not already running):
 ```bash
@@ -108,15 +110,22 @@ docker exec arkilian-minio-demo mc mb local/arkilian-test-bucket || true
 
 ### Run:
 ```bash
-node 02_advanced_s3_failover.js
+npx tsx 02_advanced_s3_failover.ts
+# or
+npm run start:advanced
+```
+
+### Type Checking:
+```bash
+npm run typecheck
 ```
 
 ### Expected Output:
 ```text
-=== Arkilian Node.js SDK: Advanced S3 Streaming & Cold-Start Hydration ===
+=== Arkilian TypeScript SDK: Advanced S3 Streaming & Cold-Start Hydration ===
 
 [Config] Target S3 Endpoint: http://127.0.0.1:9000
-[Config] Bucket: arkilian-test-bucket | Prefix: nodejs-demo
+[Config] Bucket: arkilian-test-bucket | Prefix: nodejs-ts-demo
 
 [Phase 1] Initializing Primary Node with S3 WAL Streaming...
   Telemetry -> Sidecar Healthy: true

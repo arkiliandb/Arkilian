@@ -13,7 +13,7 @@ Every language folder contains:
 
 | Language | Directory | Release Package Artifact | Quickstart Example | Advanced Cloud / DR Example |
 | :--- | :--- | :--- | :--- | :--- |
-| **Node.js / TS** | [`examples/nodejs/`](./nodejs/) | `arkilian-1.5.0.tgz` | `node 01_simple_quickstart.js` | `node 02_advanced_s3_failover.js` |
+| **Node.js / TS** | [`examples/nodejs/`](./nodejs/) | `arkilian-1.5.0.tgz` | `npx tsx 01_simple_quickstart.ts` | `npx tsx 02_advanced_s3_failover.ts` |
 | **Python** | [`examples/python/`](./python/) | `arkilian-1.5.0-py3-none-any.whl` | `python3 01_simple_quickstart.py` | `python3 02_advanced_s3_failover.py` |
 | **Go** | [`examples/go/`](./go/) | `arkilian-go-v1.5.0.tar.gz` | `go run ./01_simple_quickstart` | `go run ./02_advanced_s3_failover` |
 | **Rust** | [`examples/rust/`](./rust/) | `arkilian-rust-v1.5.0.crate` | `cargo run --bin simple_quickstart` | `cargo run --bin advanced_s3_failover` |
