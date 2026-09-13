@@ -12,18 +12,16 @@
 
 # Arkilian
 
-Arkilian is an embedded SQLite database engine written in C99, extending SQLite with real-time change data capture (CDC) streaming directly to S3-compatible object storage and periodic full snapshot backups.
+Arkilian is an embedded SQLite database engine written in C99 that streams row-level change data capture (CDC) and periodic point-in-time snapshots directly to S3-compatible object storage.
 
-> **Key Capabilities:** Row-level CDC streaming via SQLite triggers, periodic consistent full snapshots (`backup.sqlite`, hourly by default), cold-start S3 hydration with SHA-256 integrity and mandatory HMAC-SHA256 manifest authenticity, deep health telemetry with bitmask status flags, and first-class language bindings for Node.js/Bun, Python, Go, Rust, and PHP.
+### Features
+* **Asynchronous CDC Streaming:** Batches row-level changes from a local outbox (`_pending_backup`) into SHA-256-verified SQL chunks uploaded via AWS SigV4 presigned PUTs.
+* **Point-in-Time Snapshots:** Periodic online database backups (`sqlite3_backup_step`) uploaded to S3 (`backup.sqlite`).
+* **Cold-Start Hydration:** Reconstructs the database from S3 (`manifest.json`, baseline snapshot, and incremental chunks) with HMAC-SHA256 and SHA-256 verification.
+* **Dedicated Connections:** Three independent SQLite connections (`handle`, `backup_db`, and `snapshot_db`) eliminate cross-thread lock contention (Spec §3.1).
+* **Non-Blocking Capture:** If the outbox exceeds capacity (`ARKILIAN_MAX_QUEUE_DEPTH`, default 100,000), CDC capture pauses while application writes proceed without blocking (Spec §0).
+* **Multi-Language SDKs:** Prebuilt bindings for Node.js/TypeScript (N-API), Python (CFFI), Go (cgo), Rust, PHP (FFI), and C/C++.
 
-### Key Features
-* **Simplified SQLite Binding:** Comprehensive SQLite statement, parameter, and transaction management alongside raw handle extraction (`db_get_handle`).
-* **Direct-to-S3 Data Protection:** Two integrated background threads — a flush thread that batches row-level CDC writes into SHA-256-verified SQL chunks uploaded via AWS SigV4 presigned PUTs, and a snapshot thread that uploads consistent point-in-time database backups.
-* **Transactional Manifest Publication:** Arkilian publishes the manifest (`manifest.json`) and HMAC-SHA256 signature (`manifest.sig`) as a commit pair; local state advances only after both succeed, and hydrators fail closed on incomplete or invalid publication.
-* **Fail-Safe Application Isolation (Spec §0):** Backup operations never block or fail application transactions. If the outbox exceeds capacity (`ARKILIAN_MAX_QUEUE_DEPTH`), capture safely pauses while application writes continue unimpeded, and the condition is flagged until the next snapshot re-baselines.
-* **Cross-Platform:** Pure C99 building natively on macOS, Linux, and Windows (MSVC and MinGW).
-* **Multi-Language Support:** First-class bindings across Node.js/Bun (prebuilt N-API addons), Python (CFFI), Go (cgo), Rust (safe abstractions), and PHP (FFI).
-* **Zero-Config Defaults:** Ready to run out of the box; fully configurable via `ARKILIAN_` environment variables or a local `.env` file.
 
 ---
 
@@ -374,6 +372,41 @@ Compile against static library:
 ```bash
 gcc -I/usr/local/include/arkilian myapp.c -L/usr/local/lib -larkilian -lcurl -lpthread -lm -o myapp
 ```
+
+---
+
+## Performance & Benchmarks
+
+Arkilian was benchmarked directly against raw SQLite (amalgamation 3.46.1) using [`tests/bench_1m.c`](tests/bench_1m.c) on the same machine, schema, and connection settings (Intel Core i7-9750H, macOS, `-O2`, `journal_mode=WAL`, `synchronous=NORMAL`):
+
+### Single-Row Throughput (100,000 Operations)
+
+| Operation | Raw SQLite | Arkilian | Overhead |
+| :--- | :---: | :---: | :---: |
+| **INSERT (Autocommit)** | 5,262 ops/s | 5,144 ops/s | **-2.2%** |
+| **UPDATE (by PK)** | 5,030 ops/s | 5,018 ops/s | **-0.2%** |
+| **SELECT (Point by PK)** | 139,147 ops/s | 135,875 ops/s | **-2.4%** |
+| **SELECT (Range 100 rows)** | 6,182 ops/s | 6,017 ops/s | **-2.7%** |
+
+### Batched INSERT Throughput (100,000 Operations)
+
+| Batch Size | Raw SQLite | Arkilian | Difference |
+| :--- | :---: | :---: | :---: |
+| **Batch 1 (Autocommit)** | 1,672 ops/s | 1,760 ops/s | +5.3% |
+| **Batch 10** | 10,354 ops/s | 10,516 ops/s | +1.6% |
+| **Batch 100** | 22,975 ops/s | 23,231 ops/s | +1.1% |
+| **Batch 1,000** | 28,604 ops/s | 28,383 ops/s | -0.8% |
+| **Batch 10,000** | 29,358 ops/s | 29,600 ops/s | +0.8% |
+| **Batch 100,000** | 29,304 ops/s | 29,432 ops/s | +0.4% |
+
+### Latency Percentiles (50,000 Operations)
+
+| Operation | Percentile | Raw SQLite | Arkilian |
+| :--- | :--- | :---: | :---: |
+| **INSERT** | P50 / P95 / P99 | 256 µs / 256 µs / 512 µs | 256 µs / 256 µs / 512 µs |
+| **SELECT (PK)** | P50 / P95 / P99 | 8 µs / 16 µs / 16 µs | 8 µs / 16 µs / 16 µs |
+
+Full benchmark report, batched scalability curves, memory RSS telemetry, and reproduction instructions are available in [BENCHMARK.md](BENCHMARK.md).
 
 ---
 
