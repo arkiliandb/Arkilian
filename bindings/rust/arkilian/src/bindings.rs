@@ -346,10 +346,14 @@ extern "C" {
 }
 extern "C" {
     pub fn arkilian_hydrate_s3(
-        local_db_path: *const ::std::os::raw::c_char,
-        db_id: *const ::std::os::raw::c_char,
-        s3: *const arkilian_s3_config,
-        err_buf: *mut ::std::os::raw::c_char,
-        err_buf_cap: usize,
+        db_path: *const ::std::os::raw::c_char,
+        s3_endpoint: *const ::std::os::raw::c_char,
+        s3_bucket: *const ::std::os::raw::c_char,
+        s3_region: *const ::std::os::raw::c_char,
+        s3_access_key: *const ::std::os::raw::c_char,
+        s3_secret_key: *const ::std::os::raw::c_char,
+        s3_prefix: *const ::std::os::raw::c_char,
+        progress: *mut ::std::os::raw::c_void,
+        user_data: *mut ::std::os::raw::c_void,
     ) -> ::std::os::raw::c_int;
 }

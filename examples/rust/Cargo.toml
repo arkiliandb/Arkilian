@@ -1,0 +1,15 @@
+[package]
+name = "examples-rust"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+arkilian = { path = "../../bindings/rust/arkilian" }
+
+[[bin]]
+name = "simple_quickstart"
+path = "src/bin/01_simple_quickstart.rs"
+
+[[bin]]
+name = "advanced_s3_failover"
+path = "src/bin/02_advanced_s3_failover.rs"

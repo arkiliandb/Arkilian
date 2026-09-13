@@ -90,46 +90,31 @@ impl Default for S3Config {
 }
 
 /// Cold-start database recovery from S3 storage.
-pub fn hydrate_s3(local_db_path: &str, db_id: &str, s3: &S3Config) -> Result<(), String> {
+pub fn hydrate_s3(local_db_path: &str, prefix: &str, s3: &S3Config) -> Result<(), String> {
     let c_local = CString::new(local_db_path).map_err(|e| e.to_string())?;
-    let c_db_id = CString::new(db_id).map_err(|e| e.to_string())?;
     let c_endpoint = CString::new(s3.endpoint.as_str()).map_err(|e| e.to_string())?;
-    let c_region = CString::new(s3.region.as_str()).map_err(|e| e.to_string())?;
     let c_bucket = CString::new(s3.bucket.as_str()).map_err(|e| e.to_string())?;
+    let c_region = CString::new(s3.region.as_str()).map_err(|e| e.to_string())?;
     let c_key = CString::new(s3.access_key_id.as_str()).map_err(|e| e.to_string())?;
     let c_secret = CString::new(s3.secret_access_key.as_str()).map_err(|e| e.to_string())?;
-    let c_token = match &s3.session_token {
-        Some(t) => Some(CString::new(t.as_str()).map_err(|e| e.to_string())?),
-        None => None,
-    };
+    let c_prefix = CString::new(prefix).map_err(|e| e.to_string())?;
 
-    let s3_raw = ffi::arkilian_s3_config {
-        endpoint: c_endpoint.as_ptr(),
-        region: c_region.as_ptr(),
-        bucket: c_bucket.as_ptr(),
-        access_key_id: c_key.as_ptr(),
-        secret_access_key: c_secret.as_ptr(),
-        session_token: c_token.as_ref().map_or(ptr::null(), |t| t.as_ptr()),
-        use_ssl: if s3.use_ssl { 1 } else { 0 },
-        timeout_ms: s3.timeout_ms,
-    };
-
-    let mut err_buf = vec![0u8; 1024];
     let rc = unsafe {
         ffi::arkilian_hydrate_s3(
             c_local.as_ptr(),
-            c_db_id.as_ptr(),
-            &s3_raw,
-            err_buf.as_mut_ptr() as *mut c_char,
-            err_buf.len(),
+            c_endpoint.as_ptr(),
+            c_bucket.as_ptr(),
+            c_region.as_ptr(),
+            c_key.as_ptr(),
+            c_secret.as_ptr(),
+            c_prefix.as_ptr(),
+            ptr::null_mut(),
+            ptr::null_mut(),
         )
     };
 
     if rc != HYDRATION_OK {
-        let msg = unsafe { CStr::from_ptr(err_buf.as_ptr() as *const c_char) }
-            .to_string_lossy()
-            .into_owned();
-        return Err(format!("Hydration failed (code {}): {}", rc, msg));
+        return Err(format!("Hydration failed with error code {}", rc));
     }
     Ok(())
 }

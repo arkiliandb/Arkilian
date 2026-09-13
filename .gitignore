@@ -98,3 +98,13 @@ all-tests.log
 arkilian-dlq
 newsite/
 files/
+target/
+venv/
+.venv/
+examples/c/01_simple_quickstart
+examples/c/02_advanced_s3_failover
+examples/rust/Cargo.lock
+audio
+Software design for medical devices & IoT _ Airbag Studio.html
+**.dylib
+libarkilian.a

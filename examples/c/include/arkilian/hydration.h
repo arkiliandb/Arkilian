@@ -1,0 +1,166 @@
+// Arkilian Hydration Engine v2 — Logical, Client-Driven S3 Model
+//
+// Cold-start recovery via signed-URL snapshot + incremental log chunk replay.
+// The client never touches a server's bandwidth — all heavy transfers go
+// directly through locally pre-signed S3 URLs (AWS SigV4).
+//
+// Phases:
+//   1. Read {prefix}/manifest.json (the shipper's durable registry) via a
+//      locally presigned GET → snapshot key + SHA-256 + baseline LSN + chunks
+//   2. Download the baseline .sqlite snapshot via signed GET → verify digest
+//      → validate → install as the local .db
+//   3. Open DB, query _arkilian_meta for last_applied_lsn
+//   4. Iterate incremental SQL chunks via signed GET → verify digest → replay
+//
+//   arkilian_hydrate_s3("mydb.db", endpoint, bucket, region, ak, sk, prefix);
+//
+#ifndef ARKILIAN_HYDRATION_H
+#define ARKILIAN_HYDRATION_H
+
+#include <stdint.h>
+#include <stddef.h>
+#include "deps/sqlite/sqlite3.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+// ── Error codes ─────────────────────────────────────────────────────
+
+#define HYDRATION_OK             0
+#define HYDRATION_ERR_NET       -1   // HTTP / network failure
+#define HYDRATION_ERR_DISK      -2   // local file I/O failure
+#define HYDRATION_ERR_MEM       -3   // out of memory
+#define HYDRATION_ERR_PROTO     -4   // manifest or protocol violation
+#define HYDRATION_ERR_SQL       -5   // SQL replay failed
+#define HYDRATION_ERR_DECOMP    -6   // decompression failure
+#define HYDRATION_ERR_EXPIRED   -7   // signed URL expired, caller should retry
+#define HYDRATION_ERR_NOTFOUND  -8   // snapshot not yet uploaded (cold start)
+#define HYDRATION_ERR_NEWER     -9   // local DB is AHEAD of the snapshot; refusing to clobber
+#define HYDRATION_ERR_BUSY      -10  // another connection is actively writing the local DB
+
+// ── Types ───────────────────────────────────────────────────────────
+
+// A single signed URL with its LSN range.
+typedef struct {
+  char   *url;          // Pre-Signed GET URL (caller frees)
+  char   *s3_key;       // Raw object key (no signature) when the source is
+                        // a manifest record (caller frees; may be NULL)
+  char   *sha256;       // Content digest (hex, no dashes) recorded by the
+                        // shipper in the manifest; verified by the client
+                        // after download. NULL/empty => not provided;
+                        // verification is a hard refusal.
+  int64_t lsn_start;    // first LSN in this chunk (inclusive)
+  int64_t lsn_end;      // last  LSN in this chunk (inclusive)
+  int64_t expires_at;   // unix timestamp when URL expires (0 = no expiry)
+} HydrateChunk;
+
+// The complete hydration plan built from {prefix}/manifest.json.
+typedef struct {
+  char   *snapshot_url;    // Pre-Signed GET URL for the baseline .snapshot
+  char   *snapshot_s3_key; // Raw object key of the baseline snapshot when
+                           // known (manifest-sourced; caller frees)
+  char   *snapshot_sha256; // Optional content digest of the snapshot (hex)
+  int64_t baseline_lsn;    // LSN embedded in the snapshot
+  int64_t expires_at;      // when snapshot URL expires (0 = no expiry)
+
+  HydrateChunk *chunks;   // ordered list of incremental chunks (caller frees)
+  int           chunk_count;
+} HydratePlan;
+
+// Progress callback.
+//   phase:   1 = downloading snapshot, 2 = replaying log chunks
+//   current: number of chunks processed (phase 1) or SQL statements played (phase 2)
+//   total:   total expected (0 if unknown)
+typedef void (*hydration_progress_cb)(int phase, int current, int total,
+                                       void *user_data);
+
+// ── Minimal JSON helpers (exposed for testing) ──────────────────────
+
+char   *json_get_string(const char *json, const char *key);
+// Strict integer parse (manifest wire protocol): the value must be a
+// complete, delimiter-terminated integer token — missing fields, quoted
+// numbers, and truncated tokens are REJECTED (the legacy json_get_int64
+// silently returned 0 for all of those, which the replay loop interpreted
+// as "already applied" and skipped). Returns 0 on success.
+int     json_get_int64_checked(const char *json, const char *key, int64_t *out);
+int64_t json_get_int64(const char *json, const char *key);
+int     json_array_count(const char *json, const char *key);
+char   *json_array_get(const char *json, const char *key, int index);
+
+// Download and parse {prefix}/manifest.json via a locally presigned GET.
+// The manifest is the client's persistent registry: the baseline snapshot
+// plus every uploaded WAL chunk with its LSN range and content digest.
+// On success *plan holds the snapshot key/digest/baseline LSN and the
+// ordered chunk list (caller frees with hydrate_plan_free). Returns 0 on
+// success, -1 when the manifest is absent or unparsable (a cold start has
+// no manifest yet — callers treat -1 as an empty registry, not an error).
+int ark_manifest_fetch(const char *endpoint, const char *bucket,
+                       const char *region, const char *access_key,
+                       const char *secret_key, const char *prefix,
+                       HydratePlan *plan);
+
+// Run the full two-phase hydration protocol (S3-only).
+//   db_path      Local target database path (e.g. "mydb.db")
+//   progress     Optional progress callback (may be NULL)
+//
+// DANGER — must not be called while the application has the database
+// open. Hydration replaces the database file on disk (remove + rename);
+// a live process would keep writing to the orphaned inode and diverge
+// from the restored file. Call hydrate() only from a cold process,
+// before db_init(). A best-effort probe refuses when another connection
+// is actively writing, but an idle-but-open application connection can
+// start writing immediately after the probe passes — the caller owns
+// this contract. Concurrent calls are serialized by a process-global
+// mutex (single-flight).
+//
+// Safety guards (all enforced before any file is touched):
+//   - HYDRATION_ERR_NEWER: local DB is further along than the snapshot
+//   - HYDRATION_ERR_BUSY:  another connection is actively writing, OR
+//                          another restore holds the <db_path>.arklock
+//                          exclusion (the lock is held for the ENTIRE
+//                          restore — the BEGIN IMMEDIATE probe is only a
+//                          point-in-time diagnostic for non-cooperating
+//                          writers)
+//   - manifest authenticity: when ARKILIAN_MANIFEST_HMAC_KEY is set, the
+//     manifest must verify against {prefix}/manifest.sig (HMAC-SHA-256
+//     over the exact manifest bytes) or the restore is refused — the
+//     bucket is not trusted as the root of the restore protocol
+//   - the downloaded snapshot is fsync'd and validated (opens as a
+//     clean SQLite database, PRAGMA quick_check) before install
+//   - SHA-256 digest is verified on every snapshot and chunk; a missing
+//     digest is a HARD refusal (no unauthenticated content is ever
+//     installed or replayed — chunks are executed as SQL, which is
+//     exactly why their authentication cannot be optional)
+//
+// Returns HYDRATION_OK on success, or a negative error code.
+int arkilian_hydrate_s3(const char *db_path,
+                         const char *s3_endpoint,
+                         const char *s3_bucket,
+                         const char *s3_region,
+                         const char *s3_access_key,
+                         const char *s3_secret_key,
+                         const char *s3_prefix,
+                         hydration_progress_cb progress,
+                         void *user_data);
+
+// Download a single plaintext SQL log chunk and replay it against an
+// open database.  The chunk is wrapped in an explicit transaction.
+// Updates _arkilian_meta.last_applied_lsn on success.
+// Returns 0 on success, negative on error.
+int hydrate_replay_chunk(sqlite3 *db, const char *raw_sql, int64_t chunk_lsn);
+
+// Free all memory associated with a HydratePlan.
+void hydrate_plan_free(HydratePlan *plan);
+
+// Remove db_path along with its SQLite sidecar files (-wal, -shm,
+// -journal).  Must be called before installing a downloaded snapshot:
+// leftover WAL frames from a previous database file would otherwise be
+// replayed into the new snapshot, silently corrupting it.
+void hydration_remove_db_files(const char *db_path);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif

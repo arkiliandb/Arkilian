@@ -127,11 +127,15 @@ int db_backup_is_healthy(arkilian *db);
 
 /* Hydration */
 int arkilian_hydrate_s3(
-    const char *local_db_path,
-    const char *db_id,
-    const arkilian_s3_config *s3,
-    char *err_buf,
-    size_t err_buf_cap
+    const char *db_path,
+    const char *s3_endpoint,
+    const char *s3_bucket,
+    const char *s3_region,
+    const char *s3_access_key,
+    const char *s3_secret_key,
+    const char *s3_prefix,
+    void *progress,
+    void *user_data
 );
 
 #endif
