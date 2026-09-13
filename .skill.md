@@ -1,1 +1,0 @@
-check out ./invictus.md for more info
