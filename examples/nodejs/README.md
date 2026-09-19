@@ -59,12 +59,12 @@ npm run start:simple
 ┌─────────┬────┬───────────┬────────────────────────┬─────────┐
 │ (index) │ id │ username  │ email                  │ balance │
 ├─────────┼────┼───────────┼────────────────────────┼─────────┤
-│ 0       │ 1  │ 'alice'   │ 'alice@arkilian.dev'   │ 150.5   │
-│ 1       │ 2  │ 'bob'     │ 'bob@arkilian.dev'     │ 80      │
-│ 2       │ 3  │ 'charlie' │ 'charlie@arkilian.dev' │ 220     │
+│ 0       │ 1  │ 'alice'   │ 'alice@arkilian.com'   │ 150.5   │
+│ 1       │ 2  │ 'bob'     │ 'bob@arkilian.com'     │ 80      │
+│ 2       │ 3  │ 'charlie' │ 'charlie@arkilian.com' │ 220     │
 └─────────┴────┴───────────┴────────────────────────┴─────────┘
 [5] Querying single user (username = "alice"):
-    Found user: ID=1, Email=alice@arkilian.dev, Balance=$150.50
+    Found user: ID=1, Email=alice@arkilian.com, Balance=$150.50
 
 [6] Running atomic transfer transaction ($30 from Alice to Bob)...
     ✓ Transaction committed successfully.

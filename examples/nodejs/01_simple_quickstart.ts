@@ -58,9 +58,9 @@ function main(): void {
   // 2. Insert records using parameterized queries
   console.log('[3] Inserting sample records...');
   const insertStmt = 'INSERT INTO users (username, email, balance) VALUES (?, ?, ?)';
-  db.run(insertStmt, ['alice', 'alice@arkilian.dev', 150.50]);
-  db.run(insertStmt, ['bob', 'bob@arkilian.dev', 80.00]);
-  db.run(insertStmt, ['charlie', 'charlie@arkilian.dev', 220.00]);
+  db.run(insertStmt, ['alice', 'alice@arkilian.com', 150.50]);
+  db.run(insertStmt, ['bob', 'bob@arkilian.com', 80.00]);
+  db.run(insertStmt, ['charlie', 'charlie@arkilian.com', 220.00]);
   console.log('    ✓ 3 users inserted.');
 
   // 3. Query records with typed generic all<T>()
