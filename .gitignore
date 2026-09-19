@@ -96,7 +96,7 @@ cmake-napi-build/
 bindings/rust/arkilian-sys/target/*
 all-tests.log
 arkilian-dlq
-newsite/
+site/
 files/
 target/
 venv/
