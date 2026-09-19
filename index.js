@@ -11,12 +11,12 @@ const require = createRequire(import.meta.url);
 // the native binding path at load time keeps `npm test` and any ESM
 // consumer working on plain `import Arkilian from "arkilian"`.
 const __dirname = import.meta.dirname ?? dirname(fileURLToPath(import.meta.url));
-// Runtime resolution via node-gyp-build: picks the prebuilt .node for this
-// platform/arch from the bundled prebuilds/ dir (offline, no compiler),
-// falling back to the build/Release output of a source build. Lets
-// `npm install arkilian` succeed on toolchain-less hosts (Alpine/Lambda/
-// serverless) where the prebuildify-produced .node is bundled — launch
-// Checklist #2.
+// Runtime resolution via node-gyp-build: picks the install-time downloaded
+// .node for this platform/arch from prebuilds/ (fetched from the latest
+// GitHub release by install.cjs), falling back to the build/Release output
+// of a source build. Lets `npm install arkilian` succeed on toolchain-less
+// hosts (Alpine/Lambda/serverless) without bundling every platform's binary
+// in the npm tarball.
 const native = require("node-gyp-build")(__dirname);
 
 const SQLITE_OK = 0;

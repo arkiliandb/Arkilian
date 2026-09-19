@@ -120,7 +120,7 @@ ARKILIAN_ENABLE_BACKUP=1
 
 ### 1 — Node.js / Bun (npm)
 
-The `arkilian` npm package includes prebuilt N-API binaries for Linux (x64, arm64, glibc, musl/Alpine), macOS (x64, arm64), and Windows (x64). No C compiler or libcurl headers are required at install time.
+The `arkilian` npm package pulls the prebuilt N-API binary for your platform from the latest GitHub release at install time (Linux x64/arm64 glibc + musl/Alpine, macOS x64/arm64, Windows x64). No C compiler or libcurl headers are required. If the download fails (offline / no release yet), install falls back to building from the bundled C sources.
 
 ```bash
 npm install arkilian

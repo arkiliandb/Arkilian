@@ -5,8 +5,8 @@
   "main": "index.js",
   "type": "module",
   "scripts": {
-    "install": "node-gyp-build",
-    "build": "node-gyp configure && node-gyp build",
+    "install": "node install.cjs",
+    "build": "node-gyp rebuild",
     "build:cmake": "cmake-js compile -T arkilian_napi",
     "clean": "node-gyp clean",
     "pretest": "node-gyp configure && node-gyp build",
@@ -41,10 +41,10 @@
   "gypfile": false,
   "files": [
     "index.js",
+    "install.cjs",
     "binding.gyp",
     "LICENSE",
     "README.md",
-    "prebuilds/",
     "src/class.c",
     "src/class.h",
     "src/arkilian.cc",
