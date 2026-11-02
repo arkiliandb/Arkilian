@@ -1,5 +1,31 @@
 # Changelog
 
+## 1.6.2 — manifest publish fix
+
+### Fixed
+
+- **A restart could freeze shipping for good with "manifest HMAC MISMATCH".**
+  The manifest was published as two objects, `manifest.json` then
+  `manifest.sig`. A process killed between the two PUTs (a platform SIGKILL
+  during the shutdown drain, an OOM kill) left the new manifest next to the
+  previous signature. Every later start refused the prefix as tampered and
+  froze shipping and publishing, and restores of that prefix failed. The only
+  way out was `ARKILIAN_MANIFEST_REBASE=1`. The signature is now embedded in
+  `manifest.json`, so one PUT publishes both atomically; `manifest.sig` is
+  still written for older readers. Covered by `tests/test_manifest_torn.c`.
+- A writer frozen on an unreadable remote manifest re-reads it every
+  `ARKILIAN_MANIFEST_RECHECK_SEC` (default 60 s) and resumes shipping once it
+  verifies, instead of staying frozen until a restart.
+
+### Upgrade notes
+
+- Readers of 1.6.2 accept manifests from older writers. Readers older than
+  1.6.2 accept manifests from 1.6.2 writers through `manifest.sig`.
+- A prefix already torn by an older writer still has a mismatched signature.
+  Start the writer once with `ARKILIAN_MANIFEST_REBASE=1` (after confirming
+  no other writer uses the prefix), wait for the next snapshot to publish,
+  then remove the variable.
+
 ## 1.6.1 — DDL capture fix
 
 ### Fixed
