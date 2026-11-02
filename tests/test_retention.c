@@ -28,6 +28,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <utime.h>
 
 #define KEY "retention-test-key"
 static const char *SRC = "rt_src.db";
@@ -130,6 +134,60 @@ static void cycle(arkilian *db) {
   assert(arkilian_run_snapshot_cycle(db) == SQLITE_OK);
 }
 
+static void touch(const char *path, time_t mtime) {
+  FILE *f = fopen(path, "wb");
+  assert(f);
+  fputs("staging", f);
+  fclose(f);
+  if (mtime) {
+    struct utimbuf t = {mtime, mtime};
+    assert(utime(path, &t) == 0);
+  }
+}
+
+static int file_exists(const char *p) {
+  struct stat st;
+  return stat(p, &st) == 0;
+}
+
+// 7. Staging files left by dead processes are removed at startup; files of
+//    live processes (and of live instances in this process) are kept.
+static void staging_cleanup_test(void) {
+  pid_t child = fork();
+  if (child == 0) _exit(0);
+  assert(child > 0);
+  waitpid(child, NULL, 0);  // reaped: this PID is now dead
+  char dead[256], own_old[256], live[256], odd[256], own_new[256];
+  snprintf(dead, sizeof(dead), "rt_backup.sqlite.arktmp.%ld.3.snapshot", (long)child);
+  snprintf(own_old, sizeof(own_old), "rt_backup.sqlite.arktmp.%ld.1.snapshot", (long)getpid());
+  snprintf(live, sizeof(live), "rt_backup.sqlite.arktmp.%ld.2.chunk", (long)getppid());
+  snprintf(odd, sizeof(odd), "rt_backup.sqlite.arktmp.notes.txt");
+  touch(dead, 0);
+  touch(own_old, time(NULL) - 3600);  // same PID as us, from a previous boot
+  touch(live, 0);
+  touch(odd, 0);
+  arkilian *db = NULL;
+  assert(db_init(&db, SRC) == 0);
+  assert(!file_exists(dead));
+  assert(!file_exists(own_old));
+  assert(file_exists(live));
+  assert(file_exists(odd));
+  // A file this process created after its first db_init (a live instance)
+  // survives the next instance's startup.
+  snprintf(own_new, sizeof(own_new), "rt_backup.sqlite.arktmp.%ld.99.manifest", (long)getpid());
+  sleep(1);
+  touch(own_new, 0);
+  arkilian *db2 = NULL;
+  assert(db_init(&db2, "rt_src2.db") == 0);
+  assert(file_exists(own_new));
+  db_close(db2);
+  db_close(db);
+  remove(live); remove(odd); remove(own_new);
+  rm_db("rt_src2.db");
+  rm_db(SRC);
+  printf("  stale staging files removed at startup; live ones kept\n");
+}
+
 int main(void) {
   printf("=== storage retention ===\n");
   stub_start();
@@ -143,6 +201,7 @@ int main(void) {
   setenv("ARKILIAN_BACKUP_PATH", "rt_backup.sqlite", 1);
   unsetenv("ARKILIAN_RETENTION");
   rm_db(SRC);
+  staging_cleanup_test();
 
   char k[600];
   // Leftovers of a 1.6.0/1.6.1 deployment: superseded snapshots and the
@@ -161,12 +220,37 @@ int main(void) {
     put(keep_keys[i], "not-arkilian");
   }
 
+  char *before_init = manifest();
   arkilian *db = NULL;
   assert(db_init(&db, SRC) == 0);
   assert(db_exec(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)") == SQLITE_OK);
   for (int i = 0; i < 200 && !(db_backup_health_flags(db) & ARK_HF_MANIFEST_RESOLVED); i++)
     usleep(50000);
   assert(db_backup_health_flags(db) & ARK_HF_MANIFEST_RESOLVED);
+  // Let this writer's own startup snapshot publish before driving cycles
+  // from the test thread (the two would otherwise run concurrently).
+  // (Wait for the snapshot KEY to change: chunk publishes also change the
+  // manifest, and stopping on those let the startup snapshot race the
+  // test's own cycle.)
+  char before_snap[512] = "";
+  if (before_init) {
+    char refs[64][512];
+    if (manifest_keys(before_init, refs, 64) > 0 && strstr(refs[0], "/snapshots/"))
+      snprintf(before_snap, sizeof(before_snap), "%s", refs[0]);
+  }
+  int started = 0;
+  for (int i = 0; i < 400 && !started; i++) {
+    char *m = manifest();
+    char refs[64][512];
+    if (m && manifest_keys(m, refs, 64) > 0 && strstr(refs[0], "/snapshots/") &&
+        strcmp(refs[0], before_snap) != 0)
+      started = 1;
+    free(m);
+    if (!started) usleep(50000);
+  }
+  assert(started);
+  free(before_init);
+  sleep(1);
 
   // Several snapshot generations with writes in between.
   char *prev_manifest = NULL;
@@ -182,12 +266,69 @@ int main(void) {
       for (int i = 0; i < n; i++) {
         if (!exists(refs[i])) {
           fprintf(stderr, "generation %d: previous manifest object deleted: %s\n", gen, refs[i]);
+          fprintf(stderr, "previous manifest: %s\n", prev_manifest);
+          char *cm = manifest();
+          fprintf(stderr, "current manifest: %s\n", cm ? cm : "(none)");
+          free(cm);
           assert(0);
         }
       }
     }
   }
   free(prev_manifest);
+
+  // A manifest can list a chunk at or below its own baseline (it shipped
+  // while the snapshot was being copied). That chunk must survive one more
+  // generation: restores of that manifest still download it.
+  {
+    char ck[512], sha[65];
+    snprintf(ck, sizeof(ck), "%s/chunks/lsn_0000000002_0000000002_covered.sql", PREFIX);
+    const char *body = "-- covered by the snapshot\n";
+    put(ck, body);
+    ark_sha256_hex(body, strlen(body), sha);
+    assert(arkilian_registry_record(db, ck, sha, 2, 2) == 0);
+    int listed = 0;
+    for (int i = 0; i < 200 && !listed; i++) {
+      db_wal_flush(db);
+      char *m = manifest();
+      listed = m && strstr(m, "_covered.sql");
+      free(m);
+      if (!listed) usleep(50000);
+    }
+    assert(listed);
+    char *m1 = manifest();
+    write_rows(db, 5);
+    cycle(db);
+    assert(exists(ck));  // the previous manifest lists it
+    char refs[64][512];
+    int n = manifest_keys(m1, refs, 64);
+    for (int i = 0; i < n; i++) assert(exists(refs[i]));
+    free(m1);
+    write_rows(db, 5);
+    cycle(db);
+    assert(!exists(ck));  // two generations later it is gone
+    printf("  chunk listed below its manifest's baseline kept for one generation\n");
+  }
+
+  // An idle cycle re-publishes the SAME snapshot. It must not count as a
+  // new generation: a restore that read the manifest before the last real
+  // generation still needs its snapshot.
+  {
+    char *m1 = manifest();
+    write_rows(db, 5);
+    cycle(db);   // new generation
+    cycle(db);   // idle: same baseline, same key
+    char refs[64][512];
+    int n = manifest_keys(m1, refs, 64);
+    for (int i = 0; i < n; i++) {
+      if (!exists(refs[i])) {
+        fprintf(stderr, "idle republish deleted %s\n", refs[i]);
+        assert(0);
+      }
+    }
+    free(m1);
+    printf("  idle re-publish keeps the previous restore point\n");
+  }
   int snaps = count_with("/snapshots/") - 3;  // minus the three foreign keys containing it
   printf("  snapshots kept after 6 generations: %d (current + previous)\n", snaps);
   assert(snaps <= 2);

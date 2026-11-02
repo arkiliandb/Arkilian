@@ -60,6 +60,8 @@
 #include <strings.h>
 #include <unistd.h>
 #include <sys/file.h>
+#include <dirent.h>
+#include <signal.h>
 #endif
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -301,6 +303,12 @@ struct arkilian {
   char *retention_prev_key;      // previous baseline snapshot's object key
   uint64_t retention_prev_baseline;
   int retention_have_prev;       // a snapshot publish replaced a baseline
+  // Chunk keys the previous generation's manifests could reference (the
+  // registry just before the last baseline change). A manifest may list a
+  // chunk at or below its own baseline (shipped while the snapshot was
+  // being copied), so LSNs alone cannot tell what it references.
+  char **retention_prev_chunks;
+  int retention_prev_chunk_count;
   int manifest_pending;          // chunk records added since last manifest PUT
   time_t manifest_last_upload;   // last successful manifest PUT (0 = never)
   // Startup manifest read state. Publishing is gated on it: until the
@@ -656,6 +664,136 @@ FILE *arkilian_unique_tmp(const char *base, const char *suffix,
     return f;
   }
   return NULL;
+}
+
+// ── Stale staging cleanup ───────────────────────────────────────────
+// Staging files (<backup_path>.arktmp.<pid>.<n>.<suffix>) are unlinked
+// after use, but a process killed mid-copy or mid-upload leaves its file
+// behind, and a snapshot staging file is a full copy of the database.
+// Nothing removed them, so a host that restarts during snapshot uploads
+// (a platform redeploy, an OOM kill) accumulated full database copies.
+// At startup, files left by a process that no longer runs are deleted.
+// Containers often reuse the same PID on every boot, so a file carrying
+// THIS process's PID counts as stale only when it predates the first
+// db_init of this process (live instances in this process create theirs
+// later). Files of other live processes are never touched.
+
+#ifdef _WIN32
+static time_t g_ark_first_init_time = 0;
+static volatile LONG g_ark_first_init_set = 0;
+#else
+static time_t g_ark_first_init_time = 0;
+static pthread_once_t g_ark_first_init_once = PTHREAD_ONCE_INIT;
+static void ark_record_first_init(void) { g_ark_first_init_time = time(NULL); }
+#endif
+
+static void ark_note_first_init(void) {
+#ifdef _WIN32
+  if (InterlockedCompareExchange(&g_ark_first_init_set, 1, 0) == 0)
+    g_ark_first_init_time = time(NULL);
+#else
+  pthread_once(&g_ark_first_init_once, ark_record_first_init);
+#endif
+}
+
+static int ark_pid_alive(long pid) {
+  if (pid <= 0) return 1;  // unknown: treat as alive (never delete)
+#ifdef _WIN32
+  HANDLE h = OpenProcess(SYNCHRONIZE, FALSE, (DWORD)pid);
+  if (!h) return GetLastError() == ERROR_ACCESS_DENIED;  // exists, not ours
+  DWORD w = WaitForSingleObject(h, 0);
+  CloseHandle(h);
+  return w == WAIT_TIMEOUT;
+#else
+  if (kill((pid_t)pid, 0) == 0) return 1;
+  return errno != ESRCH;  // EPERM: exists under another user
+#endif
+}
+
+// name must be "<base>.arktmp.<pid>.<n>.<suffix>" with a lowercase suffix.
+static int ark_parse_staging_name(const char *name, const char *base, long *pid) {
+  size_t bl = strlen(base);
+  if (strncmp(name, base, bl) != 0 || strncmp(name + bl, ".arktmp.", 8) != 0) return 0;
+  const char *p = name + bl + 8;
+  char *e = NULL;
+  errno = 0;
+  long v = strtol(p, &e, 10);
+  if (errno || e == p || *e != '.') return 0;
+  p = e + 1;
+  const char *q = p;
+  while (*q >= '0' && *q <= '9') q++;
+  if (q == p || *q != '.') return 0;
+  q++;
+  if (!*q) return 0;
+  for (const char *r = q; *r; r++)
+    if (*r < 'a' || *r > 'z') return 0;
+  *pid = v;
+  return 1;
+}
+
+static void cleanup_stale_staging(arkilian *db, const char *backup_path) {
+  if (!backup_path || !backup_path[0]) return;
+  char dir[1024];
+  const char *base = backup_path;
+  {
+    const char *slash = strrchr(backup_path, '/');
+#ifdef _WIN32
+    const char *bs = strrchr(backup_path, '\\');
+    if (bs && (!slash || bs > slash)) slash = bs;
+#endif
+    if (slash) {
+      size_t dl = (size_t)(slash - backup_path);
+      if (dl == 0) dl = 1;  // "/name"
+      if (dl >= sizeof(dir)) return;
+      memcpy(dir, backup_path, dl);
+      dir[dl] = '\0';
+      base = slash + 1;
+    } else {
+      strcpy(dir, ".");
+    }
+  }
+  if (!base[0]) return;
+  long self = (long)ARK_GETPID();
+  int removed = 0;
+  unsigned long long bytes = 0;
+#ifdef _WIN32
+  char pattern[1100];
+  snprintf(pattern, sizeof(pattern), "%s\\%s.arktmp.*", dir, base);
+  WIN32_FIND_DATAA fd;
+  HANDLE h = FindFirstFileA(pattern, &fd);
+  if (h == INVALID_HANDLE_VALUE) return;
+  do {
+    long pid = 0;
+    if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+    if (!ark_parse_staging_name(fd.cFileName, base, &pid)) continue;
+    char full[1400];
+    snprintf(full, sizeof(full), "%s\\%s", dir, fd.cFileName);
+    struct _stat64 st;
+    if (_stat64(full, &st) != 0) continue;
+    int stale = pid == self ? (st.st_mtime < g_ark_first_init_time) : !ark_pid_alive(pid);
+    if (stale && remove(full) == 0) { removed++; bytes += (unsigned long long)st.st_size; }
+  } while (FindNextFileA(h, &fd));
+  FindClose(h);
+#else
+  DIR *d = opendir(dir);
+  if (!d) return;
+  struct dirent *ent;
+  while ((ent = readdir(d)) != NULL) {
+    long pid = 0;
+    if (!ark_parse_staging_name(ent->d_name, base, &pid)) continue;
+    char full[1400];
+    if ((size_t)snprintf(full, sizeof(full), "%s/%s", dir, ent->d_name) >= sizeof(full)) continue;
+    struct stat st;
+    if (lstat(full, &st) != 0 || !S_ISREG(st.st_mode)) continue;
+    int stale = pid == self ? (st.st_mtime < g_ark_first_init_time) : !ark_pid_alive(pid);
+    if (stale && unlink(full) == 0) { removed++; bytes += (unsigned long long)st.st_size; }
+  }
+  closedir(d);
+#endif
+  if (removed)
+    ark_log(db, ARK_LOG_INFO,
+            "removed %d staging file(s) (%.1f MiB) left by a previous process next to %s",
+            removed, (double)bytes / (1024.0 * 1024.0), backup_path);
 }
 
 // ── Structured logging ──────────────────────────────────────────────
@@ -3305,6 +3443,8 @@ int db_init(arkilian **db_ptr, const char *filename) {
   const char *backup_path_tmp = get_env_default("ARKILIAN_BACKUP_PATH", DEFAULT_BACKUP_PATH);
   db->backup_path = malloc(strlen(backup_path_tmp) + 1);
   if (db->backup_path) strcpy(db->backup_path, backup_path_tmp);
+  ark_note_first_init();
+  cleanup_stale_staging(db, db->backup_path);
 
   // S3 destination — the ONLY backup target. SigV4 requests are signed
   // locally with the per-database access/secret keys; no other credential
@@ -3854,6 +3994,9 @@ void db_close(arkilian *db) {
   free(db->manifest_snapshot_key);
   free(db->manifest_snapshot_sha);
   free(db->retention_prev_key);
+  for (int i = 0; i < db->retention_prev_chunk_count; i++)
+    free(db->retention_prev_chunks[i]);
+  free(db->retention_prev_chunks);
   if (db->chunk.buffer) free(db->chunk.buffer);
 
   free(db);
@@ -5556,10 +5699,35 @@ static int manifest_registry_upload(arkilian *db, const char *snapshot_key,
     // Atomically commit candidate snapshot metadata and prune covered chunks.
     if (snapshot_key) {
       // The replaced baseline becomes the retained previous restore point.
-      free(db->retention_prev_key);
-      db->retention_prev_key = db->manifest_snapshot_key;  // may be NULL
-      db->retention_prev_baseline = db->manifest_baseline_lsn;
-      db->retention_have_prev = 1;
+      // Re-publishing the SAME snapshot (an idle database, a retried
+      // startup snapshot) is not a new generation: the previous restore
+      // point stays the last DIFFERENT one, which in-flight restores need.
+      if (db->manifest_snapshot_key && strcmp(db->manifest_snapshot_key, cand_nk) == 0) {
+        free(db->manifest_snapshot_key);
+      } else {
+        // Snapshot of the registry BEFORE the prune below: every chunk the
+        // manifests of the generation being replaced could reference.
+        char **keys = db->manifest_chunk_count > 0
+            ? calloc((size_t)db->manifest_chunk_count, sizeof(char *)) : NULL;
+        int nkeys = 0, keys_ok = db->manifest_chunk_count == 0 || keys != NULL;
+        for (int i = 0; keys && i < db->manifest_chunk_count; i++) {
+          if (!db->manifest_chunks[i].s3_key) continue;
+          keys[nkeys] = strdup(db->manifest_chunks[i].s3_key);
+          if (!keys[nkeys]) { keys_ok = 0; break; }
+          nkeys++;
+        }
+        for (int i = 0; i < db->retention_prev_chunk_count; i++)
+          free(db->retention_prev_chunks[i]);
+        free(db->retention_prev_chunks);
+        db->retention_prev_chunks = keys;
+        db->retention_prev_chunk_count = nkeys;
+        free(db->retention_prev_key);
+        db->retention_prev_key = db->manifest_snapshot_key;  // may be NULL
+        db->retention_prev_baseline = db->manifest_baseline_lsn;
+        // Out of memory: no reliable protected set, so retention waits for
+        // the next generation instead of guessing.
+        db->retention_have_prev = keys_ok;
+      }
       free(db->manifest_snapshot_sha);
       db->manifest_snapshot_key = cand_nk;
       db->manifest_snapshot_sha = cand_ns;
@@ -6077,10 +6245,13 @@ static int parse_u64_field(const char *s, size_t width, uint64_t *out, const cha
   return 0;
 }
 
-static int key_referenced(const char *key, const HydratePlan *plan) {
+static int key_referenced(const char *key, const HydratePlan *plan,
+                          char *const *prev_chunks, int prev_count) {
   if (plan->snapshot_s3_key && strcmp(plan->snapshot_s3_key, key) == 0) return 1;
   for (int i = 0; i < plan->chunk_count; i++)
     if (plan->chunks[i].s3_key && strcmp(plan->chunks[i].s3_key, key) == 0) return 1;
+  for (int i = 0; i < prev_count; i++)
+    if (prev_chunks[i] && strcmp(prev_chunks[i], key) == 0) return 1;
   return 0;
 }
 
@@ -6088,11 +6259,12 @@ static int key_referenced(const char *key, const HydratePlan *plan) {
 // is the previous restore point's baseline LSN; prev_key its snapshot.
 static int retention_deletable(const char *prefix, const char *key,
                                const HydratePlan *plan, const char *prev_key,
-                               uint64_t prev_baseline) {
+                               uint64_t prev_baseline,
+                               char *const *prev_chunks, int prev_count) {
   size_t pl = strlen(prefix);
   if (strncmp(key, prefix, pl) != 0 || key[pl] != '/') return 0;
   const char *rel = key + pl + 1;
-  if (key_referenced(key, plan)) return 0;
+  if (key_referenced(key, plan, prev_chunks, prev_count)) return 0;
   if (prev_key && strcmp(prev_key, key) == 0) return 0;
   if (strncmp(rel, "snapshots/", 10) == 0) {
     // snapshots/<20-digit baseline>_<writer>.backup.sqlite
@@ -6138,10 +6310,19 @@ static void retention_gc(arkilian *db) {
   char *prev_key = prev_exists ? strdup(db->retention_prev_key) : NULL;
   char *cur_key = db->manifest_snapshot_key ? strdup(db->manifest_snapshot_key) : NULL;
   uint64_t cur_baseline = db->manifest_baseline_lsn;
+  int pc_count = db->retention_prev_chunk_count;
+  char **pc = pc_count > 0 ? calloc((size_t)pc_count, sizeof(char *)) : NULL;
+  int pc_ok = pc_count == 0 || pc != NULL;
+  for (int i = 0; pc && i < pc_count; i++) {
+    pc[i] = db->retention_prev_chunks[i] ? strdup(db->retention_prev_chunks[i]) : NULL;
+    if (db->retention_prev_chunks[i] && !pc[i]) pc_ok = 0;
+  }
   manifest_registry_unlock(db);
+#define RETENTION_FREE_PC() do { for (int i_ = 0; pc && i_ < pc_count; i_++) free(pc[i_]); free(pc); } while (0)
   if (!have_prev || !cur_key || prev_baseline > cur_baseline ||
-      (prev_exists && !prev_key)) {
+      (prev_exists && !prev_key) || !pc_ok) {
     free(prev_key); free(cur_key);
+    RETENTION_FREE_PC();
     return;
   }
 
@@ -6160,6 +6341,7 @@ static void retention_gc(arkilian *db) {
       hydrate_plan_free(&plan);
     }
     free(prev_key); free(cur_key);
+    RETENTION_FREE_PC();
     return;
   }
 
@@ -6187,10 +6369,16 @@ static void retention_gc(arkilian *db) {
     char *xml = NULL;
     long st = s3_signed_request(db, "GET", NULL, query, &xml);
     if (st != 200 || !xml) {
-      if (pages == 0)
+      if (pages == 0 && (st == 401 || st == 403))
         ark_log(db, ARK_LOG_WARN,
-                "retention skipped: listing %s/ failed (HTTP %ld)",
-                db->s3_prefix, st);
+                "retention skipped: the storage credentials may not list %s/ "
+                "(HTTP %ld). Grant list and delete permission on the bucket "
+                "(s3:ListBucket, s3:DeleteObject) or set ARKILIAN_RETENTION=0; "
+                "backups are unaffected", db->s3_prefix, st);
+      else if (pages == 0)
+        ark_log(db, ARK_LOG_WARN,
+                "retention skipped: listing %s/ failed (HTTP %ld); retried "
+                "after the next snapshot", db->s3_prefix, st);
       free(xml);
       break;
     }
@@ -6203,15 +6391,17 @@ static void retention_gc(arkilian *db) {
       if (!ce) break;
       char key[1100], size_s[32];
       if (xml_tag_text(c, ce, "Key", key, sizeof(key)) &&
-          retention_deletable(db->s3_prefix, key, &plan, prev_key, prev_baseline)) {
+          retention_deletable(db->s3_prefix, key, &plan, prev_key, prev_baseline,
+                              pc, pc_count)) {
         unsigned long long sz = 0;
         if (xml_tag_text(c, ce, "Size", size_s, sizeof(size_s))) sz = strtoull(size_s, NULL, 10);
         long ds = s3_signed_request(db, "DELETE", key, NULL, NULL);
         if ((ds >= 200 && ds < 300) || ds == 404) { deleted++; freed += sz; }
-        else failed++;
+        else if (++failed >= 20) break;  // e.g. no delete permission: stop early
       }
       p = ce + 11;
     }
+    if (failed >= 20) { free(xml); break; }
     char trunc[16] = "";
     xml_tag_text(xml, NULL, "IsTruncated", trunc, sizeof(trunc));
     int more = strcmp(trunc, "true") == 0 &&
@@ -6224,10 +6414,13 @@ static void retention_gc(arkilian *db) {
     ark_log(db, failed ? ARK_LOG_WARN : ARK_LOG_INFO,
             "retention: deleted %ld superseded object(s) (%.1f MiB) from %s/%s",
             deleted, (double)freed / (1024.0 * 1024.0), db->s3_prefix,
-            failed ? " — some deletes failed and are retried next cycle" : "");
+            failed ? " — some deletes failed (check the credentials have "
+                     "delete permission); retried after the next snapshot" : "");
   hydrate_plan_free(&plan);
   free(prev_key);
   free(cur_key);
+  RETENTION_FREE_PC();
+#undef RETENTION_FREE_PC
 }
 
 // Upload the staged image, then (gap-checked) publish it as the new
