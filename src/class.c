@@ -295,6 +295,12 @@ struct arkilian {
   char *manifest_snapshot_key;   // current baseline snapshot's object key
   char *manifest_snapshot_sha;   // its sha256
   uint64_t manifest_baseline_lsn;
+  // Retention: the restore point the latest snapshot publish replaced.
+  // It is kept (with everything it needs) for restores already in flight;
+  // older snapshots and chunks are deleted from storage.
+  char *retention_prev_key;      // previous baseline snapshot's object key
+  uint64_t retention_prev_baseline;
+  int retention_have_prev;       // a snapshot publish replaced a baseline
   int manifest_pending;          // chunk records added since last manifest PUT
   time_t manifest_last_upload;   // last successful manifest PUT (0 = never)
   // Startup manifest read state. Publishing is gated on it: until the
@@ -3847,6 +3853,7 @@ void db_close(arkilian *db) {
   free(db->manifest_chunks);
   free(db->manifest_snapshot_key);
   free(db->manifest_snapshot_sha);
+  free(db->retention_prev_key);
   if (db->chunk.buffer) free(db->chunk.buffer);
 
   free(db);
@@ -5548,7 +5555,11 @@ static int manifest_registry_upload(arkilian *db, const char *snapshot_key,
     // Both manifest.json and manifest.sig are durably published.
     // Atomically commit candidate snapshot metadata and prune covered chunks.
     if (snapshot_key) {
-      free(db->manifest_snapshot_key);
+      // The replaced baseline becomes the retained previous restore point.
+      free(db->retention_prev_key);
+      db->retention_prev_key = db->manifest_snapshot_key;  // may be NULL
+      db->retention_prev_baseline = db->manifest_baseline_lsn;
+      db->retention_have_prev = 1;
       free(db->manifest_snapshot_sha);
       db->manifest_snapshot_key = cand_nk;
       db->manifest_snapshot_sha = cand_ns;
@@ -5866,6 +5877,359 @@ int arkilian_run_snapshot_cycle(arkilian *db) {
   return status;
 }
 
+// ── Storage retention ───────────────────────────────────────────────
+// Snapshots use immutable per-cycle keys (since 1.6.0), so nothing was
+// ever overwritten and nothing was ever deleted: a bucket grew by one full
+// database image per snapshot interval. After every successful snapshot
+// publish the writer now deletes what no restore can need any more.
+//
+// Kept: everything the current manifest references, the previous baseline
+// snapshot, every chunk that ends after the previous baseline (restores
+// that started from the previous manifest), every object above the current
+// baseline (uploaded but not yet published), and any key not written by
+// Arkilian. Deleted: snapshots below the previous baseline, the legacy
+// fixed {prefix}/backup.sqlite once replaced, and chunks that end at or
+// below the previous baseline. Before deleting, the remote manifest is
+// re-read and must still be the one this process just published; any
+// doubt skips the run (the next cycle retries). ARKILIAN_RETENTION=0
+// disables it (for buckets managed by lifecycle rules).
+
+typedef struct { char *buf; size_t len, cap; } ark_membuf;
+
+static size_t ark_membuf_cb(void *ptr, size_t size, size_t nmemb, void *user) {
+  ark_membuf *m = (ark_membuf *)user;
+  size_t n = size * nmemb;
+  if (m->len + n + 1 > (size_t)32 * 1024 * 1024) return 0;  // cap: 32 MiB
+  if (m->len + n + 1 > m->cap) {
+    size_t nc = m->cap ? m->cap : 65536;
+    while (nc < m->len + n + 1) nc *= 2;
+    char *nb = realloc(m->buf, nc);
+    if (!nb) return 0;
+    m->buf = nb;
+    m->cap = nc;
+  }
+  memcpy(m->buf + m->len, ptr, n);
+  m->len += n;
+  m->buf[m->len] = '\0';
+  return n;
+}
+
+// SigV4 request signed with an Authorization header (not a presigned URL):
+// R2 accepts presigned URLs for object operations only, and listing is a
+// bucket operation. METHOD is "GET" (body returned, caller frees) or
+// "DELETE". key NULL = the bucket. `query`: as for s3_presign (encoded,
+// sorted). Returns the HTTP status, or -1 on a transport/signing failure.
+static long s3_signed_request(arkilian *db, const char *method, const char *key,
+                              const char *query, char **body_out) {
+  if (body_out) *body_out = NULL;
+  if (!db || !method || !has_direct_s3(db)) return -1;
+  time_t now = time(NULL);
+  struct tm g;
+  memset(&g, 0, sizeof(g));
+  if (!ark_gmtime_utc(&now, &g)) return -1;
+  char date_stamp[9], amz_date[17];
+  strftime(date_stamp, sizeof(date_stamp), "%Y%m%d", &g);
+  strftime(amz_date, sizeof(amz_date), "%Y%m%dT%H%M%SZ", &g);
+
+  const char *scheme = "https";
+  const char *host = db->s3_endpoint;
+  if (strncmp(host, "https://", 8) == 0) host += 8;
+  else if (strncmp(host, "http://", 7) == 0) { scheme = "http"; host += 7; }
+  char host_clean[256];
+  {
+    size_t hl = strlen(host);
+    if (hl >= sizeof(host_clean)) hl = sizeof(host_clean) - 1;
+    memcpy(host_clean, host, hl);
+    while (hl > 0 && host_clean[hl - 1] == '/') hl--;
+    host_clean[hl] = '\0';
+  }
+  char key_enc[1024] = "";
+  if (key) {
+    s3_url_encode_inline(key, key_enc, sizeof(key_enc));
+    for (char *p = key_enc; *p; p++) {
+      if (p[0] == '%' && p[1] == '2' && (p[2] == 'F' || p[2] == 'f')) {
+        *p = '/'; memmove(p + 1, p + 3, strlen(p + 3) + 1);
+      }
+    }
+  }
+  char path[1400];
+  if (key) snprintf(path, sizeof(path), "/%s/%s", db->s3_bucket, key_enc);
+  else snprintf(path, sizeof(path), "/%s", db->s3_bucket);
+  const char *qs = (query && query[0]) ? query : "";
+
+  static const char kEmptySha[] =
+      "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+  char canonical[6144];
+  int cn = snprintf(canonical, sizeof(canonical),
+      "%s\n%s\n%s\nhost:%s\nx-amz-content-sha256:%s\nx-amz-date:%s\n\n"
+      "host;x-amz-content-sha256;x-amz-date\n%s",
+      method, path, qs, host_clean, kEmptySha, amz_date, kEmptySha);
+  if (cn < 0 || (size_t)cn >= sizeof(canonical)) return -1;
+  char scope[256];
+  snprintf(scope, sizeof(scope), "%s/%s/s3/aws4_request", date_stamp, db->s3_region);
+  char canon_hash[65];
+  ark_sha256_hex(canonical, strlen(canonical), canon_hash);
+  char sts[1024];
+  snprintf(sts, sizeof(sts), "AWS4-HMAC-SHA256\n%s\n%s\n%s", amz_date, scope, canon_hash);
+  uint8_t k_date[32], k_region[32], k_service[32], k_signing[32];
+  char kseed[512];
+  snprintf(kseed, sizeof(kseed), "AWS4%s", db->s3_secret_key);
+  ark_hmac_sha256((const uint8_t *)kseed, strlen(kseed), date_stamp, strlen(date_stamp), k_date);
+  ark_hmac_sha256(k_date, 32, db->s3_region, strlen(db->s3_region), k_region);
+  ark_hmac_sha256(k_region, 32, "s3", 2, k_service);
+  ark_hmac_sha256(k_service, 32, "aws4_request", 12, k_signing);
+  char sig_hex[65];
+  ark_hmac_sha256_hex(k_signing, 32, sts, strlen(sts), sig_hex);
+
+  size_t ul = strlen(scheme) + 3 + strlen(host_clean) + strlen(path) + strlen(qs) + 8;
+  char *url = malloc(ul);
+  if (!url) return -1;
+  snprintf(url, ul, "%s://%s%s%s%s", scheme, host_clean, path, qs[0] ? "?" : "", qs);
+  if (!url_is_allowed_storage(url)) { free(url); return -1; }
+
+  char h_auth[1200], h_date[64], h_sha[128];
+  snprintf(h_auth, sizeof(h_auth),
+           "Authorization: AWS4-HMAC-SHA256 Credential=%s/%s, "
+           "SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=%s",
+           db->s3_access_key, scope, sig_hex);
+  snprintf(h_date, sizeof(h_date), "x-amz-date: %s", amz_date);
+  snprintf(h_sha, sizeof(h_sha), "x-amz-content-sha256: %s", kEmptySha);
+
+  CURL *curl = curl_easy_init();
+  if (!curl) { free(url); return -1; }
+  struct curl_slist *hdrs = NULL, *t = NULL;
+  int hdr_ok = (t = curl_slist_append(hdrs, h_auth)) != NULL && (hdrs = t) &&
+               (t = curl_slist_append(hdrs, h_date)) != NULL && (hdrs = t) &&
+               (t = curl_slist_append(hdrs, h_sha)) != NULL && (hdrs = t);
+  ark_membuf mb = {0};
+  CURLcode rc = hdr_ok ? CURLE_OK : CURLE_OUT_OF_MEMORY;
+  if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_URL, url);
+  if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs);
+  if (rc == CURLE_OK && strcmp(method, "GET") != 0)
+    rc = curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, method);
+  if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_TIMEOUT, 60L);
+  if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
+  if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
+  if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
+  if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+  if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, curl_abort_cb);
+  if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_XFERINFODATA, (void *)&db->shutdown_requested);
+  if (rc == CURLE_OK) rc = curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION,
+                                            body_out ? ark_membuf_cb : curl_discard_cb);
+  if (rc == CURLE_OK && body_out) rc = curl_easy_setopt(curl, CURLOPT_WRITEDATA, &mb);
+  long status = -1;
+  if (rc == CURLE_OK && curl_easy_perform(curl) == CURLE_OK)
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
+  curl_easy_cleanup(curl);
+  curl_slist_free_all(hdrs);
+  free(url);
+  if (body_out && status >= 200 && status < 300) *body_out = mb.buf;
+  else free(mb.buf);
+  return status;
+}
+
+// Text of the first <tag>...</tag> at or after p (before `end`), XML
+// entities decoded into out. Returns a pointer past the closing tag, or
+// NULL when absent.
+static const char *xml_tag_text(const char *p, const char *end, const char *tag,
+                                char *out, size_t cap) {
+  char open[64], close[64];
+  snprintf(open, sizeof(open), "<%s>", tag);
+  snprintf(close, sizeof(close), "</%s>", tag);
+  const char *a = strstr(p, open);
+  if (!a || (end && a >= end)) return NULL;
+  a += strlen(open);
+  const char *b = strstr(a, close);
+  if (!b || (end && b > end)) return NULL;
+  size_t w = 0;
+  for (const char *q = a; q < b && w + 1 < cap; ) {
+    if (*q == '&') {
+      static const struct { const char *e; char c; } ents[] = {
+        {"&amp;", '&'}, {"&lt;", '<'}, {"&gt;", '>'}, {"&quot;", '"'}, {"&apos;", '\''}};
+      int hit = 0;
+      for (size_t i = 0; i < sizeof(ents) / sizeof(ents[0]); i++) {
+        size_t el = strlen(ents[i].e);
+        if ((size_t)(b - q) >= el && strncmp(q, ents[i].e, el) == 0) {
+          out[w++] = ents[i].c; q += el; hit = 1; break;
+        }
+      }
+      if (!hit) out[w++] = *q++;
+    } else {
+      out[w++] = *q++;
+    }
+  }
+  out[w] = '\0';
+  return b + strlen(close);
+}
+
+// Parse "<digits>" exactly `width` long (width 0 = any length >= 1).
+static int parse_u64_field(const char *s, size_t width, uint64_t *out, const char **endp) {
+  uint64_t v = 0;
+  size_t n = 0;
+  while (s[n] >= '0' && s[n] <= '9') {
+    if (v > (UINT64_MAX - 9) / 10) return -1;
+    v = v * 10 + (uint64_t)(s[n] - '0');
+    n++;
+  }
+  if (n == 0 || (width && n != width)) return -1;
+  *out = v;
+  if (endp) *endp = s + n;
+  return 0;
+}
+
+static int key_referenced(const char *key, const HydratePlan *plan) {
+  if (plan->snapshot_s3_key && strcmp(plan->snapshot_s3_key, key) == 0) return 1;
+  for (int i = 0; i < plan->chunk_count; i++)
+    if (plan->chunks[i].s3_key && strcmp(plan->chunks[i].s3_key, key) == 0) return 1;
+  return 0;
+}
+
+// Decide whether `key` (under "<prefix>/") may be deleted. prev_baseline
+// is the previous restore point's baseline LSN; prev_key its snapshot.
+static int retention_deletable(const char *prefix, const char *key,
+                               const HydratePlan *plan, const char *prev_key,
+                               uint64_t prev_baseline) {
+  size_t pl = strlen(prefix);
+  if (strncmp(key, prefix, pl) != 0 || key[pl] != '/') return 0;
+  const char *rel = key + pl + 1;
+  if (key_referenced(key, plan)) return 0;
+  if (prev_key && strcmp(prev_key, key) == 0) return 0;
+  if (strncmp(rel, "snapshots/", 10) == 0) {
+    // snapshots/<20-digit baseline>_<writer>.backup.sqlite
+    uint64_t lsn = 0;
+    const char *e = NULL;
+    if (parse_u64_field(rel + 10, 20, &lsn, &e) != 0 || *e != '_') return 0;
+    const char *tail = strstr(e, ".backup.sqlite");
+    if (!tail || tail[14] != '\0') return 0;
+    return lsn < prev_baseline;
+  }
+  if (strcmp(rel, "backup.sqlite") == 0) {
+    // Pre-1.6.0 fixed snapshot key: gone once a later baseline has itself
+    // been superseded (the previous restore point is a newer snapshot).
+    return prev_key != NULL && strncmp(prev_key, prefix, pl) == 0 &&
+           prev_key[pl] == '/' && strncmp(prev_key + pl + 1, "snapshots/", 10) == 0;
+  }
+  if (strncmp(rel, "chunks/lsn_", 11) == 0) {
+    // chunks/lsn_<start>_<end>[_<writer>].sql
+    uint64_t a = 0, b = 0;
+    const char *e = NULL;
+    if (parse_u64_field(rel + 11, 0, &a, &e) != 0 || *e != '_') return 0;
+    if (parse_u64_field(e + 1, 0, &b, &e) != 0) return 0;
+    if (*e != '_' && strcmp(e, ".sql") != 0) return 0;
+    if (*e == '_') {
+      const char *tail = strstr(e, ".sql");
+      if (!tail || tail[4] != '\0') return 0;
+    }
+    return b <= prev_baseline;
+  }
+  return 0;
+}
+
+static void retention_gc(arkilian *db) {
+  if (!db || !has_direct_s3(db) || !db->s3_prefix || !db->s3_prefix[0]) return;
+  const char *ret = getenv("ARKILIAN_RETENTION");
+  if (ret && strcmp(ret, "0") == 0) return;
+  if (ARK_LOAD(&db->manifest_seed_resolved) != 1) return;
+
+  manifest_registry_lock(db);
+  int have_prev = db->retention_have_prev;
+  uint64_t prev_baseline = db->retention_prev_baseline;
+  int prev_exists = db->retention_prev_key != NULL;
+  char *prev_key = prev_exists ? strdup(db->retention_prev_key) : NULL;
+  char *cur_key = db->manifest_snapshot_key ? strdup(db->manifest_snapshot_key) : NULL;
+  uint64_t cur_baseline = db->manifest_baseline_lsn;
+  manifest_registry_unlock(db);
+  if (!have_prev || !cur_key || prev_baseline > cur_baseline ||
+      (prev_exists && !prev_key)) {
+    free(prev_key); free(cur_key);
+    return;
+  }
+
+  // The remote manifest must still be exactly what this process published.
+  HydratePlan plan;
+  memset(&plan, 0, sizeof(plan));
+  int frc = ark_manifest_fetch(db->s3_endpoint, db->s3_bucket, db->s3_region,
+                               db->s3_access_key, db->s3_secret_key,
+                               db->s3_prefix, &plan);
+  if (frc != 0 || !plan.snapshot_s3_key || strcmp(plan.snapshot_s3_key, cur_key) != 0 ||
+      (uint64_t)plan.baseline_lsn != cur_baseline) {
+    if (frc == 0) {
+      ark_log(db, ARK_LOG_WARN,
+              "retention skipped: the remote manifest is not the one this "
+              "process published (another writer?)");
+      hydrate_plan_free(&plan);
+    }
+    free(prev_key); free(cur_key);
+    return;
+  }
+
+  char prefix_q[1100];
+  {
+    char pfx[600];
+    snprintf(pfx, sizeof(pfx), "%s/", db->s3_prefix);
+    s3_url_encode_inline(pfx, prefix_q, sizeof(prefix_q));
+  }
+  char token[1100] = "";
+  long deleted = 0, failed = 0;
+  unsigned long long freed = 0;
+  int pages = 0;
+  for (;;) {
+    if (ARK_LOAD(&db->shutdown_requested)) break;
+    char token_q[3400] = "";
+    if (token[0]) {
+      char enc[3300];
+      s3_url_encode_inline(token, enc, sizeof(enc));
+      snprintf(token_q, sizeof(token_q), "continuation-token=%s&", enc);
+    }
+    char query[4800];
+    snprintf(query, sizeof(query), "%slist-type=2&max-keys=1000&prefix=%s",
+             token_q, prefix_q);
+    char *xml = NULL;
+    long st = s3_signed_request(db, "GET", NULL, query, &xml);
+    if (st != 200 || !xml) {
+      if (pages == 0)
+        ark_log(db, ARK_LOG_WARN,
+                "retention skipped: listing %s/ failed (HTTP %ld)",
+                db->s3_prefix, st);
+      free(xml);
+      break;
+    }
+    pages++;
+    const char *p = xml;
+    for (;;) {
+      const char *c = strstr(p, "<Contents>");
+      if (!c) break;
+      const char *ce = strstr(c, "</Contents>");
+      if (!ce) break;
+      char key[1100], size_s[32];
+      if (xml_tag_text(c, ce, "Key", key, sizeof(key)) &&
+          retention_deletable(db->s3_prefix, key, &plan, prev_key, prev_baseline)) {
+        unsigned long long sz = 0;
+        if (xml_tag_text(c, ce, "Size", size_s, sizeof(size_s))) sz = strtoull(size_s, NULL, 10);
+        long ds = s3_signed_request(db, "DELETE", key, NULL, NULL);
+        if ((ds >= 200 && ds < 300) || ds == 404) { deleted++; freed += sz; }
+        else failed++;
+      }
+      p = ce + 11;
+    }
+    char trunc[16] = "";
+    xml_tag_text(xml, NULL, "IsTruncated", trunc, sizeof(trunc));
+    int more = strcmp(trunc, "true") == 0 &&
+               xml_tag_text(xml, NULL, "NextContinuationToken", token, sizeof(token)) &&
+               token[0];
+    free(xml);
+    if (!more || pages >= 100) break;  // bounded per cycle; the next cycle continues
+  }
+  if (deleted || failed)
+    ark_log(db, failed ? ARK_LOG_WARN : ARK_LOG_INFO,
+            "retention: deleted %ld superseded object(s) (%.1f MiB) from %s/%s",
+            deleted, (double)freed / (1024.0 * 1024.0), db->s3_prefix,
+            failed ? " — some deletes failed and are retried next cycle" : "");
+  hydrate_plan_free(&plan);
+  free(prev_key);
+  free(cur_key);
+}
+
 // Upload the staged image, then (gap-checked) publish it as the new
 // baseline. Returns 0 when the manifest was published.
 static int snapshot_upload_and_publish(arkilian *db, const char *stage,
@@ -5958,6 +6322,7 @@ static int snapshot_upload_and_publish(arkilian *db, const char *stage,
   if (read_gap_and_seq(db->snapshot_db, gap_after, sizeof(gap_after), &ignored) == 0 &&
       gap_after[0])
     ARK_STORE(&db->capture_paused, 1);  // a newer gap is still open
+  retention_gc(db);
   return 0;
 }
 

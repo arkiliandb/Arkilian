@@ -99,6 +99,7 @@ run      test_raw_transaction_recovery tests/test_raw_transaction_recovery.c
 run      test_capture_gap_lifecycle    tests/test_capture_gap_lifecycle.c
 run      test_ddl_concurrency tests/test_ddl_concurrency.c
 run      test_manifest_torn   tests/test_manifest_torn.c
+run      test_retention       tests/test_retention.c
 run      test_health_flags    tests/test_health_flags.c
 run      test_sha256          tests/test_sha256.c
 run_hydration

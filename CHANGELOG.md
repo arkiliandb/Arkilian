@@ -1,5 +1,31 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **Backup storage grew without bound (34 GB in a few days on R2).** Since
+  1.6.0 every snapshot is written under its own key, and nothing ever deleted
+  superseded snapshots or chunks, so a bucket grew by one full database image
+  per snapshot interval. After each snapshot publish the writer now deletes
+  snapshots older than the previous restore point and chunks that end at or
+  below it. The current and the previous restore point are kept, so restores
+  already in progress finish. Before deleting, the writer re-reads the remote
+  manifest and skips the run if it is not the one it just published. Keys not
+  written by Arkilian are never touched. Listing and deleting use
+  header-signed SigV4 requests, which every S3-compatible store accepts (R2
+  supports presigned URLs only for object operations). Covered by
+  `tests/test_retention.c`.
+
+### Upgrade notes
+
+- The first snapshot after upgrading deletes the snapshots and chunks that
+  1.6.0 and 1.6.1 left behind, so existing buckets shrink to about two
+  database images. After `ARKILIAN_MANIFEST_REBASE=1`, the cleanup runs from
+  the second snapshot on.
+- To keep every snapshot (for example under bucket lifecycle rules), set
+  `ARKILIAN_RETENTION=0`.
+
 ## 1.6.2 — manifest publish fix
 
 ### Fixed

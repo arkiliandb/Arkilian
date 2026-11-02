@@ -407,6 +407,16 @@ if(ARKILIAN_BUILD_TESTS)
             target_compile_options(test_manifest_torn PRIVATE -UNDEBUG)
             target_compile_definitions(test_manifest_torn PRIVATE ${ARK_POSIX_DEFS})
             add_test(NAME test_manifest_torn COMMAND test_manifest_torn)
+
+            # ── Storage retention (snapshots + chunks) ──
+            add_executable(test_retention tests/test_retention.c
+                           src/class.c src/hydration.c src/sha256.c src/deps/sqlite/sqlite3.c)
+            target_include_directories(test_retention PRIVATE src src/deps/sqlite)
+            target_link_libraries(test_retention PRIVATE ${CMAKE_THREAD_LIBS_INIT}
+                                  ${CURL_LIBRARIES} ${ARK_LIBM})
+            target_compile_options(test_retention PRIVATE -UNDEBUG)
+            target_compile_definitions(test_retention PRIVATE ${ARK_POSIX_DEFS})
+            add_test(NAME test_retention COMMAND test_retention)
         endif()
 
         # ── SHA-256 NIST vectors ──

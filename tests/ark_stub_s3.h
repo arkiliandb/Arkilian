@@ -36,6 +36,9 @@ static inline void stub_set_status_override_manifest_sig(int sc) { (void)sc; }
 static inline void stub_set_delay_ms(int ms) { (void)ms; }
 static inline void stub_set_drop_connection(int d) { (void)d; }
 static inline void stub_set_require_presign(int r) { (void)r; }
+static inline void stub_set_list_page(int n) { (void)n; }
+static inline void stub_set_manifest_get_body(const char *b) { (void)b; }
+static inline int stub_list_count(void) { return 0; }
 static inline int stub_manifest_contains(const char *needle, int timeout_s) {
   (void)needle; (void)timeout_s; return 0;
 }
@@ -115,6 +118,11 @@ static atomic_int g_stub_status_override_manifest_sig = 0; // overrides PUT of m
 static atomic_int g_stub_delay_ms = 0;
 static atomic_int g_stub_drop_connection = 0;
 static atomic_int g_stub_require_presign = 0;
+static atomic_int g_stub_list_page = 1000;   // ListObjectsV2 page size cap
+static atomic_int g_stub_list_count = 0;
+// When set, GETs of */manifest.json return this body instead of the
+// stored object (simulates another writer publishing concurrently).
+static char *g_stub_manifest_get_body = NULL;
 
 static inline void stub_put(const char *key, const char *data, size_t len) {
   pthread_mutex_lock(&g_stub_store_mutex);
@@ -240,6 +248,100 @@ static inline void stub_set_drop_connection(int drop) {
   atomic_store(&g_stub_drop_connection, drop);
 }
 
+static inline void stub_set_list_page(int n) { atomic_store(&g_stub_list_page, n); }
+static inline void stub_set_manifest_get_body(const char *body) {
+  pthread_mutex_lock(&g_stub_store_mutex);
+  free(g_stub_manifest_get_body);
+  g_stub_manifest_get_body = body ? strdup(body) : NULL;
+  pthread_mutex_unlock(&g_stub_store_mutex);
+}
+static inline int stub_list_count(void) { return atomic_load(&g_stub_list_count); }
+
+// Value of query parameter `name` (percent-decoded) from a request path.
+static inline int stub_query_param(const char *path, const char *name, char *out, size_t cap) {
+  const char *q = strchr(path, '?');
+  if (!q) return 0;
+  size_t nl = strlen(name);
+  for (const char *p = q + 1; *p; ) {
+    if (strncmp(p, name, nl) == 0 && p[nl] == '=') {
+      p += nl + 1;
+      size_t w = 0;
+      while (*p && *p != '&' && w + 1 < cap) {
+        if (*p == '%' && p[1] && p[2]) {
+          char h[3] = {p[1], p[2], 0};
+          out[w++] = (char)strtol(h, NULL, 16);
+          p += 3;
+        } else {
+          out[w++] = *p++;
+        }
+      }
+      out[w] = '\0';
+      return 1;
+    }
+    const char *amp = strchr(p, '&');
+    if (!amp) break;
+    p = amp + 1;
+  }
+  return 0;
+}
+
+static int stub_cmp_str(const void *a, const void *b) {
+  return strcmp(*(const char *const *)a, *(const char *const *)b);
+}
+
+static const char *BUCKET;  // defined below
+
+// ListObjectsV2: keys sorted, prefix filter, numeric continuation tokens.
+static inline void stub_handle_list(int fd, const char *path) {
+  atomic_fetch_add(&g_stub_list_count, 1);
+  char prefix[1024] = "", token[64] = "", maxk[16] = "";
+  stub_query_param(path, "prefix", prefix, sizeof(prefix));
+  stub_query_param(path, "continuation-token", token, sizeof(token));
+  stub_query_param(path, "max-keys", maxk, sizeof(maxk));
+  int page = maxk[0] ? atoi(maxk) : 1000;
+  if (page > atomic_load(&g_stub_list_page)) page = atomic_load(&g_stub_list_page);
+  int start = token[0] ? atoi(token + 4) : 0;   // "tok-N"
+  pthread_mutex_lock(&g_stub_store_mutex);
+  int n = 0;
+  char **keys = malloc(sizeof(char *) * (size_t)(g_stub_object_count + 1));
+  size_t *sizes = malloc(sizeof(size_t) * (size_t)(g_stub_object_count + 1));
+  for (int i = 0; i < g_stub_object_count; i++)
+    if (strncmp(g_stub_objects[i].key, prefix, strlen(prefix)) == 0)
+      keys[n++] = strdup(g_stub_objects[i].key);
+  qsort(keys, (size_t)n, sizeof(char *), stub_cmp_str);
+  for (int i = 0; i < n; i++) {
+    sizes[i] = 0;
+    for (int j = 0; j < g_stub_object_count; j++)
+      if (strcmp(g_stub_objects[j].key, keys[i]) == 0) sizes[i] = g_stub_objects[j].len;
+  }
+  pthread_mutex_unlock(&g_stub_store_mutex);
+  size_t cap = 4096 + (size_t)n * 1400;
+  char *xml = malloc(cap);
+  size_t w = (size_t)snprintf(xml, cap,
+      "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+      "<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">"
+      "<Name>%s</Name><Prefix>%s</Prefix>", BUCKET, prefix);
+  int end = start + page < n ? start + page : n;
+  for (int i = start; i < end; i++)
+    w += (size_t)snprintf(xml + w, cap - w,
+        "<Contents><Key>%s</Key><Size>%zu</Size><StorageClass>STANDARD</StorageClass></Contents>",
+        keys[i], sizes[i]);
+  if (end < n)
+    w += (size_t)snprintf(xml + w, cap - w,
+        "<IsTruncated>true</IsTruncated><NextContinuationToken>tok-%d</NextContinuationToken>", end);
+  else
+    w += (size_t)snprintf(xml + w, cap - w, "<IsTruncated>false</IsTruncated>");
+  w += (size_t)snprintf(xml + w, cap - w, "<KeyCount>%d</KeyCount></ListBucketResult>", end - start);
+  char head[256];
+  snprintf(head, sizeof(head),
+           "HTTP/1.1 200 OK\r\nContent-Type: application/xml\r\n"
+           "Content-Length: %zu\r\nServer: AmazonS3\r\nConnection: close\r\n\r\n", w);
+  send(fd, head, strlen(head), 0);
+  send(fd, xml, w, 0);
+  for (int i = 0; i < n; i++) free(keys[i]);
+  free(keys); free(sizes); free(xml);
+}
+
 static inline void stub_set_require_presign(int req) {
   atomic_store(&g_stub_require_presign, req);
 }
@@ -299,6 +401,10 @@ static inline void stub_handle(int fd) {
   }
 
   int presigned_ok = stub_validate_presigned_url(path_presigned);
+  // Header-signed SigV4 (Authorization header) is valid authentication too.
+  if (!presigned_ok && strcasestr(header, "authorization: AWS4-HMAC-SHA256 Credential=") &&
+      strcasestr(header, "x-amz-date:") && strcasestr(header, "Signature="))
+    presigned_ok = 1;
 
   char path[1024];
   strncpy(path, path_presigned, sizeof(path) - 1);
@@ -391,11 +497,21 @@ static inline void stub_handle(int fd) {
                etag);
       send(fd, resp, strlen(resp), 0);
     }
+  } else if (strcmp(method, "GET") == 0 && strstr(path_presigned, "list-type=2")) {
+    stub_handle_list(fd, path_presigned);
   } else if (strcmp(method, "GET") == 0) {
     atomic_fetch_add(&g_stub_get_count, 1);
     char *data = NULL;
     size_t len = 0;
-    if (stub_get(key, &data, &len)) {
+    int have = 0;
+    pthread_mutex_lock(&g_stub_store_mutex);
+    if (g_stub_manifest_get_body && strstr(key, "manifest.json")) {
+      data = strdup(g_stub_manifest_get_body);
+      len = strlen(data);
+      have = 1;
+    }
+    pthread_mutex_unlock(&g_stub_store_mutex);
+    if (have || stub_get(key, &data, &len)) {
       char head[256];
       snprintf(head, sizeof(head),
                "HTTP/1.1 200 OK\r\n"
