@@ -397,6 +397,16 @@ if(ARKILIAN_BUILD_TESTS)
             target_compile_options(test_ddl_concurrency PRIVATE -UNDEBUG)
             target_compile_definitions(test_ddl_concurrency PRIVATE ${ARK_POSIX_DEFS})
             add_test(NAME test_ddl_concurrency COMMAND test_ddl_concurrency)
+
+            # ── Manifest torn between manifest.json and manifest.sig ──
+            add_executable(test_manifest_torn tests/test_manifest_torn.c
+                           src/class.c src/hydration.c src/sha256.c src/deps/sqlite/sqlite3.c)
+            target_include_directories(test_manifest_torn PRIVATE src src/deps/sqlite)
+            target_link_libraries(test_manifest_torn PRIVATE ${CMAKE_THREAD_LIBS_INIT}
+                                  ${CURL_LIBRARIES} ${ARK_LIBM})
+            target_compile_options(test_manifest_torn PRIVATE -UNDEBUG)
+            target_compile_definitions(test_manifest_torn PRIVATE ${ARK_POSIX_DEFS})
+            add_test(NAME test_manifest_torn COMMAND test_manifest_torn)
         endif()
 
         # ── SHA-256 NIST vectors ──

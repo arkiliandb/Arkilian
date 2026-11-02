@@ -865,6 +865,35 @@ static char *s3_presign_get(const char *endpoint, const char *bucket,
 // reader turns it into a replay plan. Exported so class.c can seed its
 // in-memory registry from the last known manifest at init.
 
+// Signature embedded in the manifest object (written since 1.6.2): the
+// object ends with exactly ,"hmac":"<64 hex>"} and the signature covers
+// the body B obtained by replacing that suffix with "}". One object, so a
+// publish can never be torn between manifest and signature.
+// Returns 1 = present and valid (json is rewritten in place to B),
+//        -1 = present and INVALID, 0 = absent (legacy manifest).
+static int manifest_verify_embedded(char *json, const char *key) {
+  static const char kPre[] = ",\"hmac\":\"";
+  const size_t pre = sizeof(kPre) - 1;          // 9
+  const size_t suffix = pre + 64 + 2;           // ,"hmac":"<64>"}
+  size_t len = strlen(json);
+  while (len > 0 && isspace((unsigned char)json[len - 1])) len--;
+  if (len < suffix + 1) return 0;
+  char *sfx = json + len - suffix;
+  if (memcmp(sfx, kPre, pre) != 0) return 0;
+  if (sfx[pre + 64] != '"' || sfx[pre + 65] != '}') return 0;
+  for (size_t i = 0; i < 64; i++)
+    if (!isxdigit((unsigned char)sfx[pre + i])) return 0;
+  char given[65];
+  memcpy(given, sfx + pre, 64);
+  given[64] = '\0';
+  sfx[0] = '}';
+  sfx[1] = '\0';
+  char expect[65];
+  ark_hmac_sha256_hex((const uint8_t *)key, strlen(key),
+                      json, strlen(json), expect);
+  return strcasecmp(given, expect) == 0 ? 1 : -1;
+}
+
 int ark_manifest_fetch(const char *endpoint, const char *bucket,
                         const char *region, const char *access_key,
                         const char *secret_key, const char *prefix,
@@ -927,9 +956,24 @@ int ark_manifest_fetch(const char *endpoint, const char *bucket,
       free(manifest_url);
       return HYDRATION_ERR_PROTO;
     }
+    int verified = 0;
+    {
+      int emb = manifest_verify_embedded(json, hmac_key);
+      if (emb == -1) {
+        fprintf(stderr,
+                "arkilian: manifest HMAC MISMATCH — refusing a manifest "
+                "whose embedded signature does not verify under "
+                "ARKILIAN_MANIFEST_HMAC_KEY (tampered storage or wrong key)\n");
+        free(json);
+        free(manifest_url);
+        return HYDRATION_ERR_PROTO;
+      }
+      verified = (emb == 1);
+    }
+    // Manifests written before 1.6.2 carry their signature only in the
+    // separate manifest.sig object.
     char sig_key[512];
     snprintf(sig_key, sizeof(sig_key), "%s/manifest.sig", prefix);
-    int verified = 0;
     for (int attempt = 0; attempt < 3 && !verified; attempt++) {
         if (attempt > 0) {
           // Publishing is manifest-PUT then sig-PUT: a signature mismatch
@@ -945,6 +989,17 @@ int ark_manifest_fetch(const char *endpoint, const char *bucket,
                     "verification (err=%d)\n", err);
             free(manifest_url);
             return err ? err : HYDRATION_ERR_NET;
+          }
+          // The writer may have republished in the new self-signed form.
+          int emb = manifest_verify_embedded(json, hmac_key);
+          if (emb == 1) { verified = 1; break; }
+          if (emb == -1) {
+            fprintf(stderr,
+                    "arkilian: manifest HMAC MISMATCH — refusing a manifest "
+                    "whose embedded signature does not verify\n");
+            free(json);
+            free(manifest_url);
+            return HYDRATION_ERR_PROTO;
           }
         }
         char *sig_url = s3_presign_get(endpoint, bucket, region,

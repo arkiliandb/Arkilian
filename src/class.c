@@ -2899,8 +2899,14 @@ void *run_wal_flush(void *arg) {
     if (!manifest_seeded) {
       time_t now = time(NULL);
       if (now >= next_seed_retry) {
-        manifest_seeded = manifest_registry_seed(db);
-        if (!manifest_seeded) next_seed_retry = now + 5;
+        int seed_rc = manifest_registry_seed(db);
+        manifest_seeded = seed_rc == 1;
+        if (seed_rc == 0) next_seed_retry = now + 5;
+        else if (seed_rc < 0) {
+          // Frozen on an unreadable manifest: re-read it on a slow cadence.
+          int recheck = get_env_int_default("ARKILIAN_MANIFEST_RECHECK_SEC", 60);
+          next_seed_retry = now + (recheck > 0 ? recheck : 60);
+        }
       }
     }
 
@@ -5400,7 +5406,52 @@ static int manifest_registry_upload(arkilian *db, const char *snapshot_key,
     return -1;
   }
 
-  // Stage the manifest body in a unique per-instance file (fixed
+  // ── Manifest authenticity ──────────────────────────────────────────
+  // The manifest is the ROOT OF TRUST: digests cannot authenticate it
+  // (circular) and the restore path EXECUTES its SQL. ARKILIAN_MANIFEST_HMAC_KEY
+  // is REQUIRED (no legacy). The key MUST live outside the bucket.
+  if (!db->manifest_hmac_key || !db->manifest_hmac_key[0]) {
+    ark_log(db, ARK_LOG_ERROR,
+            "ARKILIAN_MANIFEST_HMAC_KEY not configured — refusing to publish "
+            "unauthenticated manifest (no legacy)");
+    free(json);
+    free(cand_nk);
+    free(cand_ns);
+    manifest_registry_unlock(db);
+    return -1;
+  }
+  // The signature is embedded in manifest.json itself, so one PUT
+  // publishes manifest and signature atomically. It used to live only in
+  // a separate manifest.sig object: a process killed between the two
+  // PUTs (a platform restart during the shutdown drain, an OOM kill)
+  // left a new manifest next to the previous signature, and every later
+  // startup refused the prefix as tampered. Envelope: the body B ends in
+  // '}'; the published object is B minus that brace plus
+  //   ,"hmac":"<HMAC-SHA-256(key, B) hex>"}
+  // Readers strip that exact suffix and verify B (hydration.c).
+  if (jlen < 2 || json[jlen - 1] != '}') {
+    free(json);
+    free(cand_nk);
+    free(cand_ns);
+    manifest_registry_unlock(db);
+    return -1;
+  }
+  {
+    char inner_sig[65];
+    ark_hmac_sha256_hex((const uint8_t *)db->manifest_hmac_key,
+                        strlen(db->manifest_hmac_key), json, jlen, inner_sig);
+    jlen--;  // drop the closing brace; the envelope suffix restores it
+    json[jlen] = '\0';
+    if (jbuf_append(&json, &jlen, &jcap, ",\"hmac\":\"%s\"}", inner_sig) != 0) {
+      free(json);
+      free(cand_nk);
+      free(cand_ns);
+      manifest_registry_unlock(db);
+      return -1;
+    }
+  }
+
+  // Stage the manifest in a unique per-instance file (fixed
   // "%s.manifest" names collided across instances sharing a backup path).
   char tmp_path[1200];
   FILE *f = arkilian_unique_tmp(db->backup_path, "manifest",
@@ -5423,24 +5474,10 @@ static int manifest_registry_upload(arkilian *db, const char *snapshot_key,
     return -1;
   }
 
-  // ── Manifest authenticity: sign the exact bytes we are about to PUT ──
-  // The manifest is the ROOT OF TRUST: digests cannot authenticate it
-  // (circular) and the restore path EXECUTES its SQL. ARKILIAN_MANIFEST_HMAC_KEY
-  // is REQUIRED (no legacy). {prefix}/manifest.sig carries HMAC-SHA-256
-  // over the exact manifest bytes; missing/invalid sig is fail-closed.
-  // The key MUST live outside the bucket.
+  // manifest.sig (HMAC over the whole published object) is still written
+  // for readers older than 1.6.2, which only know the separate signature.
   char sig_path[1200];
   int have_sig = 0;
-  if (!db->manifest_hmac_key || !db->manifest_hmac_key[0]) {
-    ark_log(db, ARK_LOG_ERROR,
-            "ARKILIAN_MANIFEST_HMAC_KEY not configured — refusing to publish "
-            "unauthenticated manifest (no legacy)");
-    free(json);
-    free(cand_nk);
-    free(cand_ns);
-    manifest_registry_unlock(db);
-    return -1;
-  }
   {
     char sig_hex[65];
     ark_hmac_sha256_hex((const uint8_t *)db->manifest_hmac_key,
@@ -5451,6 +5488,7 @@ static int manifest_registry_upload(arkilian *db, const char *snapshot_key,
     if (!sf || fwrite(sig_hex, 1, 64, sf) != 64) {
       if (sf) fclose(sf);
       unlink(sig_path);
+      unlink(tmp_path);
       free(json);
       free(cand_nk);
       free(cand_ns);
@@ -5477,9 +5515,9 @@ static int manifest_registry_upload(arkilian *db, const char *snapshot_key,
     manifest_registry_unlock(db);
     return -1;
   }
-  // Publish order: manifest.json first, then manifest.sig (hydrators
-  // re-fetch both once on a signature mismatch to absorb the torn
-  // two-object commit window).
+  // Publish order: manifest.json (self-authenticating) first, then the
+  // legacy manifest.sig. Older hydrators re-fetch both on a mismatch to
+  // absorb the window between the two PUTs.
   int rc = upload_to_s3(db, put_url, tmp_path);
   free(put_url);
   unlink(tmp_path);
@@ -5580,7 +5618,8 @@ static void manifest_registry_maybe_upload(arkilian *db) {
 //     deleted)
 //   - transient net/mem failure → stays unresolved; the flush loop retries
 //     on a bounded cadence, and NO manifest is published until then
-// Returns 1 once resolved (terminal), 0 while still pending.
+// Returns 1 once resolved (terminal), 0 while still pending (transient),
+// -1 while frozen on an unreadable manifest (re-read every 60 s).
 static int manifest_registry_seed(arkilian *db) {
   if (!db || !has_direct_s3(db)) {
     // No destination: there is no remote registry to adopt and nothing to
@@ -5631,10 +5670,18 @@ static int manifest_registry_seed(arkilian *db) {
     if (rc == HYDRATION_ERR_NOTFOUND) {
       ARK_STORE(&db->manifest_seed_resolved, 1);  // cold start, nothing to adopt
     } else if (rc == HYDRATION_ERR_PROTO) {
-      freeze_shipping(db,
-              "remote manifest for prefix %s is unreadable — shipping and "
-              "publishing frozen (set ARKILIAN_MANIFEST_REBASE=1 to make this "
-              "database the authority)", db->s3_prefix);
+      // Frozen, but re-read every minute: a store that serves a stale or
+      // half-replicated object (eventually consistent / cached storage)
+      // or an operator repairing the prefix must not need a restart.
+      // Nothing ships or publishes while frozen; a read is harmless.
+      if (ARK_LOAD(&db->manifest_seed_resolved) != -1) {
+        freeze_shipping(db,
+                "remote manifest for prefix %s is unreadable — shipping and "
+                "publishing frozen; re-checked every 60 s (set "
+                "ARKILIAN_MANIFEST_REBASE=1 to make this database the "
+                "authority)", db->s3_prefix);
+      }
+      return -1;
     } else {
       return 0; // transient (net/mem) — retried by the flush loop
     }
@@ -5694,6 +5741,12 @@ static int manifest_registry_seed(arkilian *db) {
   db->manifest_pending = 0;
   db->manifest_last_upload = time(NULL);
   manifest_registry_unlock(db);
+  if (ARK_LOAD(&db->manifest_seed_resolved) == -1) {
+    ark_log(db, ARK_LOG_WARN,
+            "remote manifest for prefix %s now verifies — shipping resumed",
+            db->s3_prefix);
+    db->freeze_reason[0] = '\0';
+  }
   ARK_STORE(&db->manifest_seed_resolved, 1);
   hydrate_plan_free(&plan);
   return 1;

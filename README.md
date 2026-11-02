@@ -31,7 +31,7 @@ Arkilian is an embedded SQLite database engine written in C99 that streams row-l
   <img src="./arkilian_architecture.svg" alt="Arkilian Engine Architecture" width="100%">
 </p>
 
-Arkilian operates with **three dedicated SQLite connections** (`db->handle`, `db->backup_db`, and `db->snapshot_db`) to eliminate cross-thread lock contention. Application writes are captured via automated DML triggers (`sync_backup_triggers`) and a transaction-aware sidecar journal (`.arkddlqueue`). A background **Flush Thread** batches outbox rows and uploads SHA-256 verified SQL chunks to S3 alongside an HMAC-SHA256 authenticated manifest (`manifest.json` + `manifest.sig`), while an independent **Snapshot Thread** performs periodic non-blocking online snapshots (`backup.sqlite`). Client processes can cold-start restore from object storage at any time using `arkilian_hydrate_s3()`.
+Arkilian operates with **three dedicated SQLite connections** (`db->handle`, `db->backup_db`, and `db->snapshot_db`) to eliminate cross-thread lock contention. Application writes are captured via automated DML triggers (`sync_backup_triggers`) and a transaction-aware sidecar journal (`.arkddlqueue`). A background **Flush Thread** batches outbox rows and uploads SHA-256 verified SQL chunks to S3 alongside an HMAC-SHA256 authenticated, self-signed manifest (`manifest.json`, plus `manifest.sig` for older readers), while an independent **Snapshot Thread** performs periodic non-blocking online snapshots (`backup.sqlite`). Client processes can cold-start restore from object storage at any time using `arkilian_hydrate_s3()`.
 
 ---
 
@@ -96,6 +96,7 @@ Arkilian reads configuration from process environment variables or a `./.env` fi
 | `ARKILIAN_ALLOW_INSECURE` | `0` | Set `1` to allow cleartext `http://` endpoints for non-loopback hosts during development |
 | `ARKILIAN_STORAGE_HOSTS` | *(empty)* | Comma-separated allowlist of custom storage hostnames to prevent SSRF vulnerabilities |
 | `ARKILIAN_CAPTURE_OVERFLOW` | *(empty)* | `abort` = strict mode: a write that cannot be captured because the outbox is full fails (`SQLITE_CONSTRAINT`) instead of opening a capture gap |
+| `ARKILIAN_MANIFEST_RECHECK_SEC` | `60` | While shipping is frozen on an unreadable remote manifest, how often it is re-read; shipping resumes once it verifies |
 | `ARKILIAN_MANIFEST_REBASE` | `0` | `1` makes this database the authority for its prefix: an unreadable or ahead-of-local remote manifest is ignored and restores resume after the next snapshot publishes. Use only after confirming no other writer uses the prefix |
 | `ARKILIAN_SHUTDOWN_DRAIN_SEC` | `10` | Time budget for `db_close()` to ship buffered chunks and publish the final manifest (0 disables the shutdown drain) |
 
@@ -423,7 +424,7 @@ Full benchmark report, batched scalability curves, memory RSS telemetry, and rep
 * **Recovery point:** Chunks ship every `ARKILIAN_CHUNK_INTERVAL_SEC` (default 1 s), but a restore sees what the manifest references, published at most every `ARKILIAN_MANIFEST_INTERVAL_SEC` (default 30 s). The recovery point objective is therefore about the manifest interval plus upload time; a clean `db_close()` publishes immediately. Tables without a PRIMARY KEY are not captured (listed by `db_backup_skipped_table_count`).
 * **Durability:** With `ARKILIAN_OUTBOX_DURABLE=1` (the default), Arkilian configures `PRAGMA synchronous=FULL;` on the application connection so committed outbox records are durably flushed according to SQLite's full-synchronous durability semantics. Operators prioritizing maximum write throughput over power-loss durability can opt in to `ARKILIAN_OUTBOX_DURABLE=0` (`PRAGMA synchronous=NORMAL;`).
 * **Integrity:** Every uploaded chunk and snapshot is content-addressed and digest-verified. The SHA-256 hash is recorded in the manifest, and hydrators strictly verify object content before applying any SQL chunks.
-* **Authenticity:** Manifest publication and hydration require HMAC-SHA256 signing via `ARKILIAN_MANIFEST_HMAC_KEY`. A companion signature `{prefix}/manifest.sig` is stored alongside `{prefix}/manifest.json`. Hydration strictly refuses unauthenticated, missing, or mismatched manifest signatures (fail closed).
+* **Authenticity:** Manifest publication and hydration require HMAC-SHA256 signing via `ARKILIAN_MANIFEST_HMAC_KEY`. Since 1.6.2 the signature is embedded in `{prefix}/manifest.json` itself (a trailing `"hmac"` field over the rest of the document), so manifest and signature are published in one atomic PUT. `{prefix}/manifest.sig` is still written for readers older than 1.6.2. Hydration strictly refuses unauthenticated, missing, or mismatched manifest signatures (fail closed). A writer that finds its prefix unreadable stops shipping and re-reads it every `ARKILIAN_MANIFEST_RECHECK_SEC` (default 60 s), resuming on its own once it verifies.
 
 ---
 
