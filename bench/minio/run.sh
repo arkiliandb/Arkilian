@@ -38,7 +38,7 @@ for sync in NORMAL FULL; do
   n=20000; [ "$sync" = FULL ] && n=3000
   for rep in 1 2 3; do
     ./bench_cmp $n $sync raw sqlite 2>/dev/null | tee -a "$LOG"
-    ./bench_cmp $n $sync ark arkilian-1.6.2 2>/dev/null | tee -a "$LOG"
+    ./bench_cmp $n $sync ark arkilian-1.6.3 2>/dev/null | tee -a "$LOG"
   done
 done
 

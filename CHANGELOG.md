@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.6.3 — storage retention
 
 ### Fixed
 
@@ -16,6 +16,13 @@
   header-signed SigV4 requests, which every S3-compatible store accepts (R2
   supports presigned URLs only for object operations). Covered by
   `tests/test_retention.c`.
+- **Leftover staging files filled the local disk.** A process killed while a
+  snapshot was being copied or uploaded left its staging file
+  (`<backup path>.arktmp.<pid>.<n>.snapshot`, a full copy of the database)
+  behind, and nothing removed it. At startup, staging files left by processes
+  that no longer run are now deleted. Containers that reuse the same PID on
+  every boot are handled: a file with this process's PID counts as stale only
+  if it predates this process's first `db_init`.
 
 ### Upgrade notes
 
@@ -25,6 +32,12 @@
   the second snapshot on.
 - To keep every snapshot (for example under bucket lifecycle rules), set
   `ARKILIAN_RETENTION=0`.
+- Retention needs the storage credentials to list and delete objects in the
+  bucket (`s3:ListBucket`, `s3:DeleteObject`). Without them, retention logs
+  a warning naming the missing permission and skips; backups and restores are
+  unaffected.
+- Nothing else changes: the manifest format, object keys, restore, and the
+  public API are the same as 1.6.2, and 1.6.x readers and writers interoperate.
 
 ## 1.6.2 — manifest publish fix
 
