@@ -1,24 +1,13 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1080 500" width="100%" role="img" aria-label="Arkilian Architecture">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 980 450" width="100%" role="img" aria-label="Arkilian Architecture">
   <defs>
-    <linearGradient id="bg-grad" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0%" stop-color="#070A12"/>
-      <stop offset="100%" stop-color="#0C1220"/>
-    </linearGradient>
-
-    <linearGradient id="engine-border" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0%" stop-color="#1E3A8A"/>
-      <stop offset="50%" stop-color="#117BC8"/>
-      <stop offset="100%" stop-color="#1E293B"/>
-    </linearGradient>
-
-    <marker id="arr-white" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
-      <path d="M 1 1.5 L 8.5 5 L 1 8.5 z" fill="#94A3B8"/>
+    <marker id="arr-dark" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M 1 1.8 L 8.2 5 L 1 8.2 z" fill="#334155"/>
     </marker>
-    <marker id="arr-blue" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
-      <path d="M 1 1.5 L 8.5 5 L 1 8.5 z" fill="#38BDF8"/>
+    <marker id="arr-brand" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M 1 1.8 L 8.2 5 L 1 8.2 z" fill="#117BC8"/>
     </marker>
-    <marker id="arr-hydrate" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
-      <path d="M 1 1.5 L 8.5 5 L 1 8.5 z" fill="#60A5FA"/>
+    <marker id="arr-navy" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M 1 1.8 L 8.2 5 L 1 8.2 z" fill="#062E6F"/>
     </marker>
 
     <style>
@@ -28,140 +17,160 @@
     </style>
   </defs>
 
-  <!-- Background Canvas -->
-  <rect width="1080" height="500" rx="14" fill="url(#bg-grad)" stroke="#1E293B" stroke-width="1.5"/>
+  <!-- Outer Card -->
+  <rect x="1" y="1" width="978" height="448" rx="10" fill="#FFFFFF" stroke="#DADADA" stroke-width="1.25"/>
 
-  <!-- Subtle Top Brand Header -->
-  <g transform="translate(36, 26)">
-    <!-- Arkilian Emblem -->
-    <g transform="scale(0.78)">
-      <path d="M 14 2 L 17 0.5 L 17 11.5 L 5.5 29 L 1 27.5 L 12.5 4.5 Z" fill="#FFFFFF"/>
-      <path d="M 18.5 1 L 21.5 3 L 21.5 12.5 L 18 10.5 Z" fill="#FFFFFF"/>
-      <path d="M 17.5 12 L 21.5 14 L 11 31.5 L 2 29 L 6.5 27.5 Z" fill="#FFFFFF"/>
-      <path d="M 30 2 L 27 0.5 L 27 11.5 L 38.5 29 L 43 27.5 L 31.5 4.5 Z" fill="#FFFFFF"/>
-      <path d="M 25.5 1 L 22.5 3 L 22.5 12.5 L 26 10.5 Z" fill="#FFFFFF"/>
-      <path d="M 26.5 12 L 22.5 14 L 33 31.5 L 42 29 L 37.5 27.5 Z" fill="#FFFFFF"/>
-      <path d="M 22 16.5 L 28.5 28.5 Q 29 29.5 27.8 29.5 L 16.2 29.5 Q 15 29.5 15.5 28.5 Z" fill="#2563EB"/>
+  <!-- Top Brand Bar -->
+  <g transform="translate(28, 20)">
+    <!-- Exact Traced Arkilian Logo from site/images/logo.png -->
+    <g transform="translate(0, 1) scale(0.95)">
+      <path d="M12.2,0.9L12.4,7.2L5.8,20.6L1.0,22.7L0.9,22.0L10.8,1.9L11.0,1.6Z M13.1,0.9L15.1,2.5L15.2,8.4L13.2,7.1Z M18.8,0.9L18.8,7.2L16.9,8.4L16.9,2.5Z M19.7,0.9L21.2,1.8L30.8,21.3L31.1,22.2L31.1,22.7L26.2,20.6L19.6,7.2Z M13.0,7.9L15.2,9.1L15.1,10.4L9.1,23.2L8.3,23.6L3.5,25.2L2.8,24.9L1.3,23.6L6.4,21.4Z M18.9,7.9L20.3,10.6L25.6,21.4L30.7,23.6L29.2,25.0L28.6,25.2L24.1,23.8L23.0,23.2L16.9,10.4L16.8,9.1Z" fill="#0F172A"/>
+      <path d="M15.9,13.2L16.2,13.3L16.4,13.6L20.1,21.1L19.8,21.6L16.2,21.6L12.2,21.6L12.0,21.4L12.1,20.8L12.6,19.8L15.6,13.6Z" fill="#0B2EC6"/>
     </g>
-    <text x="44" y="20" class="serif" font-size="19" font-weight="500" fill="#FFFFFF" letter-spacing="-0.02em">Arkilian</text>
-    <text x="118" y="19" class="sans" font-size="12" fill="#64748B">Architecture</text>
+    <text x="40" y="19" class="serif" font-size="18" font-weight="600" fill="#0F172A" letter-spacing="-0.02em">Arkilian</text>
+    <line x1="115" y1="4" x2="115" y2="22" stroke="#CBD5E1" stroke-width="1.2"/>
+    <text x="126" y="18" class="sans" font-size="12.5" font-weight="500" fill="#64748B">Engine Architecture</text>
   </g>
 
-  <text x="1044" y="45" text-anchor="end" class="mono" font-size="11" fill="#64748B">3 Dedicated SQLite Connections · Zero Lock Contention</text>
-
-  <line x1="36" y1="66" x2="1044" y2="66" stroke="#1E293B" stroke-width="1"/>
-
-  <!-- ==================================================================== -->
-  <!-- COLUMN 1: YOUR APPLICATION                                           -->
-  <!-- ==================================================================== -->
-  <g transform="translate(36, 102)">
-    <rect width="190" height="300" rx="10" fill="#111827" stroke="#1E293B" stroke-width="1.25"/>
-    <text x="95" y="42" text-anchor="middle" class="sans" font-size="14" font-weight="600" fill="#F8FAFC">Your Application</text>
-    <text x="95" y="62" text-anchor="middle" class="mono" font-size="11" fill="#64748B">In-Process Library</text>
-
-    <line x1="24" y1="82" x2="166" y2="82" stroke="#1E293B" stroke-width="1"/>
-
-    <!-- Write API box -->
-    <rect x="20" y="102" width="150" height="64" rx="6" fill="#0B0F19" stroke="#1E293B" stroke-width="1"/>
-    <text x="95" y="128" text-anchor="middle" class="mono" font-size="11.5" font-weight="600" fill="#E2E8F0">db_exec / db_step</text>
-    <text x="95" y="148" text-anchor="middle" class="sans" font-size="11" fill="#94A3B8">Standard SQLite reads/writes</text>
-
-    <!-- SDK list -->
-    <rect x="20" y="184" width="150" height="92" rx="6" fill="#0B0F19" stroke="#1E293B" stroke-width="1"/>
-    <text x="95" y="208" text-anchor="middle" class="sans" font-size="10.5" font-weight="600" fill="#64748B" letter-spacing="0.06em">NATIVE BINDINGS</text>
-    <text x="95" y="230" text-anchor="middle" class="mono" font-size="11" fill="#94A3B8">C99 · Node.js · Python</text>
-    <text x="95" y="250" text-anchor="middle" class="mono" font-size="11" fill="#94A3B8">Go · Rust · PHP</text>
-  </g>
-
-  <!-- Arrow: App -> Writer Connection -->
-  <line x1="226" y1="168" x2="288" y2="168" stroke="#94A3B8" stroke-width="1.75" marker-end="url(#arr-white)"/>
-  <text x="257" y="158" text-anchor="middle" class="mono" font-size="10" fill="#94A3B8">SQL</text>
+  <text x="952" y="38" text-anchor="end" class="mono" font-size="11" fill="#475569">3 Dedicated SQLite Connections · Zero Cross-Thread Contention</text>
+  <line x1="28" y1="56" x2="952" y2="56" stroke="#E2E8F0" stroke-width="1"/>
 
   <!-- ==================================================================== -->
-  <!-- COLUMN 2: ARKILIAN ENGINE (3 CONNECTIONS)                            -->
+  <!-- 1. APPLICATION LAYER (Left)                                          -->
   <!-- ==================================================================== -->
-  <g transform="translate(296, 90)">
-    <rect width="444" height="324" rx="12" fill="#0F172A" stroke="url(#engine-border)" stroke-width="1.5"/>
+  <g transform="translate(28, 126)">
+    <rect width="156" height="196" rx="8" fill="#FAFAFA" stroke="#CBD5E1" stroke-width="1.25"/>
+    <text x="78" y="34" text-anchor="middle" class="sans" font-size="13" font-weight="600" fill="#0F172A">Application</text>
+    <text x="78" y="52" text-anchor="middle" class="mono" font-size="10.5" fill="#117BC8">db_exec / db_step</text>
 
-    <text x="24" y="30" class="sans" font-size="13" font-weight="600" fill="#F8FAFC">Arkilian Embedded Engine</text>
-    <text x="420" y="30" text-anchor="end" class="mono" font-size="11" fill="#38BDF8">app.sqlite (WAL Mode)</text>
+    <line x1="20" y1="68" x2="136" y2="68" stroke="#E2E8F0" stroke-width="1"/>
 
-    <!-- Connection 1: Writer + Outbox -->
-    <g transform="translate(20, 46)">
-      <rect width="404" height="76" rx="8" fill="#131C2E" stroke="#1E293B" stroke-width="1.25"/>
-      <rect x="0" y="0" width="4" height="76" rx="2" fill="#38BDF8"/>
-      <text x="18" y="28" class="sans" font-size="13" font-weight="600" fill="#FFFFFF">1. Primary Writer</text>
-      <rect x="136" y="14" width="84" height="20" rx="4" fill="#0B0F19" stroke="#1E293B" stroke-width="1"/>
-      <text x="178" y="28" text-anchor="middle" class="mono" font-size="10.5" fill="#38BDF8">db-&gt;handle</text>
-
-      <text x="18" y="52" class="sans" font-size="11.5" fill="#94A3B8">Captures DML triggers &amp; DDL into durable <tspan class="mono" fill="#E2E8F0">_pending_backup</tspan> outbox</text>
-    </g>
-
-    <!-- Internal vertical connector: Outbox -> Flush Thread -->
-    <line x1="222" y1="122" x2="222" y2="142" stroke="#38BDF8" stroke-width="1.5" marker-end="url(#arr-blue)"/>
-
-    <!-- Connection 2: Flush Thread -->
-    <g transform="translate(20, 144)">
-      <rect width="404" height="76" rx="8" fill="#131C2E" stroke="#1E293B" stroke-width="1.25"/>
-      <rect x="0" y="0" width="4" height="76" rx="2" fill="#2563EB"/>
-      <text x="18" y="28" class="sans" font-size="13" font-weight="600" fill="#FFFFFF">2. Flush Thread</text>
-      <rect x="126" y="14" width="102" height="20" rx="4" fill="#0B0F19" stroke="#1E293B" stroke-width="1"/>
-      <text x="177" y="28" text-anchor="middle" class="mono" font-size="10.5" fill="#60A5FA">db-&gt;backup_db</text>
-      <text x="388" y="28" text-anchor="end" class="mono" font-size="10.5" fill="#38BDF8">Every 1s</text>
-
-      <text x="18" y="52" class="sans" font-size="11.5" fill="#94A3B8">Batches outbox rows into <tspan class="mono" fill="#E2E8F0">SHA-256</tspan> SQL chunks &amp; updates manifest</text>
-    </g>
-
-    <!-- Connection 3: Snapshot Thread -->
-    <g transform="translate(20, 232)">
-      <rect width="404" height="74" rx="8" fill="#131C2E" stroke="#1E293B" stroke-width="1.25"/>
-      <rect x="0" y="0" width="4" height="74" rx="2" fill="#6366F1"/>
-      <text x="18" y="28" class="sans" font-size="13" font-weight="600" fill="#FFFFFF">3. Snapshot Thread</text>
-      <rect x="148" y="14" width="114" height="20" rx="4" fill="#0B0F19" stroke="#1E293B" stroke-width="1"/>
-      <text x="205" y="28" text-anchor="middle" class="mono" font-size="10.5" fill="#818CF8">db-&gt;snapshot_db</text>
-      <text x="388" y="28" text-anchor="end" class="mono" font-size="10.5" fill="#818CF8">Periodic</text>
-
-      <text x="18" y="52" class="sans" font-size="11.5" fill="#94A3B8">Streams non-blocking <tspan class="mono" fill="#E2E8F0">sqlite3_backup_step()</tspan> baseline snapshots</text>
-    </g>
-  </g>
-
-  <!-- Arrows: Engine -> S3 -->
-  <line x1="740" y1="272" x2="824" y2="272" stroke="#38BDF8" stroke-width="1.75" marker-end="url(#arr-blue)"/>
-  <text x="782" y="261" text-anchor="middle" class="mono" font-size="10" fill="#38BDF8">SigV4 PUT</text>
-
-  <line x1="740" y1="358" x2="824" y2="358" stroke="#38BDF8" stroke-width="1.75" marker-end="url(#arr-blue)"/>
-  <text x="782" y="347" text-anchor="middle" class="mono" font-size="10" fill="#38BDF8">SigV4 PUT</text>
-
-  <!-- ==================================================================== -->
-  <!-- COLUMN 3: S3-COMPATIBLE STORAGE                                      -->
-  <!-- ==================================================================== -->
-  <g transform="translate(832, 102)">
-    <rect width="212" height="300" rx="10" fill="#111827" stroke="#1E293B" stroke-width="1.25"/>
-    <text x="106" y="40" text-anchor="middle" class="sans" font-size="14" font-weight="600" fill="#F8FAFC">S3 Object Storage</text>
-    <text x="106" y="58" text-anchor="middle" class="sans" font-size="11" fill="#64748B">AWS S3 · R2 · MinIO</text>
-
-    <line x1="20" y1="76" x2="192" y2="76" stroke="#1E293B" stroke-width="1"/>
-
-    <!-- Object 1: Manifest -->
-    <rect x="18" y="92" width="176" height="56" rx="6" fill="#0B0F19" stroke="#1E293B" stroke-width="1"/>
-    <text x="106" y="116" text-anchor="middle" class="mono" font-size="11.5" font-weight="600" fill="#60A5FA">manifest.json</text>
-    <text x="106" y="135" text-anchor="middle" class="sans" font-size="10.5" fill="#94A3B8">HMAC-SHA256 signed</text>
-
-    <!-- Object 2: Chunks -->
-    <rect x="18" y="160" width="176" height="56" rx="6" fill="#0B0F19" stroke="#1E293B" stroke-width="1"/>
-    <text x="106" y="184" text-anchor="middle" class="mono" font-size="11.5" font-weight="600" fill="#38BDF8">chunks/lsn_*.sql</text>
-    <text x="106" y="203" text-anchor="middle" class="sans" font-size="10.5" fill="#94A3B8">1s CDC · SHA-256 verified</text>
-
-    <!-- Object 3: Snapshots -->
-    <rect x="18" y="228" width="176" height="56" rx="6" fill="#0B0F19" stroke="#1E293B" stroke-width="1"/>
-    <text x="106" y="252" text-anchor="middle" class="mono" font-size="11.5" font-weight="600" fill="#818CF8">snapshots/*.sqlite</text>
-    <text x="106" y="271" text-anchor="middle" class="sans" font-size="10.5" fill="#94A3B8">Baseline · SHA-256 verified</text>
+    <text x="78" y="92" text-anchor="middle" class="sans" font-size="10" font-weight="600" fill="#64748B" letter-spacing="0.06em">SDK BINDINGS</text>
+    <text x="78" y="114" text-anchor="middle" class="mono" font-size="10.5" fill="#334155">C99 / C++</text>
+    <text x="78" y="132" text-anchor="middle" class="mono" font-size="10.5" fill="#334155">Node.js · Python</text>
+    <text x="78" y="150" text-anchor="middle" class="mono" font-size="10.5" fill="#334155">Go · Rust · PHP</text>
   </g>
 
   <!-- ==================================================================== -->
-  <!-- BOTTOM RETURN PATH: COLD-START HYDRATION                             -->
+  <!-- 2. ARKILIAN EMBEDDED ENGINE (Center Container — #F5F8FE)             -->
   <!-- ==================================================================== -->
-  <path d="M 938 402 L 938 456 L 518 456 L 518 422" fill="none" stroke="#60A5FA" stroke-width="1.5" stroke-dasharray="5,4" marker-end="url(#arr-hydrate)"/>
-  <rect x="612" y="442" width="236" height="26" rx="13" fill="#0F172A" stroke="#1E3A8A" stroke-width="1"/>
-  <text x="730" y="459" text-anchor="middle" class="mono" font-size="11" fill="#93C5FD">Cold-Start Restore: arkilian_hydrate_s3()</text>
+  <g transform="translate(232, 76)">
+    <rect width="484" height="300" rx="10" fill="#F5F8FE" stroke="#117BC8" stroke-width="1.25"/>
+
+    <!-- Container Header -->
+    <text x="20" y="26" class="sans" font-size="12" font-weight="700" fill="#062E6F" letter-spacing="0.03em">ARKILIAN IN-PROCESS ENGINE</text>
+    <text x="464" y="26" text-anchor="end" class="mono" font-size="10.5" fill="#117BC8">struct arkilian</text>
+    <line x1="20" y1="38" x2="464" y2="38" stroke="#DCE6F7" stroke-width="1"/>
+
+    <!-- 2A. Primary Writer Handle -->
+    <g transform="translate(20, 66)">
+      <rect width="176" height="84" rx="6" fill="#FFFFFF" stroke="#CBD5E1" stroke-width="1.25"/>
+      <rect x="0" y="0" width="4" height="84" rx="2" fill="#0F172A"/>
+      <text x="16" y="25" class="sans" font-size="12.5" font-weight="600" fill="#0F172A">1. Primary Writer</text>
+      <text x="16" y="43" class="mono" font-size="10.5" font-weight="600" fill="#117BC8">db-&gt;handle</text>
+      <text x="16" y="64" class="sans" font-size="10.5" fill="#475569">DML triggers &amp; DDL</text>
+      <text x="16" y="77" class="sans" font-size="10.5" fill="#475569">sidecar (<tspan class="mono" font-size="9.8">.arkddlqueue</tspan>)</text>
+    </g>
+
+    <!-- Connector: Primary Writer -> Local SQLite WAL + Outbox -->
+    <circle cx="108" cy="150" r="3" fill="#334155"/>
+    <line x1="108" y1="150" x2="108" y2="180" stroke="#334155" stroke-width="1.5" marker-end="url(#arr-dark)"/>
+    <text x="142" y="169" class="mono" font-size="9.5" fill="#475569">ACID write</text>
+
+    <!-- 2B. Local SQLite Database Cylinder / Storage Node -->
+    <g transform="translate(20, 184)">
+      <rect width="176" height="94" rx="6" fill="#FFFFFF" stroke="#117BC8" stroke-width="1.25"/>
+      <!-- Clean Database Cylinder Icon -->
+      <g transform="translate(16, 16)" fill="none" stroke="#117BC8" stroke-width="1.4">
+        <ellipse cx="9" cy="4" rx="8" ry="3"/>
+        <path d="M 1 4 V 16 C 1 17.7 4.6 19 9 19 C 13.4 19 17 17.7 17 16 V 4"/>
+        <path d="M 1 10 C 1 11.7 4.6 13 9 13 C 13.4 13 17 11.7 17 10"/>
+      </g>
+      <text x="40" y="26" class="mono" font-size="12" font-weight="700" fill="#0F172A">app.sqlite</text>
+      <text x="40" y="40" class="sans" font-size="10" fill="#64748B">WAL Mode · Local Disk</text>
+      <line x1="16" y1="50" x2="160" y2="50" stroke="#E2E8F0" stroke-width="1"/>
+      <text x="16" y="66" class="mono" font-size="10" font-weight="600" fill="#062E6F">_pending_backup</text>
+      <text x="16" y="81" class="sans" font-size="10" fill="#475569">Outbox · <tspan class="mono" font-size="9.5">_arkilian_meta</tspan></text>
+    </g>
+
+    <!-- Internal Split Connector: app.sqlite -> Flush Thread & Snapshot Thread -->
+    <circle cx="196" cy="231" r="3" fill="#117BC8"/>
+    <path d="M 196 231 L 226 231 L 226 108 L 254 108" fill="none" stroke="#117BC8" stroke-width="1.5" marker-end="url(#arr-brand)"/>
+    <path d="M 226 231 L 254 231" fill="none" stroke="#117BC8" stroke-width="1.5" marker-end="url(#arr-brand)"/>
+
+    <!-- 2C. Flush Thread (db->backup_db) -->
+    <g transform="translate(258, 66)">
+      <rect width="206" height="84" rx="6" fill="#FFFFFF" stroke="#CBD5E1" stroke-width="1.25"/>
+      <rect x="0" y="0" width="4" height="84" rx="2" fill="#117BC8"/>
+      <text x="16" y="25" class="sans" font-size="12.5" font-weight="600" fill="#0F172A">2. Flush Thread</text>
+      <rect x="148" y="11" width="46" height="18" rx="4" fill="#EFF6FF"/>
+      <text x="171" y="23" text-anchor="middle" class="mono" font-size="9.5" font-weight="600" fill="#117BC8">1s CDC</text>
+      <text x="16" y="43" class="mono" font-size="10.5" font-weight="600" fill="#117BC8">db-&gt;backup_db</text>
+      <text x="16" y="64" class="sans" font-size="10.5" fill="#475569">Batches outbox into <tspan class="mono" font-size="9.8">SHA-256</tspan></text>
+      <text x="16" y="77" class="sans" font-size="10.5" fill="#475569">SQL chunks &amp; updates manifest</text>
+    </g>
+
+    <!-- 2D. Snapshot Thread (db->snapshot_db) -->
+    <g transform="translate(258, 184)">
+      <rect width="206" height="94" rx="6" fill="#FFFFFF" stroke="#CBD5E1" stroke-width="1.25"/>
+      <rect x="0" y="0" width="4" height="94" rx="2" fill="#062E6F"/>
+      <text x="16" y="25" class="sans" font-size="12.5" font-weight="600" fill="#0F172A">3. Snapshot Thread</text>
+      <text x="16" y="43" class="mono" font-size="10.5" font-weight="600" fill="#062E6F">db-&gt;snapshot_db</text>
+      <text x="16" y="64" class="sans" font-size="10.5" fill="#475569">Non-blocking online copy via</text>
+      <text x="16" y="79" class="mono" font-size="9.8" fill="#334155">sqlite3_backup_step()</text>
+    </g>
+  </g>
+
+  <!-- Connectors: Flush & Snapshot Threads -> S3 Object Storage -->
+  <circle cx="696" cy="184" r="3" fill="#117BC8"/>
+  <line x1="696" y1="184" x2="770" y2="184" stroke="#117BC8" stroke-width="1.5" marker-end="url(#arr-brand)"/>
+  <text x="745" y="174" text-anchor="middle" class="mono" font-size="9.5" font-weight="600" fill="#117BC8">SigV4 PUT</text>
+
+  <circle cx="696" cy="307" r="3" fill="#062E6F"/>
+  <line x1="696" y1="307" x2="770" y2="307" stroke="#062E6F" stroke-width="1.5" marker-end="url(#arr-navy)"/>
+  <text x="745" y="297" text-anchor="middle" class="mono" font-size="9.5" font-weight="600" fill="#062E6F">SigV4 PUT</text>
+
+  <!-- ==================================================================== -->
+  <!-- 3. S3-COMPATIBLE OBJECT STORAGE (Right)                              -->
+  <!-- ==================================================================== -->
+  <g transform="translate(774, 76)">
+    <rect width="178" height="300" rx="10" fill="#FAFAFA" stroke="#CBD5E1" stroke-width="1.25"/>
+    <text x="89" y="28" text-anchor="middle" class="sans" font-size="13" font-weight="600" fill="#0F172A">S3 Object Storage</text>
+    <text x="89" y="45" text-anchor="middle" class="sans" font-size="10.5" fill="#64748B">AWS S3 · R2 · MinIO</text>
+    <line x1="16" y1="58" x2="162" y2="58" stroke="#E2E8F0" stroke-width="1"/>
+
+    <!-- Artifact 1: manifest.json -->
+    <g transform="translate(14, 74)">
+      <rect width="150" height="60" rx="6" fill="#FFFFFF" stroke="#CBD5E1" stroke-width="1"/>
+      <text x="75" y="25" text-anchor="middle" class="mono" font-size="11" font-weight="600" fill="#062E6F">manifest.json</text>
+      <text x="75" y="43" text-anchor="middle" class="sans" font-size="10" fill="#475569">HMAC-SHA256 signed</text>
+    </g>
+
+    <!-- Artifact 2: chunks/lsn_*.sql -->
+    <g transform="translate(14, 146)">
+      <rect width="150" height="60" rx="6" fill="#FFFFFF" stroke="#CBD5E1" stroke-width="1"/>
+      <text x="75" y="25" text-anchor="middle" class="mono" font-size="11" font-weight="600" fill="#117BC8">chunks/lsn_*.sql</text>
+      <text x="75" y="43" text-anchor="middle" class="sans" font-size="10" fill="#475569">SHA-256 verified CDC</text>
+    </g>
+
+    <!-- Artifact 3: snapshots/*.sqlite -->
+    <g transform="translate(14, 218)">
+      <rect width="150" height="60" rx="6" fill="#FFFFFF" stroke="#CBD5E1" stroke-width="1"/>
+      <text x="75" y="25" text-anchor="middle" class="mono" font-size="10.5" font-weight="600" fill="#0F172A">snapshots/*.sqlite</text>
+      <text x="75" y="43" text-anchor="middle" class="sans" font-size="10" fill="#475569">Immutable baseline</text>
+    </g>
+  </g>
+
+  <!-- Connector: Application -> Primary Writer (painted on top of container border) -->
+  <circle cx="184" cy="184" r="3" fill="#334155"/>
+  <line x1="184" y1="184" x2="250" y2="184" stroke="#334155" stroke-width="1.5" marker-end="url(#arr-dark)"/>
+  <text x="208" y="175" text-anchor="middle" class="mono" font-size="10" font-weight="600" fill="#334155">SQL</text>
+
+  <!-- ==================================================================== -->
+  <!-- 4. COLD-START HYDRATION LOOP (Bottom)                                -->
+  <!-- ==================================================================== -->
+  <circle cx="863" cy="376" r="3" fill="#062E6F"/>
+  <path d="M 863 376 L 863 414 L 340 414 L 340 356" fill="none" stroke="#062E6F" stroke-width="1.5" stroke-dasharray="5,4" marker-end="url(#arr-navy)"/>
+  <rect x="476" y="401" width="268" height="24" rx="12" fill="#F5F8FE" stroke="#117BC8" stroke-width="1"/>
+  <text x="610" y="417" text-anchor="middle" class="mono" font-size="10.5" font-weight="600" fill="#062E6F">Cold-Start Restore: arkilian_hydrate_s3()</text>
 </svg>
