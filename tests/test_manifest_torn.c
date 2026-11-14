@@ -106,6 +106,34 @@ static int resolved(arkilian *db) {
   return (db_backup_health_flags(db) & ARK_HF_MANIFEST_RESOLVED) != 0;
 }
 
+static long long outbox_head_lsn(arkilian *db) {
+  sqlite3_stmt *st = NULL;
+  long long v = 0;
+  if (sqlite3_prepare_v2(db_get_handle(db),
+        "SELECT seq FROM sqlite_sequence WHERE name='_pending_backup'",
+        -1, &st, NULL) == SQLITE_OK && sqlite3_step(st) == SQLITE_ROW) {
+    v = sqlite3_column_int64(st, 0);
+  }
+  sqlite3_finalize(st);
+  return v;
+}
+
+static long long manifest_max_lsn(const char *m) {
+  if (!m) return 0;
+  long long max_lsn = 0;
+  const char *keys[] = {"\"baseline_lsn\":", "\"lsn_end\":"};
+  for (size_t k = 0; k < 2; k++) {
+    size_t klen = strlen(keys[k]);
+    const char *p = m;
+    while ((p = strstr(p, keys[k])) != NULL) {
+      p += klen;
+      long long val = strtoll(p, NULL, 10);
+      if (val > max_lsn) max_lsn = val;
+    }
+  }
+  return max_lsn;
+}
+
 // Wait (up to ~20 s) until the published manifest contains `needle`.
 static int wait_manifest_contains(const char *needle) {
   for (int i = 0; i < 400; i++) {
@@ -143,10 +171,12 @@ int main(void) {
   char *before = get_obj("manifest.json");
   stub_set_status_override_manifest_sig(500);
   insert_rows(db, 6, 10);
+  long long target_lsn = outbox_head_lsn(db);
+  assert(target_lsn > 0);
   int changed = 0;
   for (int i = 0; i < 400 && !changed; i++) {
     char *m = get_obj("manifest.json");
-    changed = m && strcmp(m, before) != 0;
+    changed = m && strcmp(m, before) != 0 && manifest_max_lsn(m) >= target_lsn;
     free(m);
     if (!changed) usleep(50000);
   }
