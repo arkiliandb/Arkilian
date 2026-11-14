@@ -1,212 +1,167 @@
-<svg width="100%" viewBox="0 0 880 620" role="img" xmlns="http://www.w3.org/2000/svg">
-  <title>Arkilian Architecture</title>
-  <desc>Your app calls into the arkilian connection. Arkilian uses three dedicated SQLite connections (db->handle for App writes, db->backup_db for WAL chunk shipping, db->snapshot_db for hourly backups) to eliminate cross-thread lock contention. Writes are captured via DML triggers (sync_backup_triggers) and transaction-aware sidecar DDL (.arkddlqueue) into the _pending_backup outbox table. The Flush Thread batches outbox rows and PUTs chunks to S3, updating the HMAC-signed manifest registry. The Snapshot Thread performs non-blocking online snapshots (sqlite3_backup_step) to backup.sqlite. Cold-start disaster recovery (arkilian_hydrate_s3) replays the signed manifest, snapshot, and chunks.</desc>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1080 500" width="100%" role="img" aria-label="Arkilian Architecture">
   <defs>
-    <!-- Solid Crisp Arrowheads -->
-    <marker id="arrow-gray" viewBox="0 0 10 10" refX="6" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
-      <path d="M 1 2 L 7 5 L 1 8 z" fill="rgb(100, 100, 95)"/>
+    <linearGradient id="bg-grad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#070A12"/>
+      <stop offset="100%" stop-color="#0C1220"/>
+    </linearGradient>
+
+    <linearGradient id="engine-border" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#1E3A8A"/>
+      <stop offset="50%" stop-color="#117BC8"/>
+      <stop offset="100%" stop-color="#1E293B"/>
+    </linearGradient>
+
+    <marker id="arr-white" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M 1 1.5 L 8.5 5 L 1 8.5 z" fill="#94A3B8"/>
     </marker>
-    <marker id="arrow-green" viewBox="0 0 10 10" refX="6" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
-      <path d="M 1 2 L 7 5 L 1 8 z" fill="rgb(15, 110, 86)"/>
+    <marker id="arr-blue" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M 1 1.5 L 8.5 5 L 1 8.5 z" fill="#38BDF8"/>
     </marker>
-    <marker id="arrow-orange" viewBox="0 0 10 10" refX="6" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
-      <path d="M 1 2 L 7 5 L 1 8 z" fill="rgb(180, 75, 40)"/>
-    </marker>
-    <marker id="arrow-purple" viewBox="0 0 10 10" refX="6" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
-      <path d="M 1 2 L 7 5 L 1 8 z" fill="rgb(99, 87, 219)"/>
+    <marker id="arr-hydrate" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M 1 1.5 L 8.5 5 L 1 8.5 z" fill="#60A5FA"/>
     </marker>
 
     <style>
-      .text-base { font-family: -apple-system, system-ui, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; font-size: 13px; font-weight: 400; text-anchor: start; }
-      .text-title { font-family: -apple-system, system-ui, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; font-size: 12.5px; font-weight: 600; text-anchor: middle; }
-      .text-desc { font-family: -apple-system, system-ui, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; font-size: 11px; font-weight: 400; text-anchor: middle; }
-      .text-header { font-family: -apple-system, system-ui, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; font-size: 14px; font-weight: 700; text-anchor: start; }
-      .text-sub { font-family: -apple-system, system-ui, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; font-size: 11px; font-weight: 400; text-anchor: start; }
-      .text-mono { font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, Courier, monospace; font-size: 10px; }
-      
-      .line-conn { fill: none; stroke: rgb(100, 100, 95); stroke-width: 1.5; stroke-linecap: round; }
-      .line-green { fill: none; stroke: rgb(15, 110, 86); stroke-width: 1.5; stroke-linecap: round; }
-      .line-orange { fill: none; stroke: rgb(180, 75, 40); stroke-width: 1.5; stroke-linecap: round; }
-      .line-purple { fill: none; stroke: rgb(99, 87, 219); stroke-width: 1.5; stroke-dasharray: 4,4; stroke-linecap: round; }
+      .sans { font-family: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+      .mono { font-family: "SFMono-Regular", ui-monospace, "JetBrains Mono", Menlo, Consolas, monospace; }
+      .serif { font-family: "Signifier", Georgia, serif; }
     </style>
   </defs>
 
-  <!-- ================================================================== -->
-  <!-- 1. YOUR APP CODE (Aligned directly above App Thread)               -->
-  <!-- ================================================================== -->
-  <g class="text-base">
-    <rect x="45" y="20" width="225" height="48" rx="8" stroke-width="0.8" style="fill:rgb(241, 239, 232);stroke:rgb(95, 94, 90);"/>
-    <text x="157" y="40" class="text-title" style="fill:rgb(50, 50, 48);">Your Application Code</text>
-    <text x="157" y="56" class="text-desc" style="fill:rgb(100, 100, 95);">Calls public API (db_exec, db_step)</text>
+  <!-- Background Canvas -->
+  <rect width="1080" height="500" rx="14" fill="url(#bg-grad)" stroke="#1E293B" stroke-width="1.5"/>
+
+  <!-- Subtle Top Brand Header -->
+  <g transform="translate(36, 26)">
+    <!-- Arkilian Emblem -->
+    <g transform="scale(0.78)">
+      <path d="M 14 2 L 17 0.5 L 17 11.5 L 5.5 29 L 1 27.5 L 12.5 4.5 Z" fill="#FFFFFF"/>
+      <path d="M 18.5 1 L 21.5 3 L 21.5 12.5 L 18 10.5 Z" fill="#FFFFFF"/>
+      <path d="M 17.5 12 L 21.5 14 L 11 31.5 L 2 29 L 6.5 27.5 Z" fill="#FFFFFF"/>
+      <path d="M 30 2 L 27 0.5 L 27 11.5 L 38.5 29 L 43 27.5 L 31.5 4.5 Z" fill="#FFFFFF"/>
+      <path d="M 25.5 1 L 22.5 3 L 22.5 12.5 L 26 10.5 Z" fill="#FFFFFF"/>
+      <path d="M 26.5 12 L 22.5 14 L 33 31.5 L 42 29 L 37.5 27.5 Z" fill="#FFFFFF"/>
+      <path d="M 22 16.5 L 28.5 28.5 Q 29 29.5 27.8 29.5 L 16.2 29.5 Q 15 29.5 15.5 28.5 Z" fill="#2563EB"/>
+    </g>
+    <text x="44" y="20" class="serif" font-size="19" font-weight="500" fill="#FFFFFF" letter-spacing="-0.02em">Arkilian</text>
+    <text x="118" y="19" class="sans" font-size="12" fill="#64748B">Architecture</text>
   </g>
 
-  <!-- Clean Vertical Arrow: App Code -> Primary SQLite Handle -->
-  <line x1="157" y1="68" x2="157" y2="128" marker-end="url(#arrow-gray)" class="line-conn"/>
+  <text x="1044" y="45" text-anchor="end" class="mono" font-size="11" fill="#64748B">3 Dedicated SQLite Connections · Zero Lock Contention</text>
 
-  <!-- ================================================================== -->
-  <!-- 2. ARKILIAN CONNECTION CONTAINER (Spec §3.1 / §3.3)                 -->
-  <!-- ================================================================== -->
-  <g class="text-base">
-    <rect x="30" y="85" width="820" height="345" rx="14" stroke-width="0.8" style="fill:rgb(244, 243, 255);stroke:rgb(99, 87, 219);"/>
-    <text x="48" y="108" class="text-header" style="fill:rgb(60, 52, 137);">arkilian connection</text>
-    <text x="195" y="108" class="text-sub" style="fill:rgb(99, 87, 219);">Three dedicated SQLite connections — zero cross-thread mutex contention (Spec §3.1)</text>
+  <line x1="36" y1="66" x2="1044" y2="66" stroke="#1E293B" stroke-width="1"/>
+
+  <!-- ==================================================================== -->
+  <!-- COLUMN 1: YOUR APPLICATION                                           -->
+  <!-- ==================================================================== -->
+  <g transform="translate(36, 102)">
+    <rect width="190" height="300" rx="10" fill="#111827" stroke="#1E293B" stroke-width="1.25"/>
+    <text x="95" y="42" text-anchor="middle" class="sans" font-size="14" font-weight="600" fill="#F8FAFC">Your Application</text>
+    <text x="95" y="62" text-anchor="middle" class="mono" font-size="11" fill="#64748B">In-Process Library</text>
+
+    <line x1="24" y1="82" x2="166" y2="82" stroke="#1E293B" stroke-width="1"/>
+
+    <!-- Write API box -->
+    <rect x="20" y="102" width="150" height="64" rx="6" fill="#0B0F19" stroke="#1E293B" stroke-width="1"/>
+    <text x="95" y="128" text-anchor="middle" class="mono" font-size="11.5" font-weight="600" fill="#E2E8F0">db_exec / db_step</text>
+    <text x="95" y="148" text-anchor="middle" class="sans" font-size="11" fill="#94A3B8">Standard SQLite reads/writes</text>
+
+    <!-- SDK list -->
+    <rect x="20" y="184" width="150" height="92" rx="6" fill="#0B0F19" stroke="#1E293B" stroke-width="1"/>
+    <text x="95" y="208" text-anchor="middle" class="sans" font-size="10.5" font-weight="600" fill="#64748B" letter-spacing="0.06em">NATIVE BINDINGS</text>
+    <text x="95" y="230" text-anchor="middle" class="mono" font-size="11" fill="#94A3B8">C99 · Node.js · Python</text>
+    <text x="95" y="250" text-anchor="middle" class="mono" font-size="11" fill="#94A3B8">Go · Rust · PHP</text>
   </g>
 
-  <!-- ================================================================== -->
-  <!-- 2A. COLUMN 1: APP / WRITER THREAD (db->handle)                     -->
-  <!-- ================================================================== -->
-  <g class="text-base">
-    <rect x="45" y="125" width="225" height="290" rx="8" stroke-width="0.8" style="fill:rgb(228, 247, 240);stroke:rgb(15, 110, 86);"/>
-    <text x="157" y="147" class="text-title" style="fill:rgb(8, 80, 65);">App / Writer Thread</text>
-    <text x="157" y="163" class="text-desc text-mono" style="fill:rgb(15, 110, 86);">Primary: db->handle</text>
+  <!-- Arrow: App -> Writer Connection -->
+  <line x1="226" y1="168" x2="288" y2="168" stroke="#94A3B8" stroke-width="1.75" marker-end="url(#arr-white)"/>
+  <text x="257" y="158" text-anchor="middle" class="mono" font-size="10" fill="#94A3B8">SQL</text>
 
-    <!-- Subcard: SQLite Engine -->
-    <rect x="58" y="175" width="199" height="56" rx="6" stroke-width="0.8" style="fill:rgb(255, 255, 255);stroke:rgb(170, 195, 185);"/>
-    <text x="157" y="196" class="text-title" style="fill:rgb(50, 50, 48);">SQLite Engine</text>
-    <text x="157" y="214" class="text-desc" style="fill:rgb(90, 90, 85);">executes writes in WAL mode</text>
+  <!-- ==================================================================== -->
+  <!-- COLUMN 2: ARKILIAN ENGINE (3 CONNECTIONS)                            -->
+  <!-- ==================================================================== -->
+  <g transform="translate(296, 90)">
+    <rect width="444" height="324" rx="12" fill="#0F172A" stroke="url(#engine-border)" stroke-width="1.5"/>
 
-    <!-- Subcard: Capture Subsystem -->
-    <rect x="58" y="255" width="199" height="145" rx="6" stroke-width="0.8" style="fill:rgb(255, 255, 255);stroke:rgb(170, 195, 185);"/>
-    <text x="157" y="275" class="text-title" style="fill:rgb(8, 80, 65);">Capture Subsystem</text>
-    
-    <text x="157" y="295" class="text-desc text-mono" style="fill:rgb(15, 110, 86); font-weight: 600;">sync_backup_triggers()</text>
-    <text x="157" y="310" class="text-desc" style="fill:rgb(90, 90, 85); font-size: 10.5px;">AFTER INSERT/UPDATE/DELETE</text>
-    <text x="157" y="325" class="text-desc" style="fill:rgb(90, 90, 85); font-size: 10px;">captures PK row-level DML</text>
-    
-    <line x1="70" y1="335" x2="245" y2="335" stroke="rgb(210, 225, 220)" stroke-width="0.8"/>
-    
-    <text x="157" y="352" class="text-desc text-mono" style="fill:rgb(15, 110, 86); font-weight: 600;">trace_raw_ddl (.arkddlqueue)</text>
-    <text x="157" y="368" class="text-desc" style="fill:rgb(90, 90, 85); font-size: 10px;">journals DDL &amp; savepoints</text>
-    <text x="157" y="384" class="text-desc text-mono" style="fill:rgb(180, 75, 40); font-size: 9.5px;">on_schema_authorizer</text>
+    <text x="24" y="30" class="sans" font-size="13" font-weight="600" fill="#F8FAFC">Arkilian Embedded Engine</text>
+    <text x="420" y="30" text-anchor="end" class="mono" font-size="11" fill="#38BDF8">app.sqlite (WAL Mode)</text>
+
+    <!-- Connection 1: Writer + Outbox -->
+    <g transform="translate(20, 46)">
+      <rect width="404" height="76" rx="8" fill="#131C2E" stroke="#1E293B" stroke-width="1.25"/>
+      <rect x="0" y="0" width="4" height="76" rx="2" fill="#38BDF8"/>
+      <text x="18" y="28" class="sans" font-size="13" font-weight="600" fill="#FFFFFF">1. Primary Writer</text>
+      <rect x="136" y="14" width="84" height="20" rx="4" fill="#0B0F19" stroke="#1E293B" stroke-width="1"/>
+      <text x="178" y="28" text-anchor="middle" class="mono" font-size="10.5" fill="#38BDF8">db-&gt;handle</text>
+
+      <text x="18" y="52" class="sans" font-size="11.5" fill="#94A3B8">Captures DML triggers &amp; DDL into durable <tspan class="mono" fill="#E2E8F0">_pending_backup</tspan> outbox</text>
+    </g>
+
+    <!-- Internal vertical connector: Outbox -> Flush Thread -->
+    <line x1="222" y1="122" x2="222" y2="142" stroke="#38BDF8" stroke-width="1.5" marker-end="url(#arr-blue)"/>
+
+    <!-- Connection 2: Flush Thread -->
+    <g transform="translate(20, 144)">
+      <rect width="404" height="76" rx="8" fill="#131C2E" stroke="#1E293B" stroke-width="1.25"/>
+      <rect x="0" y="0" width="4" height="76" rx="2" fill="#2563EB"/>
+      <text x="18" y="28" class="sans" font-size="13" font-weight="600" fill="#FFFFFF">2. Flush Thread</text>
+      <rect x="126" y="14" width="102" height="20" rx="4" fill="#0B0F19" stroke="#1E293B" stroke-width="1"/>
+      <text x="177" y="28" text-anchor="middle" class="mono" font-size="10.5" fill="#60A5FA">db-&gt;backup_db</text>
+      <text x="388" y="28" text-anchor="end" class="mono" font-size="10.5" fill="#38BDF8">Every 1s</text>
+
+      <text x="18" y="52" class="sans" font-size="11.5" fill="#94A3B8">Batches outbox rows into <tspan class="mono" fill="#E2E8F0">SHA-256</tspan> SQL chunks &amp; updates manifest</text>
+    </g>
+
+    <!-- Connection 3: Snapshot Thread -->
+    <g transform="translate(20, 232)">
+      <rect width="404" height="74" rx="8" fill="#131C2E" stroke="#1E293B" stroke-width="1.25"/>
+      <rect x="0" y="0" width="4" height="74" rx="2" fill="#6366F1"/>
+      <text x="18" y="28" class="sans" font-size="13" font-weight="600" fill="#FFFFFF">3. Snapshot Thread</text>
+      <rect x="148" y="14" width="114" height="20" rx="4" fill="#0B0F19" stroke="#1E293B" stroke-width="1"/>
+      <text x="205" y="28" text-anchor="middle" class="mono" font-size="10.5" fill="#818CF8">db-&gt;snapshot_db</text>
+      <text x="388" y="28" text-anchor="end" class="mono" font-size="10.5" fill="#818CF8">Periodic</text>
+
+      <text x="18" y="52" class="sans" font-size="11.5" fill="#94A3B8">Streams non-blocking <tspan class="mono" fill="#E2E8F0">sqlite3_backup_step()</tspan> baseline snapshots</text>
+    </g>
   </g>
 
-  <!-- Clean Vertical Arrow: SQLite Engine -> Capture Subsystem -->
-  <line x1="157" y1="231" x2="157" y2="255" marker-end="url(#arrow-green)" class="line-green"/>
+  <!-- Arrows: Engine -> S3 -->
+  <line x1="740" y1="272" x2="824" y2="272" stroke="#38BDF8" stroke-width="1.75" marker-end="url(#arr-blue)"/>
+  <text x="782" y="261" text-anchor="middle" class="mono" font-size="10" fill="#38BDF8">SigV4 PUT</text>
 
-  <!-- ================================================================== -->
-  <!-- 2B. COLUMN 2: OUTBOX TABLE (_pending_backup)                       -->
-  <!-- ================================================================== -->
-  <g class="text-base">
-    <rect x="285" y="125" width="145" height="290" rx="8" stroke-width="0.8" style="fill:rgb(228, 247, 240);stroke:rgb(15, 110, 86);"/>
-    <text x="357" y="147" class="text-title" style="fill:rgb(8, 80, 65);">Outbox Table</text>
-    <text x="357" y="163" class="text-desc text-mono" style="fill:rgb(15, 110, 86); font-weight: 600;">_pending_backup</text>
+  <line x1="740" y1="358" x2="824" y2="358" stroke="#38BDF8" stroke-width="1.75" marker-end="url(#arr-blue)"/>
+  <text x="782" y="347" text-anchor="middle" class="mono" font-size="10" fill="#38BDF8">SigV4 PUT</text>
 
-    <!-- Queue Box -->
-    <rect x="296" y="175" width="123" height="130" rx="6" stroke-width="0.8" style="fill:rgb(255, 255, 255);stroke:rgb(170, 195, 185);"/>
-    <text x="357" y="196" class="text-desc text-mono" style="fill:rgb(100, 100, 100); font-size: 9.5px;">lsn | table | op | row</text>
-    <line x1="305" y1="205" x2="410" y2="205" stroke="rgb(210, 225, 220)" stroke-width="0.8"/>
-    
-    <text x="357" y="226" class="text-title" style="fill:rgb(8, 80, 65);">Cap: 100k rows</text>
-    <text x="357" y="244" class="text-desc" style="fill:rgb(70, 100, 85); font-size: 10.5px;">Pauses CDC at cap</text>
-    <text x="357" y="260" class="text-desc" style="fill:rgb(70, 100, 85); font-size: 10px;">(Never stalls app writes)</text>
-    <line x1="305" y1="272" x2="410" y2="272" stroke="rgb(210, 225, 220)" stroke-width="0.8"/>
-    <text x="357" y="291" class="text-desc text-mono" style="fill:rgb(15, 110, 86); font-size: 9px;">synchronous=FULL</text>
+  <!-- ==================================================================== -->
+  <!-- COLUMN 3: S3-COMPATIBLE STORAGE                                      -->
+  <!-- ==================================================================== -->
+  <g transform="translate(832, 102)">
+    <rect width="212" height="300" rx="10" fill="#111827" stroke="#1E293B" stroke-width="1.25"/>
+    <text x="106" y="40" text-anchor="middle" class="sans" font-size="14" font-weight="600" fill="#F8FAFC">S3 Object Storage</text>
+    <text x="106" y="58" text-anchor="middle" class="sans" font-size="11" fill="#64748B">AWS S3 · R2 · MinIO</text>
 
-    <!-- DLQ & Meta Box -->
-    <rect x="296" y="315" width="123" height="85" rx="6" stroke-width="0.8" style="fill:rgb(255, 255, 255);stroke:rgb(170, 195, 185);"/>
-    <text x="357" y="335" class="text-desc text-mono" style="fill:rgb(180, 60, 30); font-weight: 600;">_dead_backup</text>
-    <text x="357" y="352" class="text-desc" style="fill:rgb(100, 100, 95); font-size: 10px;">DLQ (100 retries max)</text>
-    <line x1="305" y1="363" x2="410" y2="363" stroke="rgb(210, 225, 220)" stroke-width="0.8"/>
-    <text x="357" y="382" class="text-desc text-mono" style="fill:rgb(15, 110, 86); font-weight: 600;">_arkilian_meta</text>
+    <line x1="20" y1="76" x2="192" y2="76" stroke="#1E293B" stroke-width="1"/>
+
+    <!-- Object 1: Manifest -->
+    <rect x="18" y="92" width="176" height="56" rx="6" fill="#0B0F19" stroke="#1E293B" stroke-width="1"/>
+    <text x="106" y="116" text-anchor="middle" class="mono" font-size="11.5" font-weight="600" fill="#60A5FA">manifest.json</text>
+    <text x="106" y="135" text-anchor="middle" class="sans" font-size="10.5" fill="#94A3B8">HMAC-SHA256 signed</text>
+
+    <!-- Object 2: Chunks -->
+    <rect x="18" y="160" width="176" height="56" rx="6" fill="#0B0F19" stroke="#1E293B" stroke-width="1"/>
+    <text x="106" y="184" text-anchor="middle" class="mono" font-size="11.5" font-weight="600" fill="#38BDF8">chunks/lsn_*.sql</text>
+    <text x="106" y="203" text-anchor="middle" class="sans" font-size="10.5" fill="#94A3B8">1s CDC · SHA-256 verified</text>
+
+    <!-- Object 3: Snapshots -->
+    <rect x="18" y="228" width="176" height="56" rx="6" fill="#0B0F19" stroke="#1E293B" stroke-width="1"/>
+    <text x="106" y="252" text-anchor="middle" class="mono" font-size="11.5" font-weight="600" fill="#818CF8">snapshots/*.sqlite</text>
+    <text x="106" y="271" text-anchor="middle" class="sans" font-size="10.5" fill="#94A3B8">Baseline · SHA-256 verified</text>
   </g>
 
-  <!-- Clean Horizontal Arrow: Capture Subsystem -> Outbox Table -->
-  <line x1="257" y1="327" x2="285" y2="327" marker-end="url(#arrow-green)" class="line-green"/>
-
-  <!-- ================================================================== -->
-  <!-- 2C. COLUMN 3: WAL FLUSH THREAD (db->backup_db)                     -->
-  <!-- ================================================================== -->
-  <g class="text-base">
-    <rect x="445" y="125" width="195" height="290" rx="8" stroke-width="0.8" style="fill:rgb(254, 242, 237);stroke:rgb(180, 75, 40);"/>
-    <text x="542" y="147" class="text-title" style="fill:rgb(130, 45, 20);">Flush Thread (Realtime)</text>
-    <text x="542" y="163" class="text-desc text-mono" style="fill:rgb(180, 75, 40);">Dedicated: db->backup_db</text>
-
-    <!-- Shipping Card -->
-    <rect x="456" y="175" width="173" height="110" rx="6" stroke-width="0.8" style="fill:rgb(255, 255, 255);stroke:rgb(225, 195, 180);"/>
-    <text x="542" y="196" class="text-title" style="fill:rgb(130, 45, 20);">Chunk Shipping</text>
-    <text x="542" y="214" class="text-desc" style="fill:rgb(90, 90, 85);">Drains outbox batches</text>
-    <text x="542" y="230" class="text-desc text-mono" style="fill:rgb(130, 45, 20); font-size: 9.5px;">in-memory wal_chunk</text>
-    <text x="542" y="248" class="text-desc" style="fill:rgb(90, 90, 85); font-weight: 600;">AWS SigV4 Presigning</text>
-    <text x="542" y="264" class="text-desc" style="fill:rgb(180, 75, 40); font-size: 9.5px;">SSRF &amp; cleartext guards</text>
-
-    <!-- Manifest Card -->
-    <rect x="456" y="295" width="173" height="105" rx="6" stroke-width="0.8" style="fill:rgb(255, 255, 255);stroke:rgb(225, 195, 180);"/>
-    <text x="542" y="316" class="text-title" style="fill:rgb(130, 45, 20);">Manifest Registry</text>
-    <text x="542" y="334" class="text-desc" style="fill:rgb(90, 90, 85);">Maintains LSN sequence</text>
-    <text x="542" y="352" class="text-desc text-mono" style="fill:rgb(180, 75, 40);">manifest.json</text>
-    <text x="542" y="368" class="text-desc text-mono" style="fill:rgb(180, 75, 40);">+ manifest.sig</text>
-    <text x="542" y="384" class="text-desc" style="fill:rgb(130, 45, 20); font-size: 9px; font-weight: 600;">HMAC-SHA256 authenticated</text>
-  </g>
-
-  <!-- Clean Horizontal Arrow: Outbox Table -> Flush Thread -->
-  <line x1="430" y1="230" x2="445" y2="230" marker-end="url(#arrow-orange)" class="line-orange"/>
-
-  <!-- ================================================================== -->
-  <!-- 2D. COLUMN 4: HOURLY SNAPSHOT THREAD (db->snapshot_db)             -->
-  <!-- ================================================================== -->
-  <g class="text-base">
-    <rect x="655" y="125" width="180" height="290" rx="8" stroke-width="0.8" style="fill:rgb(254, 242, 237);stroke:rgb(180, 75, 40);"/>
-    <text x="745" y="147" class="text-title" style="fill:rgb(130, 45, 20);">Snapshot Thread (Hourly)</text>
-    <text x="745" y="163" class="text-desc text-mono" style="fill:rgb(180, 75, 40);">Dedicated: db->snapshot_db</text>
-
-    <!-- Online Copy Card -->
-    <rect x="666" y="175" width="158" height="110" rx="6" stroke-width="0.8" style="fill:rgb(255, 255, 255);stroke:rgb(225, 195, 180);"/>
-    <text x="745" y="196" class="text-title" style="fill:rgb(130, 45, 20);">Online Backup</text>
-    <text x="745" y="214" class="text-desc text-mono" style="fill:rgb(180, 75, 40); font-size: 9.5px;">sqlite3_backup_step()</text>
-    <text x="745" y="232" class="text-desc" style="fill:rgb(90, 90, 85);">Non-blocking point-in-time</text>
-    <text x="745" y="248" class="text-desc" style="fill:rgb(90, 90, 85);">page copy of database</text>
-    <text x="745" y="266" class="text-desc" style="fill:rgb(70, 70, 70); font-size: 10px;">Staged to unique temp file</text>
-
-    <!-- Prune Card -->
-    <rect x="666" y="295" width="158" height="105" rx="6" stroke-width="0.8" style="fill:rgb(255, 255, 255);stroke:rgb(225, 195, 180);"/>
-    <text x="745" y="316" class="text-title" style="fill:rgb(130, 45, 20);">Snapshot Upload</text>
-    <text x="745" y="334" class="text-desc text-mono" style="fill:rgb(180, 75, 40);">PUT backup.sqlite</text>
-    <text x="745" y="352" class="text-desc" style="fill:rgb(90, 90, 85);">Advances baseline LSN</text>
-    <text x="745" y="368" class="text-desc" style="fill:rgb(90, 90, 85);">Prunes superseded chunks</text>
-    <text x="745" y="384" class="text-desc" style="fill:rgb(130, 45, 20); font-size: 9px;">Republishes signed manifest</text>
-  </g>
-
-  <!-- ================================================================== -->
-  <!-- 3. S3-COMPATIBLE STORAGE (Bottom Container)                        -->
-  <!-- ================================================================== -->
-  <g class="text-base">
-    <rect x="30" y="460" width="820" height="125" rx="12" stroke-width="0.8" style="fill:rgb(245, 247, 252);stroke:rgb(70, 95, 150);"/>
-    <text x="48" y="482" class="text-header" style="fill:rgb(40, 65, 120);">S3-Compatible Object Storage</text>
-    <text x="250" y="482" class="text-sub" style="fill:rgb(90, 110, 150);">AWS S3 / MinIO / Cloudflare R2 / Ceph — Target prefix: {ARKILIAN_S3_PREFIX}/</text>
-
-    <!-- Artifact 1: Manifest -->
-    <rect x="45" y="495" width="225" height="74" rx="6" stroke-width="0.6" style="fill:rgb(255, 255, 255);stroke:rgb(180, 195, 225);"/>
-    <text x="157" y="516" class="text-title text-mono" style="fill:rgb(40, 65, 120);">manifest.json + .sig</text>
-    <text x="157" y="534" class="text-desc" style="fill:rgb(70, 70, 75);">Durable atomic registry</text>
-    <text x="157" y="552" class="text-desc" style="fill:rgb(180, 75, 40); font-weight: 600;">HMAC-SHA256 signature</text>
-
-    <!-- Artifact 2: Chunks -->
-    <rect x="285" y="495" width="260" height="74" rx="6" stroke-width="0.6" style="fill:rgb(255, 255, 255);stroke:rgb(180, 195, 225);"/>
-    <text x="415" y="516" class="text-title text-mono" style="fill:rgb(40, 65, 120);">chunks/lsn_*.sql</text>
-    <text x="415" y="534" class="text-desc" style="fill:rgb(70, 70, 75);">Incremental CDC SQL chunks</text>
-    <text x="415" y="552" class="text-desc" style="fill:rgb(15, 110, 86); font-weight: 600;">SHA-256 digest per chunk</text>
-
-    <!-- Artifact 3: Snapshot -->
-    <rect x="560" y="495" width="275" height="74" rx="6" stroke-width="0.6" style="fill:rgb(255, 255, 255);stroke:rgb(180, 195, 225);"/>
-    <text x="697" y="516" class="text-title text-mono" style="fill:rgb(40, 65, 120);">backup.sqlite</text>
-    <text x="697" y="534" class="text-desc" style="fill:rgb(70, 70, 75);">Hourly full database snapshot</text>
-    <text x="697" y="552" class="text-desc" style="fill:rgb(40, 65, 120);">Consistent baseline copy</text>
-  </g>
-
-  <!-- Clean Vertical Arrow: Flush Thread -> S3 Storage (Chunks/Manifest) -->
-  <line x1="542" y1="415" x2="542" y2="460" marker-end="url(#arrow-orange)" class="line-orange"/>
-
-  <!-- Clean Vertical Arrow: Snapshot Thread -> S3 Storage (backup.sqlite) -->
-  <line x1="745" y1="415" x2="745" y2="460" marker-end="url(#arrow-orange)" class="line-orange"/>
-
-  <!-- ================================================================== -->
-  <!-- 4. COLD-START HYDRATION (Clean rectangular return path)            -->
-  <!-- ================================================================== -->
-  <path d="M 45,532 L 18,532 L 18,203 L 45,203" marker-end="url(#arrow-purple)" class="line-purple"/>
-  
-  <rect x="8" y="345" width="20" height="75" rx="3" fill="rgb(244, 243, 255)" stroke="rgb(99, 87, 219)" stroke-width="0.6"/>
-  <g class="text-base" transform="translate(22, 412) rotate(-90)">
-    <text x="0" y="0" class="text-desc text-mono" style="fill:rgb(99, 87, 219); font-weight: 600; font-size: 8.5px;">arkilian_hydrate_s3()</text>
-  </g>
-
+  <!-- ==================================================================== -->
+  <!-- BOTTOM RETURN PATH: COLD-START HYDRATION                             -->
+  <!-- ==================================================================== -->
+  <path d="M 938 402 L 938 456 L 518 456 L 518 422" fill="none" stroke="#60A5FA" stroke-width="1.5" stroke-dasharray="5,4" marker-end="url(#arr-hydrate)"/>
+  <rect x="612" y="442" width="236" height="26" rx="13" fill="#0F172A" stroke="#1E3A8A" stroke-width="1"/>
+  <text x="730" y="459" text-anchor="middle" class="mono" font-size="11" fill="#93C5FD">Cold-Start Restore: arkilian_hydrate_s3()</text>
 </svg>
