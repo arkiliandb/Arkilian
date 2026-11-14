@@ -37,6 +37,10 @@
           "libraries": ["-lcurl"]
         }],
         ["OS=='linux'", {
+          "cflags": [
+            "-Wno-discarded-qualifiers",
+            "-Wno-stringop-overread"
+          ],
           "cflags_cc": ["-fPIC"],
           "libraries": ["-lcurl"]
         }],
